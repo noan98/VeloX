@@ -6,6 +6,8 @@
 //! `browser::`, so open/close/activate logic is unit-tested without a
 //! window or a webview.
 
+use std::time::{Duration, Instant};
+
 use super::tab::{Tab, TabId};
 
 /// An ordered set of tabs with exactly one active tab.
@@ -92,6 +94,16 @@ impl Tabs {
         id
     }
 
+    /// Like [`Self::open`], but first records `now` as the moment the
+    /// previously active tab went to the background — see
+    /// [`Self::idle_background_tabs`]. Prefer this over `open` wherever a
+    /// real clock is available (i.e. everywhere but tests that don't care
+    /// about the auto-suspend idle clock).
+    pub fn open_at(&mut self, url: impl Into<String>, now: Instant) -> TabId {
+        self.active_mut().mark_backgrounded(now);
+        self.open(url)
+    }
+
     /// Close the tab `id`.
     ///
     /// Returns the id of the tab that is active afterwards (unchanged if a
@@ -127,6 +139,68 @@ impl Tabs {
             }
             None => false,
         }
+    }
+
+    /// Like [`Self::activate`], but first records `now` as the moment the
+    /// previously active tab went to the background — see
+    /// [`Self::idle_background_tabs`]. A no-op (like `activate`) when `id`
+    /// is unknown, in which case nothing is marked either.
+    pub fn activate_at(&mut self, id: TabId, now: Instant) -> bool {
+        if self.index_of(id).is_none() {
+            return false;
+        }
+        self.active_mut().mark_backgrounded(now);
+        self.activate(id)
+    }
+
+    /// Suspend tab `id`: mark it dormant so its content webview can be
+    /// dropped (see `ui::window::BrowserWindow::suspend_tab`). Refuses —
+    /// returning `false`, leaving every tab unchanged — for the active tab
+    /// (the visible tab always needs a live webview), an already-suspended
+    /// tab, or an unknown id.
+    pub fn suspend(&mut self, id: TabId) -> bool {
+        if id == self.active_id() {
+            return false;
+        }
+        match self.get_mut(id) {
+            Some(tab) if !tab.is_suspended() => {
+                tab.suspend();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Background (non-active) tabs that are not yet suspended and have
+    /// been idle for at least `idle_after` as of `now`. The active tab is
+    /// never a candidate: suspending the tab the user is looking at would
+    /// be visibly disruptive, not a background memory optimization.
+    ///
+    /// Pure and clock-injected on purpose, so the auto-suspend policy is
+    /// unit-testable without sleeping a real thread — see the tests below.
+    pub fn idle_background_tabs(&self, now: Instant, idle_after: Duration) -> Vec<TabId> {
+        let active = self.active_id();
+        self.tabs
+            .iter()
+            .filter(|tab| {
+                tab.id() != active && !tab.is_suspended() && tab.idle_for(now) >= idle_after
+            })
+            .map(Tab::id)
+            .collect()
+    }
+
+    /// The earliest instant at which a currently-awake background tab will
+    /// next become eligible for automatic suspension, for scheduling the
+    /// next idle check (e.g. `tao::event_loop::ControlFlow::WaitUntil`).
+    /// `None` when there is no such tab (e.g. a single-tab window, or every
+    /// background tab is already suspended) — nothing to wait for.
+    pub fn next_idle_deadline(&self, idle_after: Duration) -> Option<Instant> {
+        let active = self.active_id();
+        self.tabs
+            .iter()
+            .filter(|tab| tab.id() != active && !tab.is_suspended())
+            .map(|tab| tab.last_active_at() + idle_after)
+            .min()
     }
 }
 
@@ -282,5 +356,150 @@ mod tests {
             .unwrap()
             .on_load_finished("https://b.example/done");
         assert_eq!(tabs.get(b).unwrap().current_url(), "https://b.example/done");
+    }
+
+    #[test]
+    fn suspend_refuses_the_active_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let active = tabs.active_id();
+
+        assert!(!tabs.suspend(active));
+        assert!(!tabs.get(active).unwrap().is_suspended());
+    }
+
+    #[test]
+    fn suspend_refuses_an_unknown_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        assert!(!tabs.suspend(TabId::from(999)));
+    }
+
+    #[test]
+    fn suspend_marks_a_background_tab_dormant() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/"); // active
+        tabs.activate(a); // b is now the background tab
+
+        assert!(tabs.suspend(b));
+        assert!(tabs.get(b).unwrap().is_suspended());
+        // A second suspend is a no-op (already suspended).
+        assert!(!tabs.suspend(b));
+    }
+
+    #[test]
+    fn activate_at_marks_the_outgoing_tab_backgrounded() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/"); // active
+
+        let t0 = Instant::now();
+        assert!(tabs.activate_at(a, t0));
+
+        // b just went to the background at t0, so it is not yet idle...
+        assert!(tabs
+            .idle_background_tabs(t0, Duration::from_secs(1))
+            .is_empty());
+        // ...but it is after enough time passes.
+        assert_eq!(
+            tabs.idle_background_tabs(t0 + Duration::from_secs(1), Duration::from_secs(1)),
+            vec![b]
+        );
+    }
+
+    #[test]
+    fn activate_at_is_a_no_op_for_an_unknown_id() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+
+        assert!(!tabs.activate_at(TabId::from(999), Instant::now()));
+        assert_eq!(tabs.active_id(), a);
+    }
+
+    #[test]
+    fn open_at_marks_the_previously_active_tab_backgrounded() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+
+        let t0 = Instant::now();
+        let b = tabs.open_at("https://b.example/", t0);
+
+        assert_eq!(tabs.active_id(), b);
+        assert_eq!(
+            tabs.idle_background_tabs(t0 + Duration::from_secs(5), Duration::from_secs(5)),
+            vec![a]
+        );
+    }
+
+    #[test]
+    fn idle_background_tabs_excludes_the_active_and_already_suspended_tabs() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/"); // active
+
+        let t0 = Instant::now();
+        tabs.activate_at(a, t0); // backgrounds c
+        tabs.activate_at(b, t0); // backgrounds a; b is now active
+
+        let long_after = t0 + Duration::from_secs(3600);
+        // a and c are both idle background tabs...
+        let mut idle = tabs.idle_background_tabs(long_after, Duration::from_secs(1));
+        idle.sort();
+        let mut expected = vec![a, c];
+        expected.sort();
+        assert_eq!(idle, expected);
+
+        // ...but not once c is suspended, and never b (it's active).
+        assert!(tabs.suspend(c));
+        assert_eq!(
+            tabs.idle_background_tabs(long_after, Duration::from_secs(1)),
+            vec![a]
+        );
+        assert!(!tabs
+            .idle_background_tabs(long_after, Duration::from_secs(1))
+            .contains(&b));
+    }
+
+    #[test]
+    fn idle_background_tabs_respects_the_threshold() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let t0 = Instant::now();
+        tabs.activate_at(a, t0); // backgrounds b at t0
+
+        let idle_after = Duration::from_secs(60);
+        assert!(tabs
+            .idle_background_tabs(t0 + Duration::from_secs(30), idle_after)
+            .is_empty());
+        assert_eq!(
+            tabs.idle_background_tabs(t0 + Duration::from_secs(60), idle_after),
+            vec![b]
+        );
+    }
+
+    #[test]
+    fn next_idle_deadline_is_none_with_no_background_tabs() {
+        let tabs = Tabs::new("https://a.example/");
+        assert_eq!(tabs.next_idle_deadline(Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn next_idle_deadline_tracks_the_soonest_background_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let t0 = Instant::now();
+        tabs.activate_at(a, t0); // backgrounds b at t0
+
+        let idle_after = Duration::from_secs(60);
+        assert_eq!(
+            tabs.next_idle_deadline(idle_after),
+            Some(t0 + Duration::from_secs(60))
+        );
+
+        // Once suspended, b no longer contributes a deadline.
+        assert!(tabs.suspend(b));
+        assert_eq!(tabs.next_idle_deadline(idle_after), None);
     }
 }

@@ -65,6 +65,10 @@
   }
   .tab.active { background: var(--field-bg); }
   .tab.loading .tab-label::before { content: "\21BB\a0"; }
+  /* Suspended: webview dropped to reclaim memory, only the URL survives.
+     Dimmed so it reads as dormant, distinct from an ordinary background tab. */
+  .tab.suspended { opacity: 0.55; }
+  .tab.suspended .tab-label::before { content: "\1F4A4\a0"; } /* 💤 */
   .tab-label {
     flex: 1;
     min-width: 0;
@@ -73,7 +77,7 @@
     white-space: nowrap;
     font-size: 12px;
   }
-  .tab-close {
+  .tab-close, .tab-suspend {
     flex: none;
     width: 18px;
     height: 18px;
@@ -86,7 +90,8 @@
     line-height: 1;
     cursor: pointer;
   }
-  .tab-close:hover { background: rgba(128, 128, 128, 0.3); }
+  .tab-close:hover, .tab-suspend:hover { background: rgba(128, 128, 128, 0.3); }
+  .tab-suspend { font-size: 11px; }
   #new-tab {
     flex: none;
     width: 24px;
@@ -183,14 +188,33 @@
     tabsContainer.innerHTML = "";
     for (const tab of tabs) {
       const el = document.createElement("div");
-      el.className = "tab" + (tab.active ? " active" : "") + (tab.loading ? " loading" : "");
-      el.title = tab.url;
+      el.className = "tab"
+        + (tab.active ? " active" : "")
+        + (tab.loading ? " loading" : "")
+        + (tab.suspended ? " suspended" : "");
+      el.title = tab.url + (tab.suspended ? " (suspended)" : "");
       el.addEventListener("click", () => send({ cmd: "activate_tab", id: tab.id }));
 
       const label = document.createElement("span");
       label.className = "tab-label";
       label.textContent = tab.url || "New Tab";
       el.appendChild(label);
+
+      /* Suspending only makes sense for a background tab that is still
+         awake; the active tab must stay live and an already-suspended tab
+         has nothing left to drop. Clicking the tab itself (above) resumes
+         it, so no separate "resume" button is needed. */
+      if (!tab.active && !tab.suspended) {
+        const suspend = document.createElement("button");
+        suspend.className = "tab-suspend";
+        suspend.title = "Suspend Tab";
+        suspend.textContent = "⏾";
+        suspend.addEventListener("click", (e) => {
+          e.stopPropagation();
+          send({ cmd: "suspend_tab", id: tab.id });
+        });
+        el.appendChild(suspend);
+      }
 
       const close = document.createElement("button");
       close.className = "tab-close";

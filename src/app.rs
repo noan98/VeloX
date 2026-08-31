@@ -6,6 +6,7 @@
 //! [`UserEvent`]s, so all state lives in one place and no locking is needed.
 
 use std::error::Error;
+use std::time::Instant;
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
@@ -38,6 +39,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let mut tabs = Tabs::new(config.homepage.clone());
     let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id())?;
     let homepage = config.homepage.clone();
+    let auto_suspend_after = config.auto_suspend_after;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -59,7 +61,47 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
             }
             _ => {}
         }
+
+        // Automatic tab suspension: on every pass through the loop (an
+        // actual event, or the timer below waking us up), suspend whatever
+        // background tabs have gone idle long enough, then schedule the
+        // next wake-up for whichever background tab will go idle soonest.
+        // `Tabs::idle_background_tabs`/`next_idle_deadline` are pure and
+        // clock-injected (see `browser::tabs`), so all the policy logic
+        // this loop needs is already unit-tested without a window.
+        if *control_flow != ControlFlow::Exit {
+            if let Some(next_wake) =
+                sweep_idle_tabs(&mut window, &mut tabs, auto_suspend_after, Instant::now())
+            {
+                *control_flow = ControlFlow::WaitUntil(next_wake);
+            }
+        }
     });
+}
+
+/// Suspend every background tab that has been idle for at least
+/// `auto_suspend_after` as of `now`, then return when the loop should next
+/// check again (the soonest a still-awake background tab would become
+/// eligible). Returns `None` when automatic suspension is disabled
+/// (`auto_suspend_after` is `None`) or there is no background tab to watch,
+/// in which case the caller should leave `control_flow` as `Wait`.
+fn sweep_idle_tabs(
+    window: &mut BrowserWindow,
+    tabs: &mut Tabs,
+    auto_suspend_after: Option<std::time::Duration>,
+    now: Instant,
+) -> Option<Instant> {
+    let idle_after = auto_suspend_after?;
+    let candidates = tabs.idle_background_tabs(now, idle_after);
+    if !candidates.is_empty() {
+        for id in candidates {
+            if tabs.suspend(id) {
+                log_failure("auto-suspend tab", window.suspend_tab(id));
+            }
+        }
+        sync_tab_strip(window, tabs);
+    }
+    tabs.next_idle_deadline(idle_after)
 }
 
 /// Dispatch one [`UserEvent`]. UI failures are logged, never fatal.
@@ -130,7 +172,7 @@ fn handle_toolbar_command(
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
         ToolbarCommand::NewTab => {
-            let id = tabs.open(homepage.to_owned());
+            let id = tabs.open_at(homepage.to_owned(), Instant::now());
             log_failure("open tab", window.open_tab(id, homepage));
             activate_and_refresh(window, tabs, id);
         }
@@ -138,6 +180,10 @@ fn handle_toolbar_command(
             let id = TabId::from(id);
             if let Some(new_active) = tabs.close(id) {
                 window.close_tab(id);
+                // The tab that replaces the one just closed may itself have
+                // been suspended (a background tab can be suspended while
+                // the tab in front of it is closed); `activate_and_refresh`
+                // resumes it if so.
                 activate_and_refresh(window, tabs, new_active);
             }
             // Otherwise: unknown id, or `id` was the only remaining tab —
@@ -145,9 +191,18 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::ActivateTab { id } => {
             let id = TabId::from(id);
-            if tabs.activate(id) {
+            if tabs.activate_at(id, Instant::now()) {
                 activate_and_refresh(window, tabs, id);
             }
+        }
+        ToolbarCommand::SuspendTab { id } => {
+            let id = TabId::from(id);
+            if tabs.suspend(id) {
+                log_failure("suspend tab", window.suspend_tab(id));
+                sync_tab_strip(window, tabs);
+            }
+            // Otherwise: unknown id, the active tab (never suspended), or
+            // already suspended — a no-op, mirroring `CloseTab`'s guards.
         }
         ToolbarCommand::Ready => {
             log_failure(
@@ -165,9 +220,29 @@ fn handle_toolbar_command(
 
 /// Show `id` in the window, then bring the toolbar (address bar, loading
 /// indicator, tab strip) up to date with the now-active tab. The caller must
-/// have already made `id` the active tab in `tabs`.
-fn activate_and_refresh(window: &mut BrowserWindow, tabs: &Tabs, id: TabId) {
-    log_failure("activate tab", window.activate_tab(id));
+/// have already made `id` the active tab in `tabs` (`activate`/`activate_at`,
+/// `open`/`open_at`, or the replacement tab returned by `close`).
+///
+/// If `id` was suspended, this also resumes it: clears the suspended flag
+/// on the `Tabs` side and rebuilds its content webview (loading its last
+/// known URL) on the `BrowserWindow` side, instead of the plain visibility
+/// toggle used for an already-awake tab.
+fn activate_and_refresh(window: &mut BrowserWindow, tabs: &mut Tabs, id: TabId) {
+    let was_suspended = tabs.active().is_suspended();
+    let result = if was_suspended {
+        tabs.active_mut().resume();
+        window.resume_tab(id, tabs.active().current_url())
+    } else {
+        window.activate_tab(id)
+    };
+    log_failure(
+        if was_suspended {
+            "resume tab"
+        } else {
+            "activate tab"
+        },
+        result,
+    );
     if let Some(tab) = tabs.get(id) {
         log_failure(
             "update address bar",
@@ -188,6 +263,7 @@ fn sync_tab_strip(window: &BrowserWindow, tabs: &Tabs) {
             url: tab.current_url().to_owned(),
             loading: tab.is_loading(),
             active: tab.id() == active_id,
+            suspended: tab.is_suspended(),
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));

@@ -3,6 +3,8 @@
 //! Kept as a plain struct so that a config file / CLI flags can be layered on
 //! later without touching the rest of the code.
 
+use std::time::Duration;
+
 /// Application configuration, currently compile-time defaults only.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -15,6 +17,18 @@ pub struct Config {
     pub window_height: u32,
     /// Height of the toolbar strip (logical pixels), tab strip included.
     pub toolbar_height: u32,
+    /// Tab suspension policy: how long a background tab must sit idle
+    /// (elapsed time since it was last the active tab) before it becomes
+    /// eligible for *automatic* suspension — see
+    /// `browser::tabs::Tabs::idle_background_tabs`.
+    ///
+    /// `None` disables automatic suspension entirely; manual suspension
+    /// (the tab strip's suspend button, `ui::toolbar::ToolbarCommand::SuspendTab`)
+    /// is always available regardless of this setting. Defaults to `None`
+    /// so a fresh checkout never suspends a tab the user did not ask to
+    /// suspend — see docs/decisions.md D9 for why automatic suspension is
+    /// opt-in for now.
+    pub auto_suspend_after: Option<Duration>,
 }
 
 impl Default for Config {
@@ -27,6 +41,7 @@ impl Default for Config {
             // A 34px tab strip row on top of the 48px address bar row (see
             // ui/toolbar.html).
             toolbar_height: 82,
+            auto_suspend_after: None,
         }
     }
 }
@@ -41,5 +56,8 @@ mod tests {
         assert!(config.homepage.starts_with("https://"));
         assert!(config.toolbar_height > 0);
         assert!(config.window_height > config.toolbar_height);
+        // Automatic suspension must be opt-in: a fresh checkout should never
+        // surprise a user by suspending a tab on its own.
+        assert_eq!(config.auto_suspend_after, None);
     }
 }
