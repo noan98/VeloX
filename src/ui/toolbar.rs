@@ -31,8 +31,16 @@ pub enum ToolbarCommand {
     CloseTab {
         id: u64,
     },
-    /// A tab in the strip was clicked: make it the active tab.
+    /// A tab in the strip was clicked: make it the active tab. Resumes the
+    /// tab first (rebuilding its content webview) if it was suspended.
     ActivateTab {
+        id: u64,
+    },
+    /// A tab's suspend button was clicked: drop its content webview to
+    /// reclaim memory while keeping its URL, to be reloaded on the next
+    /// `ActivateTab`. A no-op for the active tab or an already-suspended
+    /// tab (see `browser::tabs::Tabs::suspend`).
+    SuspendTab {
         id: u64,
     },
     /// The toolbar document finished loading and wants the current state
@@ -48,6 +56,10 @@ pub struct TabSummary {
     pub url: String,
     pub loading: bool,
     pub active: bool,
+    /// Whether the tab is suspended (its content webview has been dropped
+    /// to reclaim memory — see docs/decisions.md D9). The tab strip shows
+    /// this distinctly so the user can tell a dormant tab from a live one.
+    pub suspended: bool,
 }
 
 /// Parse a raw IPC message body into a [`ToolbarCommand`].
@@ -131,6 +143,10 @@ mod tests {
             parse_command(r#"{"cmd":"activate_tab","id":42}"#).unwrap(),
             ToolbarCommand::ActivateTab { id: 42 }
         );
+        assert_eq!(
+            parse_command(r#"{"cmd":"suspend_tab","id":7}"#).unwrap(),
+            ToolbarCommand::SuspendTab { id: 7 }
+        );
     }
 
     #[test]
@@ -159,12 +175,21 @@ mod tests {
                 url: "https://a.example/".to_owned(),
                 loading: false,
                 active: true,
+                suspended: false,
             },
             TabSummary {
                 id: 2,
                 url: "https://b.example/?q=\"x\"".to_owned(),
                 loading: true,
                 active: false,
+                suspended: false,
+            },
+            TabSummary {
+                id: 3,
+                url: "https://c.example/".to_owned(),
+                loading: false,
+                active: false,
+                suspended: true,
             },
         ];
         let script = set_tabs_script(&tabs);
@@ -172,6 +197,7 @@ mod tests {
         assert!(script.ends_with("]);"));
         // Quotes inside a URL must be escaped, not break out of the array.
         assert!(script.contains(r#"\"x\""#));
+        assert!(script.contains(r#""suspended":true"#));
 
         let empty = set_tabs_script(&[]);
         assert_eq!(empty, "veloxSetTabs([]);");
@@ -186,5 +212,6 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("new_tab"));
         assert!(TOOLBAR_HTML.contains("close_tab"));
         assert!(TOOLBAR_HTML.contains("activate_tab"));
+        assert!(TOOLBAR_HTML.contains("suspend_tab"));
     }
 }

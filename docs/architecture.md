@@ -1,7 +1,7 @@
 # VeloX Architecture
 
-Status: single window, multiple tabs. This document describes what exists
-today and where the extension points are.
+Status: single window, multiple tabs, tab suspension. This document
+describes what exists today and where the extension points are.
 
 ## Overall structure
 
@@ -150,12 +150,54 @@ page starts loading in parallel).
   `ActivateTab { id }` — purely additive to the existing serde enum. The
   toolbar pushes tab state back with `TabSummary`/`veloxSetTabs`, rendered as
   the tab strip above the address bar (`src/ui/toolbar.html`).
-- **Built for tab suspension, not implementing it**: `ContentTab::webview` is
-  an `Option<WebView>`. VeloX does not suspend tabs today (every open tab's
-  webview is always `Some`), but a future feature that drops a background
-  tab's webview to reclaim memory can `take()` it and leave the tab's `Tab`
-  state (URL, loading flag, position in `Tabs`) untouched — reactivating
-  would rebuild the webview from that state instead of everything moving.
+## Tab suspension
+
+Status: manual suspension shipped, automatic suspension implemented and
+opt-in (default off). See docs/decisions.md D9 for the full rationale,
+including the WebKitGTK/WKWebView/WebView2 cache-control investigation.
+
+- **What "suspended" means**: `ContentTab::webview` (`ui::window`) is
+  `Option<WebView>`; suspending a tab `take()`s and drops it
+  (`BrowserWindow::suspend_tab`), reclaiming the memory the webview held.
+  `browser::tab::Tab` mirrors this with a `suspended` flag and keeps
+  `current_url` — the only state that survives. Scroll position,
+  in-progress form input, and session history (back/forward) are lost, the
+  same trade-off already accepted for tab *close* — suspension is a deeper
+  version of the same idea, not a new category of data loss.
+- **Never the active tab**: both the manual command and the automatic sweep
+  refuse to suspend the currently active tab — `browser::tabs::Tabs::suspend`
+  enforces this on the state side, `BrowserWindow::suspend_tab` defensively
+  checks again on the webview side. The visible tab always needs a live
+  webview.
+- **Resuming**: reactivating a suspended tab (clicking it in the tab strip,
+  or it becoming active because the tab in front of it closed) rebuilds the
+  webview and reloads `current_url` — `BrowserWindow::resume_tab` is exactly
+  `open_tab` followed by `activate_tab`, since rebuilding a dropped webview
+  for a `TabId` the app already knows about is the same operation as
+  building the first one for a brand new tab.
+- **Manual suspension**: `ToolbarCommand::SuspendTab { id }`, sent by a
+  per-tab button in the tab strip (hidden for the active tab and for a tab
+  already suspended, since clicking the tab itself resumes it — no separate
+  "resume" affordance is needed). `TabSummary` carries a `suspended` flag so
+  the strip can render dormant tabs distinctly (dimmed, a 💤 marker).
+- **Automatic suspension**: `Config::auto_suspend_after: Option<Duration>`
+  (default `None`, i.e. disabled) is the idle threshold — how long a
+  background tab must have sat unviewed before it is eligible. The pure
+  policy logic lives entirely in `browser::tabs::Tabs`:
+  `idle_background_tabs(now, idle_after)` (which background, non-suspended
+  tabs have crossed the threshold) and `next_idle_deadline(idle_after)` (the
+  soonest a still-awake background tab will cross it), both clock-injected
+  (`now: Instant` passed in, never read internally) so they are
+  unit-testable without sleeping a real thread. `app::run`'s event loop
+  calls these on every pass and drives `tao::event_loop::ControlFlow` with
+  `WaitUntil(next_deadline)` instead of a fixed `Wait`, so the loop wakes
+  itself up exactly when needed rather than polling.
+- **Idle clock**: a tab's "idle since" timestamp is the moment it stopped
+  being the active tab, recorded by `Tabs::activate_at`/`open_at` (thin
+  wrappers around the existing `activate`/`open` that additionally stamp the
+  *outgoing* active tab before switching) — see `Tab::mark_backgrounded`.
+  The currently active tab's timestamp is never read, since the active tab
+  is always excluded from suspension candidates regardless of its value.
 
 ## Performance extension points
 
@@ -168,7 +210,10 @@ Design choices made for measurability, and where instrumentation goes next:
   brackets every load in one place (`app::handle_user_event`).
 - **Memory**: the engine is out-of-process-ish (WebKit's network/render
   helpers); process-tree RSS sampling can be added behind a config flag
-  without touching browser logic.
+  without touching browser logic. Tab suspension (above) is the primary
+  lever for reducing it — dropping a background tab's webview releases that
+  process-tree's share of RSS; measuring the before/after delta is process-
+  tree RSS sampling's first real use case (see docs/decisions.md D9).
 - **Tab switch time**: `BrowserWindow::activate_tab` is the single code path
   for switching the visible tab, so it can be timed trivially.
 - The `Config` struct is the natural home for benchmark/telemetry toggles.

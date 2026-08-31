@@ -18,9 +18,9 @@
 //! tabs toggles visibility/bounds rather than destroying and recreating a
 //! webview, so an inactive tab's scroll position and in-progress form input
 //! survive the switch. Every content webview lives behind an `Option` inside
-//! [`ContentTab`] so a future tab-suspension feature (dropping a background
-//! tab's webview to save memory) can drop it without reshaping this struct —
-//! see [`ContentTab`].
+//! [`ContentTab`], which is what lets tab suspension ([`Self::suspend_tab`])
+//! drop a background tab's webview to reclaim memory without reshaping this
+//! struct, and [`Self::resume_tab`] rebuild it later — see [`ContentTab`].
 
 use std::collections::HashMap;
 
@@ -56,11 +56,11 @@ fn to_bounds((x, y, width, height): LogicalRect) -> Rect {
 struct ContentTab {
     /// The tab's webview.
     ///
-    /// Wrapped in `Option` so a later tab-suspension feature can `take()`
-    /// and drop it for a backgrounded tab to reclaim memory, while the
-    /// tab's `Tab` state (URL, loading flag — kept by `app.rs`, outside this
-    /// struct) is enough to rebuild it on reactivation. VeloX does not
-    /// suspend tabs yet, so this is always `Some` today.
+    /// `Some` for every open, awake tab. `None` while the tab is suspended
+    /// ([`BrowserWindow::suspend_tab`] `take()`s and drops it to reclaim
+    /// memory); the tab's `Tab` state (URL, loading flag — kept by
+    /// `browser::Tabs`, outside this struct) is enough to rebuild it on
+    /// reactivation via [`BrowserWindow::resume_tab`].
     webview: Option<WebView>,
 }
 
@@ -268,6 +268,48 @@ impl BrowserWindow {
                 Ok(())
             }
         }
+    }
+
+    /// Suspend tab `id`: drop its content webview to reclaim memory,
+    /// keeping the `contents` entry (now `webview: None`) so the tab can be
+    /// rebuilt later via [`Self::resume_tab`]. Refuses — logging instead of
+    /// panicking, like every other UI call here — to suspend the currently
+    /// active tab (it must stay visible) or an unknown tab id. The caller
+    /// (`app.rs`) is expected to have already checked
+    /// `browser::Tabs::suspend` succeeded, which enforces the same rule on
+    /// the state side; this is a defensive second check on the webview
+    /// side, not the source of truth for whether suspension is allowed.
+    pub fn suspend_tab(&mut self, id: TabId) -> wry::Result<()> {
+        if self.active == Some(id) {
+            eprintln!("velox: suspend_tab: refusing to suspend the active tab {id:?}");
+            return Ok(());
+        }
+        match self.contents.get_mut(&id) {
+            Some(tab) => {
+                // Dropped here: this is the memory reclaim.
+                tab.webview.take();
+                Ok(())
+            }
+            None => {
+                eprintln!("velox: suspend_tab: unknown tab {id:?}");
+                Ok(())
+            }
+        }
+    }
+
+    /// Rebuild a suspended tab's content webview, loading `url` (its last
+    /// known address — everything else, scroll position, in-progress form
+    /// input, and JS-side session history, was lost when the webview was
+    /// dropped by [`Self::suspend_tab`]), and make it the visible tab.
+    ///
+    /// This is exactly [`Self::open_tab`] followed by [`Self::activate_tab`]
+    /// — rebuilding a dropped webview for a `TabId` that `contents` already
+    /// tracks is the same operation as building the first one for a new
+    /// tab, so there is nothing suspension-specific to do here beyond
+    /// reusing that path.
+    pub fn resume_tab(&mut self, id: TabId, url: &str) -> wry::Result<()> {
+        self.open_tab(id, url)?;
+        self.activate_tab(id)
     }
 
     /// The active tab's content webview, if any is currently active.
