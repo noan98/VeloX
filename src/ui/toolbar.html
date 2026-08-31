@@ -7,16 +7,22 @@
     color-scheme: light dark;
     --bg: #f3f3f5;
     --fg: #1c1c1e;
+    --dim-fg: #6b6b70;
     --field-bg: #ffffff;
+    --row-hover: rgba(128, 128, 128, 0.12);
     --border: #d0d0d5;
     --accent: #4a6cf7;
+    --tab-bg: #e3e3e8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       --bg: #2b2b2e;
       --fg: #ececf0;
+      --dim-fg: #9a9aa0;
       --field-bg: #1c1c1e;
+      --row-hover: rgba(255, 255, 255, 0.08);
       --border: #47474c;
+      --tab-bg: #38383c;
     }
   }
   html, body {
@@ -28,11 +34,86 @@
     user-select: none;
     overflow: hidden;
   }
-  #toolbar {
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+  #tabstrip {
+    flex: 0 0 34px;
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    padding: 4px 6px 0;
+    box-sizing: border-box;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  #tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    min-width: 0;
+  }
+  .tab {
     display: flex;
     align-items: center;
     gap: 6px;
-    height: 100%;
+    height: 28px;
+    max-width: 180px;
+    min-width: 80px;
+    padding: 0 6px 0 10px;
+    border-radius: 8px 8px 0 0;
+    background: var(--tab-bg);
+    cursor: default;
+    flex: none;
+  }
+  .tab.active { background: var(--field-bg); }
+  .tab.loading .tab-label::before { content: "\21BB\a0"; }
+  /* Suspended: webview dropped to reclaim memory, only the URL survives.
+     Dimmed so it reads as dormant, distinct from an ordinary background tab. */
+  .tab.suspended { opacity: 0.55; }
+  .tab.suspended .tab-label::before { content: "\1F4A4\a0"; } /* 💤 */
+  .tab-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .tab-close, .tab-suspend {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fg);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .tab-close:hover, .tab-suspend:hover { background: rgba(128, 128, 128, 0.3); }
+  .tab-suspend { font-size: 11px; }
+  #new-tab {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    align-self: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fg);
+    font-size: 15px;
+    cursor: pointer;
+  }
+  #new-tab:hover { background: rgba(128, 128, 128, 0.2); }
+  #toolbar {
+    display: flex;
+    flex: 0 0 48px;
+    align-items: center;
+    gap: 6px;
     padding: 0 8px;
     box-sizing: border-box;
     border-bottom: 1px solid var(--border);
@@ -49,6 +130,7 @@
     cursor: pointer;
   }
   button:hover { background: rgba(128, 128, 128, 0.2); }
+  button.active { color: var(--accent); }
   #url {
     flex: 1;
     height: 32px;
@@ -62,29 +144,152 @@
   }
   #url:focus { border-color: var(--accent); }
   #toolbar.loading #url { border-color: var(--accent); }
+
+  #panel {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  #panel[hidden] { display: none; }
+  .panel-list {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .panel-list[hidden] { display: none; }
+  .panel-header {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 12px;
+    font-size: 12px;
+    color: var(--dim-fg);
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-header button {
+    width: auto;
+    height: auto;
+    padding: 2px 8px;
+    font-size: 12px;
+    color: var(--dim-fg);
+  }
+  .panel-rows {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  .panel-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    height: 34px;
+  }
+  .panel-row:hover { background: var(--row-hover); }
+  .panel-row-link {
+    flex: 1;
+    min-width: 0;
+    height: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    color: var(--fg);
+    font-size: 13px;
+    width: auto;
+    padding: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: pointer;
+  }
+  .panel-row-meta {
+    flex: none;
+    font-size: 11px;
+    color: var(--dim-fg);
+  }
+  .panel-row-delete {
+    flex: none;
+    width: 22px;
+    height: 22px;
+    font-size: 14px;
+    line-height: 1;
+    color: var(--dim-fg);
+  }
+  .panel-empty {
+    padding: 16px 12px;
+    font-size: 12px;
+    color: var(--dim-fg);
+    text-align: center;
+  }
 </style>
 </head>
 <body>
+<div id="tabstrip">
+  <div id="tabs"></div>
+  <button id="new-tab" title="New Tab">&#43;</button>
+</div>
 <div id="toolbar">
   <button id="back" title="Back">&#8592;</button>
   <button id="forward" title="Forward">&#8594;</button>
   <button id="reload" title="Reload">&#8635;</button>
   <input id="url" type="text" spellcheck="false" autocomplete="off"
          placeholder="Enter a URL, e.g. example.com" />
+  <button id="bookmark-star" title="ブックマークに追加/削除">&#9733;</button>
+  <button id="history-toggle" title="履歴">&#128337;</button>
+  <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
+</div>
+<div id="panel" hidden>
+  <div id="panel-history" class="panel-list">
+    <div class="panel-header">
+      <span>履歴</span>
+      <button id="history-clear">すべて削除</button>
+    </div>
+    <div id="history-rows" class="panel-rows"></div>
+  </div>
+  <div id="panel-bookmarks" class="panel-list" hidden>
+    <div class="panel-header">
+      <span>ブックマーク</span>
+    </div>
+    <div id="bookmarks-rows" class="panel-rows"></div>
+  </div>
 </div>
 <script>
   "use strict";
   const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
   const urlInput = document.getElementById("url");
+  const tabsContainer = document.getElementById("tabs");
+  const panelEl = document.getElementById("panel");
+  const historyPanelEl = document.getElementById("panel-history");
+  const bookmarksPanelEl = document.getElementById("panel-bookmarks");
+  const historyRowsEl = document.getElementById("history-rows");
+  const bookmarksRowsEl = document.getElementById("bookmarks-rows");
 
   document.getElementById("back").addEventListener("click", () => send({ cmd: "back" }));
   document.getElementById("forward").addEventListener("click", () => send({ cmd: "forward" }));
   document.getElementById("reload").addEventListener("click", () => send({ cmd: "reload" }));
+  document.getElementById("new-tab").addEventListener("click", () => send({ cmd: "new_tab" }));
   urlInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       send({ cmd: "navigate", input: urlInput.value });
       urlInput.blur();
     }
+  });
+
+  document.getElementById("bookmark-star").addEventListener("click", () => {
+    send({ cmd: "toggle_bookmark" });
+  });
+  document.getElementById("history-toggle").addEventListener("click", () => {
+    send({ cmd: "toggle_panel", panel: "history" });
+  });
+  document.getElementById("bookmarks-toggle").addEventListener("click", () => {
+    send({ cmd: "toggle_panel", panel: "bookmarks" });
+  });
+  document.getElementById("history-clear").addEventListener("click", () => {
+    send({ cmd: "clear_history" });
   });
 
   /* Called from Rust via evaluate_script. Keep the user's in-progress edit. */
@@ -95,6 +300,124 @@
   };
   window.veloxSetLoading = (loading) => {
     document.getElementById("toolbar").classList.toggle("loading", loading);
+  };
+  window.veloxSetBookmarkActive = (active) => {
+    document.getElementById("bookmark-star").classList.toggle("active", active);
+  };
+  window.veloxSetPanel = (panel) => {
+    panelEl.hidden = panel === null;
+    historyPanelEl.hidden = panel !== "history";
+    bookmarksPanelEl.hidden = panel !== "bookmarks";
+  };
+
+  /* Full re-render of the tab strip from the current tab list. Simpler and
+     plenty fast for the handful of tabs a desktop browser session has open,
+     versus diffing the DOM against the previous list. */
+  window.veloxSetTabs = (tabs) => {
+    tabsContainer.innerHTML = "";
+    for (const tab of tabs) {
+      const el = document.createElement("div");
+      el.className = "tab"
+        + (tab.active ? " active" : "")
+        + (tab.loading ? " loading" : "")
+        + (tab.suspended ? " suspended" : "");
+      el.title = tab.url + (tab.suspended ? " (suspended)" : "");
+      el.addEventListener("click", () => send({ cmd: "activate_tab", id: tab.id }));
+
+      const label = document.createElement("span");
+      label.className = "tab-label";
+      label.textContent = tab.url || "New Tab";
+      el.appendChild(label);
+
+      /* Suspending only makes sense for a background tab that is still
+         awake; the active tab must stay live and an already-suspended tab
+         has nothing left to drop. Clicking the tab itself (above) resumes
+         it, so no separate "resume" button is needed. */
+      if (!tab.active && !tab.suspended) {
+        const suspend = document.createElement("button");
+        suspend.className = "tab-suspend";
+        suspend.title = "Suspend Tab";
+        suspend.textContent = "⏾";
+        suspend.addEventListener("click", (e) => {
+          e.stopPropagation();
+          send({ cmd: "suspend_tab", id: tab.id });
+        });
+        el.appendChild(suspend);
+      }
+
+      const close = document.createElement("button");
+      close.className = "tab-close";
+      close.title = "Close Tab";
+      close.textContent = "×";
+      close.addEventListener("click", (e) => {
+        e.stopPropagation();
+        send({ cmd: "close_tab", id: tab.id });
+      });
+      el.appendChild(close);
+
+      tabsContainer.appendChild(el);
+    }
+  };
+
+  function formatTimestamp(seconds) {
+    if (typeof seconds !== "number") return "";
+    try {
+      return new Date(seconds * 1000).toLocaleString();
+    } catch (err) {
+      return "";
+    }
+  }
+
+  function renderRows(container, entries, opts) {
+    container.replaceChildren();
+    if (entries.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "panel-empty";
+      empty.textContent = opts.emptyText;
+      container.appendChild(empty);
+      return;
+    }
+    for (const entry of entries) {
+      const row = document.createElement("div");
+      row.className = "panel-row";
+
+      const link = document.createElement("button");
+      link.className = "panel-row-link";
+      link.textContent = entry.title && entry.title.length > 0 ? entry.title : entry.url;
+      link.title = entry.url;
+      link.addEventListener("click", () => send({ cmd: "navigate", input: entry.url }));
+
+      const meta = document.createElement("span");
+      meta.className = "panel-row-meta";
+      meta.textContent = formatTimestamp(opts.timestamp(entry));
+
+      const del = document.createElement("button");
+      del.className = "panel-row-delete";
+      del.textContent = "×";
+      del.title = "削除";
+      del.addEventListener("click", (event) => {
+        event.stopPropagation();
+        send(opts.deleteMessage(entry));
+      });
+
+      row.append(link, meta, del);
+      container.appendChild(row);
+    }
+  }
+
+  window.veloxSetHistory = (entries) => {
+    renderRows(historyRowsEl, entries, {
+      emptyText: "履歴はありません",
+      timestamp: (entry) => entry.visited_at,
+      deleteMessage: (entry) => ({ cmd: "delete_history_entry", id: entry.id }),
+    });
+  };
+  window.veloxSetBookmarks = (entries) => {
+    renderRows(bookmarksRowsEl, entries, {
+      emptyText: "ブックマークはありません",
+      timestamp: (entry) => entry.created_at,
+      deleteMessage: (entry) => ({ cmd: "remove_bookmark", id: entry.id }),
+    });
   };
 
   /* Ask Rust for the current state: the content page may have started
