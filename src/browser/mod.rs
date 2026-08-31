@@ -9,6 +9,7 @@
 
 pub mod bookmarks;
 pub mod history;
+pub mod metrics;
 pub mod navigation;
 pub mod persistence;
 pub mod tab;

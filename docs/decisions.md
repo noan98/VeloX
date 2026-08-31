@@ -455,3 +455,55 @@ of this is emulated by VeloX itself):
 
 No VeloX code branches on platform for this — `.with_incognito(bool)` is
 one call in `ui::window.rs`, and wry owns the platform dispatch.
+
+## D16: Performance metrics — `/proc` directly, no new dependency
+
+**Decision**: implement startup timestamps, page-load duration and
+process-tree RSS sampling (Issue #3) as a pure, UI/engine-independent module
+(`browser::metrics`), reading `/proc` directly on Linux instead of adding a
+crate like `sysinfo`.
+
+**Why not `sysinfo` (or similar)?** `sysinfo` (and comparable crates) pull in
+a much larger surface than this needs — full per-process CPU/disk/network
+stats, a whole-system snapshot API, and platform backends for OSes VeloX does
+not even build native RSS support for yet. VeloX's own dependency policy
+(D6) asks "why is this needed" before adding a crate; here the actual need
+is two integers per process (`PPid`, `VmRSS`) out of a text file the kernel
+already exposes, which is a few dozen lines of parsing — well within "not
+worth a dependency" territory. Per D6's own logic (the engine already ships
+what we need, don't duplicate it in a crate), the direct-`/proc` route is
+also what let this land with zero new lines in `Cargo.toml`.
+
+**Design**:
+
+- `browser::metrics` holds only pure logic: `StartupTimestamps` (four
+  checkpoints → a `Duration` report), `PageLoadTimer` (start/finish →
+  `Duration`), and `sample_process_tree_rss(pid)` (walks `/proc`, sums
+  `VmRSS` over the whole descendant tree — WebKit's network/render/GPU
+  helper processes included, since a single-PID reading would understate
+  real memory use). All formatting and tree-walking is unit-tested with
+  synthetic data; the `/proc` integration itself is exercised against the
+  test process's own tree (including a spawned child) since CI runs on
+  Linux.
+- `sample_process_tree_rss` is a standalone function — no `Config` or app
+  state involved — specifically so Issue #5 (tab suspension) can call it
+  directly to measure RSS before/after suspending a tab, independent of
+  whether startup/page-load logging is enabled.
+- Enabling is a `Config` flag (`perf_metrics`, plus `perf_rss_interval` for
+  the periodic RSS sampler), following the existing `VELOX_DEBUG` env-var
+  pattern via `Config::from_env_and_args` (`VELOX_PERF_METRICS`,
+  `VELOX_PERF_RSS_INTERVAL_MS`). When off, `app::run` never calls
+  `Instant::now()` for these checkpoints and never spawns the sampling
+  thread — the check is a single `Option::is_none()`/`bool` per event, so
+  the disabled path carries no meaningful overhead.
+- Output is structured `eprintln!` lines (`velox[perf] …`) for now, matching
+  the issue's "stderr is enough for now" scope; visualization/CI benchmarks
+  are left to follow-up issues.
+
+**Cost / revisit condition**: the `/proc` path only covers Linux precisely.
+Non-Linux Unix falls back to shelling out to `ps` (untested by this
+project's Linux-only CI); Windows returns `RssError::Unsupported` for now.
+If accurate cross-platform RSS becomes a priority before this project adds a
+Windows/macOS CI leg, that is the point to revisit a crate (or
+platform-specific APIs) with the actual OSes to test against, rather than
+guessing at `ps`/API behavior blind.

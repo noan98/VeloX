@@ -5,15 +5,17 @@
 //! (IPC, navigation, page load) forward their payloads into the event loop as
 //! [`UserEvent`]s, so all state lives in one place and no locking is needed.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
 use crate::browser::{
-    navigation, persistence, BookmarkEntry, BookmarkStore, HistoryEntry, HistoryStore, TabId, Tabs,
+    metrics, navigation, persistence, BookmarkEntry, BookmarkStore, HistoryEntry, HistoryStore,
+    TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -57,14 +59,40 @@ struct AppState {
 
 /// Build the window and run the event loop. Only returns on setup failure;
 /// once running, the process exits with the event loop.
-pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
+///
+/// `process_start` is the earliest timestamp the caller could capture
+/// (ideally the top of `main`); it only feeds the startup-timing report and
+/// is otherwise unused when `config.perf_metrics` is off.
+pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>> {
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
+    // `.then(...)` short-circuits: when metrics are off, no `Instant` is
+    // captured here and `startup` stays `None`, so every checkpoint below
+    // becomes a single cheap `Option` check with no clock read.
+    let mut startup = config
+        .perf_metrics
+        .then(|| metrics::StartupTimestamps::new(process_start));
+
     let tabs = Tabs::new(config.homepage.clone());
     let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id())?;
+    if let Some(startup) = startup.as_mut() {
+        startup.mark_window_created(Instant::now());
+    }
+
+    if config.perf_metrics {
+        if let Some(interval) = config.perf_rss_interval {
+            spawn_rss_sampler(interval);
+        }
+    }
+
     let homepage = config.homepage.clone();
     let auto_suspend_after = config.auto_suspend_after;
+    let perf_metrics_enabled = config.perf_metrics;
+    // One timer per tab: background tabs load concurrently with the active
+    // one, so a single shared timer would have their loads overwrite each
+    // other's start times.
+    let mut page_load_timers: HashMap<TabId, metrics::PageLoadTimer> = HashMap::new();
 
     let data_dir = persistence::default_data_dir();
     if data_dir.is_none() {
@@ -106,6 +134,9 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 if std::env::var_os("VELOX_DEBUG").is_some() {
                     eprintln!("velox[debug]: {user_event:?}");
                 }
+                if perf_metrics_enabled {
+                    record_perf_event(&mut startup, &mut page_load_timers, &user_event);
+                }
                 handle_user_event(&mut window, &mut state, &config, &homepage, user_event);
             }
             _ => {}
@@ -128,6 +159,77 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 *control_flow = ControlFlow::WaitUntil(next_wake);
             }
         }
+    });
+}
+
+/// Update startup/page-load metrics state for one [`UserEvent`], logging to
+/// stderr whenever a measurement completes. Only called when
+/// `config.perf_metrics` is on, so every branch here is allowed a clock read
+/// (the off-path never reaches this function at all).
+fn record_perf_event(
+    startup: &mut Option<metrics::StartupTimestamps>,
+    page_load_timers: &mut HashMap<TabId, metrics::PageLoadTimer>,
+    event: &UserEvent,
+) {
+    match event {
+        UserEvent::ToolbarMessage(body) => {
+            if matches!(toolbar::parse_command(body), Ok(ToolbarCommand::Ready)) {
+                mark_startup(startup, metrics::StartupTimestamps::mark_toolbar_ready);
+            }
+        }
+        UserEvent::NavigationStarted(id, _) => {
+            page_load_timers
+                .entry(*id)
+                .or_default()
+                .start(Instant::now());
+        }
+        UserEvent::LoadFinished(id, url) => {
+            if let Some(duration) = page_load_timers
+                .get_mut(id)
+                .and_then(|timer| timer.finish(Instant::now()))
+            {
+                eprintln!("velox[perf] {}", metrics::format_page_load(url, duration));
+            }
+            // The first page to finish anywhere is time-to-first-page; a
+            // background tab cannot beat the initial one to it, since it
+            // can only be opened after the window is up.
+            mark_startup(
+                startup,
+                metrics::StartupTimestamps::mark_first_load_finished,
+            );
+        }
+        UserEvent::LoadStarted(..) | UserEvent::PageTitleResolved { .. } => {}
+    }
+}
+
+/// Apply one startup-checkpoint mark and, once the full report is
+/// available, print it and clear `startup` so it is only reported once.
+fn mark_startup(
+    startup: &mut Option<metrics::StartupTimestamps>,
+    mark: fn(&mut metrics::StartupTimestamps, Instant),
+) {
+    let Some(timestamps) = startup.as_mut() else {
+        return;
+    };
+    mark(timestamps, Instant::now());
+    if let Some(report) = timestamps.report() {
+        eprintln!("velox[perf] {report}");
+        *startup = None;
+    }
+}
+
+/// Spawn a background thread that periodically samples this process's
+/// (and its descendants') RSS and logs it to stderr. Runs for the lifetime
+/// of the process; only ever spawned when `config.perf_metrics` and
+/// `config.perf_rss_interval` are both set, so it costs nothing otherwise.
+fn spawn_rss_sampler(interval: Duration) {
+    let pid = std::process::id();
+    std::thread::spawn(move || loop {
+        match metrics::sample_process_tree_rss(pid) {
+            Ok(sample) => eprintln!("velox[perf] {sample}"),
+            Err(err) => eprintln!("velox: rss sampling failed: {err}"),
+        }
+        std::thread::sleep(interval);
     });
 }
 
