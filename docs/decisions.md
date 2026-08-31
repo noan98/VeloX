@@ -363,13 +363,95 @@ the (now possibly no-longer-current) history entry it belongs to.
 ## D13: Single choke point for disabling history recording
 
 `app::record_visit_if_enabled` is the only place `HistoryStore::record_visit`
-is called from, gated by `AppState::history_enabled` (`true` today — nothing
-in this issue's scope ever sets it to `false`). This is the seam the
-following issue, #7 (private browsing), is expected to use: making
-`history_enabled` reflect whether the active tab/window is private needs no
-change to `HistoryStore` itself, `persistence`, or any other call site.
-Bookmarking is deliberately **not** gated by this flag — explicitly saving a
-bookmark is a distinct user action from passive visit recording, and real
-browsers typically keep letting users bookmark from a private
-window/tab — but the same `AppState`-level pattern would extend to it if a
-future decision says otherwise.
+is called from, gated by `AppState::history_enabled`. This is the seam the
+following issue, #7 (private browsing), was expected to use, and now does:
+`app::run` sets `history_enabled = !config.private` at startup, so private
+browsing needed no change to `HistoryStore` itself, `persistence`, or any
+other call site — see D14 below. Bookmarking is deliberately **not** gated
+by this flag — explicitly saving a bookmark is a distinct user action from
+passive visit recording, and real browsers typically keep letting users
+bookmark from a private window/tab — but the same `AppState`-level pattern
+would extend to it if a future decision says otherwise.
+
+## D14: Private browsing (#7) — whole-app mode, not a separate private window
+
+**Decision**: private browsing is a single flag (`Config::private`,
+sourced from the `VELOX_PRIVATE` env var or a `--private` CLI arg parsed by
+hand — see D6, no CLI-parsing crate added) that puts the *entire* running
+process into private mode for its whole lifetime. There is no "open a
+private window" action and no per-tab private state.
+
+**Why not a separate private window, as the issue's own implementation
+notes suggested as the more realistic long-term shape?** VeloX is
+single-window today (docs/architecture.md, "Adding tabs later" is still a
+roadmap item, not implemented). A second, independently-private window
+needs multi-window support to exist first — `BrowserWindow` today owns
+*the* `tao::window::Window` for the process, and `app::run`'s event loop
+closes the whole process on the first `CloseRequested`. Building
+multi-window support as a side effect of this issue would both blow its
+scope and pre-empt a design that deserves its own decision (e.g. how
+`AppState` — currently one struct for the one window — splits per window).
+The issue's own text names exactly this tradeoff and accepts starting with
+an app-wide flag; this decision records that choice formally.
+
+**Extension path when multi-window support lands**: the seams are already
+where they'd need to be to make each window's privacy independent without
+revisiting this issue's code:
+
+- `Config::private` becomes a per-window construction parameter instead of
+  a process-wide startup flag (e.g. `BrowserWindow::new` already takes it
+  from `&Config` today — that just stops being *the* process config and
+  becomes *a* window's config).
+- `.with_incognito(...)` is already a per-`WebViewBuilder` call
+  (`ui::window.rs`), not a global engine setting, so giving one window's
+  content webview an ephemeral store while another's stays persistent needs
+  no change there.
+- `AppState::history_enabled` (above) would need to move from one
+  process-wide bool to a per-window (or per-tab, once tabs exist) value,
+  since recording has to be gated per window rather than for the whole app.
+- The toolbar badge/color and window-title suffix (below) are already
+  computed from a `bool` passed in at window-build time, so per-window
+  values just flow through unchanged.
+
+## D15: `wry::WebViewBuilder::with_incognito` — availability and per-platform backing
+
+Verified against wry 0.56.1's source (`~/.cargo/registry/src/.../wry-0.56.1`,
+not assumed from memory, since a nonexistent API here would simply fail to
+compile): `with_incognito(bool)` exists on `WebViewBuilder` and is wired on
+every platform VeloX ships on. Only the *content* webview gets
+`.with_incognito(config.private)` — the toolbar webview only ever loads our
+own embedded `TOOLBAR_HTML` (`with_html`, no site content, no cookies), so
+there is nothing there for incognito to isolate.
+
+Per-platform backing (all give a non-persistent, in-memory-only store; none
+of this is emulated by VeloX itself):
+
+- **WebKitGTK (Linux/BSD)** — `webkitgtk/mod.rs`: when `incognito` is set,
+  wry builds the webview against `WebContext::new_ephemeral()` instead of
+  the default/shared context, and **ignores any custom `WebContext`**
+  passed via `attributes.context` (wry's own doc comment on `incognito`
+  says so explicitly). VeloX does not pass a custom context today, so this
+  does not affect us, but it would matter if `WebContext` ever gets used
+  for something else (e.g. proxy config) alongside incognito.
+- **WKWebView (macOS/iOS)** — `wkwebview/mod.rs`: when `incognito` is set,
+  the webview's `WKWebViewConfiguration` gets
+  `WKWebsiteDataStore::nonPersistentDataStore()`. This path does not depend
+  on the "custom data store by identifier" OS-version gate (macOS 14+ /
+  iOS 17+) that the *non*-incognito branch uses for
+  `pl_attrs.data_store_identifier` — `nonPersistentDataStore()` itself has
+  been available since far earlier OS versions, so incognito is not
+  version-gated on Apple platforms.
+- **WebView2 (Windows)** — `webview2/mod.rs`: `incognito` maps to
+  `ICoreWebView2ControllerOptions3::SetIsInPrivateModeEnabled(true)`, which
+  is only reachable by casting the environment to
+  `ICoreWebView2Environment10`. If that cast fails (an old WebView2 Runtime
+  that predates that interface), the whole `controller_opts` block is
+  skipped and **`incognito` is silently not applied** — no error is
+  surfaced by wry. In practice the WebView2 Runtime auto-updates
+  (Evergreen distribution), so this is a theoretical edge case rather than
+  an expected one, but it means Windows is the one platform where "private
+  mode was requested" is not a hard guarantee at the engine level; nothing
+  in VeloX today detects or reports this fallback.
+
+No VeloX code branches on platform for this — `.with_incognito(bool)` is
+one call in `ui::window.rs`, and wry owns the platform dispatch.

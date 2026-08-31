@@ -104,6 +104,9 @@ pub struct BrowserWindow {
     proxy: EventLoopProxy<UserEvent>,
     contents: HashMap<TabId, ContentTab>,
     active: Option<TabId>,
+    /// Whole-app private browsing (see docs/decisions.md D14). Kept so tabs
+    /// opened after startup are built with the same ephemeral data store.
+    private: bool,
 }
 
 impl BrowserWindow {
@@ -115,8 +118,16 @@ impl BrowserWindow {
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // A window-title suffix is a second, independent tell for private
+        // mode (docs/decisions.md D14): unlike the toolbar badge it survives
+        // being covered by another window in a taskbar/alt-tab switcher.
+        let window_title = if config.private {
+            format!("{} — プライベート", config.window_title)
+        } else {
+            config.window_title.clone()
+        };
         let window = WindowBuilder::new()
-            .with_title(&config.window_title)
+            .with_title(&window_title)
             .with_inner_size(tao::dpi::LogicalSize::new(
                 config.window_width,
                 config.window_height,
@@ -183,8 +194,13 @@ impl BrowserWindow {
             });
         let toolbar = attach(toolbar_builder)?;
 
-        let content_builder =
-            content_webview_builder(initial_tab, &config.homepage, content_rect, &proxy);
+        let content_builder = content_webview_builder(
+            initial_tab,
+            &config.homepage,
+            content_rect,
+            &proxy,
+            config.private,
+        );
         let content = attach(content_builder)?;
 
         let mut contents = HashMap::new();
@@ -212,6 +228,7 @@ impl BrowserWindow {
             proxy,
             contents,
             active: Some(initial_tab),
+            private: config.private,
         })
     }
 
@@ -253,8 +270,8 @@ impl BrowserWindow {
     /// also the newly active one.
     pub fn open_tab(&mut self, id: TabId, url: &str) -> wry::Result<()> {
         let (_, content_rect) = self.layout();
-        let builder =
-            content_webview_builder(id, url, content_rect, &self.proxy).with_visible(false);
+        let builder = content_webview_builder(id, url, content_rect, &self.proxy, self.private)
+            .with_visible(false);
         let webview = self.attach_webview(builder)?;
         self.contents.insert(
             id,
@@ -411,6 +428,12 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_bookmark_active_script(active))
     }
 
+    /// Show or hide the toolbar's always-visible private-browsing indicator.
+    pub fn set_private(&self, private: bool) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_private_script(private))
+    }
+
     /// Which history/bookmarks panel is currently open, if any.
     pub fn open_panel(&self) -> Option<Panel> {
         self.open_panel.get()
@@ -495,12 +518,22 @@ fn content_webview_builder<'a>(
     url: &str,
     content_rect: LogicalRect,
     proxy: &EventLoopProxy<UserEvent>,
+    private: bool,
 ) -> WebViewBuilder<'a> {
     let nav_proxy = proxy.clone();
     let load_proxy = proxy.clone();
     WebViewBuilder::new()
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
+        // Ephemeral (non-persistent) cookies/storage/cache for the page
+        // content itself; see docs/decisions.md D15 for the per-platform
+        // backing (WebKitGTK ephemeral WebContext / WKWebsiteDataStore
+        // nonPersistentDataStore / WebView2 private-mode controller option)
+        // and why the toolbar webview does not need this (it only ever loads
+        // our own embedded HTML, never site content). Every tab's webview
+        // goes through this builder, so tabs opened later - and suspended
+        // tabs rebuilt on resume - stay ephemeral too.
+        .with_incognito(private)
         .with_navigation_handler(move |url| {
             let _ = nav_proxy.send_event(UserEvent::NavigationStarted(id, url));
             true
