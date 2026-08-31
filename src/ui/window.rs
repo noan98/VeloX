@@ -39,6 +39,45 @@ use crate::ui::toolbar::{self, Panel};
 /// A rectangle in logical pixels: `(x, y, width, height)`.
 type LogicalRect = (u32, u32, u32, u32);
 
+/// The only message the content webview's devtools IPC channel accepts.
+///
+/// The content webview renders untrusted page content, so unlike the
+/// toolbar's IPC channel (which parses a structured, trusted [`ToolbarCommand`]),
+/// this handler does not deserialize anything a page sends it. It only ever
+/// compares the raw body against this fixed string and otherwise ignores the
+/// message. See docs/decisions.md D18 for the trust-boundary reasoning.
+///
+/// [`ToolbarCommand`]: crate::ui::toolbar::ToolbarCommand
+const OPEN_DEVTOOLS_MESSAGE: &str = "velox:open-devtools";
+
+/// Initialization script injected into the content webview to capture the
+/// devtools shortcut (F12, or Cmd+Opt+I on macOS) even while the page has
+/// focus, and forward it to Rust over [`OPEN_DEVTOOLS_MESSAGE`].
+///
+/// Registered via `with_initialization_script`, so it runs before any page
+/// script on every navigation, and listens in the capture phase so it gets
+/// first refusal against pages that try to swallow the keydown themselves.
+/// See docs/decisions.md D18 for why this approach was chosen over a
+/// tao-level accelerator / `WindowEvent::KeyboardInput`.
+fn devtools_shortcut_script() -> String {
+    format!(
+        r#"(() => {{
+  "use strict";
+  window.addEventListener("keydown", (event) => {{
+    const isF12 = event.key === "F12";
+    const isMacToggle = event.metaKey && event.altKey && (event.key === "i" || event.key === "I");
+    if (!isF12 && !isMacToggle) {{
+      return;
+    }}
+    event.preventDefault();
+    if (window.ipc) {{
+      window.ipc.postMessage("{OPEN_DEVTOOLS_MESSAGE}");
+    }}
+  }}, true);
+}})();"#
+    )
+}
+
 /// Split the window area into a toolbar strip and the content area below it.
 fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, LogicalRect) {
     let toolbar_height = toolbar_height.min(height);
@@ -456,6 +495,35 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_block_count_script(count))
     }
 
+    /// Open DevTools (Web Inspector) for the active tab's content webview.
+    ///
+    /// Kept as this one method (rather than inlining at each call site) so
+    /// that a future change to how "active" is resolved only has to change
+    /// here. A no-op — logged, not an error — when there is no active tab or
+    /// the active tab is currently suspended (`webview: None`): there is
+    /// nothing to open an inspector on until the tab is resumed.
+    ///
+    /// Compiled in whenever wry's `open_devtools` API exists: unconditionally
+    /// on Linux/Windows, debug-only on macOS. See docs/decisions.md D18.
+    #[cfg(any(debug_assertions, not(target_os = "macos")))]
+    pub fn open_devtools(&self) {
+        match self.active_webview() {
+            Some(webview) => webview.open_devtools(),
+            None => eprintln!(
+                "velox: open_devtools: no active (or suspended) content webview to open devtools for"
+            ),
+        }
+    }
+
+    /// macOS release builds do not compile wry's devtools API (see
+    /// docs/decisions.md D18); log instead of silently doing nothing.
+    #[cfg(not(any(debug_assertions, not(target_os = "macos"))))]
+    pub fn open_devtools(&self) {
+        eprintln!(
+            "velox: devtools is unavailable in macOS release builds (see docs/decisions.md D18)"
+        );
+    }
+
     /// Re-render the tab strip from `tabs`.
     pub fn set_tabs(&self, tabs: &[toolbar::TabSummary]) -> wry::Result<()> {
         self.toolbar
@@ -576,6 +644,7 @@ fn content_webview_builder<'a>(
     let nav_proxy = proxy.clone();
     let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
+    let devtools_proxy = proxy.clone();
     WebViewBuilder::new()
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
@@ -588,6 +657,14 @@ fn content_webview_builder<'a>(
         // goes through this builder, so tabs opened later - and suspended
         // tabs rebuilt on resume - stay ephemeral too.
         .with_incognito(private)
+        // DevTools (see docs/decisions.md D18): every content webview built
+        // through this one function — the initial tab, a newly opened tab,
+        // and a suspended tab rebuilt on resume — gets the inspector enabled,
+        // the F12/Cmd+Opt+I capture script injected, and its own untrusted
+        // devtools IPC channel, so the shortcut keeps working no matter when
+        // or how the webview came to exist.
+        .with_devtools(true)
+        .with_initialization_script(devtools_shortcut_script())
         .with_navigation_handler(move |url| {
             if content_blocking_enabled && blocklist.is_blocked(&url) {
                 let _ = block_proxy.send_event(UserEvent::NavigationBlocked(id, url));
@@ -602,6 +679,14 @@ fn content_webview_builder<'a>(
                 PageLoadEvent::Finished => UserEvent::LoadFinished(id, url),
             };
             let _ = load_proxy.send_event(event);
+        })
+        .with_ipc_handler(move |request| {
+            // See OPEN_DEVTOOLS_MESSAGE: this content-webview IPC channel is
+            // untrusted and deliberately does nothing but this one
+            // exact-match check — it never deserializes page-supplied data.
+            if request.body().as_str() == OPEN_DEVTOOLS_MESSAGE {
+                let _ = devtools_proxy.send_event(UserEvent::OpenDevtoolsRequested);
+            }
         })
 }
 
@@ -651,6 +736,18 @@ mod tests {
         let (toolbar, content) = split_layout(200, 30, 48);
         assert_eq!(toolbar, (0, 0, 200, 30));
         assert_eq!(content, (0, 30, 200, 0));
+    }
+
+    #[test]
+    fn devtools_script_captures_f12_and_mac_toggle_and_reports_the_trigger_message() {
+        let script = devtools_shortcut_script();
+        assert!(script.contains("F12"));
+        assert!(script.contains("metaKey && event.altKey"));
+        assert!(script.contains(&format!(
+            "window.ipc.postMessage(\"{OPEN_DEVTOOLS_MESSAGE}\")"
+        )));
+        // Registered in the capture phase (the trailing `true` to addEventListener).
+        assert!(script.contains("}, true);"));
     }
 
     #[test]
