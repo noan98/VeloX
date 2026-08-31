@@ -36,6 +36,13 @@ pub enum UserEvent {
     /// `document.title` for the history entry `id` came back from the
     /// content webview (see `BrowserWindow::fetch_page_title`).
     PageTitleResolved { id: u64, title: String },
+    /// The active content webview's devtools shortcut (F12 / Cmd+Opt+I)
+    /// fired. Sent over a dedicated, tightly-restricted IPC channel, separate
+    /// from the toolbar's — see docs/decisions.md D18. Carries no `TabId`:
+    /// `BrowserWindow::open_devtools` always resolves the currently active
+    /// tab itself, matching how the shortcut is only ever wired into the
+    /// webview the user is actually looking at.
+    OpenDevtoolsRequested,
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -198,7 +205,9 @@ fn record_perf_event(
                 metrics::StartupTimestamps::mark_first_load_finished,
             );
         }
-        UserEvent::LoadStarted(..) | UserEvent::PageTitleResolved { .. } => {}
+        UserEvent::LoadStarted(..)
+        | UserEvent::PageTitleResolved { .. }
+        | UserEvent::OpenDevtoolsRequested => {}
     }
 }
 
@@ -320,6 +329,7 @@ fn handle_user_event(
                 refresh_history_panel(window, state, config);
             }
         }
+        UserEvent::OpenDevtoolsRequested => window.open_devtools(),
     }
 }
 
@@ -351,6 +361,7 @@ fn handle_toolbar_command(
         ToolbarCommand::Back => log_failure("go back", window.go_back()),
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
+        ToolbarCommand::OpenDevtools => window.open_devtools(),
         ToolbarCommand::NewTab => {
             let id = state.tabs.open_at(homepage.to_owned(), Instant::now());
             log_failure("open tab", window.open_tab(id, homepage));

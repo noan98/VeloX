@@ -284,6 +284,7 @@
   </span>
   <input id="url" type="text" spellcheck="false" autocomplete="off"
          placeholder="Enter a URL, e.g. example.com" />
+  <button id="devtools" title="Open DevTools (F12)">&#9881;</button>
   <button id="bookmark-star" title="ブックマークに追加/削除">&#9733;</button>
   <button id="history-toggle" title="履歴">&#128337;</button>
   <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
@@ -317,6 +318,7 @@
   document.getElementById("back").addEventListener("click", () => send({ cmd: "back" }));
   document.getElementById("forward").addEventListener("click", () => send({ cmd: "forward" }));
   document.getElementById("reload").addEventListener("click", () => send({ cmd: "reload" }));
+  document.getElementById("devtools").addEventListener("click", () => send({ cmd: "open_devtools" }));
   document.getElementById("new-tab").addEventListener("click", () => send({ cmd: "new_tab" }));
   urlInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
