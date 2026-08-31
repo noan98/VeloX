@@ -10,6 +10,7 @@
     --field-bg: #ffffff;
     --border: #d0d0d5;
     --accent: #4a6cf7;
+    --tab-bg: #e3e3e8;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -17,6 +18,7 @@
       --fg: #ececf0;
       --field-bg: #1c1c1e;
       --border: #47474c;
+      --tab-bg: #38383c;
     }
   }
   html, body {
@@ -28,11 +30,82 @@
     user-select: none;
     overflow: hidden;
   }
+  body {
+    display: flex;
+    flex-direction: column;
+  }
+  #tabstrip {
+    flex: 0 0 34px;
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    padding: 4px 6px 0;
+    box-sizing: border-box;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  #tabs {
+    display: flex;
+    align-items: flex-end;
+    gap: 4px;
+    min-width: 0;
+  }
+  .tab {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    max-width: 180px;
+    min-width: 80px;
+    padding: 0 6px 0 10px;
+    border-radius: 8px 8px 0 0;
+    background: var(--tab-bg);
+    cursor: default;
+    flex: none;
+  }
+  .tab.active { background: var(--field-bg); }
+  .tab.loading .tab-label::before { content: "\21BB\a0"; }
+  .tab-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+  .tab-close {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fg);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .tab-close:hover { background: rgba(128, 128, 128, 0.3); }
+  #new-tab {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    align-self: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fg);
+    font-size: 15px;
+    cursor: pointer;
+  }
+  #new-tab:hover { background: rgba(128, 128, 128, 0.2); }
   #toolbar {
     display: flex;
     align-items: center;
     gap: 6px;
-    height: 100%;
+    flex: 1;
+    min-height: 0;
     padding: 0 8px;
     box-sizing: border-box;
     border-bottom: 1px solid var(--border);
@@ -65,6 +138,10 @@
 </style>
 </head>
 <body>
+<div id="tabstrip">
+  <div id="tabs"></div>
+  <button id="new-tab" title="New Tab">&#43;</button>
+</div>
 <div id="toolbar">
   <button id="back" title="Back">&#8592;</button>
   <button id="forward" title="Forward">&#8594;</button>
@@ -76,10 +153,12 @@
   "use strict";
   const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
   const urlInput = document.getElementById("url");
+  const tabsContainer = document.getElementById("tabs");
 
   document.getElementById("back").addEventListener("click", () => send({ cmd: "back" }));
   document.getElementById("forward").addEventListener("click", () => send({ cmd: "forward" }));
   document.getElementById("reload").addEventListener("click", () => send({ cmd: "reload" }));
+  document.getElementById("new-tab").addEventListener("click", () => send({ cmd: "new_tab" }));
   urlInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       send({ cmd: "navigate", input: urlInput.value });
@@ -95,6 +174,36 @@
   };
   window.veloxSetLoading = (loading) => {
     document.getElementById("toolbar").classList.toggle("loading", loading);
+  };
+
+  /* Full re-render of the tab strip from the current tab list. Simpler and
+     plenty fast for the handful of tabs a desktop browser session has open,
+     versus diffing the DOM against the previous list. */
+  window.veloxSetTabs = (tabs) => {
+    tabsContainer.innerHTML = "";
+    for (const tab of tabs) {
+      const el = document.createElement("div");
+      el.className = "tab" + (tab.active ? " active" : "") + (tab.loading ? " loading" : "");
+      el.title = tab.url;
+      el.addEventListener("click", () => send({ cmd: "activate_tab", id: tab.id }));
+
+      const label = document.createElement("span");
+      label.className = "tab-label";
+      label.textContent = tab.url || "New Tab";
+      el.appendChild(label);
+
+      const close = document.createElement("button");
+      close.className = "tab-close";
+      close.title = "Close Tab";
+      close.textContent = "×";
+      close.addEventListener("click", (e) => {
+        e.stopPropagation();
+        send({ cmd: "close_tab", id: tab.id });
+      });
+      el.appendChild(close);
+
+      tabsContainer.appendChild(el);
+    }
   };
 
   /* Ask Rust for the current state: the content page may have started

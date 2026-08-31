@@ -13,7 +13,7 @@ pub struct Config {
     /// Initial window size (logical pixels).
     pub window_width: u32,
     pub window_height: u32,
-    /// Height of the toolbar strip (logical pixels).
+    /// Height of the toolbar strip (logical pixels), tab strip included.
     pub toolbar_height: u32,
 }
 
@@ -24,7 +24,9 @@ impl Default for Config {
             window_title: "VeloX".to_owned(),
             window_width: 1024,
             window_height: 768,
-            toolbar_height: 48,
+            // A 34px tab strip row on top of the 48px address bar row (see
+            // ui/toolbar.html).
+            toolbar_height: 82,
         }
     }
 }

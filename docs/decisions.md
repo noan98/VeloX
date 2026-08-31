@@ -98,3 +98,52 @@ address bar snaps back to the current page. No search-engine fallback yet —
 that is a product decision (default engine, privacy) deferred until settings
 exist. Rejecting unknown schemes also keeps surprises (e.g. `javascript:`)
 out of the engine.
+
+## D8: Multiple tabs — one content webview per tab, kept alive while open
+
+**Decision**: `BrowserWindow` owns one content `WebView` per open tab
+(keyed by `TabId`, a never-reused `u64`), all attached to the same window at
+once. Switching the active tab toggles `WebView::set_visible`/`set_bounds`
+on the outgoing and incoming webview; it never destroys and rebuilds a
+webview on switch.
+
+**Why not one webview, reloaded per tab switch?** That would be simpler (one
+`WebView` field, load a different URL on activation) but throws away
+scroll position, in-progress form input, and JS-side state (e.g.
+`pushState` history, unsaved editor content) on every switch — the issue's
+acceptance criteria rule this out directly ("タブ切替時に表示中ページの状態
+… が失われない").
+
+**Why not a single Rust-side `TabId -> WebView` map with all webviews
+visible/stacked, relying on z-order?** wry only exposes `set_bounds` /
+`set_visible`, not z-order control uniform across the gtk/WKWebView/WebView2
+backends; explicit visibility toggling is the portable primitive and is
+simple to reason about (`BrowserWindow::activate_tab` is the one place tab
+switching happens).
+
+**Tab collection lives in `browser::tabs::Tabs`, not in `BrowserWindow`**:
+`Tabs` (open/close/activate, id issuing, active-tab bookkeeping) has zero
+webview/window dependencies, so it is unit-tested directly — the acceptance
+criterion "cargo test covers open/close/activate, including closing the last
+tab" is covered here without a display. `BrowserWindow` mirrors only which
+`TabId`s currently have a content webview; `app.rs` is the single place that
+keeps `Tabs` and `BrowserWindow` in sync (`Tabs` is always updated first,
+then pushed to `BrowserWindow`).
+
+**Ids, not indices**: `TabId` is a `u64` issued once by `Tabs` and never
+reused, rather than a `Vec` index. Toolbar IPC messages (`close_tab`,
+`activate_tab`) carry a tab id set by a `veloxSetTabs` render that may be
+stale by the time the user clicks (another tab already closed, shifting
+indices) — an id lookup just misses cleanly (logged, no-op) instead of
+silently acting on the wrong tab.
+
+**Built for suspension, not implementing it**: `ContentTab::webview` (in
+`ui::window`) is `Option<WebView>` specifically so a follow-up "tab
+suspension" feature (dropping a background tab's webview to reclaim memory,
+issue #5) can `take()` it and rebuild later from the surviving `Tab` state,
+without reshaping this struct. VeloX does not suspend tabs today — every
+open tab's webview is always `Some` — this is scaffolding, not a feature.
+
+**Trade-off accepted**: every open tab keeps a live webview (and the memory
+that comes with it) for the lifetime of this issue; that is exactly the gap
+issue #5 (tab suspension) is scoped to close.
