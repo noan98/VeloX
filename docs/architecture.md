@@ -124,19 +124,38 @@ The pieces already in place:
 
 ## Performance extension points
 
-Design choices made for measurability, and where instrumentation goes next:
+Implemented in `browser::metrics` (see D8 in `docs/decisions.md`), gated by
+`Config::perf_metrics` / `Config::perf_rss_interval` (opt-in via
+`VELOX_PERF_METRICS=1`, `VELOX_PERF_RSS_INTERVAL_MS`, same pattern as
+`VELOX_DEBUG`). All arithmetic/formatting/process-tree-walking is pure Rust
+in `src/browser/metrics.rs`, unit-tested without a window.
 
-- **Startup time**: `main.rs` → `app::run` is a single straight-line path;
-  timestamp instrumentation fits at process start, window creation, first
-  `Ready`, and first `LoadFinished` (≈ time-to-first-page).
-- **Page load time**: `UserEvent::NavigationStarted` → `LoadFinished` already
-  brackets every load in one place (`app::handle_user_event`).
-- **Memory**: the engine is out-of-process-ish (WebKit's network/render
-  helpers); process-tree RSS sampling can be added behind a config flag
-  without touching browser logic.
+- **Startup time**: `main.rs` captures `process_start` before building
+  `Config`, and passes it into `app::run`. `metrics::StartupTimestamps`
+  records window creation, the toolbar's first `Ready`, and the first
+  `LoadFinished` (≈ time-to-first-page) against it; `app::run` prints one
+  `velox[perf] startup …` line to stderr once all three have fired.
+- **Page load time**: `UserEvent::NavigationStarted` → `LoadFinished` is
+  bracketed by `metrics::PageLoadTimer` in `app::run`, logging one
+  `velox[perf] page_load …` line per load.
+- **Memory**: `metrics::sample_process_tree_rss(pid)` walks the whole
+  process tree (WebKit's network/render helpers included) and sums RSS. It
+  is a standalone public function with no dependency on `Config` or the
+  running app — callable on demand from anywhere (e.g. Issue #5's tab
+  suspension work, to compare RSS before/after suspending a tab). When
+  `perf_rss_interval` is set, `app::run` also spawns a background thread
+  that samples it periodically and logs `velox[perf] rss …` lines.
+  Implementation reads `/proc` directly on Linux (no extra dependency);
+  other Unix falls back to parsing `ps` output; Windows is not implemented
+  yet (`RssError::Unsupported`).
 - **Tab switch time**: once tabs exist, activation is a single code path in
-  `BrowserWindow`, so it can be timed trivially.
-- The `Config` struct is the natural home for benchmark/telemetry toggles.
+  `BrowserWindow`, so it can be timed trivially — not implemented yet.
+- The `Config` struct is the home for these toggles; `Config::from_env`
+  layers the environment-variable overrides onto `Config::default`.
+
+When metrics are off, `app::run` never spawns the RSS thread and every
+checkpoint is a single `Option`-is-`None` check with no `Instant::now()`
+call — the disabled path stays effectively free.
 
 The layering matters more than any single hook: measurements attach to the
 application layer, so swapping or tuning the engine below does not invalidate
