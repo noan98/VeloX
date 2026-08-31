@@ -57,13 +57,54 @@ the tao window; on macOS/Windows they are true child webviews
 | IPC protocol (JSON) | `ui::toolbar` (`ToolbarCommand`) |
 | URL normalization | `browser::navigation` |
 | Address bar / loading state | `browser::tab::Tab` (mirrored into the toolbar) |
+| Visit history (persisted) | `browser::history::HistoryStore` + `browser::persistence` |
+| Bookmarks (persisted) | `browser::bookmarks::BookmarkStore` + `browser::persistence` |
 | Page rendering, network, cookies | web engine (wry) |
 | Session history (back/forward) | web engine (wry) |
 
-VeloX deliberately does **not** duplicate the engine's session history. The
-engine already tracks redirects, `pushState`, anchors etc.; a parallel Rust
-history would drift from reality. `Tab` mirrors only what the UI needs
-(current URL, loading flag).
+VeloX deliberately does **not** duplicate the engine's session history for
+back/forward. The engine already tracks redirects, `pushState`, anchors
+etc.; a parallel Rust history would drift from reality. `Tab` mirrors only
+what the UI needs (current URL, loading flag).
+
+The app-level **visit history** (a persisted "where have I been" log,
+separate from the above) and **bookmarks** are a different concern entirely
+— see the next section.
+
+## Visit history and bookmarks
+
+`browser::history::HistoryStore` and `browser::bookmarks::BookmarkStore` are
+plain, serde-derived, UI/engine-independent collections (de-duplication,
+caps, ordering — the unit-tested part); `browser::persistence` is the thin
+IO layer that loads/saves each as its own JSON file under a per-platform
+data directory (env-var resolved, see docs/decisions.md D8). `app::AppState`
+owns one instance of each store plus the resolved data directory for the
+process's lifetime; every mutation is followed by writing the affected store
+back to disk (best-effort — a write failure is logged, never fatal).
+
+**Recording a visit** happens at the same point session-history state
+already updates: `UserEvent::LoadFinished` calls
+`app::record_visit_if_enabled`, the single choke point future private
+browsing (#7) needs to gate — see docs/decisions.md D11. The entry is
+created with `title: None` immediately (the store's own de-duplication
+collapses a reload into updating that same entry rather than creating a
+new one); `BrowserWindow::fetch_page_title` then asynchronously reads
+`document.title` from the content webview and reports it back as
+`UserEvent::PageTitleResolved { id, title }`, which fills in the title once
+it arrives (see docs/decisions.md D10 for why this is async and
+best-effort).
+
+**The history/bookmarks panel** is UI inside the *toolbar* webview, not a
+separate page — opening it grows the toolbar webview's own bounds rather
+than overlaying the content webview, which two independently-bounded
+webviews cannot do. See docs/decisions.md D9 for the alternatives
+considered and `ui::window::effective_toolbar_height` /
+`BrowserWindow::set_panel` for the mechanics. `ToolbarCommand` gained
+`ToggleBookmark`, `TogglePanel { panel }`, `DeleteHistoryEntry { id }`,
+`ClearHistory`, and `RemoveBookmark { id }`; opening a history/bookmark
+entry reuses the existing `Navigate { input }` command (the stored URL is
+already normalized, so it round-trips through `navigation::normalize_input`
+unchanged) rather than adding a dedicated "open" command.
 
 ## Event flow
 
