@@ -3,10 +3,10 @@
 //!
 //! ```text
 //! +--------------------------------------+
-//! |  toolbar webview (browser chrome)    |  <- fixed height strip, shared
-//! +--------------------------------------+
-//! |  content webview (the active tab)    |  <- fills the rest
-//! +--------------------------------------+
+//! |  toolbar webview (browser chrome)    |  <- fixed height strip, shared;
+//! +--------------------------------------+     grows to make room for an
+//! |  content webview (the active tab)    |  <- fills the rest       open
+//! +--------------------------------------+     history/bookmarks panel
 //! ```
 //!
 //! The toolbar is our own HTML (see [`crate::ui::toolbar`]); each tab's
@@ -22,6 +22,7 @@
 //! drop a background tab's webview to reclaim memory without reshaping this
 //! struct, and [`Self::resume_tab`] rebuild it later — see [`ContentTab`].
 
+use std::cell::Cell;
 use std::collections::HashMap;
 
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
@@ -30,9 +31,9 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
-use crate::browser::TabId;
+use crate::browser::{BookmarkEntry, HistoryEntry, TabId};
 use crate::config::Config;
-use crate::ui::toolbar;
+use crate::ui::toolbar::{self, Panel};
 
 /// A rectangle in logical pixels: `(x, y, width, height)`.
 type LogicalRect = (u32, u32, u32, u32);
@@ -43,6 +44,21 @@ fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, L
     let toolbar_rect = (0, 0, width, toolbar_height);
     let content_rect = (0, toolbar_height, width, height - toolbar_height);
     (toolbar_rect, content_rect)
+}
+
+/// How tall the toolbar webview needs to be: just the tab strip + address
+/// bar rows, or that plus room for an open history/bookmarks panel.
+///
+/// The panel lives inside the toolbar webview (not a content webview), so
+/// opening it means growing the toolbar webview's own native bounds rather
+/// than drawing an overlay — see docs/decisions.md D11 and the "Visit
+/// history and bookmarks" section of docs/architecture.md.
+fn effective_toolbar_height(toolbar_height: u32, panel_height: u32, panel_open: bool) -> u32 {
+    if panel_open {
+        toolbar_height.saturating_add(panel_height)
+    } else {
+        toolbar_height
+    }
 }
 
 fn to_bounds((x, y, width, height): LogicalRect) -> Rect {
@@ -78,6 +94,13 @@ pub struct BrowserWindow {
     host: gtk::Fixed,
     toolbar: WebView,
     toolbar_height: u32,
+    panel_height: u32,
+    /// Which history/bookmarks panel is currently open, if any. Interior
+    /// mutability is needed because `sync_layout` (called from the window
+    /// resize handler, which only has `&BrowserWindow`) must account for it.
+    open_panel: Cell<Option<Panel>>,
+    /// Kept so panel-driven UI updates (`fetch_page_title`) can send
+    /// [`UserEvent`]s back into the event loop after `new` has returned.
     proxy: EventLoopProxy<UserEvent>,
     contents: HashMap<TabId, ContentTab>,
     active: Option<TabId>,
@@ -184,22 +207,34 @@ impl BrowserWindow {
             host,
             toolbar,
             toolbar_height: config.toolbar_height,
+            panel_height: config.panel_height,
+            open_panel: Cell::new(None),
             proxy,
             contents,
             active: Some(initial_tab),
         })
     }
 
-    /// Current toolbar/content rectangles for the window's present size.
+    /// Current toolbar/content rectangles for the window's present size,
+    /// accounting for whether a history/bookmarks panel is currently open
+    /// (it grows the toolbar webview and shrinks the content area).
     fn layout(&self) -> (LogicalRect, LogicalRect) {
         let size = self
             .window
             .inner_size()
             .to_logical::<u32>(self.window.scale_factor());
-        split_layout(size.width, size.height, self.toolbar_height)
+        let toolbar_height = effective_toolbar_height(
+            self.toolbar_height,
+            self.panel_height,
+            self.open_panel.get().is_some(),
+        );
+        split_layout(size.width, size.height, toolbar_height)
     }
 
-    /// Recompute webview bounds after the window was resized.
+    /// Recompute webview bounds after the window was resized (or a panel was
+    /// opened/closed). Every open tab's content webview is resized, not just
+    /// the active one, so a background tab is laid out correctly the moment
+    /// it becomes visible instead of only on its own activation.
     pub fn sync_layout(&self) -> wry::Result<()> {
         let (toolbar_rect, content_rect) = self.layout();
         self.toolbar.set_bounds(to_bounds(toolbar_rect))?;
@@ -369,6 +404,87 @@ impl BrowserWindow {
         self.toolbar
             .evaluate_script(&toolbar::set_tabs_script(tabs))
     }
+
+    /// Toggle the bookmark ("star") button's active state.
+    pub fn set_bookmark_active(&self, active: bool) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_bookmark_active_script(active))
+    }
+
+    /// Which history/bookmarks panel is currently open, if any.
+    pub fn open_panel(&self) -> Option<Panel> {
+        self.open_panel.get()
+    }
+
+    /// Open the given panel, or close it if it is already open (pass
+    /// `None` to unconditionally close). Resizes the toolbar webview to
+    /// make room — shrinking every open tab's content webview, not just the
+    /// active one, via [`Self::sync_layout`] — and updates the toolbar's DOM
+    /// to match.
+    pub fn set_panel(&self, panel: Option<Panel>) -> wry::Result<()> {
+        self.open_panel.set(panel);
+        self.sync_layout()?;
+        self.toolbar
+            .evaluate_script(&toolbar::set_panel_script(panel))
+    }
+
+    /// Replace the history panel's contents.
+    pub fn set_history(&self, entries: &[&HistoryEntry]) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_history_script(entries))
+    }
+
+    /// Replace the bookmarks panel's contents.
+    pub fn set_bookmarks(&self, entries: &[&BookmarkEntry]) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_bookmarks_script(entries))
+    }
+
+    /// Asynchronously read `document.title` from tab `tab_id`'s content
+    /// webview and report it back as [`UserEvent::PageTitleResolved`] for
+    /// the history entry `history_id`.
+    ///
+    /// A no-op — not an error — when `tab_id` is unknown or currently
+    /// suspended (no webview to read from): the history entry simply keeps
+    /// showing its URL as the interim title until the tab is next resumed
+    /// and reloads, at which point a fresh `LoadFinished` records a new
+    /// entry and requests its title the normal way.
+    ///
+    /// Fire-and-forget by design (see docs/decisions.md D12): wry has no
+    /// synchronous way to read a JS value, and the load that triggered this
+    /// request may already be superseded by the time the title comes back —
+    /// the callback still applies it to `history_id`, which is fine, it
+    /// simply means an older history entry's title arrives late. A blank
+    /// title is dropped rather than overwriting a previously known one.
+    pub fn fetch_page_title(&self, tab_id: TabId, history_id: u64) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        let proxy = self.proxy.clone();
+        webview.evaluate_script_with_callback("document.title", move |raw| {
+            if let Some(title) = extract_js_string_result(&raw) {
+                let title = title.trim();
+                if !title.is_empty() {
+                    let _ = proxy.send_event(UserEvent::PageTitleResolved {
+                        id: history_id,
+                        title: title.to_owned(),
+                    });
+                }
+            }
+        })
+    }
+}
+
+/// `WebView::evaluate_script_with_callback` hands back the JS result
+/// serialized as a JSON string (see wry's `eval`); unwrap that one layer to
+/// get the actual string `document.title` evaluated to.
+fn extract_js_string_result(raw: &str) -> Option<String> {
+    serde_json::from_str::<String>(raw).ok()
 }
 
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
@@ -444,5 +560,26 @@ mod tests {
         let (toolbar, content) = split_layout(200, 30, 48);
         assert_eq!(toolbar, (0, 0, 200, 30));
         assert_eq!(content, (0, 30, 200, 0));
+    }
+
+    #[test]
+    fn effective_height_adds_panel_height_only_when_open() {
+        assert_eq!(effective_toolbar_height(48, 320, false), 48);
+        assert_eq!(effective_toolbar_height(48, 320, true), 368);
+    }
+
+    #[test]
+    fn extracts_a_js_string_result() {
+        assert_eq!(
+            extract_js_string_result("\"Example Domain\""),
+            Some("Example Domain".to_owned())
+        );
+    }
+
+    #[test]
+    fn extracting_non_string_js_results_yields_none() {
+        assert_eq!(extract_js_string_result("null"), None);
+        assert_eq!(extract_js_string_result(""), None);
+        assert_eq!(extract_js_string_result("42"), None);
     }
 }

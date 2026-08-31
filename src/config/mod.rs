@@ -17,6 +17,15 @@ pub struct Config {
     pub window_height: u32,
     /// Height of the toolbar strip (logical pixels), tab strip included.
     pub toolbar_height: u32,
+    /// Height of the history/bookmarks dropdown panel (logical pixels) when
+    /// open; added to `toolbar_height` while a panel is showing.
+    pub panel_height: u32,
+    /// Hard cap on the number of entries kept in the history store. `0`
+    /// means unlimited.
+    pub history_max_entries: usize,
+    /// Maximum number of entries sent to the history panel at once (the
+    /// store itself may hold more, up to `history_max_entries`).
+    pub history_panel_limit: usize,
     /// Tab suspension policy: how long a background tab must sit idle
     /// (elapsed time since it was last the active tab) before it becomes
     /// eligible for *automatic* suspension — see
@@ -41,6 +50,9 @@ impl Default for Config {
             // A 34px tab strip row on top of the 48px address bar row (see
             // ui/toolbar.html).
             toolbar_height: 82,
+            panel_height: 320,
+            history_max_entries: 5000,
+            history_panel_limit: 200,
             auto_suspend_after: None,
         }
     }
@@ -56,6 +68,8 @@ mod tests {
         assert!(config.homepage.starts_with("https://"));
         assert!(config.toolbar_height > 0);
         assert!(config.window_height > config.toolbar_height);
+        assert!(config.panel_height > 0);
+        assert!(config.history_panel_limit > 0);
         // Automatic suspension must be opt-in: a fresh checkout should never
         // surprise a user by suspending a tab on its own.
         assert_eq!(config.auto_suspend_after, None);

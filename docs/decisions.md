@@ -275,3 +275,101 @@ e.g. cold cache making every resume feel like a first load — that is the
 moment to reconsider `webkit2gtk`'s `CacheModel`/`WebsiteDataManager` as a
 deliberate new Linux-only dependency, or the WebView2 memory-level hint as a
 `cfg(windows)` addition, each on its own merits rather than as a bundle.
+
+## D10: History/bookmarks persistence — JSON files, no new dependency
+
+History (`browser::history::HistoryStore`) and bookmarks
+(`browser::bookmarks::BookmarkStore`) are plain, serde-derived structs;
+`browser::persistence` is a thin wrapper that reads/writes each as its own
+pretty-printed JSON file (`history.json`, `bookmarks.json`) using `serde`/
+`serde_json`, both already dependencies (D6). No database crate was added —
+the issue's own guidance is to start file-based and revisit (SQLite or
+similar) only once entry counts make that necessary; `HistoryStore` already
+enforces a cap (`Config::history_max_entries`, default 5000), so an
+unbounded file is not a near-term risk.
+
+The collection logic (de-duplication of consecutive visits/bookmarked URLs,
+the history cap, ordering, removal) lives entirely in `history.rs`/
+`bookmarks.rs` as pure functions with no filesystem or UI dependency, per the
+existing `browser::navigation`/`browser::tab` pattern — that is what the unit
+tests exercise. `persistence.rs` only turns a store into/from JSON on disk
+and is intentionally "dumb"; its own tests are the round-trip-through-a-temp-
+directory kind, not collection-logic tests.
+
+**Data directory resolution**: a `dirs`-style crate was considered and
+rejected for the same reason new dependencies generally are (D6) — the need
+is met by reading the one environment variable each platform already
+guarantees (`XDG_DATA_HOME`/`HOME` on Linux/BSD, `HOME` on macOS, `APPDATA`
+on Windows), with `VELOX_DATA_DIR` as an explicit override used by nothing
+in-repo today but available for tests or portable installs. If VeloX later
+needs more XDG-adjacent behavior (config dir, cache dir, respecting
+`XDG_DATA_DIRS` for lookup, etc.) that breadth is the point at which pulling
+in `dirs` starts paying for itself; one directory for one file pair does not
+justify it yet. When no relevant environment variable is set, VeloX degrades
+to an unpersisted in-memory session (logged once at startup) rather than
+failing to start.
+
+## D11: History/bookmarks UI is a panel in the toolbar webview, not a content-webview page
+
+The toolbar and content areas are two separate native webviews with
+independently managed bounds (D3); a dropdown rendered inside the toolbar
+webview's HTML cannot visually extend over the content webview's screen
+region, since each webview is clipped to its own allocated rect. Two designs
+were considered:
+
+- **A dedicated internal page** (e.g. `velox://history`) loaded into the
+  *content* webview, in the spirit of `chrome://`/`about:` pages in other
+  browsers. Rejected for now: making it interactive (delete/clear buttons)
+  would need either an IPC channel on the content webview — which breaks the
+  D3 security boundary that untrusted page content can never talk to
+  Rust — or intercepting `velox://`-scheme navigations in the existing
+  content `navigation_handler`, which is reachable by *any* loaded page
+  (`<a href="velox://history?clear=1">`), not just our own generated one,
+  without extra provenance tracking real browsers use to gate `chrome://`
+  navigation to trusted origins only. Solvable, but more machinery than this
+  issue needs.
+- **A panel inside the toolbar webview, grown into view** (chosen): opening
+  the history/bookmarks panel resizes the toolbar webview's own native
+  bounds (`toolbar_height` + `Config::panel_height`, see
+  `ui::window::effective_toolbar_height`) instead of overlaying anything;
+  the panel's HTML/CSS just fills whatever height the webview actually has
+  (`body { display:flex; flex-direction:column }`, `#panel { flex:1 }`).
+  This keeps the panel inside the already-trusted webview — no new IPC
+  surface, no scheme interception — at the cost of the content webview
+  visibly shrinking while a panel is open (acceptable: it is a deliberate,
+  user-triggered, temporary state, closed automatically on navigating from a
+  panel entry).
+
+`BrowserWindow` tracks which panel is open in a `Cell<Option<Panel>>`
+(interior mutability, main-thread-only) because the window-resize handler in
+`app.rs` only holds `&BrowserWindow`, not the mutable app state, and still
+needs to preserve the open panel's extra height across a resize.
+
+## D12: Page titles are fetched asynchronously and applied best-effort
+
+wry's `WebView::evaluate_script` cannot return a value synchronously; only
+`evaluate_script_with_callback` can, and its callback fires later (and off
+the call stack that triggered it). So `LoadFinished` records a history entry
+with `title: None` immediately (using the URL as the interim display value),
+then asks `document.title` for that entry's `id` and applies whatever comes
+back whenever it arrives (`UserEvent::PageTitleResolved`). This matches the
+staged design the issue itself suggested as acceptable. A blank/whitespace
+title is dropped rather than overwriting a previously known one (covers
+pages that briefly have an empty `<title>` before script sets it); the
+result always applies to the `id` it was requested for regardless of what
+the tab is showing by the time it arrives, so a late title only ever affects
+the (now possibly no-longer-current) history entry it belongs to.
+
+## D13: Single choke point for disabling history recording
+
+`app::record_visit_if_enabled` is the only place `HistoryStore::record_visit`
+is called from, gated by `AppState::history_enabled` (`true` today — nothing
+in this issue's scope ever sets it to `false`). This is the seam the
+following issue, #7 (private browsing), is expected to use: making
+`history_enabled` reflect whether the active tab/window is private needs no
+change to `HistoryStore` itself, `persistence`, or any other call site.
+Bookmarking is deliberately **not** gated by this flag — explicitly saving a
+bookmark is a distinct user action from passive visit recording, and real
+browsers typically keep letting users bookmark from a private
+window/tab — but the same `AppState`-level pattern would extend to it if a
+future decision says otherwise.
