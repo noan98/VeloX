@@ -1,0 +1,68 @@
+! VeloX built-in minimal content-blocking list.
+!
+! This is NOT a copy of EasyList/EasyPrivacy (https://easylist.to) and is not
+! fetched from the network (VeloX ships no list-update mechanism yet, see
+! docs/decisions.md D8). It is a small, hand-picked subset of publicly known
+! ad-serving/tracking infrastructure domains, written in the `||domain^`
+! syntax those community lists use so a real EasyList-format file can be
+! merged in later (see `Config::extra_blocklist_path`) without changing the
+! parser.
+!
+! Format understood by VeloX's parser (see `blocklist.rs`):
+!   ||domain^        block `domain` and any subdomain of it
+!   @@||domain^      exception: never block `domain` (or its subdomains)
+!   ! comment        ignored
+!   anything with ## or #@# (element hiding)  ignored
+!   anything else that isn't a ||domain^ rule  ignored
+
+! --- Ad networks / ad serving ---
+||doubleclick.net^
+||googlesyndication.com^
+||googleadservices.com^
+||adservice.google.com^
+||adnxs.com^
+||rubiconproject.com^
+||pubmatic.com^
+||openx.net^
+||criteo.com^
+||criteo.net^
+||outbrain.com^
+||taboola.com^
+||adsrvr.org^
+||mathtag.com^
+||adroll.com^
+||casalemedia.com^
+||contextweb.com^
+||indexww.com^
+||smartadserver.com^
+||yieldmo.com^
+||sharethrough.com^
+||moatads.com^
+||amazon-adsystem.com^
+||media.net^
+||yieldlab.net^
+||adform.net^
+||adition.com^
+||bat.bing.com^
+||ads-twitter.com^
+
+! --- Analytics / trackers ---
+||google-analytics.com^
+||googletagmanager.com^
+||googletagservices.com^
+||scorecardresearch.com^
+||quantserve.com^
+||quantcast.com^
+||hotjar.com^
+||chartbeat.com^
+||mixpanel.com^
+||segment.io^
+||doubleverify.com^
+||crazyegg.com^
+||clicktale.net^
+||facebook.net^
+||amplitude.com^
+||fullstory.com^
+||branch.io^
+||appsflyer.com^
+||adjust.com^

@@ -62,6 +62,20 @@
   }
   #url:focus { border-color: var(--accent); }
   #toolbar.loading #url { border-color: var(--accent); }
+  #block-count {
+    flex: none;
+    min-width: 20px;
+    padding: 0 6px;
+    height: 20px;
+    line-height: 20px;
+    text-align: center;
+    border-radius: 10px;
+    background: rgba(128, 128, 128, 0.2);
+    color: var(--fg);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  #block-count[hidden] { display: none; }
 </style>
 </head>
 <body>
@@ -71,6 +85,7 @@
   <button id="reload" title="Reload">&#8635;</button>
   <input id="url" type="text" spellcheck="false" autocomplete="off"
          placeholder="Enter a URL, e.g. example.com" />
+  <span id="block-count" title="Blocked ad/tracker requests" hidden>0</span>
 </div>
 <script>
   "use strict";
@@ -95,6 +110,11 @@
   };
   window.veloxSetLoading = (loading) => {
     document.getElementById("toolbar").classList.toggle("loading", loading);
+  };
+  window.veloxSetBlockCount = (count) => {
+    const badge = document.getElementById("block-count");
+    badge.textContent = String(count);
+    badge.hidden = count === 0;
   };
 
   /* Ask Rust for the current state: the content page may have started

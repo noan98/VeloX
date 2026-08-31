@@ -12,12 +12,15 @@
 //! renders whatever page the user navigates to. Keeping the chrome in a
 //! separate webview means untrusted page content can never touch the UI.
 
+use std::sync::Arc;
+
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Window, WindowBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
+use crate::browser::FilterList;
 use crate::config::Config;
 use crate::ui::toolbar;
 
@@ -54,6 +57,7 @@ impl BrowserWindow {
         event_loop: &EventLoopWindowTarget<UserEvent>,
         config: &Config,
         proxy: EventLoopProxy<UserEvent>,
+        blocklist: Arc<FilterList>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let window = WindowBuilder::new()
             .with_title(&config.window_title)
@@ -76,11 +80,17 @@ impl BrowserWindow {
             });
 
         let nav_proxy = proxy.clone();
+        let block_proxy = proxy.clone();
         let load_proxy = proxy;
+        let content_blocking_enabled = config.content_blocking_enabled;
         let content_builder = WebViewBuilder::new()
             .with_bounds(to_bounds(content_rect))
             .with_url(&config.homepage)
             .with_navigation_handler(move |url| {
+                if content_blocking_enabled && blocklist.is_blocked(&url) {
+                    let _ = block_proxy.send_event(UserEvent::NavigationBlocked(url));
+                    return false;
+                }
                 let _ = nav_proxy.send_event(UserEvent::NavigationStarted(url));
                 true
             })
@@ -143,6 +153,12 @@ impl BrowserWindow {
     pub fn set_loading(&self, loading: bool) -> wry::Result<()> {
         self.toolbar
             .evaluate_script(&toolbar::set_loading_script(loading))
+    }
+
+    /// Update the toolbar's blocked-request counter badge.
+    pub fn set_block_count(&self, count: u32) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_block_count_script(count))
     }
 }
 

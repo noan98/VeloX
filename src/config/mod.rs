@@ -15,6 +15,14 @@ pub struct Config {
     pub window_height: u32,
     /// Height of the toolbar strip (logical pixels).
     pub toolbar_height: u32,
+    /// Whether ad/tracker content blocking is active. Applies to main-frame
+    /// navigation today; see docs/decisions.md D8 for why subresource
+    /// blocking is not implemented on top of wry 0.56.
+    pub content_blocking_enabled: bool,
+    /// Optional path to an extra EasyList-style filter list (see
+    /// `browser::FilterList`), merged on top of VeloX's built-in list.
+    /// `None` uses only the built-in list.
+    pub extra_blocklist_path: Option<String>,
 }
 
 impl Default for Config {
@@ -25,6 +33,8 @@ impl Default for Config {
             window_width: 1024,
             window_height: 768,
             toolbar_height: 48,
+            content_blocking_enabled: true,
+            extra_blocklist_path: None,
         }
     }
 }
@@ -39,5 +49,12 @@ mod tests {
         assert!(config.homepage.starts_with("https://"));
         assert!(config.toolbar_height > 0);
         assert!(config.window_height > config.toolbar_height);
+    }
+
+    #[test]
+    fn content_blocking_is_on_by_default_with_no_extra_list() {
+        let config = Config::default();
+        assert!(config.content_blocking_enabled);
+        assert_eq!(config.extra_blocklist_path, None);
     }
 }

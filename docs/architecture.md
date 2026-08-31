@@ -57,6 +57,7 @@ the tao window; on macOS/Windows they are true child webviews
 | IPC protocol (JSON) | `ui::toolbar` (`ToolbarCommand`) |
 | URL normalization | `browser::navigation` |
 | Address bar / loading state | `browser::tab::Tab` (mirrored into the toolbar) |
+| Content-blocking rule matching | `browser::blocklist::FilterList` |
 | Page rendering, network, cookies | web engine (wry) |
 | Session history (back/forward) | web engine (wry) |
 
@@ -107,6 +108,38 @@ Startup ordering: the toolbar sends `{"cmd":"ready"}` once its document is
 loaded, and the app answers with the current state. Without this handshake
 the first `veloxSetUrl` could run before the toolbar's JS exists (the content
 page starts loading in parallel).
+
+## Content blocking
+
+`browser::blocklist::FilterList` is a small EasyList-subset parser/matcher
+(`||domain^` block rules, `@@||domain^` exceptions) built at startup from an
+embedded default list (`browser/default_blocklist.txt`) plus an optional
+user file (`Config::extra_blocklist_path`). It is pure logic with no engine
+dependency, so it is unit-tested directly without a webview.
+
+`app::run` builds one `FilterList`, wraps it in an `Arc`, and hands it to
+`BrowserWindow::new`, which closes over it in the content webview's
+`with_navigation_handler` callback:
+
+```
+content webview navigates to `url`
+        │
+        ▼
+FilterList::is_blocked(url)?  (host lookup + domain-suffix match)
+   │ yes                              │ no
+   ▼                                  ▼
+return false (navigation refused)     UserEvent::NavigationStarted(url)
+UserEvent::NavigationBlocked(url)     (existing flow)
+        │
+        ▼
+Tab::on_navigation_blocked  →  toolbar block-count badge
+```
+
+This only covers **main-frame navigation** — wry 0.56 exposes no hook for
+subresource requests (images/scripts/XHR), so ad/tracker resources loaded
+*within* an allowed page are not filtered today. See docs/decisions.md D8
+for the platform-by-platform investigation and why that gap is not closed
+in this iteration.
 
 ## Adding tabs later
 

@@ -3,7 +3,7 @@
 //! The toolbar is rendered by a dedicated webview from [`TOOLBAR_HTML`].
 //! JS -> Rust: `window.ipc.postMessage` with a JSON [`ToolbarCommand`].
 //! Rust -> JS: `evaluate_script` with the snippets built by
-//! [`set_url_script`] / [`set_loading_script`].
+//! [`set_url_script`] / [`set_loading_script`] / [`set_block_count_script`].
 
 use serde::Deserialize;
 
@@ -46,6 +46,11 @@ pub fn set_url_script(url: &str) -> String {
 /// JS snippet that toggles the loading indicator.
 pub fn set_loading_script(loading: bool) -> String {
     format!("veloxSetLoading({loading});")
+}
+
+/// JS snippet that updates the blocked-request counter badge.
+pub fn set_block_count_script(count: u32) -> String {
+    format!("veloxSetBlockCount({count});")
 }
 
 #[cfg(test)]
@@ -102,9 +107,16 @@ mod tests {
     }
 
     #[test]
+    fn block_count_script_is_an_int_literal() {
+        assert_eq!(set_block_count_script(0), "veloxSetBlockCount(0);");
+        assert_eq!(set_block_count_script(42), "veloxSetBlockCount(42);");
+    }
+
+    #[test]
     fn toolbar_html_declares_expected_hooks() {
         assert!(TOOLBAR_HTML.contains("veloxSetUrl"));
         assert!(TOOLBAR_HTML.contains("veloxSetLoading"));
+        assert!(TOOLBAR_HTML.contains("veloxSetBlockCount"));
         assert!(TOOLBAR_HTML.contains("ipc.postMessage"));
     }
 }

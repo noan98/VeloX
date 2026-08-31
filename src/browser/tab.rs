@@ -11,6 +11,7 @@
 pub struct Tab {
     current_url: String,
     loading: bool,
+    blocked_count: u32,
 }
 
 impl Tab {
@@ -19,6 +20,7 @@ impl Tab {
         Self {
             current_url: initial_url.into(),
             loading: true,
+            blocked_count: 0,
         }
     }
 
@@ -30,6 +32,12 @@ impl Tab {
     /// Whether the engine is currently loading a page.
     pub fn is_loading(&self) -> bool {
         self.loading
+    }
+
+    /// Number of navigations content blocking has refused since this tab
+    /// was created.
+    pub fn blocked_count(&self) -> u32 {
+        self.blocked_count
     }
 
     /// The engine started navigating to `url` (typed URL, link click, or
@@ -49,6 +57,13 @@ impl Tab {
     /// like). The address bar keeps the URL the user tried to reach.
     pub fn on_load_failed(&mut self) {
         self.loading = false;
+    }
+
+    /// Content blocking refused a main-frame navigation to `url`; the
+    /// address bar and loading state are left untouched since the current
+    /// page never actually navigated away.
+    pub fn on_navigation_blocked(&mut self, _url: &str) {
+        self.blocked_count += 1;
     }
 }
 
@@ -90,5 +105,25 @@ mod tests {
         tab.on_load_finished("https://example.com/new");
         assert_eq!(tab.current_url(), "https://example.com/new");
         assert!(!tab.is_loading());
+    }
+
+    #[test]
+    fn new_tab_has_no_blocked_navigations() {
+        let tab = Tab::new("https://example.com/");
+        assert_eq!(tab.blocked_count(), 0);
+    }
+
+    #[test]
+    fn blocked_navigation_increments_the_counter_without_changing_the_page() {
+        let mut tab = Tab::new("https://example.com/");
+        tab.on_load_finished("https://example.com/");
+
+        tab.on_navigation_blocked("https://doubleclick.net/");
+        assert_eq!(tab.blocked_count(), 1);
+        assert_eq!(tab.current_url(), "https://example.com/");
+        assert!(!tab.is_loading());
+
+        tab.on_navigation_blocked("https://googlesyndication.com/");
+        assert_eq!(tab.blocked_count(), 2);
     }
 }
