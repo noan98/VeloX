@@ -27,6 +27,10 @@ pub enum UserEvent {
     LoadStarted(String),
     /// The content webview finished loading this URL.
     LoadFinished(String),
+    /// The content webview's devtools shortcut (F12 / Cmd+Opt+I) fired. Sent
+    /// over a dedicated, tightly-restricted IPC channel, separate from the
+    /// toolbar's — see docs/decisions.md D8.
+    OpenDevtoolsRequested,
 }
 
 /// Build the window and run the event loop. Only returns on setup failure;
@@ -84,6 +88,7 @@ fn handle_user_event(window: &BrowserWindow, tab: &mut Tab, event: UserEvent) {
             }
             log_failure("hide loading state", window.set_loading(false));
         }
+        UserEvent::OpenDevtoolsRequested => window.open_devtools(),
     }
 }
 
@@ -106,6 +111,7 @@ fn handle_toolbar_command(window: &BrowserWindow, tab: &mut Tab, command: Toolba
         ToolbarCommand::Back => log_failure("go back", window.go_back()),
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
+        ToolbarCommand::OpenDevtools => window.open_devtools(),
         ToolbarCommand::Ready => {
             log_failure(
                 "initialize address bar",

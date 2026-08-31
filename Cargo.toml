@@ -10,14 +10,27 @@ rust-version = "1.77"
 [dependencies]
 # Window creation and event loop (cross-platform: macOS / Linux / Windows).
 tao = "0.37"
-# WebView embedding (WebKitGTK on Linux, WKWebView on macOS, WebView2 on Windows).
-wry = "0.56"
 # Typed deserialization of toolbar IPC messages.
 serde = { version = "1", features = ["derive"] }
 # JSON wire format for toolbar IPC and safe JS string escaping.
 serde_json = "1"
 # URL parsing and normalization of address bar input.
 url = "2"
+
+# WebView embedding (WebKitGTK on Linux, WKWebView on macOS, WebView2 on
+# Windows). Split by target because devtools availability differs by
+# platform (see docs/decisions.md D8):
+# - macOS: the in-page inspector needs a private WebKit API, so wry only
+#   compiles `WebView::open_devtools` when `debug_assertions` is set. We do
+#   not add the `devtools` feature here, keeping release builds private-API
+#   free (App Store safe) and devtools debug-only, matching wry's own gate.
+# - everywhere else: no such constraint, so `devtools` is enabled
+#   unconditionally (debug and release both get it).
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wry = { version = "0.56", features = ["devtools"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wry = "0.56"
 
 # wry's gtk backend exposes raw gtk containers; we need the gtk crate to place
 # two webviews (toolbar + content) inside one window on Linux/BSD.

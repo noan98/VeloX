@@ -25,6 +25,8 @@ pub enum ToolbarCommand {
     /// (the content page may have started loading before the toolbar was
     /// ready to display it).
     Ready,
+    /// Open the content webview's DevTools (Web Inspector).
+    OpenDevtools,
 }
 
 /// Parse a raw IPC message body into a [`ToolbarCommand`].
@@ -80,6 +82,10 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"ready"}"#).unwrap(),
             ToolbarCommand::Ready
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"open_devtools"}"#).unwrap(),
+            ToolbarCommand::OpenDevtools
         );
     }
 

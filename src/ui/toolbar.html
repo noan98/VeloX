@@ -71,6 +71,7 @@
   <button id="reload" title="Reload">&#8635;</button>
   <input id="url" type="text" spellcheck="false" autocomplete="off"
          placeholder="Enter a URL, e.g. example.com" />
+  <button id="devtools" title="Open DevTools (F12)">&#9881;</button>
 </div>
 <script>
   "use strict";
@@ -80,6 +81,7 @@
   document.getElementById("back").addEventListener("click", () => send({ cmd: "back" }));
   document.getElementById("forward").addEventListener("click", () => send({ cmd: "forward" }));
   document.getElementById("reload").addEventListener("click", () => send({ cmd: "reload" }));
+  document.getElementById("devtools").addEventListener("click", () => send({ cmd: "open_devtools" }));
   urlInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
       send({ cmd: "navigate", input: urlInput.value });
