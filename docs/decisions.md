@@ -99,7 +99,184 @@ that is a product decision (default engine, privacy) deferred until settings
 exist. Rejecting unknown schemes also keeps surprises (e.g. `javascript:`)
 out of the engine.
 
-## D8: History/bookmarks persistence — JSON files, no new dependency
+## D8: Multiple tabs — one content webview per tab, kept alive while open
+
+**Decision**: `BrowserWindow` owns one content `WebView` per open tab
+(keyed by `TabId`, a never-reused `u64`), all attached to the same window at
+once. Switching the active tab toggles `WebView::set_visible`/`set_bounds`
+on the outgoing and incoming webview; it never destroys and rebuilds a
+webview on switch.
+
+**Why not one webview, reloaded per tab switch?** That would be simpler (one
+`WebView` field, load a different URL on activation) but throws away
+scroll position, in-progress form input, and JS-side state (e.g.
+`pushState` history, unsaved editor content) on every switch — the issue's
+acceptance criteria rule this out directly ("タブ切替時に表示中ページの状態
+… が失われない").
+
+**Why not a single Rust-side `TabId -> WebView` map with all webviews
+visible/stacked, relying on z-order?** wry only exposes `set_bounds` /
+`set_visible`, not z-order control uniform across the gtk/WKWebView/WebView2
+backends; explicit visibility toggling is the portable primitive and is
+simple to reason about (`BrowserWindow::activate_tab` is the one place tab
+switching happens).
+
+**Tab collection lives in `browser::tabs::Tabs`, not in `BrowserWindow`**:
+`Tabs` (open/close/activate, id issuing, active-tab bookkeeping) has zero
+webview/window dependencies, so it is unit-tested directly — the acceptance
+criterion "cargo test covers open/close/activate, including closing the last
+tab" is covered here without a display. `BrowserWindow` mirrors only which
+`TabId`s currently have a content webview; `app.rs` is the single place that
+keeps `Tabs` and `BrowserWindow` in sync (`Tabs` is always updated first,
+then pushed to `BrowserWindow`).
+
+**Ids, not indices**: `TabId` is a `u64` issued once by `Tabs` and never
+reused, rather than a `Vec` index. Toolbar IPC messages (`close_tab`,
+`activate_tab`) carry a tab id set by a `veloxSetTabs` render that may be
+stale by the time the user clicks (another tab already closed, shifting
+indices) — an id lookup just misses cleanly (logged, no-op) instead of
+silently acting on the wrong tab.
+
+**Built for suspension, not implementing it**: `ContentTab::webview` (in
+`ui::window`) is `Option<WebView>` specifically so a follow-up "tab
+suspension" feature (dropping a background tab's webview to reclaim memory,
+issue #5) can `take()` it and rebuild later from the surviving `Tab` state,
+without reshaping this struct. VeloX does not suspend tabs today — every
+open tab's webview is always `Some` — this is scaffolding, not a feature.
+
+**Trade-off accepted**: every open tab keeps a live webview (and the memory
+that comes with it) for the lifetime of this issue; that is exactly the gap
+issue #5 (tab suspension) is scoped to close.
+
+## D9: Tab suspension — drop the webview, keep the URL; no engine cache tuning
+
+**Decision**: implement tab suspension exactly as D8 scaffolded it —
+`ContentTab::webview.take()` drops a background tab's webview, and
+reactivation rebuilds it from the surviving `Tab` state (just `current_url`).
+Manual suspension (a tab-strip button) ships now; automatic suspension
+(idle-time policy) ships too, but disabled by default. Engine-level cache
+tuning was investigated and **not applied** — see below.
+
+### What is lost on suspension
+
+Only `Tab::current_url` survives. Everything the *engine* held is gone with
+the webview:
+
+- Scroll position and in-progress form input (already lost on an ordinary
+  tab *close*; suspension is the same loss, just reversible).
+- JS-side state: `pushState`/`replaceState` history, in-memory app state,
+  open WebSocket/EventSource connections.
+- The engine's own session history (back/forward) — D4 already declined to
+  mirror this in Rust, so resuming a tab is indistinguishable from a fresh
+  navigation to `current_url`; the back button will not reach whatever the
+  tab's history held before suspension.
+
+This is deliberately the same shape of loss D8 already accepted for closing
+a tab, applied to a tab that is not closed — suspension trades that state for
+memory, reversibly (the URL comes back; nothing else does). The tab strip
+marks a suspended tab distinctly (dimmed, 💤) precisely so this is not a
+silent surprise: what looks like "still open" is actually "will reload from
+scratch when you switch to it."
+
+### Never the active tab; idle clock lives in `browser::tabs::Tabs`
+
+The active tab is never a suspension candidate — the visible tab always
+needs a live webview. This is enforced twice: `Tabs::suspend` refuses on the
+state side (so a bug in `ui::window` can never even attempt it), and
+`BrowserWindow::suspend_tab` defensively refuses again on the webview side.
+
+The automatic-suspension policy — "how long has a background tab sat idle" —
+is pure, clock-injected Rust in `browser::tabs::Tabs`
+(`idle_background_tabs(now, idle_after)`, `next_idle_deadline(idle_after)`),
+matching D8's precedent of keeping tab-collection logic engine/UI-independent
+and unit-tested without a window. "Idle since" is the moment a tab stopped
+being active, stamped on the *outgoing* tab by `Tabs::activate_at`/`open_at`
+— additive wrappers around the existing `activate`/`open` (which stay
+untouched) that stamp the departing tab before switching. `app::run`'s event
+loop drives `tao::event_loop::ControlFlow::WaitUntil(next_deadline)` instead
+of a fixed `Wait` so it wakes itself up exactly when a tab crosses the
+threshold, rather than polling on a fixed tick.
+
+**Default is disabled** (`Config::auto_suspend_after: None`): the issue asks
+for manual suspension before automatic, and an unexpected suspension (losing
+scroll position/form input the user didn't ask to lose) is a worse default
+than doing nothing. Enabling it today means changing `Config::default()` in
+code — `Config` has no runtime loading yet (its own doc comment: "currently
+compile-time defaults only"); wiring it to an env var (in the shape of #3's
+`VELOX_PERF_METRICS`) is straightforward once that pattern exists on `main`,
+but is not added speculatively here.
+
+### Effect measurement: deferred to #3, not duplicated
+
+The acceptance criterion "process-tree RSS decreases, measurably, after
+suspension" needs #3's `browser::metrics::sample_process_tree_rss`, which is
+merged in a separate, already-PR'd branch (`claude/issue-3-perf-metrics`) not
+yet in this stacked branch's history. Calling it here would not compile, and
+reimplementing an equivalent sampler here would fork the same logic across
+two issues. So:
+
+- This branch does not call `browser::metrics` and does not reimplement RSS
+  sampling.
+- What *is* covered here, in code and tests: `BrowserWindow::suspend_tab`
+  unconditionally drops the `Option<WebView>` it holds
+  (`tab.webview.take()`), and `browser::tabs::Tabs::suspend` records the
+  transition on the state side (`browser::tabs::tests::suspend_*`,
+  `browser::tab::tests::suspend_*`). A `WebView`'s `Drop` releasing its
+  WebKitGTK/WKWebView/WebView2-side resources is the platform's contract,
+  not VeloX's to re-test.
+- Manual verification procedure, once #3 is on `main` (or merged into this
+  branch): run with `VELOX_PERF_METRICS=1 VELOX_PERF_RSS_INTERVAL_MS=1000
+  cargo run`, open several tabs and let each load a real page, note the
+  periodic `velox[perf] rss` total, suspend the background tabs (button or
+  `auto_suspend_after`), and confirm the next sample's total drops. This
+  browser cannot be run in the sandboxed/headless environment this issue was
+  implemented in, so this procedure — not an automated measurement — is the
+  acceptance check for that criterion until #3 lands here.
+
+### Cache-control investigation (wry 0.56.1, `~/.cargo/registry/.../wry-0.56.1`)
+
+The issue asks to survey what cache tuning the system webviews expose
+through wry before touching anything. Findings, read directly from the
+vendored `wry` 0.56.1 source (not from docs, since the issue warned a guessed
+API would fail to build):
+
+| Platform / backend | What wry exposes | Notes |
+|---|---|---|
+| WebKitGTK (`src/webkitgtk/mod.rs`) | Nothing tunable. `set_webview_settings` hardcodes `settings.set_enable_page_cache(true)` on every webview; no builder method or `WebContext` setter changes it. | The *disk* cache model/size lives on `libwebkit2gtk`'s `WebKitWebContext`/`CacheModel`, reachable only through the raw `webkit2gtk::WebContext` (`WebContextExt::context()`), i.e. by adding `webkit2gtk` as a **new**, Linux-only direct dependency and bypassing wry's own API. |
+| WKWebView (macOS, `src/wkwebview/mod.rs`) | Nothing. No cache- or memory-related method anywhere in the backend. | WKWebView's own cache is entirely OS-managed; no public hook in wry at all. |
+| WebView2 (Windows, `src/webview2/mod.rs`) | `WebViewExtWindows::set_memory_usage_level(MemoryUsageLevel::Low \| Normal)` — `#[cfg(target_os = "windows")]` only, added specifically for "app going inactive" scenarios (wraps `ICoreWebView2Controller4::SetMemoryUsageTargetLevel`, Runtime ≥114.0.1823.32; a no-op on older runtimes). | The closest thing to a purpose-built hook for this exact feature, but Windows-only. |
+| All platforms (`WebView::clear_all_browsing_data`) | Wipes cookies, cache, and local storage together — no way to target just the cache. | Wrong tool: applying it on suspend would silently log the user out of every suspended tab's site, which is a correctness regression, not a memory optimization. |
+
+**Applied**: none of the above. Reasoning:
+
+- WebKitGTK's only lever requires a new direct dependency
+  (`webkit2gtk`, Linux-only) reaching past wry's own API, which D6's
+  dependency policy asks to justify — and the payoff (tuning a cache model
+  enum) is speculative next to the deterministic, cross-platform win that
+  dropping the whole webview already gives.
+- WKWebView exposes nothing at all; there is no decision to make there.
+- WebView2's `set_memory_usage_level` is the one genuinely relevant, well-
+  targeted hook (it is *for* exactly this: backgrounded content) — but it is
+  `#[cfg(target_os = "windows")]`, and applying a Windows-only soft memory
+  hint to the *other* two platforms' background tabs (the ones not yet
+  suspended, e.g. still under the idle threshold) would be a partial,
+  asymmetric feature that suspension's actual mechanism (dropping the
+  webview outright) already dominates for the tabs it applies to. Deferred:
+  worth adding as a `#[cfg(windows)]`-gated call on tabs that just went to
+  the background but have not crossed the auto-suspend threshold yet, as a
+  cheap "soften while waiting" step — tracked as a possible small follow-up,
+  not blocking this issue.
+- `clear_all_browsing_data` is excluded outright: correctness regression
+  (drops cookies/session), not a cache optimization.
+
+**Revisit condition**: if profiling ever shows the *webview construction*
+step on resume (not the steady-state memory of a suspended tab) dominating —
+e.g. cold cache making every resume feel like a first load — that is the
+moment to reconsider `webkit2gtk`'s `CacheModel`/`WebsiteDataManager` as a
+deliberate new Linux-only dependency, or the WebView2 memory-level hint as a
+`cfg(windows)` addition, each on its own merits rather than as a bundle.
+
+## D10: History/bookmarks persistence — JSON files, no new dependency
 
 History (`browser::history::HistoryStore`) and bookmarks
 (`browser::bookmarks::BookmarkStore`) are plain, serde-derived structs;
@@ -132,7 +309,7 @@ justify it yet. When no relevant environment variable is set, VeloX degrades
 to an unpersisted in-memory session (logged once at startup) rather than
 failing to start.
 
-## D9: History/bookmarks UI is a panel in the toolbar webview, not a content-webview page
+## D11: History/bookmarks UI is a panel in the toolbar webview, not a content-webview page
 
 The toolbar and content areas are two separate native webviews with
 independently managed bounds (D3); a dropdown rendered inside the toolbar
@@ -168,7 +345,7 @@ were considered:
 `app.rs` only holds `&BrowserWindow`, not the mutable app state, and still
 needs to preserve the open panel's extra height across a resize.
 
-## D10: Page titles are fetched asynchronously and applied best-effort
+## D12: Page titles are fetched asynchronously and applied best-effort
 
 wry's `WebView::evaluate_script` cannot return a value synchronously; only
 `evaluate_script_with_callback` can, and its callback fires later (and off
@@ -183,7 +360,7 @@ result always applies to the `id` it was requested for regardless of what
 the tab is showing by the time it arrives, so a late title only ever affects
 the (now possibly no-longer-current) history entry it belongs to.
 
-## D11: Single choke point for disabling history recording
+## D13: Single choke point for disabling history recording
 
 `app::record_visit_if_enabled` is the only place `HistoryStore::record_visit`
 is called from, gated by `AppState::history_enabled` (`true` today — nothing

@@ -26,7 +26,7 @@ const BOOKMARKS_FILE: &str = "bookmarks.json";
 /// installs). Otherwise this follows each platform's usual convention for
 /// per-user application data, resolved from environment variables that are
 /// already present rather than a `dirs`-style crate — see docs/decisions.md
-/// D8. Returns `None` when no suitable environment variable is set, in which
+/// D10. Returns `None` when no suitable environment variable is set, in which
 /// case history/bookmarks simply are not persisted for that run.
 pub fn default_data_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("VELOX_DATA_DIR") {

@@ -7,13 +7,13 @@
 
 use std::error::Error;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
 use crate::browser::{
-    navigation, persistence, BookmarkEntry, BookmarkStore, HistoryEntry, HistoryStore, Tab,
+    navigation, persistence, BookmarkEntry, BookmarkStore, HistoryEntry, HistoryStore, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -25,12 +25,12 @@ pub enum UserEvent {
     /// Raw IPC message from the toolbar webview (JSON, see
     /// [`toolbar::parse_command`]).
     ToolbarMessage(String),
-    /// The content webview is about to navigate to this URL.
-    NavigationStarted(String),
-    /// The content webview started loading this URL.
-    LoadStarted(String),
-    /// The content webview finished loading this URL.
-    LoadFinished(String),
+    /// Tab `.0`'s content webview is about to navigate to this URL.
+    NavigationStarted(TabId, String),
+    /// Tab `.0`'s content webview started loading this URL.
+    LoadStarted(TabId, String),
+    /// Tab `.0`'s content webview finished loading this URL.
+    LoadFinished(TabId, String),
     /// `document.title` for the history entry `id` came back from the
     /// content webview (see `BrowserWindow::fetch_page_title`).
     PageTitleResolved { id: u64, title: String },
@@ -39,7 +39,7 @@ pub enum UserEvent {
 /// All mutable application state, gathered so the event handlers below take
 /// one argument instead of a growing list of `&mut` parameters.
 struct AppState {
-    tab: Tab,
+    tabs: Tabs,
     history: HistoryStore,
     bookmarks: BookmarkStore,
     /// Where `history`/`bookmarks` are persisted; `None` when no data
@@ -50,7 +50,7 @@ struct AppState {
     /// `history`. Always `true` today; private browsing (#7) is the
     /// intended reason to ever set this to `false` (per-window/per-tab, once
     /// that concept exists) — see `record_visit_if_enabled` below and
-    /// docs/decisions.md D11.
+    /// docs/decisions.md D13.
     history_enabled: bool,
 }
 
@@ -60,7 +60,10 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
 
-    let window = BrowserWindow::new(&event_loop, &config, proxy)?;
+    let tabs = Tabs::new(config.homepage.clone());
+    let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id())?;
+    let homepage = config.homepage.clone();
+    let auto_suspend_after = config.auto_suspend_after;
 
     let data_dir = persistence::default_data_dir();
     if data_dir.is_none() {
@@ -79,7 +82,7 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
         .unwrap_or_default();
 
     let mut state = AppState {
-        tab: Tab::new(config.homepage.clone()),
+        tabs,
         history,
         bookmarks,
         data_dir,
@@ -102,48 +105,111 @@ pub fn run(config: Config) -> Result<(), Box<dyn Error>> {
                 if std::env::var_os("VELOX_DEBUG").is_some() {
                     eprintln!("velox[debug]: {user_event:?}");
                 }
-                handle_user_event(&window, &mut state, &config, user_event);
+                handle_user_event(&mut window, &mut state, &config, &homepage, user_event);
             }
             _ => {}
+        }
+
+        // Automatic tab suspension: on every pass through the loop (an
+        // actual event, or the timer below waking us up), suspend whatever
+        // background tabs have gone idle long enough, then schedule the
+        // next wake-up for whichever background tab will go idle soonest.
+        // `Tabs::idle_background_tabs`/`next_idle_deadline` are pure and
+        // clock-injected (see `browser::tabs`), so all the policy logic
+        // this loop needs is already unit-tested without a window.
+        if *control_flow != ControlFlow::Exit {
+            if let Some(next_wake) = sweep_idle_tabs(
+                &mut window,
+                &mut state.tabs,
+                auto_suspend_after,
+                Instant::now(),
+            ) {
+                *control_flow = ControlFlow::WaitUntil(next_wake);
+            }
         }
     });
 }
 
+/// Suspend every background tab that has been idle for at least
+/// `auto_suspend_after` as of `now`, then return when the loop should next
+/// check again (the soonest a still-awake background tab would become
+/// eligible). Returns `None` when automatic suspension is disabled
+/// (`auto_suspend_after` is `None`) or there is no background tab to watch,
+/// in which case the caller should leave `control_flow` as `Wait`.
+fn sweep_idle_tabs(
+    window: &mut BrowserWindow,
+    tabs: &mut Tabs,
+    auto_suspend_after: Option<std::time::Duration>,
+    now: Instant,
+) -> Option<Instant> {
+    let idle_after = auto_suspend_after?;
+    let candidates = tabs.idle_background_tabs(now, idle_after);
+    if !candidates.is_empty() {
+        for id in candidates {
+            if tabs.suspend(id) {
+                log_failure("auto-suspend tab", window.suspend_tab(id));
+            }
+        }
+        sync_tab_strip(window, tabs);
+    }
+    tabs.next_idle_deadline(idle_after)
+}
+
 /// Dispatch one [`UserEvent`]. UI failures are logged, never fatal.
 fn handle_user_event(
-    window: &BrowserWindow,
+    window: &mut BrowserWindow,
     state: &mut AppState,
     config: &Config,
+    homepage: &str,
     event: UserEvent,
 ) {
     match event {
         UserEvent::ToolbarMessage(body) => match toolbar::parse_command(&body) {
-            Ok(command) => handle_toolbar_command(window, state, config, command),
+            Ok(command) => handle_toolbar_command(window, state, config, homepage, command),
             Err(err) => eprintln!("velox: ignoring malformed toolbar message {body:?}: {err}"),
         },
-        UserEvent::NavigationStarted(url) | UserEvent::LoadStarted(url) => {
-            state.tab.on_navigation_started(&url);
-            log_failure("update address bar", window.set_url_display(&url));
-            log_failure("show loading state", window.set_loading(true));
-            sync_bookmark_star(window, state, &url);
-        }
-        UserEvent::LoadFinished(url) => {
-            // A failed load reports an empty URL; keep showing the URL the
-            // user tried to reach instead of blanking the address bar.
-            if url.is_empty() {
-                state.tab.on_load_failed();
-            } else {
-                state.tab.on_load_finished(&url);
+        UserEvent::NavigationStarted(id, url) | UserEvent::LoadStarted(id, url) => {
+            if let Some(tab) = state.tabs.get_mut(id) {
+                tab.on_navigation_started(&url);
+            }
+            if id == state.tabs.active_id() {
                 log_failure("update address bar", window.set_url_display(&url));
-
-                if let Some(id) = record_visit_if_enabled(state, &url, config.history_max_entries) {
-                    persist_history(state);
-                    refresh_history_panel(window, state, config);
-                    log_failure("fetch page title", window.fetch_page_title(id));
-                }
+                log_failure("show loading state", window.set_loading(true));
                 sync_bookmark_star(window, state, &url);
             }
-            log_failure("hide loading state", window.set_loading(false));
+            sync_tab_strip(window, &state.tabs);
+        }
+        UserEvent::LoadFinished(id, url) => {
+            // A failed load reports an empty URL; keep showing the URL the
+            // tab tried to reach instead of blanking it out.
+            if let Some(tab) = state.tabs.get_mut(id) {
+                if url.is_empty() {
+                    tab.on_load_failed();
+                } else {
+                    tab.on_load_finished(&url);
+                }
+            }
+            if !url.is_empty() {
+                // Recorded for whichever tab just finished loading, not only
+                // the active one: a background tab finishing a load is a
+                // real visit too (see docs/decisions.md D13 and the "Visit
+                // history and bookmarks" section of docs/architecture.md).
+                if let Some(history_id) =
+                    record_visit_if_enabled(state, &url, config.history_max_entries)
+                {
+                    persist_history(state);
+                    refresh_history_panel(window, state, config);
+                    log_failure("fetch page title", window.fetch_page_title(id, history_id));
+                }
+            }
+            if id == state.tabs.active_id() {
+                if !url.is_empty() {
+                    log_failure("update address bar", window.set_url_display(&url));
+                    sync_bookmark_star(window, state, &url);
+                }
+                log_failure("hide loading state", window.set_loading(false));
+            }
+            sync_tab_strip(window, &state.tabs);
         }
         UserEvent::PageTitleResolved { id, title } => {
             if state.history.update_title(id, title) {
@@ -155,15 +221,16 @@ fn handle_user_event(
 }
 
 fn handle_toolbar_command(
-    window: &BrowserWindow,
+    window: &mut BrowserWindow,
     state: &mut AppState,
     config: &Config,
+    homepage: &str,
     command: ToolbarCommand,
 ) {
     match command {
         ToolbarCommand::Navigate { input } => match navigation::normalize_input(&input) {
             Some(url) => {
-                state.tab.on_navigation_started(&url);
+                state.tabs.active_mut().on_navigation_started(&url);
                 log_failure("navigate", window.navigate(&url));
                 // A panel entry click drives this same command; close
                 // whichever panel was open now that the user has acted on it.
@@ -174,29 +241,63 @@ fn handle_toolbar_command(
                 // Snap the address bar back to the page we are actually on.
                 log_failure(
                     "restore address bar",
-                    window.set_url_display(state.tab.current_url()),
+                    window.set_url_display(state.tabs.active().current_url()),
                 );
             }
         },
         ToolbarCommand::Back => log_failure("go back", window.go_back()),
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
+        ToolbarCommand::NewTab => {
+            let id = state.tabs.open_at(homepage.to_owned(), Instant::now());
+            log_failure("open tab", window.open_tab(id, homepage));
+            activate_and_refresh(window, state, id);
+        }
+        ToolbarCommand::CloseTab { id } => {
+            let id = TabId::from(id);
+            if let Some(new_active) = state.tabs.close(id) {
+                window.close_tab(id);
+                // The tab that replaces the one just closed may itself have
+                // been suspended (a background tab can be suspended while
+                // the tab in front of it is closed); `activate_and_refresh`
+                // resumes it if so.
+                activate_and_refresh(window, state, new_active);
+            }
+            // Otherwise: unknown id, or `id` was the only remaining tab —
+            // VeloX always keeps at least one tab open.
+        }
+        ToolbarCommand::ActivateTab { id } => {
+            let id = TabId::from(id);
+            if state.tabs.activate_at(id, Instant::now()) {
+                activate_and_refresh(window, state, id);
+            }
+        }
+        ToolbarCommand::SuspendTab { id } => {
+            let id = TabId::from(id);
+            if state.tabs.suspend(id) {
+                log_failure("suspend tab", window.suspend_tab(id));
+                sync_tab_strip(window, &state.tabs);
+            }
+            // Otherwise: unknown id, the active tab (never suspended), or
+            // already suspended — a no-op, mirroring `CloseTab`'s guards.
+        }
         ToolbarCommand::Ready => {
             log_failure(
                 "initialize address bar",
-                window.set_url_display(state.tab.current_url()),
+                window.set_url_display(state.tabs.active().current_url()),
             );
             log_failure(
                 "initialize loading state",
-                window.set_loading(state.tab.is_loading()),
+                window.set_loading(state.tabs.active().is_loading()),
             );
-            let url = state.tab.current_url().to_owned();
+            let url = state.tabs.active().current_url().to_owned();
             sync_bookmark_star(window, state, &url);
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
+            sync_tab_strip(window, &state.tabs);
         }
         ToolbarCommand::ToggleBookmark => {
-            let url = state.tab.current_url().to_owned();
+            let url = state.tabs.active().current_url().to_owned();
             let title = known_title_for(&state.history, &url);
             let now = now_unix();
             let active = state.bookmarks.toggle(&url, title, now);
@@ -232,11 +333,62 @@ fn handle_toolbar_command(
             if state.bookmarks.remove(id) {
                 persist_bookmarks(state);
                 refresh_bookmarks_panel(window, state);
-                let url = state.tab.current_url().to_owned();
+                let url = state.tabs.active().current_url().to_owned();
                 sync_bookmark_star(window, state, &url);
             }
         }
     }
+}
+
+/// Show `id` in the window, then bring the toolbar (address bar, loading
+/// indicator, bookmark star, tab strip) up to date with the now-active tab.
+/// The caller must have already made `id` the active tab in `state.tabs`
+/// (`activate`/`activate_at`, `open`/`open_at`, or the replacement tab
+/// returned by `close`).
+///
+/// If `id` was suspended, this also resumes it: clears the suspended flag
+/// on the `Tabs` side and rebuilds its content webview (loading its last
+/// known URL) on the `BrowserWindow` side, instead of the plain visibility
+/// toggle used for an already-awake tab.
+fn activate_and_refresh(window: &mut BrowserWindow, state: &mut AppState, id: TabId) {
+    let was_suspended = state.tabs.active().is_suspended();
+    let result = if was_suspended {
+        state.tabs.active_mut().resume();
+        window.resume_tab(id, state.tabs.active().current_url())
+    } else {
+        window.activate_tab(id)
+    };
+    log_failure(
+        if was_suspended {
+            "resume tab"
+        } else {
+            "activate tab"
+        },
+        result,
+    );
+    if let Some(tab) = state.tabs.get(id) {
+        let url = tab.current_url().to_owned();
+        log_failure("update address bar", window.set_url_display(&url));
+        log_failure("update loading state", window.set_loading(tab.is_loading()));
+        sync_bookmark_star(window, state, &url);
+    }
+    sync_tab_strip(window, &state.tabs);
+}
+
+/// Push the full tab list to the toolbar's tab strip.
+fn sync_tab_strip(window: &BrowserWindow, tabs: &Tabs) {
+    let active_id = tabs.active_id();
+    let summaries: Vec<toolbar::TabSummary> = tabs
+        .iter()
+        .map(|tab| toolbar::TabSummary {
+            id: tab.id().get(),
+            url: tab.current_url().to_owned(),
+            loading: tab.is_loading(),
+            active: tab.id() == active_id,
+            suspended: tab.is_suspended(),
+        })
+        .collect();
+    log_failure("update tab strip", window.set_tabs(&summaries));
 }
 
 /// Record a page visit if history recording is currently enabled.

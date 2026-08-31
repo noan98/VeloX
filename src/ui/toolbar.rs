@@ -3,7 +3,12 @@
 //! The toolbar is rendered by a dedicated webview from [`TOOLBAR_HTML`].
 //! JS -> Rust: `window.ipc.postMessage` with a JSON [`ToolbarCommand`].
 //! Rust -> JS: `evaluate_script` with the snippets built by
-//! [`set_url_script`] / [`set_loading_script`] and friends below.
+//! [`set_url_script`] / [`set_loading_script`] / [`set_tabs_script`] and
+//! friends below.
+//!
+//! Tabs are identified to the toolbar by a plain `u64` (the toolbar's JS has
+//! no notion of `browser::TabId`); `app.rs` converts between the two at the
+//! boundary.
 
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +36,24 @@ pub enum ToolbarCommand {
     Back,
     Forward,
     Reload,
+    /// The "+" button was clicked: open a new tab.
+    NewTab,
+    /// A tab's close button was clicked.
+    CloseTab {
+        id: u64,
+    },
+    /// A tab in the strip was clicked: make it the active tab. Resumes the
+    /// tab first (rebuilding its content webview) if it was suspended.
+    ActivateTab {
+        id: u64,
+    },
+    /// A tab's suspend button was clicked: drop its content webview to
+    /// reclaim memory while keeping its URL, to be reloaded on the next
+    /// `ActivateTab`. A no-op for the active tab or an already-suspended
+    /// tab (see `browser::tabs::Tabs::suspend`).
+    SuspendTab {
+        id: u64,
+    },
     /// The toolbar document finished loading and wants the current state
     /// (the content page may have started loading before the toolbar was
     /// ready to display it).
@@ -55,6 +78,19 @@ pub enum ToolbarCommand {
     },
 }
 
+/// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TabSummary {
+    pub id: u64,
+    pub url: String,
+    pub loading: bool,
+    pub active: bool,
+    /// Whether the tab is suspended (its content webview has been dropped
+    /// to reclaim memory — see docs/decisions.md D9). The tab strip shows
+    /// this distinctly so the user can tell a dormant tab from a live one.
+    pub suspended: bool,
+}
+
 /// Parse a raw IPC message body into a [`ToolbarCommand`].
 pub fn parse_command(body: &str) -> Result<ToolbarCommand, serde_json::Error> {
     serde_json::from_str(body)
@@ -74,6 +110,17 @@ pub fn set_url_script(url: &str) -> String {
 /// JS snippet that toggles the loading indicator.
 pub fn set_loading_script(loading: bool) -> String {
     format!("veloxSetLoading({loading});")
+}
+
+/// JS snippet that re-renders the tab strip from scratch.
+///
+/// `tabs` is embedded as a JSON array, so no tab title/URL can break out of
+/// the script. Serialization only fails for types that cannot occur here
+/// (e.g. non-string map keys), so a failure falls back to an empty tab strip
+/// rather than panicking.
+pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
+    let json = serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned());
+    format!("veloxSetTabs({json});")
 }
 
 /// JS snippet that toggles the bookmark ("star") button's active state.
@@ -140,8 +187,28 @@ mod tests {
             ToolbarCommand::Reload
         );
         assert_eq!(
+            parse_command(r#"{"cmd":"new_tab"}"#).unwrap(),
+            ToolbarCommand::NewTab
+        );
+        assert_eq!(
             parse_command(r#"{"cmd":"ready"}"#).unwrap(),
             ToolbarCommand::Ready
+        );
+    }
+
+    #[test]
+    fn parses_tab_commands_with_ids() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"close_tab","id":3}"#).unwrap(),
+            ToolbarCommand::CloseTab { id: 3 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"activate_tab","id":42}"#).unwrap(),
+            ToolbarCommand::ActivateTab { id: 42 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"suspend_tab","id":7}"#).unwrap(),
+            ToolbarCommand::SuspendTab { id: 7 }
         );
     }
 
@@ -193,6 +260,42 @@ mod tests {
     fn loading_script_is_a_bool_literal() {
         assert_eq!(set_loading_script(true), "veloxSetLoading(true);");
         assert_eq!(set_loading_script(false), "veloxSetLoading(false);");
+    }
+
+    #[test]
+    fn tabs_script_embeds_a_json_array() {
+        let tabs = vec![
+            TabSummary {
+                id: 1,
+                url: "https://a.example/".to_owned(),
+                loading: false,
+                active: true,
+                suspended: false,
+            },
+            TabSummary {
+                id: 2,
+                url: "https://b.example/?q=\"x\"".to_owned(),
+                loading: true,
+                active: false,
+                suspended: false,
+            },
+            TabSummary {
+                id: 3,
+                url: "https://c.example/".to_owned(),
+                loading: false,
+                active: false,
+                suspended: true,
+            },
+        ];
+        let script = set_tabs_script(&tabs);
+        assert!(script.starts_with("veloxSetTabs(["));
+        assert!(script.ends_with("]);"));
+        // Quotes inside a URL must be escaped, not break out of the array.
+        assert!(script.contains(r#"\"x\""#));
+        assert!(script.contains(r#""suspended":true"#));
+
+        let empty = set_tabs_script(&[]);
+        assert_eq!(empty, "veloxSetTabs([]);");
     }
 
     #[test]
@@ -276,11 +379,16 @@ mod tests {
     fn toolbar_html_declares_expected_hooks() {
         assert!(TOOLBAR_HTML.contains("veloxSetUrl"));
         assert!(TOOLBAR_HTML.contains("veloxSetLoading"));
+        assert!(TOOLBAR_HTML.contains("veloxSetTabs"));
         assert!(TOOLBAR_HTML.contains("veloxSetBookmarkActive"));
         assert!(TOOLBAR_HTML.contains("veloxSetPanel"));
         assert!(TOOLBAR_HTML.contains("veloxSetHistory"));
         assert!(TOOLBAR_HTML.contains("veloxSetBookmarks"));
         assert!(TOOLBAR_HTML.contains("ipc.postMessage"));
+        assert!(TOOLBAR_HTML.contains("new_tab"));
+        assert!(TOOLBAR_HTML.contains("close_tab"));
+        assert!(TOOLBAR_HTML.contains("activate_tab"));
+        assert!(TOOLBAR_HTML.contains("suspend_tab"));
         assert!(TOOLBAR_HTML.contains("toggle_bookmark"));
         assert!(TOOLBAR_HTML.contains("toggle_panel"));
         assert!(TOOLBAR_HTML.contains("delete_history_entry"));

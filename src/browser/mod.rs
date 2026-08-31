@@ -12,7 +12,9 @@ pub mod history;
 pub mod navigation;
 pub mod persistence;
 pub mod tab;
+pub mod tabs;
 
 pub use bookmarks::{BookmarkEntry, BookmarkStore};
 pub use history::{HistoryEntry, HistoryStore};
-pub use tab::Tab;
+pub use tab::{Tab, TabId};
+pub use tabs::Tabs;
