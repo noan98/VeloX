@@ -36,6 +36,9 @@ pub struct Tab {
     id: TabId,
     current_url: String,
     loading: bool,
+    /// Number of navigations content blocking has refused since this tab
+    /// was created.
+    blocked_count: u32,
     /// Whether this tab is suspended: its content webview has been dropped
     /// to reclaim memory (see `ui::window::BrowserWindow::suspend_tab`) and
     /// only this `Tab`'s state — the URL — survives. Scroll position,
@@ -58,6 +61,7 @@ impl Tab {
             id,
             current_url: initial_url.into(),
             loading: true,
+            blocked_count: 0,
             suspended: false,
             last_active: Instant::now(),
         }
@@ -78,6 +82,12 @@ impl Tab {
     /// suspended (nothing is loading — there is no webview).
     pub fn is_loading(&self) -> bool {
         self.loading
+    }
+
+    /// Number of navigations content blocking has refused since this tab
+    /// was created.
+    pub fn blocked_count(&self) -> u32 {
+        self.blocked_count
     }
 
     /// Whether this tab is suspended (see the `suspended` field docs).
@@ -139,6 +149,13 @@ impl Tab {
     pub fn on_load_failed(&mut self) {
         self.loading = false;
     }
+
+    /// Content blocking refused a main-frame navigation to `url`; the
+    /// address bar and loading state are left untouched since the current
+    /// page never actually navigated away.
+    pub fn on_navigation_blocked(&mut self, _url: &str) {
+        self.blocked_count += 1;
+    }
 }
 
 #[cfg(test)]
@@ -180,6 +197,26 @@ mod tests {
         tab.on_load_finished("https://example.com/new");
         assert_eq!(tab.current_url(), "https://example.com/new");
         assert!(!tab.is_loading());
+    }
+
+    #[test]
+    fn new_tab_has_no_blocked_navigations() {
+        let tab = Tab::new(TabId::from(0), "https://example.com/");
+        assert_eq!(tab.blocked_count(), 0);
+    }
+
+    #[test]
+    fn blocked_navigation_increments_the_counter_without_changing_the_page() {
+        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        tab.on_load_finished("https://example.com/");
+
+        tab.on_navigation_blocked("https://doubleclick.net/");
+        assert_eq!(tab.blocked_count(), 1);
+        assert_eq!(tab.current_url(), "https://example.com/");
+        assert!(!tab.is_loading());
+
+        tab.on_navigation_blocked("https://googlesyndication.com/");
+        assert_eq!(tab.blocked_count(), 2);
     }
 
     #[test]

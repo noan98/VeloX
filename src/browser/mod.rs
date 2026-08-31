@@ -7,6 +7,7 @@
 //! that reads/writes `history`/`bookmarks` as JSON files; see its module
 //! doc comment.
 
+pub mod blocklist;
 pub mod bookmarks;
 pub mod history;
 pub mod metrics;
@@ -15,6 +16,7 @@ pub mod persistence;
 pub mod tab;
 pub mod tabs;
 
+pub use blocklist::FilterList;
 pub use bookmarks::{BookmarkEntry, BookmarkStore};
 pub use history::{HistoryEntry, HistoryStore};
 pub use tab::{Tab, TabId};

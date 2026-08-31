@@ -1,8 +1,8 @@
 # VeloX Architecture
 
-Status: single window, multiple tabs, tab suspension, visit history and
-bookmarks. This document describes what exists today and where the
-extension points are.
+Status: single window, multiple tabs, tab suspension, visit history,
+bookmarks, and content blocking. This document describes what exists today
+and where the extension points are.
 
 ## Overall structure
 
@@ -65,8 +65,10 @@ macOS/Windows they are true child webviews (`build_as_child`).
 | Per-tab webview lifecycle (open/close/activate) | `ui::window::BrowserWindow` |
 | Toolbar + tab strip rendering, input | `ui/toolbar.html` (in the toolbar webview) |
 | IPC protocol (JSON) | `ui::toolbar` (`ToolbarCommand`, `TabSummary`) |
+| URL normalization | `browser::navigation` |
 | Tab collection (open/close/activate, which tab is active) | `browser::tabs::Tabs` |
 | Address bar / loading state per tab | `browser::tab::Tab` (mirrored into the toolbar) |
+| Content-blocking rule matching | `browser::blocklist::FilterList` |
 | Visit history (persisted) | `browser::history::HistoryStore` + `browser::persistence` |
 | Bookmarks (persisted) | `browser::bookmarks::BookmarkStore` + `browser::persistence` |
 | Page rendering, network, cookies | web engine (wry) |
@@ -202,6 +204,50 @@ loaded, and the app answers with the current state. Without this handshake
 the first `veloxSetUrl` could run before the toolbar's JS exists (the content
 page starts loading in parallel).
 
+## Content blocking
+
+`browser::blocklist::FilterList` is a small EasyList-subset parser/matcher
+(`||domain^` block rules, `@@||domain^` exceptions) built at startup from an
+embedded default list (`browser/default_blocklist.txt`) plus an optional
+user file (`Config::extra_blocklist_path`). It is pure logic with no engine
+dependency, so it is unit-tested directly without a webview.
+
+`app::run` builds one `FilterList`, wraps it in an `Arc`, and hands it to
+`BrowserWindow`, which closes over it — together with the content-blocking
+enabled flag — inside `content_webview_builder`, the single helper every
+content webview (initial tab, a newly opened tab, and a tab rebuilt on
+resume from suspension) is constructed through. Putting the check in this
+one shared helper, rather than in `BrowserWindow::new` alone, is what makes
+blocking apply uniformly regardless of when or how a tab's webview comes
+into existence:
+
+```
+content webview navigates to `url`  (any tab, any time it gets a webview)
+        │
+        ▼
+FilterList::is_blocked(url)?  (host lookup + domain-suffix match)
+   │ yes                              │ no
+   ▼                                  ▼
+return false (navigation refused)     UserEvent::NavigationStarted(id, url)
+UserEvent::NavigationBlocked(id, url) (existing flow)
+        │
+        ▼
+Tab::on_navigation_blocked  →  toolbar block-count badge (active tab only)
+```
+
+`UserEvent::NavigationBlocked` carries the `TabId` the block happened in,
+the same way every other navigation event does, so a block in a background
+tab updates that tab's `Tab::blocked_count` without touching the badge
+shown for the active tab; switching tabs re-renders the badge from the
+newly active tab's count (`veloxSetBlockCount`), the same pattern already
+used for the address bar and the bookmark star.
+
+This only covers **main-frame navigation** — wry 0.56 exposes no hook for
+subresource requests (images/scripts/XHR), so ad/tracker resources loaded
+*within* an allowed page are not filtered today. See docs/decisions.md D17
+for the platform-by-platform investigation and why that gap is not closed
+in this iteration.
+
 ## Multiple tabs
 
 - `browser::tabs::Tabs` owns `Vec<Tab>` plus an active index. It is plain,
@@ -275,7 +321,7 @@ including the WebKitGTK/WKWebView/WebView2 cache-control investigation.
 
 ## Performance extension points
 
-Implemented in `browser::metrics` (see D8 in `docs/decisions.md`), gated by
+Implemented in `browser::metrics` (see D16 in `docs/decisions.md`), gated by
 `Config::perf_metrics` / `Config::perf_rss_interval` (opt-in via
 `VELOX_PERF_METRICS=1`, `VELOX_PERF_RSS_INTERVAL_MS`, same pattern as
 `VELOX_DEBUG`). All arithmetic/formatting/process-tree-walking is pure Rust

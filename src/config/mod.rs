@@ -22,6 +22,14 @@ pub struct Config {
     pub window_height: u32,
     /// Height of the toolbar strip (logical pixels), tab strip included.
     pub toolbar_height: u32,
+    /// Whether ad/tracker content blocking is active. Applies to main-frame
+    /// navigation today; see docs/decisions.md D17 for why subresource
+    /// blocking is not implemented on top of wry 0.56.
+    pub content_blocking_enabled: bool,
+    /// Optional path to an extra EasyList-style filter list (see
+    /// `browser::FilterList`), merged on top of VeloX's built-in list.
+    /// `None` uses only the built-in list.
+    pub extra_blocklist_path: Option<String>,
     /// Enable performance metrics logging to stderr: the four startup
     /// checkpoints, per-page-load duration, and (if
     /// [`Config::perf_rss_interval`] is set) periodic process-tree RSS
@@ -74,6 +82,8 @@ impl Default for Config {
             // A 34px tab strip row on top of the 48px address bar row (see
             // ui/toolbar.html).
             toolbar_height: 82,
+            content_blocking_enabled: true,
+            extra_blocklist_path: None,
             panel_height: 320,
             history_max_entries: 5000,
             history_panel_limit: 200,
@@ -218,5 +228,12 @@ mod tests {
             false,
             vec!["-x".to_owned(), "--private".to_owned()]
         ));
+    }
+
+    #[test]
+    fn content_blocking_is_on_by_default_with_no_extra_list() {
+        let config = Config::default();
+        assert!(config.content_blocking_enabled);
+        assert_eq!(config.extra_blocklist_path, None);
     }
 }

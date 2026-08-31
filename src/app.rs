@@ -8,14 +8,15 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
 use crate::browser::{
-    metrics, navigation, persistence, BookmarkEntry, BookmarkStore, HistoryEntry, HistoryStore,
-    TabId, Tabs,
+    metrics, navigation, persistence, BookmarkEntry, BookmarkStore, FilterList, HistoryEntry,
+    HistoryStore, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -29,6 +30,9 @@ pub enum UserEvent {
     ToolbarMessage(String),
     /// Tab `.0`'s content webview is about to navigate to this URL.
     NavigationStarted(TabId, String),
+    /// Content blocking refused a main-frame navigation in tab `.0` to this
+    /// URL.
+    NavigationBlocked(TabId, String),
     /// Tab `.0`'s content webview started loading this URL.
     LoadStarted(TabId, String),
     /// Tab `.0`'s content webview finished loading this URL.
@@ -81,8 +85,10 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         .perf_metrics
         .then(|| metrics::StartupTimestamps::new(process_start));
 
+    let blocklist = Arc::new(build_blocklist(&config));
+
     let tabs = Tabs::new(config.homepage.clone());
-    let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id())?;
+    let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id(), blocklist)?;
     if let Some(startup) = startup.as_mut() {
         startup.mark_window_created(Instant::now());
     }
@@ -169,6 +175,21 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     });
 }
 
+/// Build the content-blocking filter list: VeloX's built-in list, plus an
+/// optional user-supplied list merged on top. A missing/unreadable extra
+/// list is logged and skipped rather than treated as fatal (see the
+/// `log_failure` pattern used for UI calls below).
+fn build_blocklist(config: &Config) -> FilterList {
+    let mut list = FilterList::built_in();
+    if let Some(path) = &config.extra_blocklist_path {
+        match std::fs::read_to_string(path) {
+            Ok(text) => list.merge(&text),
+            Err(err) => eprintln!("velox: failed to read extra blocklist {path:?}: {err}"),
+        }
+    }
+    list
+}
+
 /// Update startup/page-load metrics state for one [`UserEvent`], logging to
 /// stderr whenever a measurement completes. Only called when
 /// `config.perf_metrics` is on, so every branch here is allowed a clock read
@@ -206,6 +227,7 @@ fn record_perf_event(
             );
         }
         UserEvent::LoadStarted(..)
+        | UserEvent::NavigationBlocked(..)
         | UserEvent::PageTitleResolved { .. }
         | UserEvent::OpenDevtoolsRequested => {}
     }
@@ -290,6 +312,19 @@ fn handle_user_event(
                 sync_bookmark_star(window, state, &url);
             }
             sync_tab_strip(window, &state.tabs);
+        }
+        UserEvent::NavigationBlocked(id, url) => {
+            eprintln!("velox: blocked navigation to {url} in tab {id:?}");
+            if let Some(tab) = state.tabs.get_mut(id) {
+                tab.on_navigation_blocked(&url);
+            }
+            // Only the active tab's badge is visible right now; a blocked
+            // navigation in a background tab still updates its own
+            // `Tab::blocked_count` above and is picked up the moment that
+            // tab becomes active (see `activate_and_refresh`).
+            if id == state.tabs.active_id() {
+                sync_block_count(window, &state.tabs);
+            }
         }
         UserEvent::LoadFinished(id, url) => {
             // A failed load reports an empty URL; keep showing the URL the
@@ -405,6 +440,7 @@ fn handle_toolbar_command(
                 window.set_loading(state.tabs.active().is_loading()),
             );
             log_failure("show private indicator", window.set_private(config.private));
+            sync_block_count(window, &state.tabs);
             let url = state.tabs.active().current_url().to_owned();
             sync_bookmark_star(window, state, &url);
             refresh_history_panel(window, state, config);
@@ -456,10 +492,10 @@ fn handle_toolbar_command(
 }
 
 /// Show `id` in the window, then bring the toolbar (address bar, loading
-/// indicator, bookmark star, tab strip) up to date with the now-active tab.
-/// The caller must have already made `id` the active tab in `state.tabs`
-/// (`activate`/`activate_at`, `open`/`open_at`, or the replacement tab
-/// returned by `close`).
+/// indicator, bookmark star, block-count badge, tab strip) up to date with
+/// the now-active tab. The caller must have already made `id` the active
+/// tab in `state.tabs` (`activate`/`activate_at`, `open`/`open_at`, or the
+/// replacement tab returned by `close`).
 ///
 /// If `id` was suspended, this also resumes it: clears the suspended flag
 /// on the `Tabs` side and rebuilds its content webview (loading its last
@@ -487,6 +523,7 @@ fn activate_and_refresh(window: &mut BrowserWindow, state: &mut AppState, id: Ta
         log_failure("update loading state", window.set_loading(tab.is_loading()));
         sync_bookmark_star(window, state, &url);
     }
+    sync_block_count(window, &state.tabs);
     sync_tab_strip(window, &state.tabs);
 }
 
@@ -504,6 +541,18 @@ fn sync_tab_strip(window: &BrowserWindow, tabs: &Tabs) {
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));
+}
+
+/// Push the active tab's blocked-navigation count to the toolbar badge.
+/// Background tabs keep accumulating their own `Tab::blocked_count` (see
+/// `UserEvent::NavigationBlocked`) without touching the badge until they
+/// become active, the same active-tab-only pattern `sync_bookmark_star`
+/// uses for the bookmark star.
+fn sync_block_count(window: &BrowserWindow, tabs: &Tabs) {
+    log_failure(
+        "update block counter",
+        window.set_block_count(tabs.active().blocked_count()),
+    );
 }
 
 /// Record a page visit if history recording is currently enabled.
@@ -664,5 +713,29 @@ mod tests {
         assert!(state.data_dir.is_none());
         // Should not panic and should not touch the filesystem.
         persist_history(&state);
+    }
+
+    #[test]
+    fn new_tab_has_no_blocked_navigations_in_app_state() {
+        let state = state_with_history_enabled(true);
+        assert_eq!(state.tabs.active().blocked_count(), 0);
+    }
+
+    #[test]
+    fn blocked_navigation_increments_only_the_target_tabs_counter() {
+        let mut state = state_with_history_enabled(true);
+        let active_id = state.tabs.active_id();
+        // Opening a tab makes it active; activate the original tab again so
+        // the new one is a real background tab for this test.
+        let background_id = state.tabs.open_at("https://example.com/", Instant::now());
+        state.tabs.activate_at(active_id, Instant::now());
+
+        if let Some(tab) = state.tabs.get_mut(background_id) {
+            tab.on_navigation_blocked("https://doubleclick.net/");
+        }
+
+        assert_eq!(state.tabs.active().blocked_count(), 0);
+        assert_eq!(state.tabs.get(background_id).unwrap().blocked_count(), 1);
+        assert_eq!(state.tabs.active_id(), active_id);
     }
 }

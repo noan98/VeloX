@@ -508,6 +508,86 @@ Windows/macOS CI leg, that is the point to revisit a crate (or
 platform-specific APIs) with the actual OSes to test against, rather than
 guessing at `ps`/API behavior blind.
 
+## D17: Content blocking — navigation-level only, wry 0.56 exposes no subresource hook
+
+**Decision**: VeloX blocks ad/tracker domains at main-frame navigation time,
+via `WebViewBuilder::with_navigation_handler` returning `false` for a
+blocked URL (`src/ui/window.rs`). The matching itself is a small,
+hand-written EasyList-subset parser/matcher (`src/browser/blocklist.rs`,
+`FilterList`) — pure logic, no engine dependency, fully unit-tested.
+Subresource-level blocking (images/scripts/XHR/fetch) is **not**
+implemented; the reasons follow.
+
+**What was checked**: wry 0.56.1's public API was read directly from the
+vendored crate source
+(`~/.cargo/registry/src/*/wry-0.56.1/src/lib.rs`, `webview2/mod.rs`,
+`wkwebview/*`), specifically every `WebViewBuilder::with_*` method and the
+CHANGELOG, looking for a request-interception hook usable for subresources.
+
+**Findings, per platform**:
+
+- **Cross-platform surface (what wry actually exposes today)**:
+  `with_navigation_handler(Fn(String) -> bool)` — "decide if incoming url is
+  allowed to navigate"; this is a frame-navigation decision (matches
+  WebKitGTK's `decide-policy` for navigation actions / WKWebView's
+  `decidePolicyForNavigationAction` / WebView2's `NavigationStarting`), not a
+  per-subresource one. `with_custom_protocol` /
+  `with_asynchronous_custom_protocol` intercept requests, but only for a
+  custom URI *scheme* registered up front (e.g. `wry://`) — they are not
+  invoked for ordinary `http`/`https` subresource loads, so they cannot be
+  used as a generic ad-request filter. No `with_web_resource_request_handler`
+  (or any request/response interception hook) exists in this version.
+- **WebKitGTK (Linux)**: the issue's implementation notes point at WebKit's
+  `WebKitUserContentFilter` (content-blocker JSON, compiled via
+  `webkit_user_content_filter_store_save`). wry does not bind
+  `WebKitUserContentFilter`, `WebKitUserContentManager`'s filter APIs, or the
+  underlying `webkit2gtk` request-decision signals anywhere in its public
+  surface or its `webkit2gtk`-backed internals that `wry::WebViewBuilder`
+  exposes to callers.
+- **WKWebView (macOS)**: same gap for `WKContentRuleList` /
+  `WKContentRuleListStore` — not present in `wry::WebViewBuilderExtWebview2`
+  or the `webkit2gtk`/`wkwebview` platform modules' public re-exports.
+- **WebView2 (Windows)**: same gap for `ICoreWebView2.WebResourceRequested`
+  (or `AddWebResourceRequestedFilter`) — wry's `webview2` module wires
+  webview2-com's navigation and permission events, but not
+  `WebResourceRequested`.
+
+**Conclusion**: reaching any of the three platform-native subresource
+hooks from `wry::WebViewBuilder` would require either (a) an upstream PR to
+wry adding a cross-platform `with_web_resource_request_handler`-style API
+(all three platforms have the underlying native hook; wry simply doesn't
+bind it yet), or (b) reaching past `wry::WebView` into the raw platform
+webview object it wraps (`webkit2gtk::WebView` / `WKWebView` /
+`ICoreWebView2`) and driving the native filtering API directly per
+platform — three separate, `unsafe`-adjacent implementations, which the
+project's dependency/complexity budget (D6) and the "no unsafe" rule rule
+out for this iteration. Per the issue's acceptance criteria, this
+investigation result is recorded here instead of a subresource
+implementation.
+
+**Cost / revisit condition**: revisit once either upstream wry lands a
+request-interception hook (watch the wry CHANGELOG), or VeloX outgrows wry
+entirely (see D1's revisit condition, which already lists "real content
+blocking" as a trigger for re-evaluating the engine layer).
+
+**Filter list**: a small (~45-rule) hand-picked list of known ad/tracker
+domains ships embedded in the binary (`src/browser/default_blocklist.txt`,
+via `include_str!`), written in the same `||domain^` / `@@||domain^` syntax
+EasyList/EasyPrivacy use so a real list can be dropped in later. It is
+**not** a copy of EasyList/EasyPrivacy and nothing is fetched over the
+network — this environment cannot verify network-list-update code, and it
+would add scope (refresh scheduling, caching, format coverage) beyond a
+single content-blocking PR. `Config::extra_blocklist_path` lets a user
+point at a larger/updated list file, merged on top of the built-in one at
+startup (`FilterList::merge`); fetching that file from a URL is left to a
+follow-up issue.
+
+**Why no `adblock`-style crate**: the matching needed here (domain-anchor
+block/exception, nothing else) is a few dozen lines with no external
+dependency; pulling in a full adblock-rule-engine crate for that would
+violate D6's "every dependency has one clear job" bar, and would also add
+network-fetching and cosmetic-filtering machinery VeloX does not use.
+
 ## D18: DevTools — feature gating, shortcut delivery, and the IPC trust boundary
 
 **Scope**: only the content webview gets devtools (`WebViewBuilder::with_devtools(true)`).

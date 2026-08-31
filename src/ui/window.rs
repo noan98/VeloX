@@ -24,6 +24,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Window, WindowBuilder};
@@ -31,7 +32,7 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
-use crate::browser::{BookmarkEntry, HistoryEntry, TabId};
+use crate::browser::{BookmarkEntry, FilterList, HistoryEntry, TabId};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -146,16 +147,32 @@ pub struct BrowserWindow {
     /// Whole-app private browsing (see docs/decisions.md D14). Kept so tabs
     /// opened after startup are built with the same ephemeral data store.
     private: bool,
+    /// Ad/tracker filter rules (see docs/decisions.md D17). Kept — alongside
+    /// `content_blocking_enabled` — so every tab's content webview, however
+    /// and whenever it comes into existence (a newly opened tab, a tab
+    /// rebuilt on resume from suspension), is built through
+    /// [`content_webview_builder`] with the same blocking behavior as the
+    /// first tab.
+    blocklist: Arc<FilterList>,
+    /// Whether content blocking is currently active; threaded into every
+    /// [`content_webview_builder`] call alongside `blocklist`.
+    content_blocking_enabled: bool,
 }
 
 impl BrowserWindow {
     /// Create the window, the toolbar webview, and the first tab's content
     /// webview (bound to `initial_tab`, loading `config.homepage`).
+    ///
+    /// `blocklist` is the ad/tracker filter list content blocking matches
+    /// against (see docs/decisions.md D17); it is stored on `self` so every
+    /// tab opened later — or rebuilt on resume from suspension — is built
+    /// through the same [`content_webview_builder`] with blocking applied.
     pub fn new(
         event_loop: &EventLoopWindowTarget<UserEvent>,
         config: &Config,
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
+        blocklist: Arc<FilterList>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // A window-title suffix is a second, independent tell for private
         // mode (docs/decisions.md D14): unlike the toolbar badge it survives
@@ -233,12 +250,15 @@ impl BrowserWindow {
             });
         let toolbar = attach(toolbar_builder)?;
 
+        let content_blocking_enabled = config.content_blocking_enabled;
         let content_builder = content_webview_builder(
             initial_tab,
             &config.homepage,
             content_rect,
             &proxy,
             config.private,
+            Arc::clone(&blocklist),
+            content_blocking_enabled,
         );
         let content = attach(content_builder)?;
 
@@ -268,6 +288,8 @@ impl BrowserWindow {
             contents,
             active: Some(initial_tab),
             private: config.private,
+            blocklist,
+            content_blocking_enabled,
         })
     }
 
@@ -309,8 +331,16 @@ impl BrowserWindow {
     /// also the newly active one.
     pub fn open_tab(&mut self, id: TabId, url: &str) -> wry::Result<()> {
         let (_, content_rect) = self.layout();
-        let builder = content_webview_builder(id, url, content_rect, &self.proxy, self.private)
-            .with_visible(false);
+        let builder = content_webview_builder(
+            id,
+            url,
+            content_rect,
+            &self.proxy,
+            self.private,
+            Arc::clone(&self.blocklist),
+            self.content_blocking_enabled,
+        )
+        .with_visible(false);
         let webview = self.attach_webview(builder)?;
         self.contents.insert(
             id,
@@ -455,6 +485,16 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_loading_script(loading))
     }
 
+    /// Update the toolbar's blocked-request counter badge. The caller
+    /// (`app.rs`) passes the *active* tab's `blocked_count` — background
+    /// tabs accumulate their own counts but do not touch this badge until
+    /// they become active (see `Tab::on_navigation_blocked` and
+    /// `UserEvent::NavigationBlocked`'s `TabId`).
+    pub fn set_block_count(&self, count: u32) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_block_count_script(count))
+    }
+
     /// Open DevTools (Web Inspector) for the active tab's content webview.
     ///
     /// Kept as this one method (rather than inlining at each call site) so
@@ -581,14 +621,28 @@ fn extract_js_string_result(raw: &str) -> Option<String> {
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
 /// URL, and navigation/page-load handlers that tag their `UserEvent`s with
 /// `id` so `app.rs` knows which tab they belong to.
+///
+/// Every content webview — the first tab built in [`BrowserWindow::new`], a
+/// tab opened later via [`BrowserWindow::open_tab`], and a tab rebuilt on
+/// resume from suspension (which reuses `open_tab`) — is built through this
+/// one function, which is what makes content blocking apply uniformly
+/// regardless of when or how a tab's webview comes into existence: the
+/// navigation handler checks `blocklist` before firing
+/// [`UserEvent::NavigationStarted`], refusing the navigation (returning
+/// `false`) and reporting [`UserEvent::NavigationBlocked`] instead when
+/// `content_blocking_enabled` is set and the URL matches (see
+/// docs/decisions.md D17).
 fn content_webview_builder<'a>(
     id: TabId,
     url: &str,
     content_rect: LogicalRect,
     proxy: &EventLoopProxy<UserEvent>,
     private: bool,
+    blocklist: Arc<FilterList>,
+    content_blocking_enabled: bool,
 ) -> WebViewBuilder<'a> {
     let nav_proxy = proxy.clone();
+    let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
     WebViewBuilder::new()
@@ -612,6 +666,10 @@ fn content_webview_builder<'a>(
         .with_devtools(true)
         .with_initialization_script(devtools_shortcut_script())
         .with_navigation_handler(move |url| {
+            if content_blocking_enabled && blocklist.is_blocked(&url) {
+                let _ = block_proxy.send_event(UserEvent::NavigationBlocked(id, url));
+                return false;
+            }
             let _ = nav_proxy.send_event(UserEvent::NavigationStarted(id, url));
             true
         })

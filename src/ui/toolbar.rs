@@ -3,8 +3,8 @@
 //! The toolbar is rendered by a dedicated webview from [`TOOLBAR_HTML`].
 //! JS -> Rust: `window.ipc.postMessage` with a JSON [`ToolbarCommand`].
 //! Rust -> JS: `evaluate_script` with the snippets built by
-//! [`set_url_script`] / [`set_loading_script`] / [`set_tabs_script`] and
-//! friends below.
+//! [`set_url_script`] / [`set_loading_script`] / [`set_block_count_script`] /
+//! [`set_tabs_script`] and friends below.
 //!
 //! Tabs are identified to the toolbar by a plain `u64` (the toolbar's JS has
 //! no notion of `browser::TabId`); `app.rs` converts between the two at the
@@ -112,6 +112,11 @@ pub fn set_url_script(url: &str) -> String {
 /// JS snippet that toggles the loading indicator.
 pub fn set_loading_script(loading: bool) -> String {
     format!("veloxSetLoading({loading});")
+}
+
+/// JS snippet that updates the blocked-request counter badge.
+pub fn set_block_count_script(count: u32) -> String {
+    format!("veloxSetBlockCount({count});")
 }
 
 /// JS snippet that re-renders the tab strip from scratch.
@@ -277,6 +282,12 @@ mod tests {
     }
 
     #[test]
+    fn block_count_script_is_an_int_literal() {
+        assert_eq!(set_block_count_script(0), "veloxSetBlockCount(0);");
+        assert_eq!(set_block_count_script(42), "veloxSetBlockCount(42);");
+    }
+
+    #[test]
     fn tabs_script_embeds_a_json_array() {
         let tabs = vec![
             TabSummary {
@@ -399,6 +410,7 @@ mod tests {
     fn toolbar_html_declares_expected_hooks() {
         assert!(TOOLBAR_HTML.contains("veloxSetUrl"));
         assert!(TOOLBAR_HTML.contains("veloxSetLoading"));
+        assert!(TOOLBAR_HTML.contains("veloxSetBlockCount"));
         assert!(TOOLBAR_HTML.contains("veloxSetTabs"));
         assert!(TOOLBAR_HTML.contains("veloxSetBookmarkActive"));
         assert!(TOOLBAR_HTML.contains("veloxSetPrivate"));
