@@ -1,0 +1,29 @@
+[package]
+name = "velox"
+version = "0.1.0"
+edition = "2021"
+description = "A fast, lightweight web browser built with Rust."
+license = "MIT"
+repository = "https://github.com/noan98/VeloX"
+rust-version = "1.77"
+
+[dependencies]
+# Window creation and event loop (cross-platform: macOS / Linux / Windows).
+tao = "0.37"
+# WebView embedding (WebKitGTK on Linux, WKWebView on macOS, WebView2 on Windows).
+wry = "0.56"
+# Typed deserialization of toolbar IPC messages.
+serde = { version = "1", features = ["derive"] }
+# JSON wire format for toolbar IPC and safe JS string escaping.
+serde_json = "1"
+# URL parsing and normalization of address bar input.
+url = "2"
+
+# wry's gtk backend exposes raw gtk containers; we need the gtk crate to place
+# two webviews (toolbar + content) inside one window on Linux/BSD.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+gtk = "0.18"
+
+[profile.release]
+lto = "thin"
+strip = true

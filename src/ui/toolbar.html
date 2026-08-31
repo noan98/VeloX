@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f3f3f5;
+    --fg: #1c1c1e;
+    --field-bg: #ffffff;
+    --border: #d0d0d5;
+    --accent: #4a6cf7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #2b2b2e;
+      --fg: #ececf0;
+      --field-bg: #1c1c1e;
+      --border: #47474c;
+    }
+  }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: system-ui, sans-serif;
+    user-select: none;
+    overflow: hidden;
+  }
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    height: 100%;
+    padding: 0 8px;
+    box-sizing: border-box;
+    border-bottom: 1px solid var(--border);
+  }
+  button {
+    flex: none;
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--fg);
+    font-size: 16px;
+    cursor: pointer;
+  }
+  button:hover { background: rgba(128, 128, 128, 0.2); }
+  #url {
+    flex: 1;
+    height: 32px;
+    padding: 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    background: var(--field-bg);
+    color: var(--fg);
+    font-size: 13px;
+    outline: none;
+  }
+  #url:focus { border-color: var(--accent); }
+  #toolbar.loading #url { border-color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="toolbar">
+  <button id="back" title="Back">&#8592;</button>
+  <button id="forward" title="Forward">&#8594;</button>
+  <button id="reload" title="Reload">&#8635;</button>
+  <input id="url" type="text" spellcheck="false" autocomplete="off"
+         placeholder="Enter a URL, e.g. example.com" />
+</div>
+<script>
+  "use strict";
+  const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
+  const urlInput = document.getElementById("url");
+
+  document.getElementById("back").addEventListener("click", () => send({ cmd: "back" }));
+  document.getElementById("forward").addEventListener("click", () => send({ cmd: "forward" }));
+  document.getElementById("reload").addEventListener("click", () => send({ cmd: "reload" }));
+  urlInput.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") {
+      send({ cmd: "navigate", input: urlInput.value });
+      urlInput.blur();
+    }
+  });
+
+  /* Called from Rust via evaluate_script. Keep the user's in-progress edit. */
+  window.veloxSetUrl = (url) => {
+    if (document.activeElement !== urlInput) {
+      urlInput.value = url;
+    }
+  };
+  window.veloxSetLoading = (loading) => {
+    document.getElementById("toolbar").classList.toggle("loading", loading);
+  };
+
+  /* Ask Rust for the current state: the content page may have started
+     loading before this toolbar document finished parsing. */
+  send({ cmd: "ready" });
+</script>
+</body>
+</html>
