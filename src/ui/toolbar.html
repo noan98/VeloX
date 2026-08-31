@@ -13,6 +13,12 @@
     --border: #d0d0d5;
     --accent: #4a6cf7;
     --tab-bg: #e3e3e8;
+    --private-bg: #2d1b4e;
+    --private-fg: #ece6fb;
+    --private-field-bg: #241542;
+    --private-border: #5c3f94;
+    --private-badge-bg: #6b3fa0;
+    --private-badge-fg: #ffffff;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -23,6 +29,9 @@
       --row-hover: rgba(255, 255, 255, 0.08);
       --border: #47474c;
       --tab-bg: #38383c;
+      --private-bg: #1f1338;
+      --private-field-bg: #170e29;
+      --private-border: #4a3470;
     }
   }
   html, body {
@@ -145,6 +154,39 @@
   #url:focus { border-color: var(--accent); }
   #toolbar.loading #url { border-color: var(--accent); }
 
+  /* Private browsing: an always-visible color shift plus a badge, so the
+     mode is never mistaken for normal browsing (see docs/decisions.md
+     D14). Applied via a class on <body> so it also covers the panel. */
+  body.private {
+    background: var(--private-bg);
+    color: var(--private-fg);
+  }
+  body.private #toolbar {
+    border-bottom-color: var(--private-border);
+  }
+  body.private #url {
+    background: var(--private-field-bg);
+    color: var(--private-fg);
+    border-color: var(--private-border);
+  }
+  body.private .panel-header {
+    border-bottom-color: var(--private-border);
+  }
+  .private-badge {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 13px;
+    background: var(--private-badge-bg);
+    color: var(--private-badge-fg);
+    font-size: 12px;
+    white-space: nowrap;
+  }
+  .private-badge[hidden] { display: none; }
+
   #panel {
     flex: 1;
     min-height: 0;
@@ -236,6 +278,10 @@
   <button id="back" title="Back">&#8592;</button>
   <button id="forward" title="Forward">&#8594;</button>
   <button id="reload" title="Reload">&#8635;</button>
+  <span id="private-badge" class="private-badge" hidden
+        title="このウィンドウはプライベートモードです。Cookie・ストレージ・履歴はセッション終了時に破棄されます。">
+    &#128373; プライベート
+  </span>
   <input id="url" type="text" spellcheck="false" autocomplete="off"
          placeholder="Enter a URL, e.g. example.com" />
   <button id="bookmark-star" title="ブックマークに追加/削除">&#9733;</button>
@@ -303,6 +349,10 @@
   };
   window.veloxSetBookmarkActive = (active) => {
     document.getElementById("bookmark-star").classList.toggle("active", active);
+  };
+  window.veloxSetPrivate = (private_) => {
+    document.body.classList.toggle("private", private_);
+    document.getElementById("private-badge").hidden = !private_;
   };
   window.veloxSetPanel = (panel) => {
     panelEl.hidden = panel === null;

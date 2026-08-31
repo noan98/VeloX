@@ -95,10 +95,11 @@ back to disk (best-effort — a write failure is logged, never fatal).
 
 **Recording a visit** happens at the same point session-history state
 already updates: `UserEvent::LoadFinished` calls
-`app::record_visit_if_enabled`, the single choke point future private
-browsing (#7) needs to gate — see docs/decisions.md D13. Recording is not
-limited to the active tab: every tab's `LoadFinished` runs through this same
-path, so a page finishing in a background tab is recorded too. The entry is
+`app::record_visit_if_enabled`, the single choke point private browsing
+gates via `AppState::history_enabled` — see docs/decisions.md D13 and the
+"Private browsing" section below. Recording is not limited to the active
+tab: every tab's `LoadFinished` runs through this same path, so a page
+finishing in a background tab is recorded too. The entry is
 created with `title: None` immediately (the store's own de-duplication
 collapses a reload into updating that same entry rather than creating a
 new one); `BrowserWindow::fetch_page_title` then asynchronously reads
@@ -119,6 +120,34 @@ considered and `ui::window::effective_toolbar_height` /
 entry reuses the existing `Navigate { input }` command (the stored URL is
 already normalized, so it round-trips through `navigation::normalize_input`
 unchanged) rather than adding a dedicated "open" command.
+
+## Private browsing
+
+Private browsing (#7) is a **whole-app** mode, not a per-window one — see
+docs/decisions.md D12 for why, and the extension path once multi-window
+exists. `Config::private` (set from the `VELOX_PRIVATE` env var or a
+`--private` CLI flag, `Config::from_env_and_args`) drives two independent
+things at startup, both in place before the window is shown:
+
+- `ui::window::BrowserWindow::new` builds the *content* webview with
+  `.with_incognito(config.private)`, so cookies/storage/cache use the
+  engine's ephemeral data store and never touch disk (docs/decisions.md
+  D13 has the per-platform backing). The toolbar webview never needs this —
+  it only ever loads our own embedded HTML.
+- `app::run` sets `AppState::history_enabled = !config.private`, so
+  `app::record_visit_if_enabled` (see above) never calls
+  `HistoryStore::record_visit` for the session — no history entry is ever
+  created, so there is nothing for `persist_history` to write either.
+  Bookmarks stay ungated (an explicit user action, same call as normal
+  mode — see docs/decisions.md D11).
+
+The mode is surfaced continuously, not just once, so it cannot go unnoticed
+mid-session: the toolbar webview gets a persistent badge plus a color shift
+(`ui/toolbar.html`'s `body.private`, pushed once via
+`BrowserWindow::set_private` from the toolbar's `ready` handshake, since the
+mode never changes for the life of the process), and the window title gets
+a `— プライベート` suffix (visible even when another window covers the
+toolbar, e.g. in a taskbar/alt-tab switcher).
 
 ## Event flow
 

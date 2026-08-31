@@ -128,6 +128,14 @@ pub fn set_bookmark_active_script(active: bool) -> String {
     format!("veloxSetBookmarkActive({active});")
 }
 
+/// JS snippet that toggles the always-visible private-browsing indicator
+/// (see docs/decisions.md D14). Pushed once, from the toolbar's `ready`
+/// handler, since whole-app private mode never changes for the life of the
+/// process.
+pub fn set_private_script(private: bool) -> String {
+    format!("veloxSetPrivate({private});")
+}
+
 /// JS snippet that opens the given panel, or closes whichever panel is open
 /// when `panel` is `None`.
 pub fn set_panel_script(panel: Option<Panel>) -> String {
@@ -311,6 +319,12 @@ mod tests {
     }
 
     #[test]
+    fn private_script_is_a_bool_literal() {
+        assert_eq!(set_private_script(true), "veloxSetPrivate(true);");
+        assert_eq!(set_private_script(false), "veloxSetPrivate(false);");
+    }
+
+    #[test]
     fn panel_script_names_the_open_panel_or_null() {
         assert_eq!(
             set_panel_script(Some(Panel::History)),
@@ -381,6 +395,7 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("veloxSetLoading"));
         assert!(TOOLBAR_HTML.contains("veloxSetTabs"));
         assert!(TOOLBAR_HTML.contains("veloxSetBookmarkActive"));
+        assert!(TOOLBAR_HTML.contains("veloxSetPrivate"));
         assert!(TOOLBAR_HTML.contains("veloxSetPanel"));
         assert!(TOOLBAR_HTML.contains("veloxSetHistory"));
         assert!(TOOLBAR_HTML.contains("veloxSetBookmarks"));
