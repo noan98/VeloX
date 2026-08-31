@@ -1,7 +1,7 @@
 # VeloX Architecture
 
-Status: initial MVP (single window, single tab). This document describes what
-exists today and where the extension points are.
+Status: single window, multiple tabs. This document describes what exists
+today and where the extension points are.
 
 ## Overall structure
 
@@ -25,63 +25,83 @@ they are unit-tested directly. `src/ui/` owns everything that touches wry/tao.
 
 ## Why a webview toolbar?
 
-The window hosts **two** webviews:
+The window hosts a shared toolbar webview plus **one content webview per open
+tab**:
 
 ```
 ┌──────────────────────────────────────┐
-│ ←  →  ↻   [ https://example.com ]    │  toolbar webview (our HTML, trusted)
-├──────────────────────────────────────┤
-│            Web Content               │  content webview (untrusted pages)
-└──────────────────────────────────────┘
+│ [ Tab A ] [ Tab B ] [ Tab C ]  +     │  tab strip
+│ ←  →  ↻   [ https://example.com ]    │  address bar        } toolbar webview
+├──────────────────────────────────────┤                       (our HTML, trusted)
+│            Web Content               │  content webview of the *active* tab
+└──────────────────────────────────────┘  (untrusted pages; inactive tabs'
+                                            webviews exist too, just hidden)
 ```
 
-- The toolbar is rendered from `src/ui/toolbar.html`, compiled into the
-  binary with `include_str!`. Using HTML/CSS for chrome avoids pulling in a
-  whole native widget toolkit (or a Rust GUI framework) for three buttons and
-  a text field, and it is trivially themeable later.
+- The toolbar (tab strip + address bar) is rendered from
+  `src/ui/toolbar.html`, compiled into the binary with `include_str!`. Using
+  HTML/CSS for chrome avoids pulling in a whole native widget toolkit (or a
+  Rust GUI framework), and it is trivially themeable later.
 - Keeping chrome and content in *separate* webviews is a security boundary:
   page content can never script the toolbar, and toolbar IPC messages can
   only originate from our own HTML.
+- Every open tab keeps its own content webview alive, not just the active
+  one. Switching tabs hides the previous webview and shows the target one
+  (`WebView::set_visible` + `set_bounds`) instead of destroying/recreating
+  it, so scroll position and in-progress form input survive the switch. Only
+  the active tab's webview is visible at any time.
 
-On Linux/BSD both webviews are gtk widgets placed in a `gtk::Fixed` inside
-the tao window; on macOS/Windows they are true child webviews
-(`build_as_child`). `src/ui/window.rs` hides this difference behind
-`BrowserWindow`.
+On Linux/BSD every webview (toolbar and each tab's content view) is a gtk
+widget placed in one shared `gtk::Fixed` inside the tao window; on
+macOS/Windows they are true child webviews (`build_as_child`).
+`src/ui/window.rs` hides this difference behind `BrowserWindow`.
 
 ## UI ↔ engine responsibilities
 
 | Concern | Owner |
 |---|---|
 | Window, layout, resize | `ui::window::BrowserWindow` |
-| Toolbar rendering + input | `ui/toolbar.html` (in the toolbar webview) |
-| IPC protocol (JSON) | `ui::toolbar` (`ToolbarCommand`) |
+| Per-tab webview lifecycle (open/close/activate) | `ui::window::BrowserWindow` |
+| Toolbar + tab strip rendering, input | `ui/toolbar.html` (in the toolbar webview) |
+| IPC protocol (JSON) | `ui::toolbar` (`ToolbarCommand`, `TabSummary`) |
 | URL normalization | `browser::navigation` |
-| Address bar / loading state | `browser::tab::Tab` (mirrored into the toolbar) |
+| Tab collection (open/close/activate, which tab is active) | `browser::tabs::Tabs` |
+| Address bar / loading state per tab | `browser::tab::Tab` (mirrored into the toolbar) |
 | Page rendering, network, cookies | web engine (wry) |
-| Session history (back/forward) | web engine (wry) |
+| Session history (back/forward) | web engine (wry), per content webview |
 
 VeloX deliberately does **not** duplicate the engine's session history. The
 engine already tracks redirects, `pushState`, anchors etc.; a parallel Rust
 history would drift from reality. `Tab` mirrors only what the UI needs
-(current URL, loading flag).
+(current URL, loading flag) — one `Tab` per open tab, held in `Tabs`.
 
 ## Event flow
 
 All state lives on the main thread. Webview callbacks (which may fire at
 awkward moments) never touch state directly — they post a `UserEvent` into
-the tao event loop:
+the tao event loop. Each content webview's navigation/load callbacks close
+over their own `TabId`, so events from a background tab are tagged and never
+confused with the active tab's:
 
 ```
-toolbar JS ──ipc.postMessage(JSON)──► UserEvent::ToolbarMessage ─┐
-content webview ──navigation/load callbacks──► UserEvent::…      ├─► app::handle_user_event
-                                                                 │      │
-        ┌────────────────────────────────────────────────────────┘      │
-        ▼                                                               ▼
-  BrowserWindow methods (load_url, history.back(), reload, …)      Tab state
+toolbar JS ──ipc.postMessage(JSON)──────────► UserEvent::ToolbarMessage ─┐
+tab N's content webview ──nav/load callbacks─► UserEvent::…(TabId, …)    ├─► app::handle_user_event
+                                                                         │      │
+        ┌────────────────────────────────────────────────────────────────┘      │
+        ▼                                                                       ▼
+  BrowserWindow methods (load_url, history.back(), open_tab,             Tabs (Vec<Tab> +
+  close_tab, activate_tab, …) — act on the active tab unless              active index)
+  the command is tab-scoped (open/close/activate)
         │
         ▼
-  toolbar.evaluate_script(veloxSetUrl/veloxSetLoading)   ← UI reflects state
+  toolbar.evaluate_script(veloxSetUrl/veloxSetLoading/veloxSetTabs) ← UI reflects state
 ```
+
+`app::handle_user_event`/`handle_toolbar_command` always update `Tabs` first,
+then push the result to `BrowserWindow` (webview + toolbar). Events for a
+background tab still update its `Tab` state and the tab strip (so a loading
+spinner or updated title shows even off-screen), but skip the address
+bar/loading indicator, which only reflects the active tab.
 
 This gives one single-threaded state machine: no locks, no races, and every
 state change is observable in one place (`app.rs`).
@@ -108,19 +128,34 @@ loaded, and the app answers with the current state. Without this handshake
 the first `veloxSetUrl` could run before the toolbar's JS exists (the content
 page starts loading in parallel).
 
-## Adding tabs later
+## Multiple tabs
 
-The pieces already in place:
-
-- `app.rs` talks to a `Tab` value, not to globals. A tab strip means holding
-  `Vec<Tab>` + an active index.
-- Each tab needs its own content webview. `BrowserWindow` would own
-  `Vec<WebView>` and switch visibility/bounds on activation; the toolbar
-  webview is shared.
-- `ToolbarCommand` is a serde enum — adding `NewTab`/`ActivateTab { id }`
-  messages is additive.
-- Tab suspension (a roadmap item) maps naturally onto dropping a tab's
-  webview while keeping its `Tab` state, and rebuilding it on activation.
+- `browser::tabs::Tabs` owns `Vec<Tab>` plus an active index. It is plain,
+  UI/engine-independent Rust (open/close/activate, id issuing, which tab is
+  active after a close) and is the primary unit-test target for tab
+  behavior — no window or webview needed. `Tabs` always keeps at least one
+  tab open: closing the last remaining tab is a no-op.
+- Tab ids (`browser::TabId`, a `u64` newtype) are assigned once by `Tabs` and
+  never reused, so a stale id from a delayed `close_tab`/`activate_tab`
+  message simply matches nothing instead of hitting the wrong tab.
+- `BrowserWindow` owns one content `WebView` per tab (`HashMap<TabId,
+  ContentTab>`) plus which tab is active. Opening a tab builds a new content
+  webview bound to that `TabId` (its navigation/load handlers close over the
+  id, so their `UserEvent`s are tagged); activating a tab hides the
+  previously active webview and shows the target one via `set_visible` +
+  `set_bounds` — the webview itself is never destroyed, which is what keeps
+  scroll position and form input intact across a tab switch. The toolbar
+  webview is shared by all tabs.
+- `ToolbarCommand` gained `NewTab`, `CloseTab { id }`, and
+  `ActivateTab { id }` — purely additive to the existing serde enum. The
+  toolbar pushes tab state back with `TabSummary`/`veloxSetTabs`, rendered as
+  the tab strip above the address bar (`src/ui/toolbar.html`).
+- **Built for tab suspension, not implementing it**: `ContentTab::webview` is
+  an `Option<WebView>`. VeloX does not suspend tabs today (every open tab's
+  webview is always `Some`), but a future feature that drops a background
+  tab's webview to reclaim memory can `take()` it and leave the tab's `Tab`
+  state (URL, loading flag, position in `Tabs`) untouched — reactivating
+  would rebuild the webview from that state instead of everything moving.
 
 ## Performance extension points
 
@@ -134,8 +169,8 @@ Design choices made for measurability, and where instrumentation goes next:
 - **Memory**: the engine is out-of-process-ish (WebKit's network/render
   helpers); process-tree RSS sampling can be added behind a config flag
   without touching browser logic.
-- **Tab switch time**: once tabs exist, activation is a single code path in
-  `BrowserWindow`, so it can be timed trivially.
+- **Tab switch time**: `BrowserWindow::activate_tab` is the single code path
+  for switching the visible tab, so it can be timed trivially.
 - The `Config` struct is the natural home for benchmark/telemetry toggles.
 
 The layering matters more than any single hook: measurements attach to the
