@@ -49,10 +49,11 @@ struct AppState {
     /// in which case both stores stay in-memory only for this run.
     data_dir: Option<PathBuf>,
     /// Single choke point for whether page visits are written to
-    /// `history`. Always `true` today; private browsing (#7) is the
-    /// intended reason to ever set this to `false` (per-window/per-tab, once
-    /// that concept exists) — see `record_visit_if_enabled` below and
-    /// docs/decisions.md D13.
+    /// `history`. Mirrors `Config::private` for the life of the process
+    /// (whole-app private browsing, see docs/decisions.md D14); a
+    /// per-window/per-tab notion can set it dynamically once that concept
+    /// exists — see `record_visit_if_enabled` below and docs/decisions.md
+    /// D13.
     history_enabled: bool,
 }
 
@@ -114,7 +115,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         history,
         bookmarks,
         data_dir,
-        history_enabled: true,
+        history_enabled: !config.private,
     };
 
     event_loop.run(move |event, _target, control_flow| {
@@ -392,6 +393,7 @@ fn handle_toolbar_command(
                 "initialize loading state",
                 window.set_loading(state.tabs.active().is_loading()),
             );
+            log_failure("show private indicator", window.set_private(config.private));
             let url = state.tabs.active().current_url().to_owned();
             sync_bookmark_star(window, state, &url);
             refresh_history_panel(window, state, config);
@@ -585,5 +587,71 @@ fn log_failure(action: &str, result: wry::Result<()>) {
 fn log_io_failure(action: &str, result: std::io::Result<()>) {
     if let Err(err) = result {
         eprintln!("velox: failed to {action}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build an `AppState` the way `run()` would for a fresh tab, with a
+    /// given `history_enabled` (what `Config::private` drives at startup —
+    /// see docs/decisions.md D13/D14).
+    fn state_with_history_enabled(history_enabled: bool) -> AppState {
+        AppState {
+            tabs: Tabs::new("https://example.com/"),
+            history: HistoryStore::new(),
+            bookmarks: BookmarkStore::new(),
+            data_dir: None,
+            history_enabled,
+        }
+    }
+
+    #[test]
+    fn records_a_visit_when_history_is_enabled() {
+        let mut state = state_with_history_enabled(true);
+        let id = record_visit_if_enabled(&mut state, "https://example.com/", 0);
+        assert!(id.is_some());
+        assert_eq!(state.history.entries().len(), 1);
+    }
+
+    #[test]
+    fn private_mode_records_no_visit() {
+        // This is the private-browsing invariant from docs/decisions.md
+        // D13/D14: with history recording disabled (as it is for the whole
+        // app when `Config::private` is set), a page load must never reach
+        // `HistoryStore::record_visit`.
+        let mut state = state_with_history_enabled(false);
+        let id = record_visit_if_enabled(&mut state, "https://example.com/", 0);
+        assert!(id.is_none());
+        assert!(state.history.entries().is_empty());
+    }
+
+    #[test]
+    fn private_mode_history_store_stays_empty_across_multiple_loads() {
+        let mut state = state_with_history_enabled(false);
+        for url in [
+            "https://a.example/",
+            "https://b.example/",
+            "https://a.example/",
+        ] {
+            assert!(record_visit_if_enabled(&mut state, url, 0).is_none());
+        }
+        assert!(state.history.entries().is_empty());
+    }
+
+    #[test]
+    fn persist_history_is_a_noop_without_a_data_dir() {
+        // Exercises the same "no write happens" path a private session with
+        // no data_dir override would take; a data_dir is only ever set from
+        // `persistence::default_data_dir()` in `run()`, unaffected by
+        // `history_enabled` itself, so the write-suppression for private
+        // mode has to come entirely from never producing history entries to
+        // persist in the first place (checked above) rather than from
+        // `persist_history` deciding not to write.
+        let state = state_with_history_enabled(false);
+        assert!(state.data_dir.is_none());
+        // Should not panic and should not touch the filesystem.
+        persist_history(&state);
     }
 }

@@ -10,7 +10,7 @@ use std::time::Duration;
 const DEFAULT_PERF_RSS_INTERVAL: Duration = Duration::from_millis(5000);
 
 /// Application configuration, currently compile-time defaults plus a handful
-/// of environment-variable overrides (see [`Config::from_env`]).
+/// of environment-variable overrides (see [`Config::from_env_and_args`]).
 #[derive(Debug, Clone)]
 pub struct Config {
     /// Page loaded when the browser starts.
@@ -28,7 +28,7 @@ pub struct Config {
     /// sampling. Off by default so a normal run pays no timestamp or
     /// thread-spawn overhead (see `docs/architecture.md`, "Performance
     /// extension points"). Enable via `VELOX_PERF_METRICS=1`
-    /// ([`Config::from_env`]), following the same opt-in pattern as the
+    /// ([`Config::from_env_and_args`]), following the same opt-in pattern as the
     /// existing `VELOX_DEBUG` flag in `app.rs`.
     pub perf_metrics: bool,
     /// Interval between process-tree RSS samples while `perf_metrics` is
@@ -58,6 +58,10 @@ pub struct Config {
     /// suspend — see docs/decisions.md D9 for why automatic suspension is
     /// opt-in for now.
     pub auto_suspend_after: Option<Duration>,
+    /// Whole-app private browsing mode (see docs/decisions.md D14). When
+    /// `true`, every content webview runs with an ephemeral (non-persistent)
+    /// data store and page visits are not recorded to `HistoryStore`.
+    pub private: bool,
 }
 
 impl Default for Config {
@@ -74,6 +78,7 @@ impl Default for Config {
             history_max_entries: 5000,
             history_panel_limit: 200,
             auto_suspend_after: None,
+            private: false,
             perf_metrics: false,
             perf_rss_interval: None,
         }
@@ -81,30 +86,48 @@ impl Default for Config {
 }
 
 impl Config {
-    /// [`Config::default`] layered with environment-variable overrides.
+    /// Build a config from compiled defaults, overridden by the
+    /// environment and command line:
     ///
+    /// - `VELOX_PRIVATE` — presence (like `VELOX_DEBUG`; see `app.rs`), or a
+    ///   `--private` flag in `args`, turns on whole-app private browsing.
     /// - `VELOX_PERF_METRICS` — any value (including empty) turns on
-    ///   `perf_metrics`; unset means off. Same opt-in shape as `VELOX_DEBUG`.
+    ///   `perf_metrics`; unset means off.
     /// - `VELOX_PERF_RSS_INTERVAL_MS` — only consulted when
     ///   `VELOX_PERF_METRICS` is set; overrides the periodic RSS sampling
     ///   interval in milliseconds. `0` disables periodic sampling while
     ///   still logging startup/page-load metrics. Not a valid number falls
     ///   back to the default interval.
-    pub fn from_env() -> Self {
-        let mut config = Self::default();
+    ///
+    /// No CLI-parsing crate is introduced for this (see docs/decisions.md
+    /// D6); `args` is expected to be the process arguments with argv\[0\]
+    /// already stripped (e.g. `std::env::args().skip(1)`).
+    pub fn from_env_and_args<I: IntoIterator<Item = String>>(args: I) -> Self {
+        let private = resolve_private(std::env::var_os("VELOX_PRIVATE").is_some(), args);
         let metrics_requested = std::env::var_os("VELOX_PERF_METRICS").is_some();
         let interval_raw = std::env::var("VELOX_PERF_RSS_INTERVAL_MS").ok();
         let (perf_metrics, perf_rss_interval) =
             resolve_perf_env(metrics_requested, interval_raw.as_deref());
-        config.perf_metrics = perf_metrics;
-        config.perf_rss_interval = perf_rss_interval;
-        config
+        Self {
+            private,
+            perf_metrics,
+            perf_rss_interval,
+            ..Self::default()
+        }
     }
 }
 
-/// Pure decision logic behind [`Config::from_env`]'s perf-related fields,
-/// factored out so it is unit-testable without touching real process
-/// environment variables.
+/// Whether private browsing should be enabled given the raw ingredients
+/// (environment variable presence, CLI args). Kept separate from
+/// `Config::from_env_and_args` so the decision logic is testable without
+/// touching the real process environment.
+fn resolve_private<I: IntoIterator<Item = String>>(env_flag_set: bool, args: I) -> bool {
+    env_flag_set || args.into_iter().any(|arg| arg == "--private")
+}
+
+/// Pure decision logic behind [`Config::from_env_and_args`]'s perf-related
+/// fields, factored out so it is unit-testable without touching real
+/// process environment variables.
 fn resolve_perf_env(
     metrics_requested: bool,
     interval_raw: Option<&str>,
@@ -135,6 +158,7 @@ mod tests {
         // Automatic suspension must be opt-in: a fresh checkout should never
         // surprise a user by suspending a tab on its own.
         assert_eq!(config.auto_suspend_after, None);
+        assert!(!config.private);
         assert!(!config.perf_metrics);
         assert_eq!(config.perf_rss_interval, None);
     }
@@ -171,5 +195,28 @@ mod tests {
             resolve_perf_env(true, Some("not-a-number")),
             (true, Some(DEFAULT_PERF_RSS_INTERVAL))
         );
+    }
+
+    #[test]
+    fn resolve_private_is_false_with_no_flag_or_env() {
+        assert!(!resolve_private(false, Vec::<String>::new()));
+        assert!(!resolve_private(
+            false,
+            vec!["--homepage".to_owned(), "https://a.example/".to_owned()]
+        ));
+    }
+
+    #[test]
+    fn resolve_private_true_from_env_flag() {
+        assert!(resolve_private(true, Vec::<String>::new()));
+    }
+
+    #[test]
+    fn resolve_private_true_from_cli_flag() {
+        assert!(resolve_private(false, vec!["--private".to_owned()]));
+        assert!(resolve_private(
+            false,
+            vec!["-x".to_owned(), "--private".to_owned()]
+        ));
     }
 }
