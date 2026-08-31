@@ -2,7 +2,7 @@
 //!
 //! This is not a full adblock engine: it understands only the subset of the
 //! EasyList/EasyPrivacy syntax needed for domain-level blocking, which is all
-//! VeloX can currently act on (see docs/decisions.md D8 — wry 0.56 exposes a
+//! VeloX can currently act on (see docs/decisions.md D17 — wry 0.56 exposes a
 //! main-frame navigation hook but no subresource request hook).
 //!
 //! Supported syntax:
