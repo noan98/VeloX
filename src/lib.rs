@@ -3,7 +3,8 @@
 //! The crate is split into layers so that each can grow independently:
 //!
 //! - [`ui`] — window management and the toolbar (chrome) rendering
-//! - [`browser`] — browser logic: navigation, per-tab state
+//! - [`browser`] — browser logic: navigation, per-tab state, visit history
+//!   and bookmarks (collection logic plus their JSON persistence)
 //! - [`config`] — startup configuration
 //! - [`app`] — glues the layers together and runs the event loop
 

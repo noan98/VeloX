@@ -19,7 +19,7 @@ url = "2"
 
 # WebView embedding (WebKitGTK on Linux, WKWebView on macOS, WebView2 on
 # Windows). Split by target because devtools availability differs by
-# platform (see docs/decisions.md D8):
+# platform (see docs/decisions.md D18):
 # - macOS: the in-page inspector needs a private WebKit API, so wry only
 #   compiles `WebView::open_devtools` when `debug_assertions` is set. We do
 #   not add the `devtools` feature here, keeping release builds private-API
