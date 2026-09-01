@@ -96,6 +96,11 @@ data directory (env-var resolved, see docs/decisions.md D10). `app::AppState`
 owns one instance of each store plus the resolved data directory for the
 process's lifetime; every mutation is followed by writing the affected store
 back to disk (best-effort — a write failure is logged, never fatal).
+`browser::input_history::InputHistoryStore` (Issue #20 — typed search
+queries, not page visits; see docs/decisions.md D38) follows the exact same
+three-part shape (pure store, `persistence::{load,save}_input_history`,
+`input_history.json`) as a fourth, independent file alongside
+`history.json`/`bookmarks.json`.
 
 **Recording a visit** happens at the same point session-history state
 already updates: `UserEvent::LoadFinished` calls
@@ -189,8 +194,14 @@ things at startup, both in place before the window is shown:
   `app::record_visit_if_enabled` (see above) never calls
   `HistoryStore::record_visit` for the session — no history entry is ever
   created, so there is nothing for `persist_history` to write either.
-  Bookmarks stay ungated (an explicit user action, same call as normal
-  mode — see docs/decisions.md D11).
+  `app::record_input_history_if_enabled` (Issue #20 — typed search
+  queries, see docs/decisions.md D38/D39) is gated by the exact same flag,
+  the same way. Bookmarks stay ungated (an explicit user action, same call
+  as normal mode — see docs/decisions.md D11). None of this affects
+  *reading* — the omnibox's history/bookmark/typed-query candidates (#20)
+  still surface whatever was already recorded before private mode started,
+  matching how the History panel has always behaved; see D39 for the full
+  reasoning.
 
 The mode is surfaced continuously, not just once, so it cannot go unnoticed
 mid-session: the toolbar webview gets a persistent badge plus a color shift
@@ -266,7 +277,8 @@ page starts loading in parallel).
 Issue #15 turns the address bar into an omnibox: URL-vs-search
 classification, a configurable search engine, and a candidate dropdown
 driven by keyboard (↑/↓/Enter/Esc) or the mouse. Issue #20 layers
-history/bookmark candidates and ranking on top — see "What #20 builds on"
+history/bookmark candidates, typed-search-query candidates, and ranking on
+top — see "History/bookmark/typed-query candidates and ranking (#20)"
 below.
 
 **URL vs. search — `browser::navigation::classify_input`.** Every piece of
@@ -311,15 +323,50 @@ executing one is exactly `ToolbarCommand::Navigate { input: candidate.target_url
 }` — the same path a plain Enter with no dropdown interaction takes,
 `classify_input` treating an already-absolute URL as `Intent::Url` unchanged.
 
-**What #20 builds on**: implement `browser::omnibox::CandidateSource`
-(`fn candidates(&self, input: &str, limit: usize) -> Vec<Candidate>`, one
-per history/bookmark source, ranked best-first) against
-`browser::HistoryStore`/`BookmarkStore`, then pass `&[&history_source,
-&bookmark_source]` into `build_candidates` from `app.rs`'s
-`ToolbarCommand::OmniboxInput` handler (today it passes `&[]`). No other
-signature changes — see the trait's doc comment in `browser/omnibox.rs` for
-the exact contract (candidates already ranked, `target_url` already a
-normalized/loadable URL, respect the `limit` argument).
+**History/bookmark/typed-query candidates and ranking (#20).**
+`browser::omnibox_candidates` implements `CandidateSource` twice against
+the trait's contract from `browser/omnibox.rs` (candidates already ranked
+best-first, `target_url` already normalized), and `app.rs`'s
+`ToolbarCommand::OmniboxInput` handler builds one of each fresh per
+keystroke and passes `&[&history_bookmark_source, &input_history_source]`
+into `build_candidates` (previously `&[]`):
+
+- **`HistoryBookmarkSource`** merges `HistoryStore`/`BookmarkStore` into one
+  ranked list. `browser::ranking::merge_entries` de-duplicates a URL that
+  is both visited and bookmarked into a single candidate — `Bookmark` kind
+  wins the display (an explicit save is a stronger signal than an
+  incidental visit), carrying history's `visit_count`/`visited_at` for
+  scoring regardless (see docs/decisions.md D37). `browser::ranking::
+  score_page_entry` scores each surviving match on one axis: a
+  match-location tier (host-prefix > title-prefix > host-substring >
+  title-substring > URL-substring; an entry that matches nowhere is
+  dropped, never merely scored low), a proportional-match-length bonus, a
+  frecency component (capped visit-count + a recency bucket reusing
+  `history::date_bucket`'s own today/yesterday/last-7-days/older
+  boundaries — D29), and a flat bonus for being bookmarked. See D36 for the
+  exact weights and a worked example, D37 for the de-duplication rule.
+- **`InputHistorySource`** resurfaces previously-submitted search queries
+  (`browser::input_history::InputHistoryStore`, populated from
+  `ToolbarCommand::Navigate`'s raw text whenever `classify_input` reads it
+  as `Intent::Search` — never for URL-shaped input, which `HistoryStore`
+  already covers once the page loads) as `Search` candidates, ranked by
+  `browser::ranking::rank_input_history` (the same match-tier + frecency
+  shape as page entries, without the bookmark bonus). See D38 for scope,
+  the LRU eviction rule, and persistence (`input_history.json`, alongside
+  `history.json`/`bookmarks.json`).
+
+Both sources are constructed fresh from `AppState`'s stores on every
+`OmniboxInput`, private-mode or not: they read whatever is already
+recorded regardless of `AppState::history_enabled`, matching how the
+History *panel* has always behaved — only the *recording* paths
+(`record_visit_if_enabled`, `record_input_history_if_enabled`) are gated by
+it. See D39 for the full reasoning.
+
+`build_candidates` itself needed no changes for any of this: the two
+built-in candidates (`NavigateUrl`/`Search`) are still computed first,
+unconditionally, and `sources` are only ever asked for however many slots
+remain — history/bookmark/typed-query candidates can never crowd out what
+the user literally typed.
 
 **UI wiring.** The candidate dropdown reuses the exact same toolbar-webview
 resize mechanism the history/bookmarks panel already has (`ui::toolbar::Panel`,

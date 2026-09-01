@@ -2142,3 +2142,304 @@ the address bar/panel has focus — both funneled into the same
 `toggle_current_bookmark`/`toggle_bookmark_bar` functions in `app.rs` so
 there is exactly one implementation of each action regardless of which
 webview observed the keypress.
+
+## D36: Omnibox ranking (#20) — scoring formula: match tier + frecency + bookmark bonus
+
+**Scope**: issue #20's core ask — "候補ランキング / 重み付けとスコアリング",
+implemented as pure functions in the new `browser::ranking` module
+(`score_page_entry`, `rank_page_entries`) and unit-tested there, never
+inline in `CandidateSource::candidates` — the same "pure logic module,
+thin `CandidateSource` wrapper" split D26 already used for
+`classify_input`/`build_candidates`.
+
+**The formula.** For a history/bookmark entry against the current
+address-bar text `query` (case-insensitive throughout):
+
+```
+score = match_tier + match_ratio_bonus + frequency_score + recency_score + bookmark_bonus
+```
+
+- **`match_tier`** — where `query` was found, highest first (a match at a
+  *higher* tier is checked first and wins outright; lower tiers are never
+  even consulted once a higher one hits):
+
+  | tier | condition | points |
+  |---|---|---|
+  | host prefix | URL's host starts with `query` | 100 |
+  | title prefix | title starts with `query` | 90 |
+  | host contains | `query` appears anywhere in the host | 70 |
+  | title contains | `query` appears anywhere in the title | 60 |
+  | url contains | `query` appears anywhere in the full URL (typically the path/query string) | 40 |
+  | *(none of the above)* | — | *entry is dropped entirely, not merely scored low* |
+
+  This directly implements the issue's own guidance ("URL のホスト先頭に
+  一致 > パス途中に一致"): a host-prefix hit is the strongest signal a
+  mainstream browser's omnibox also treats as king, and a bare path/query
+  substring match is deliberately the weakest tier that still counts as a
+  match at all.
+- **`match_ratio_bonus`** (0-20) — `min(len(query) / len(matched_field), 1.0)
+  × 20`, measured in `char`s (not bytes, so Japanese text is not penalized
+  relative to ASCII). Rewards a match that accounts for more of the field:
+  typing `example` against the host `example.io` (ratio ≈ 0.64) scores
+  higher than the same `example` against
+  `example-with-a-much-longer-domain-name.io` (ratio ≈ 0.15) — both are
+  host-prefix matches (tier 100), the ratio is what tells them apart.
+- **`frequency_score`** (0-30) — `min(visit_count, 20) × 1.5`. Capped and
+  linear rather than logarithmic on purpose: the cap alone already bounds
+  the top end (one page visited 5000 times cannot mathematically outscore
+  every text-match distinction below it), and a linear curve keeps every
+  score in this module an exact, hand-verifiable number for the unit tests
+  — no `ln`/`log2` arithmetic to reason about when eyeballing a test's
+  expected ordering.
+- **`recency_score`** (0-30) — bucketed onto the *exact same*
+  今日/昨日/過去7日/それ以前 boundaries `history::date_bucket` already
+  established for the history panel (D29): today = 30, yesterday = 20,
+  last 7 days = 10, older (or never visited) = 0. One recency vocabulary
+  for the whole codebase, not a second independent "how recent counts as
+  recent" scale invented for ranking alone.
+- **`bookmark_bonus`** (0 or 25, flat) — see D37 below.
+
+Maximum possible score is 100 + 20 + 30 + 30 + 25 = 205; a bare non-match
+never appears (it is filtered out, not scored 0), so there is no meaningful
+"minimum" beyond whatever the weakest tier (40, url-contains, zero
+everything else) plus nothing produces.
+
+**Frecency, not separate frequency/recency signals.** The issue explicitly
+suggested "frecency 的な組み合わせ" of `visit_count`/`visited_at`; this
+implements it as a straight sum of the two capped/bucketed scores above
+(max 60 combined) rather than a product or a single blended metric — a sum
+keeps each half independently reasoned-about and testable (see
+`ranking::tests::higher_visit_count_scores_higher_all_else_equal` and
+`...more_recent_visits_score_higher`, which each hold the other input
+fixed), at the cost of not modeling any interaction between "how often" and
+"how recently" (Firefox's actual frecency algorithm does model some
+interaction via visit-type buckets; VeloX's simpler sum was judged good
+enough for an omnibox dropdown of ~6 rows, not a research-grade ranking
+system).
+
+**Worked example** (all at `now` = some Tuesday, DuckDuckGo as the search
+engine, query `"example"`):
+
+| entry | tier | ratio | freq | recency | bookmark | **total** |
+|---|---|---|---|---|---|---|
+| `example.com`, visited 20+ times today, bookmarked | host prefix (100) | ratio for `"example"`/`"example.com"` ≈ 0.64 → 12.7 | 30 (capped) | 30 (today) | 25 | **≈197.7** |
+| `my-example.net`, never visited, bookmarked only | host contains (70) | ratio for `"example"`/`"my-example.net"` ≈ 0.5 → 10.0 | 0 | 0 | 25 | **105.0** |
+| `example.io`, visited once 3 days ago, not bookmarked | host prefix (100) | ratio ≈ 0.64 → 12.7 | 1.5 | 10 (last 7 days) | 0 | **124.2** |
+| page titled "A guide to example usage", visited 20+ times today | title contains (60) | ratio for `"example"`/that ~24-char title ≈ 0.29 → 5.8 | 30 | 30 | 0 | **125.8** |
+| `other.test/path/example`, bookmarked, never visited | url contains (40) | ratio ≈ 0.3 → 6.1 | 0 | 0 | 25 | **71.1** |
+
+Ranked order for this set: the actively-used bookmark (197.7) first, then
+the popular title match (125.8), then the recent host-prefix match
+(124.2), then the untouched bookmark that only matches by host-substring
+(105.0), and last the weak-tier bookmark (71.1) — i.e. text-match quality
+and bookmark status both matter, but neither one alone always wins; see
+`ranking::tests` for the individual pairwise assertions this table is built
+from (`bookmark_bonus_can_move_a_never_visited_bookmark_above_a_weak_history_match`,
+`a_much_more_popular_history_entry_can_still_outrank_a_weaker_tier_bookmark`).
+
+**Deliberately *not* done**: reordering built-in `NavigateUrl`/`Search`
+candidates relative to history/bookmark ones by score. `build_candidates`
+(D26) always puts the two built-ins first, unconditionally, before any
+`CandidateSource` is even asked — #20 does not change that, both because
+the issue's integration point explicitly says no signature change is
+needed and because "what you literally typed is always the first option"
+is itself a load-bearing, mainstream-browser convention worth keeping
+regardless of how a history match happens to score. Balance between kinds
+*within* the sourced portion (history vs. bookmark vs. re-suggested search
+queries) is handled by letting them all compete on one score axis instead
+of reserving fixed per-kind slots — a static quota (e.g. "at most 3
+history rows") would sometimes evict a highly relevant match just to make
+room for a barely-relevant one of a different kind purely to hit a slot
+count, which is a worse outcome than the highest-scoring candidates simply
+winning regardless of kind.
+
+## D37: History/bookmark de-duplication — one entry per URL, bookmark wins the displayed kind
+
+**Scope**: issue #20's explicit ask — "同一URLが履歴とブックマークの両方に
+ある場合、どちらか一方に寄せる".
+
+**Merge, don't pick one store and ignore the other.** `ranking::merge_entries`
+builds one `RankableEntry` per unique URL from *both* `HistoryStore` and
+`BookmarkStore`, rather than having a `HistoryBookmarkSource` simply prefer
+whichever store it happens to check first (which would silently drop the
+other store's data for that URL — e.g. a bookmarked page's `visit_count`
+would vanish from scoring if bookmarks were checked first and "won"
+outright). The merge keeps:
+
+- `is_bookmark: true` — bookmark status, once true, is never lost even
+  though `HistoryEntry` itself carries no such flag.
+- **The bookmark's title when it has one, otherwise falls back to
+  history's title.** Rationale: a bookmark's title is something the user
+  explicitly chose to keep (or explicitly edited via
+  `BookmarkStore::edit` — Issue #19/D33), which is a stronger signal of
+  "this is what I want to call this page" than whatever `<title>` the page
+  happened to report when it was last visited. When a bookmark was added
+  with no title at all (`BookmarkEntry::title: None` — always possible,
+  see `BookmarkStore::add`), history's title is a strictly better fallback
+  than showing a bare URL as the label.
+- `visit_count`/`last_visited_at` from history unconditionally — a
+  bookmark is not a visit log (`BookmarkEntry` has no such fields at all),
+  so there is nothing to prefer here; a bookmark-only entry (never visited)
+  simply gets `visit_count: 0`/`last_visited_at: None`, which
+  `score_page_entry` treats as "no frecency contribution", not as an error
+  or a special case.
+
+**The merged entry's `CandidateKind` is `Bookmark`, not `History`, whenever
+`is_bookmark` is true** — this is the actual "どちらに寄せるか" call the
+issue asked for. Reasoning: a bookmark is an explicit, durable choice the
+user made about a URL; a history entry is a side effect of merely having
+visited it once. When both exist for the same URL, the explicit signal is
+the more meaningful one to show (star icon, not clock icon), even though
+the URL is *also* in the visit log. This only affects which icon/kind the
+row renders as — the underlying score already accounts for both signals
+(frecency from history, `BOOKMARK_BONUS` from the bookmark) regardless of
+which kind wins the display.
+
+**`detail` shows the destination URL, not a visit timestamp.**
+`Candidate::detail`'s doc comment (D26/#15) suggested "a visit timestamp"
+as the likely #20 use; this implementation shows the target URL instead
+(only when the label is already showing a title — an untitled entry's
+label *is* the URL, so a duplicate `detail` would be redundant) for a
+concrete reason: the user is one click/Enter away from loading whatever
+`target_url` says, and a page's own `<title>` is attacker-influenced text
+that is not a trustworthy stand-in for "where this is about to take me" —
+showing the real URL underneath the (possibly misleading) title is a small
+but real piece of the "know what you're about to load" security surface
+this browser already cares about elsewhere (content blocking, scheme
+allow-listing). A timestamp is nice-to-have; the destination URL is the
+thing that actually matters before clicking.
+
+## D38: Typed search-query history ("入力履歴") — search queries only, LRU-capped, persisted, purged with "clear history"
+
+**Scope**: issue #20's "入力履歴" line item — remembering raw address-bar
+input the user actually submitted, separately from `HistoryStore` (which
+only ever records *page visits*, i.e. the URL a search results page ends up
+at, never the literal query text that produced it).
+
+**Only `Intent::Search` text is recorded, never `Intent::Url` text.** A new
+`browser::input_history::InputHistoryStore` records exactly one thing: the
+raw text of a submitted search query (`navigation::classify_input`
+returning `Intent::Search`). URL-shaped input the user types is
+deliberately *not* also stored here — loading it already lands the
+resulting page in `HistoryStore` once the load finishes
+(`app::record_visit_if_enabled`), with richer bookkeeping (title, favicon,
+precise `record_visit` de-duplication semantics) than a second, parallel
+"I also typed this" log could offer. Storing it twice would only add
+duplicate, lower-quality data for the omnibox to rank.
+
+**Why this needs to exist at all, given `HistoryStore` already exists**:
+a search query's *text* (`"rust ownership"`) is not recoverable from
+`HistoryStore` — what gets recorded there is the search engine's results
+URL (`https://duckduckgo.com/?q=rust+ownership`), not the human-readable
+query. Without a separate store, retyping the start of a query you
+searched for last week has nothing to resurface as a suggestion beyond
+whatever page you eventually clicked through to.
+
+**Recording point**: `app.rs`'s `ToolbarCommand::Navigate` handler
+classifies `input` once (`navigation::classify_input`), and — only when
+the result is `Intent::Search` — calls
+`record_input_history_if_enabled` before resolving the same `Intent` to a
+URL via the new `resolve_intent` helper (split out of the old
+`resolve_navigate_target` specifically so classification happens once and
+is reused for both purposes). Because `Navigate`'s `input` is the *raw*
+typed text only when the user actually typed it and pressed Enter with no
+dropdown row highlighted — a candidate-row click or an Enter with a row
+highlighted sends that candidate's already-resolved `target_url` instead
+(an absolute `https://…` URL, which `classify_input` always reads as
+`Intent::Url`, never `Intent::Search`) — this **only captures "type text,
+press Enter directly"**, not "type text, then explicitly select the
+built-in Search suggestion row from the dropdown and press
+Enter/click it". This is a known, accepted gap: the plain-Enter path is by
+far the more common way to submit a search (mainstream browsers'
+omniboxes do not require touching the dropdown to search), and closing the
+gap completely would require `ToolbarCommand::Navigate` to carry the
+original raw text alongside a resolved `target_url` for every candidate —
+a signature change the issue's integration notes say should not be needed.
+
+**LRU cap, not insertion-order cap — the one place this store's eviction
+rule intentionally differs from `HistoryStore`'s (D27).**
+`HistoryStore::record_visit` drops the *oldest-inserted* entry once
+`max_entries` is hit, which fits a visit log ("what happened, in order").
+`InputHistoryStore::record` instead drops the single
+*least-recently-used* entry (by `last_used_at`, not insertion order) —
+because this store's entire purpose is "what might I want to search for
+again", a query re-typed and re-used last week should survive eviction
+over one nobody has touched since the day it was first recorded, even if
+that one happens to be newer by insertion order alone. Default cap:
+`input_history::DEFAULT_MAX_ENTRIES` = 200 — deliberately far smaller than
+`Config::history_max_entries` (5000): a few hundred distinct recent
+queries is already generous for "does this look familiar", and this is a
+plain module constant rather than a new `Config`/env-var knob, matching
+how `omnibox::DEFAULT_CANDIDATE_LIMIT` is also a bare constant, not
+something #15 exposed for configuration.
+
+**Persisted, like history/bookmarks — `input_history.json`, same "dumb IO"
+pattern as `persistence::{save,load}_{history,bookmarks}`.** A search
+query you typed a week ago being suggestible today is exactly the feature;
+session-only storage would throw that away on every restart for no
+privacy benefit beyond what D39 already covers via the `history_enabled`
+recording gate. `AppState` gained one more field
+(`input_history: InputHistoryStore`), loaded/saved next to `history`/
+`bookmarks` in `run()`, following the identical "load at startup, persist
+after each mutation, treat every IO failure as non-fatal" shape those two
+already use — no new persistence *mechanism*, just a third JSON file
+through the existing one.
+
+**`ToolbarCommand::ClearHistory` also clears `input_history`.** Not
+explicitly named in the issue's acceptance criteria, but a search query is
+part of the same "what have I been doing in this browser" privacy surface
+as a page visit — a user who clicks "clear history" almost certainly means
+"forget what I searched for" too, and leaving a separate, undiscoverable
+store of query text behind after that action would be a surprising privacy
+gap, not a feature.
+
+## D39: Omnibox candidates in private mode — read existing data, record nothing new
+
+**Scope**: the issue's explicit call-out — "履歴候補はプライベートモードで
+どう振る舞うべきか検討してください… 既存履歴の参照まで止めるかは判断が
+必要です".
+
+**Decision: reference (read) yes, record (write) no — for both `HistoryStore`
+and the new `InputHistoryStore`.** Concretely:
+
+- `HistoryBookmarkSource`/`InputHistorySource` (the two `CandidateSource`
+  impls #20 adds) read `state.history`/`state.bookmarks`/
+  `state.input_history` exactly as they stand, with **no** `history_enabled`
+  check of their own — they are constructed fresh from the current stores
+  on every `OmniboxInput`, private mode or not.
+- Recording remains gated exactly as it already was/now is:
+  `record_visit_if_enabled` (pre-existing, D13) and the new
+  `record_input_history_if_enabled` (D38) both bail out immediately when
+  `state.history_enabled` is `false`, so nothing typed or visited during a
+  private session is ever added to either store.
+
+**Why reading is fine even though writing is not — this is not a new
+policy, it is the policy D13/D14 already established for the History
+*panel*.** `run()` loads `history.json`/`bookmarks.json` from disk
+unconditionally, regardless of `config.private`; `ToolbarCommand::TogglePanel { panel: History }`
+and its `refresh_history_panel` show whatever `state.history` already
+holds with no `history_enabled` check either. In other words: launching
+VeloX with `--private` already means "the History panel still shows
+everything from before you went private, and nothing new gets added to
+it" — #20's omnibox candidates are a second read path over the exact same
+data with the exact same rule, not a new privacy surface. This also
+matches the mainstream-browser convention (Chrome Incognito, Firefox
+Private Browsing): a private window's address bar still suggests from your
+regular history, because that data already existed on disk and offering it
+back to you is not a new leak; what private mode actually promises is that
+*this* session's own activity will not be added to it.
+
+**What this means end-to-end for a private session**: a page visited
+*before* private mode started can still appear as a `History` candidate; a
+page visited *during* private mode never gets recorded, so it can never
+appear as one (`record_visit_if_enabled` never runs). A search query typed
+before private mode started can resurface via `InputHistorySource`; one
+typed during it is never recorded. Bookmarks behave the same in both modes
+either way — bookmarking is always an explicit, deliberate action, never
+implicit like a page visit, so D14 never gated it and #20 does not either.
+
+**Revisit if**: VeloX ever gains true per-window (not whole-app, see D14)
+private browsing — at that point "does an omnibox opened in a private
+window suggest from the *other*, non-private window's very-recent history"
+becomes a real question this decision does not answer, since today there
+is only ever one `AppState`/one set of stores for the whole process.

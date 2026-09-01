@@ -1,12 +1,14 @@
-//! Thin file-backed persistence for [`HistoryStore`] and [`BookmarkStore`].
+//! Thin file-backed persistence for [`HistoryStore`], [`BookmarkStore`], and
+//! [`InputHistoryStore`].
 //!
 //! All the collection logic (de-duplication, caps, ordering) lives in
-//! [`crate::browser::history`] / [`crate::browser::bookmarks`] and is
-//! unit-tested in isolation; this module is deliberately "dumb": read a JSON
-//! file into a store, or write a store out as JSON. Callers treat every
-//! failure here as non-fatal (see `app.rs`'s `log_failure` pattern) — a
-//! missing, corrupt, or unwritable data directory degrades to an in-memory,
-//! non-persisted session rather than crashing the browser.
+//! [`crate::browser::history`] / [`crate::browser::bookmarks`] /
+//! [`crate::browser::input_history`] and is unit-tested in isolation; this
+//! module is deliberately "dumb": read a JSON file into a store, or write a
+//! store out as JSON. Callers treat every failure here as non-fatal (see
+//! `app.rs`'s `log_failure` pattern) — a missing, corrupt, or unwritable
+//! data directory degrades to an in-memory, non-persisted session rather
+//! than crashing the browser.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,9 +18,11 @@ use serde::Serialize;
 
 use super::bookmarks::BookmarkStore;
 use super::history::HistoryStore;
+use super::input_history::InputHistoryStore;
 
 const HISTORY_FILE: &str = "history.json";
 const BOOKMARKS_FILE: &str = "bookmarks.json";
+const INPUT_HISTORY_FILE: &str = "input_history.json";
 
 /// Resolve the directory VeloX stores its history/bookmarks files in.
 ///
@@ -76,6 +80,19 @@ pub fn save_bookmarks(dir: &Path, store: &BookmarkStore) -> std::io::Result<()> 
     write_json(dir, &dir.join(BOOKMARKS_FILE), store)
 }
 
+/// Load the typed-search-query history store from `dir` (Issue #20 — see
+/// docs/decisions.md D38). Any failure yields an empty store, same as
+/// [`load_history`]/[`load_bookmarks`].
+pub fn load_input_history(dir: &Path) -> InputHistoryStore {
+    read_json(&dir.join(INPUT_HISTORY_FILE)).unwrap_or_default()
+}
+
+/// Persist the typed-search-query history store to `dir`, creating the
+/// directory if needed.
+pub fn save_input_history(dir: &Path, store: &InputHistoryStore) -> std::io::Result<()> {
+    write_json(dir, &dir.join(INPUT_HISTORY_FILE), store)
+}
+
 fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
@@ -96,6 +113,21 @@ mod tests {
         let dir = unique_temp_dir("velox-persist-missing");
         assert_eq!(load_history(&dir), HistoryStore::new());
         assert_eq!(load_bookmarks(&dir), BookmarkStore::new());
+        assert_eq!(load_input_history(&dir), InputHistoryStore::new());
+    }
+
+    #[test]
+    fn input_history_round_trips_through_disk() {
+        let dir = unique_temp_dir("velox-persist-input-history");
+        let mut store = InputHistoryStore::new();
+        store.record("rust ownership", 100, 0);
+        store.record("rust async", 200, 0);
+
+        save_input_history(&dir, &store).expect("save_input_history should succeed");
+        let loaded = load_input_history(&dir);
+        assert_eq!(loaded, store);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
