@@ -796,7 +796,7 @@ a future consumer needs that, it is a small addition (an absolute
 `SystemTime`-based field alongside `ts_ms`, not a redesign) — revisit if
 Issue #14 or #36 turn out to need cross-run wall-clock correlation.
 
-## D20: Benchmark suite (#14) — pure aggregation module + separate, unverifiable-headless runner binary
+## D21: Benchmark suite (#14) — pure aggregation module + separate, unverifiable-headless runner binary
 
 **Scope**: Issue #14's acceptance criteria on top of D16/D19's perf-metrics
 foundation: run the same benchmark multiple times, compute a representative

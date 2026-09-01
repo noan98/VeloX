@@ -90,7 +90,7 @@ points」節) が生成する JSON Lines を、このスイートが回収・集
   を保存する (`benchmark::Stats`)。比較 (`velox-bench compare`) は
   **中央値 (median)** を主指標として使う — p95 は共有 CI ランナーのような
   ノイズの多い環境ではテール側が揺れやすく、閾値判定には不向きなため
-  (詳細は `docs/decisions.md` D20)。`p95` は `Stats` に含まれているので、
+  (詳細は `docs/decisions.md` D21)。`p95` は `Stats` に含まれているので、
   レビュー時に手動で見比べることはできる。
 - **cold / warm の区別**: 「cold」= プロセスやマシンを再起動した直後の 1 回目
   相当。「warm」= 直前に一度起動した後の 2 回目以降。この開発環境は OS の
