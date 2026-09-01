@@ -79,7 +79,7 @@ back/forward. The engine already tracks redirects, `pushState`, anchors
 etc.; a parallel Rust history would drift from reality. `Tab` mirrors only
 what the UI needs (current URL, title, favicon, loading flag, lifecycle
 state) — one `Tab` per open tab, held in `Tabs`. See "Tab lifecycle state"
-below for the state model and docs/decisions.md D19 for the reasoning
+below for the state model and docs/decisions.md D20 for the reasoning
 behind it.
 
 The app-level **visit history** (a persisted "where have I been" log,
@@ -273,7 +273,7 @@ in this iteration.
   the ownership boundary the whole state model below is built around**:
   `browser::` (`Tab`/`Tabs`) never references a `wry`/`tao`/`gtk` type —
   `ui::window::BrowserWindow` is the sole owner of any actual `WebView`,
-  keyed by `TabId`. See docs/decisions.md D19.
+  keyed by `TabId`. See docs/decisions.md D20.
 - `ToolbarCommand` gained `NewTab`, `CloseTab { id }`, and
   `ActivateTab { id }` — purely additive to the existing serde enum. The
   toolbar pushes tab state back with `TabSummary`/`veloxSetTabs`, rendered as
@@ -284,7 +284,7 @@ in this iteration.
 `browser::tab::TabState` is an explicit enum — `Active` / `Background` /
 `Suspended` / `Restoring` — replacing what used to be an implicit
 `suspended: bool` plus "is this id `Tabs`' active index". See
-docs/decisions.md D19 for the full design rationale; this section is the
+docs/decisions.md D20 for the full design rationale; this section is the
 quick-reference summary.
 
 ```text
@@ -349,7 +349,7 @@ quick-reference summary.
 Status: manual suspension shipped, automatic suspension implemented and
 opt-in (default off). See docs/decisions.md D9 for the full rationale,
 including the WebKitGTK/WKWebView/WebView2 cache-control investigation, and
-D19 for how suspension fits into the `TabState` model above.
+D20 for how suspension fits into the `TabState` model above.
 
 - **What "suspended" means**: `ContentTab::webview` (`ui::window`) is
   `Option<WebView>`; suspending a tab `take()`s and drops it

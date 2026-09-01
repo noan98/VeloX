@@ -7,7 +7,7 @@
 //! Multiple tabs are tracked by [`super::tabs::Tabs`], which owns a `Vec<Tab>`
 //! plus which one is active; a `Tab` itself only knows about its own page.
 //!
-//! **Ownership boundary** (see docs/decisions.md D19 and
+//! **Ownership boundary** (see docs/decisions.md D20 and
 //! docs/architecture.md): a `Tab` never holds a web engine handle of any
 //! kind. `browser::` as a whole has no dependency on `wry`/`tao`/`gtk` — the
 //! actual content `WebView` for a tab is owned exclusively by
@@ -71,7 +71,7 @@ impl From<u64> for TabId {
 /// `Restoring` is a real, distinct state — not a synonym for `Active` —
 /// because rebuilding a webview is not guaranteed to be instantaneous in
 /// general (today it happens to be, since `wry` builds a webview
-/// synchronously; see docs/decisions.md D19). It exists now so a future
+/// synchronously; see docs/decisions.md D20). It exists now so a future
 /// asynchronous session restore (#25) has a state to represent "selected,
 /// but not yet actually showing anything" instead of forcing that work to
 /// invent one later.
@@ -333,7 +333,7 @@ impl Tab {
     ///
     /// This collapses both edges of the diagram in [`TabState`]'s doc
     /// comment into one call because today's webview rebuild is synchronous
-    /// (docs/decisions.md D19) — every caller observes `Active` by the time
+    /// (docs/decisions.md D20) — every caller observes `Active` by the time
     /// this returns, never `Restoring`. The intermediate `begin_restore`
     /// step is still real (not skipped): only a currently-`Suspended` tab
     /// can be resumed, exactly as [`TabState::begin_restore`] requires.

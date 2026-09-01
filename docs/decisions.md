@@ -693,7 +693,7 @@ a tab opened later, and a suspended tab rebuilt on resume — so the F12
 shortcut keeps working no matter when or how a given webview came to exist,
 rather than only on the webview that existed at `BrowserWindow::new` time.
 
-## D19: Explicit tab lifecycle state machine, and the `Restoring` state's synchronous collapse
+## D20: Explicit tab lifecycle state machine, and the `Restoring` state's synchronous collapse
 
 **Scope**: issue #12 ("タブセッション状態とWebViewライフサイクルを整理"). Before
 this issue, a tab's lifecycle was two independent, implicit signals:

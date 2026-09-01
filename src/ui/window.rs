@@ -23,7 +23,7 @@
 //! struct, and [`Self::resume_tab`] rebuild it later — see [`ContentTab`].
 //!
 //! **Ownership boundary** (see `browser::tab` module doc comment and
-//! docs/decisions.md D19): `BrowserWindow` is the sole owner of every
+//! docs/decisions.md D20): `BrowserWindow` is the sole owner of every
 //! content `WebView`, keyed by [`crate::browser::TabId`] in `contents`
 //! below. `browser::Tab`/`Tabs` hold the *logical* lifecycle state
 //! (`browser::TabState`: active/background/suspended/restoring) that this
