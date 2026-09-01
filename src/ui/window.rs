@@ -60,7 +60,7 @@ type LogicalRect = (u32, u32, u32, u32);
 /// [`ToolbarCommand`]: crate::ui::toolbar::ToolbarCommand
 const OPEN_DEVTOOLS_MESSAGE: &str = "velox:open-devtools";
 
-// --- Tab-management keyboard shortcuts (see docs/decisions.md D22) ---
+// --- Tab-management keyboard shortcuts (see docs/decisions.md D23) ---
 //
 // Fixed sentinel strings for the content webview's shortcut IPC channel,
 // alongside `OPEN_DEVTOOLS_MESSAGE` above. As with devtools, this channel
@@ -114,7 +114,7 @@ pub enum ContentShortcut {
 /// that is not an exact match for one of the fixed sentinel strings above —
 /// including, deliberately, any attempt at parsing it as JSON or otherwise
 /// treating it as structured data (see [`ContentShortcut`]'s doc comment and
-/// docs/decisions.md D18/D22).
+/// docs/decisions.md D18/D23).
 fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
     match body {
         NEW_TAB_MESSAGE => Some(ContentShortcut::NewTab),
@@ -167,7 +167,7 @@ fn devtools_shortcut_script() -> String {
 /// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9) while the content
 /// webview has focus, forwarding a fixed sentinel string per shortcut over
 /// the same untrusted IPC channel devtools uses (see [`ContentShortcut`] and
-/// docs/decisions.md D18/D22 for why this is a separate injected script
+/// docs/decisions.md D18/D23 for why this is a separate injected script
 /// rather than a tao-level accelerator).
 ///
 /// `event.ctrlKey || event.metaKey` accepts both modifiers on every
@@ -222,7 +222,7 @@ fn tab_shortcut_script() -> String {
 /// invoked via [`BrowserWindow::fetch_favicon`]'s
 /// `evaluate_script_with_callback` — not injected as a standing listener —
 /// so this returns a value rather than posting a message. See
-/// docs/decisions.md D21 for why resolving *a URL* is all this does: the
+/// docs/decisions.md D22 for why resolving *a URL* is all this does: the
 /// actual image fetch is left entirely to the toolbar webview's own `<img>`
 /// tag, never performed here or anywhere else in Rust.
 const RESOLVE_FAVICON_SCRIPT: &str = r#"(() => {
@@ -406,7 +406,7 @@ impl BrowserWindow {
             .with_html(toolbar::TOOLBAR_HTML)
             // The toolbar now loads more than our own embedded HTML: a
             // tab's favicon is rendered as a plain `<img>` pointed at a
-            // page-controlled URL (see docs/decisions.md D21), so in
+            // page-controlled URL (see docs/decisions.md D22), so in
             // private mode this webview must be just as ephemeral as every
             // content webview (docs/decisions.md D14/D15) — otherwise a
             // favicon fetch could persist cookies/cache private browsing is
@@ -783,7 +783,7 @@ impl BrowserWindow {
     /// [`UserEvent::FaviconResolved`].
     ///
     /// Same shape and same reasoning as [`Self::fetch_page_title`] (see
-    /// docs/decisions.md D12/D21): a no-op for an unknown or suspended tab,
+    /// docs/decisions.md D12/D22): a no-op for an unknown or suspended tab,
     /// fire-and-forget (a superseded navigation just means a stale answer
     /// gets applied late), and this only ever resolves a URL string — the
     /// actual favicon image fetch happens later, asynchronously, as a plain
@@ -865,7 +865,7 @@ fn content_webview_builder<'a>(
         // or how the webview came to exist.
         .with_devtools(true)
         .with_initialization_script(devtools_shortcut_script())
-        // Tab-management keyboard shortcuts (see docs/decisions.md D22):
+        // Tab-management keyboard shortcuts (see docs/decisions.md D23):
         // same treatment, same trust boundary, same untrusted IPC channel
         // below — just a second injected script and a second fixed set of
         // sentinel strings, rather than growing the devtools one to mean two
@@ -900,13 +900,13 @@ fn content_webview_builder<'a>(
             }
         })
         // `target="_blank"` links and `window.open()` (see docs/decisions.md
-        // D24): wry's `with_new_window_req_handler` fires synchronously with
+        // D25): wry's `with_new_window_req_handler` fires synchronously with
         // the requested URL on every backend (WebKitGTK's `create` signal,
         // WebView2's `NewWindowRequested`, WKWebView's
         // `createWebViewWithConfiguration:...`). We always `Deny` — never
         // `Allow` (a bare native window outside VeloX's tab model) or
         // `Create` (would need a platform-specific webview sharing the
-        // opener's configuration; see D24) — and instead open the URL as a
+        // opener's configuration; see D25) — and instead open the URL as a
         // new VeloX tab ourselves, the same way `ToolbarCommand::NewTab`
         // does but at the requested URL instead of the homepage.
         .with_new_window_req_handler(move |url, _features| {
@@ -1054,7 +1054,7 @@ mod tests {
     #[test]
     fn parse_content_shortcut_rejects_anything_not_an_exact_known_sentinel() {
         // Never treated as JSON/structured data, and never a prefix/fuzzy
-        // match — see docs/decisions.md D18/D22.
+        // match — see docs/decisions.md D18/D23.
         for body in [
             "",
             "velox:new-tab ",

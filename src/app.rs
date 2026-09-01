@@ -49,7 +49,7 @@ pub enum UserEvent {
         title: String,
     },
     /// Tab `tab_id`'s favicon URL came back from its content webview (see
-    /// `BrowserWindow::fetch_favicon`). See docs/decisions.md D21: this is
+    /// `BrowserWindow::fetch_favicon`). See docs/decisions.md D22: this is
     /// only ever a URL to try, never image bytes — the toolbar webview's own
     /// `<img>` tag performs the actual (async, non-blocking) fetch.
     FaviconResolved { tab_id: TabId, url: String },
@@ -62,13 +62,13 @@ pub enum UserEvent {
     OpenDevtoolsRequested,
     /// One of the tab-management keyboard shortcuts fired while a content
     /// webview had focus (see `ui::window::ContentShortcut` and
-    /// docs/decisions.md D18/D22). Sent over the same kind of dedicated,
+    /// docs/decisions.md D18/D23). Sent over the same kind of dedicated,
     /// untrusted IPC channel as `OpenDevtoolsRequested`, for the same reason.
     ContentShortcut(ContentShortcut),
     /// A content webview asked to open a new window for `url` — a
     /// `target="_blank"` link or `window.open()` — which VeloX always
     /// answers by opening `url` as a new tab instead (see
-    /// docs/decisions.md D24). Carries no `TabId`: like the shortcuts above,
+    /// docs/decisions.md D25). Carries no `TabId`: like the shortcuts above,
     /// this is a browser-wide action ("open a new tab"), not something that
     /// needs to be routed back to whichever tab asked.
     NewTabRequested(String),
@@ -377,7 +377,7 @@ fn handle_user_event(
                 // Title/favicon are tab-strip state, independent of whether
                 // this visit was recorded to history — private mode (no
                 // history recording) still wants a readable tab strip (see
-                // docs/decisions.md D21). `0` is a safe sentinel
+                // docs/decisions.md D22). `0` is a safe sentinel
                 // `history_id` when there is none: `HistoryStore` ids start
                 // at 1, so `HistoryStore::update_title` simply finds nothing
                 // to update rather than touching an unrelated entry.
@@ -561,7 +561,7 @@ fn handle_toolbar_command(
 /// Open a new tab at `url` and make it active. The one path every "open a
 /// new tab" trigger funnels through — `ToolbarCommand::NewTab` (homepage),
 /// `ContentShortcut::NewTab` (homepage), and `UserEvent::NewTabRequested`
-/// (a `target="_blank"`/`window.open()` URL, see docs/decisions.md D24) —
+/// (a `target="_blank"`/`window.open()` URL, see docs/decisions.md D25) —
 /// so the webview-build-then-activate sequence is written once.
 fn open_new_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
     let id = state.tabs.open_at(url.to_owned(), Instant::now());
@@ -624,7 +624,7 @@ fn apply_activation(
 }
 
 /// Dispatch one content-webview keyboard shortcut (see
-/// `ui::window::ContentShortcut` and docs/decisions.md D18/D22) to the same
+/// `ui::window::ContentShortcut` and docs/decisions.md D18/D23) to the same
 /// tab operations the toolbar's own equivalent commands use — every branch
 /// here mirrors one `ToolbarCommand` arm in `handle_toolbar_command`.
 fn handle_content_shortcut(

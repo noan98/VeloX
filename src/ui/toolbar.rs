@@ -14,7 +14,7 @@
 //! for the tab-management keyboard shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/1-9),
 //! sending the six `ToolbarCommand` variants at the end of the enum below.
 //! This is the trusted-webview half of that feature; the content webview's
-//! untrusted half lives in `ui::window` — see docs/decisions.md D22.
+//! untrusted half lives in `ui::window` — see docs/decisions.md D23.
 
 use serde::{Deserialize, Serialize};
 
@@ -116,12 +116,12 @@ pub struct TabSummary {
     pub url: String,
     /// The page title last reported for this tab (`Tab::title`), if any has
     /// arrived yet. The tab strip falls back to `url` when this is `None` —
-    /// see docs/decisions.md D21.
+    /// see docs/decisions.md D22.
     pub title: Option<String>,
     /// A URL the tab strip can point an `<img>` at for this tab's favicon
     /// (`Tab::favicon`'s `Url` case; `Unknown` becomes `None` here). Loading
     /// it is left entirely to the toolbar webview's own `<img>` tag — see
-    /// docs/decisions.md D21 for why that, not a Rust-side HTTP fetch, is
+    /// docs/decisions.md D22 for why that, not a Rust-side HTTP fetch, is
     /// what actually retrieves the image.
     pub favicon: Option<String>,
     pub loading: bool,
@@ -506,7 +506,7 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("delete_history_entry"));
         assert!(TOOLBAR_HTML.contains("clear_history"));
         assert!(TOOLBAR_HTML.contains("remove_bookmark"));
-        // Keyboard shortcuts (see docs/decisions.md D22): the toolbar's own
+        // Keyboard shortcuts (see docs/decisions.md D23): the toolbar's own
         // capture-phase keydown listener, for when the address bar/panel
         // (not the content webview) has focus.
         assert!(TOOLBAR_HTML.contains("close_active_tab"));

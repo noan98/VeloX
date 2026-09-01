@@ -812,7 +812,7 @@ and `TabState` itself (was this tab suspended when the session ended).
 Actually persisting any of this to disk is #25's own decision to make, not
 this issue's.
 
-## D21: Tab strip — title/favicon rendering, favicon resolution, and shrink-then-scroll
+## D22: Tab strip — title/favicon rendering, favicon resolution, and shrink-then-scroll
 
 **Scope**: issue #11 ("複数タブ管理を実用レベルまで拡張"), the parts of it that
 are tab-strip presentation rather than tab lifecycle (D20 already covers the
@@ -902,7 +902,7 @@ invariant (`many_tabs_stay_internally_consistent` in
 `browser::tabs::tests`). A human should confirm the visual result once this
 lands somewhere with a display.
 
-## D22: Tab-management keyboard shortcuts — same delivery pattern as D18, two trust boundaries
+## D23: Tab-management keyboard shortcuts — same delivery pattern as D18, two trust boundaries
 
 **Scope**: issue #11's Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9.
 
@@ -973,7 +973,7 @@ already "the active tab" — so `ToolbarCommand` grew a dedicated
 `CloseActiveTab` variant instead of asking either JS side to compute an id
 `app.rs` already knows how to resolve itself.
 
-## D23: Closed-tab stack (Ctrl/Cmd+Shift+T) — bounded LIFO of URLs, in `browser::tabs`
+## D24: Closed-tab stack (Ctrl/Cmd+Shift+T) — bounded LIFO of URLs, in `browser::tabs`
 
 **Scope**: issue #11's "最後に閉じたタブの復元", tracked as its own decision
 because the issue explicitly calls for pure, unit-tested logic here rather
@@ -1006,7 +1006,7 @@ reasonable follow-ups but outside this issue's "実装すべき差分" list; #25
 (session restore) is the natural place persistence would eventually belong,
 since it already owns the question of what tab state survives a restart.
 
-## D24: `target="_blank"`/`window.open()` — wry 0.56's `with_new_window_req_handler`, confirmed from source
+## D25: `target="_blank"`/`window.open()` — wry 0.56's `with_new_window_req_handler`, confirmed from source
 
 **Scope**: issue #11 asked this to be verified against the actual wry 0.56
 source in `~/.cargo/registry` before writing any code, not assumed. This
@@ -1078,7 +1078,7 @@ the opener's storage partition/session (e.g. an OAuth popup flow that
 expects `window.opener` semantics) that a plain new tab does not provide;
 nothing here forecloses that later.
 
-**What's unverified**: same headless-environment caveat as D21 — this was
+**What's unverified**: same headless-environment caveat as D22 — this was
 confirmed by reading wry's source (the handler signature, the three
 backends' call sites, and their semantics) and by the existing
 `ToolbarCommand::NewTab` code path this reuses being already covered by
