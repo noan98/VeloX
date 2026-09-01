@@ -1279,3 +1279,310 @@ backends' call sites, and their semantics) and by the existing
 `app.rs`'s tests, but a real `target="_blank"` click or `window.open()`
 call opening a new VeloX tab has not been observed running, since there is
 no display to run VeloX against here.
+
+## D28: Downloads (#16) — wry 0.56's started/completed handlers, no progress or mid-transfer cancel
+
+**Scope**: Issue #16 ("ダウンロード管理"): start/complete/fail events, a save
+location, progress display, cancel, a download list, opening a completed
+file, opening the downloads folder, and same-name handling.
+
+### wry 0.56.1 API investigation (read from source, not assumed)
+
+Per the issue's own instruction (and this repo's precedent in D17/D18/D25),
+every finding below was confirmed by reading the vendored crate source at
+`~/.cargo/registry/src/index.crates.io-*/wry-0.56.1/src/{lib.rs,
+webkitgtk/mod.rs, webkitgtk/web_context.rs, webview2/mod.rs, wkwebview/mod.rs,
+wkwebview/download.rs}`, not from documentation or memory.
+
+**The API exists and is wired on every backend VeloX ships on.**
+`WebViewBuilder::with_download_started_handler(impl FnMut(String, &mut
+PathBuf) -> bool)` and `::with_download_completed_handler(impl Fn(String,
+Option<PathBuf>, bool))` (`src/lib.rs`) are both real, stable methods:
+
+- **WebKitGTK** (`webkitgtk/web_context.rs`,
+  `WebContext::register_download_handler`): hooked to
+  `WebContext::connect_download_started`, which itself listens for
+  `WebKitDownload::connect_decide_destination` (the started handler; can
+  mutate the destination or call `download.cancel()` if the handler returns
+  `false`) and `connect_finished`/`connect_failed` (the completed handler).
+- **WebView2** (`webview2/mod.rs`): `ICoreWebView2_4::add_DownloadStarting`
+  fires the started handler (`args.SetResultFilePath`/`args.SetCancel(true)`
+  reflect our return value/path edit back to the engine); a per-download
+  `DownloadOperation::add_StateChanged` subscription (registered *inside*
+  the same started-handler callback) is what actually calls the completed
+  handler once `state != IN_PROGRESS`.
+- **WKWebView** (`wkwebview/download.rs`,
+  `WryDownloadDelegate`/`download_policy`/`download_did_finish`/
+  `download_did_fail`): `download_policy` is the started handler
+  (`completion_handler` is called with either the chosen `NSURL` or a null
+  pointer to reject); `download_did_finish`/`download_did_fail` are the
+  completed handler.
+
+**No byte-level progress callback exists anywhere in this crate.** Neither
+`with_download_started_handler` nor `with_download_completed_handler`, nor
+any other `WebViewBuilder::with_*` method in `lib.rs`, exposes a
+bytes-received/total-bytes signal. WebView2's own `StateChanged` event (used
+internally above) is polled only for `state != IN_PROGRESS`, i.e. purely to
+detect "finished, one way or another" — wry never reads or forwards
+`DownloadOperation::BytesReceived`/`TotalBytesToReceive`, even though the
+underlying WebView2 COM API has them. WebKitGTK's `WebKitDownload` has an
+`estimated-progress` GObject property and WKWebView's `WKDownload` has a
+`progress: Progress` (`NSProgress`) — neither is bound anywhere in wry's
+public surface. **Conclusion: percentage/byte-level progress is not
+obtainable through wry 0.56's public API on any platform**, full stop — not
+a per-platform gap, an every-platform one.
+
+**No mid-transfer cancel handle exists either.** The only way to stop a
+download from happening at all is to return `false` from
+`download_started_handler` — which every backend translates into "never
+start" (`download.cancel()` on WebKitGTK, `args.SetCancel(true)` on
+WebView2, a null `NSURL` to the completion block on WKWebView), decided
+*synchronously*, before any bytes are written. Once accepted (`true`
+returned, which is the only sane default — see below), wry hands the caller
+no handle to the in-flight download at all: the started handler's signature
+is `(String, &mut PathBuf) -> bool`, no id, no `Arc<Download>`, nothing to
+call `.cancel()` on later. The `WebKitDownload`/`DownloadOperation`/
+`WKDownload` objects wry's own internals hold *do* have real cancel methods
+(`webkit_download_cancel`, `ICoreWebView2DownloadOperation::Cancel`,
+`WKDownload::cancel(completionHandler:)`) — wry simply never exposes them to
+a caller past the moment of the initial accept/reject decision.
+
+**Alternative considered and not taken: a self-written HTTP downloader.**
+The issue itself asks this to be flagged for the parent to decide, so it is
+recorded here rather than silently dropped. Real byte-level progress and a
+true mid-transfer cancel are only achievable by *not* letting the engine
+handle the download at all: reject it in `with_download_started_handler`
+and instead fetch the URL ourselves with an HTTP client
+(`reqwest`/`ureq`/hand-rolled `std::net::TcpStream` + manual HTTP), reading
+the response in chunks to report progress and drop the connection to
+cancel. **Not implemented, for three reasons**: (1) it needs a new
+dependency — an HTTP client at minimum, likely a TLS stack and possibly an
+async runtime behind it — which conflicts with CLAUDE.md's "additional
+dependencies need a clear, singular justification" policy (D6) for a
+feature this codebase's own precedent (D17) already accepts losing when the
+underlying engine API doesn't reach far enough; (2) it silently drops
+cookies/session/auth state — the WebView's own cookie jar/session that made
+an authenticated download link work in the browser is not reachable from a
+bare HTTP client without also reimplementing cookie extraction, which wry
+does not expose either, so an authenticated download (e.g. a file behind a
+login) would simply break; (3) it duplicates redirect handling, `Referer`/
+`Content-Disposition` parsing, and TLS validation the engine already gets
+right, doubling the surface that could have a bug. If a future need makes
+real progress/cancel a hard requirement, this is the natural next step to
+revisit — but it is a second implementation of "download a URL", not a
+one-line addition, and deserves its own decision when someone actually
+needs it.
+
+**Decision: implement what wry's API actually supports, document the two
+gaps as known limitations, do not add a dependency.** Every content webview
+(via `content_webview_builder`, so every tab, exactly like every other
+per-tab handler in this file — see D17/D18/D25's precedent) gets both
+handlers. VeloX always accepts every download (`true`, unconditionally),
+matching `WebViewAttributes::default()`'s own documented "allowing all
+downloads to match browser behavior" — there is no "block this download"
+feature here, so the only thing VeloX's started handler ever does is
+*redirect* the destination, never refuse it.
+
+### What "進捗表示" (progress display) actually shows
+
+Since no byte count is available, the downloads panel shows only
+`DownloadState` (`InProgress`/`Completed`/`Failed`/`Cancelled`) as a text
+status line, plus a small CSS-only pulsing dot on an in-progress row (an
+"something is happening" cue, not a percentage — see `ui/toolbar.html`'s
+`.download-row.in-progress` rule). This satisfies the acceptance criterion
+at the coarsest level wry's API allows; a determinate progress bar is not
+implemented and, per the investigation above, is not implementable without
+the alternative-downloader path above.
+
+### What "キャンセルできる" actually does
+
+`ToolbarCommand::CancelDownload` (`app::cancel_download`) transitions the
+entry to `DownloadState::Cancelled` and best-effort `std::fs::remove_file`s
+whatever partial file currently exists at its destination. **This does not
+stop the underlying engine transfer** — per the investigation above, there
+is no handle to do that through wry's public API. If the engine is still
+mid-write when this runs, it may recreate/continue writing to that same
+path afterward (WebKitGTK/WebView2/WKWebView all own the file handle
+independently of anything VeloX does here); VeloX's own bookkeeping is not
+fooled by this, since `DownloadStore::cancel`/`complete`/`fail` all reject
+any further transition once an entry has reached a terminal state (see
+`terminal_states_reject_every_further_transition` in
+`browser::downloads::tests`) — a completion notification racing a cancel
+request cannot un-cancel it, so the *displayed* state stays correct even if
+a stray file reappears on disk. This is the best available behavior given
+the API gap, not a full implementation of the acceptance criterion; flagged
+here explicitly as the issue's own reporting checklist asks for ("API 制約
+により実現できず落とした機能").
+
+### Filename sanitization and same-name collision avoidance
+
+Implemented as pure functions in the new `src/browser/downloads.rs`
+(`browser::` stays free of any `wry`/`tao`/`gtk` dependency, per D20's
+boundary — `ui::window` is the only caller that talks to wry's actual
+download callbacks):
+
+- **`sanitize_filename`**: takes only the last `/`- or `\`-separated segment
+  of the server-supplied name (defeating path traversal and absolute paths
+  by construction — there is no directory component left to traverse with,
+  not a blocklist of `..` patterns), strips control characters (including
+  NUL), rejects a bare `.`/`..`, trims trailing dots/spaces (Windows
+  disallows both), escapes the eight/eighteen Windows reserved device names
+  (`CON`/`PRN`/`AUX`/`NUL`/`COM1`-`COM9`/`LPT1`-`LPT9`, matched
+  case-insensitively against the name up to its first `.`, not merely as a
+  prefix — `CONSTITUTION.txt` is untouched) with a leading `_`, and
+  truncates to 200 bytes on a UTF-8 char boundary, preserving the extension
+  when there is room for it. Falls back to a fixed `"download"` name when
+  nothing usable survives (empty, whitespace-only, or all-`.` input).
+- **`unique_filename`**: given an injected "does this name already exist"
+  predicate (kept generic/pure for unit testing, real usage in
+  `build_destination` backs it with `Path::exists`), returns the name
+  unchanged if free, otherwise the first free `"{stem} ({n}){ext}"` for
+  increasing `n` — `report.pdf` → `report (1).pdf`. The stem/extension split
+  is at the *first* `.`, not the last, so a compound extension survives
+  intact (`archive.tar.gz` → `archive (1).tar.gz`, not
+  `archive.tar (1).gz`) — the same split wry's own bundled WKWebView
+  download-destination logic already uses internally
+  (`wkwebview/download.rs`), reused here for consistency rather than
+  inventing a different convention. A filename with no extension
+  (`README` → `README (1)`) and a dotfile with nothing before its first `.`
+  (`.gitignore` → `.gitignore (1)`, since a would-be-empty stem falls back
+  to treating the whole name as the stem) are both covered explicitly.
+- Both are exercised heavily in `browser::downloads::tests` — path
+  traversal (relative and absolute, both separators), NUL/control
+  characters, bare `.`/`..`, every reserved device name (and the
+  false-positive check that a name merely *starting* with one, like
+  `COMPANY.pdf`, is left alone), extremely long names (both with and
+  without an extension, plus a multi-byte-character truncation-boundary
+  case), and the full `unique_filename` collision ladder including compound
+  extensions and dotfiles.
+- **`prepare_destination`** (`fs::create_dir_all` + `build_destination`) is
+  the one IO-performing wrapper, called from `ui::window`'s
+  `download_started_handler` before the download is accepted — mirroring
+  `persistence::write_json`'s "create the directory, then act" shape.
+
+### Save location
+
+Configurable via `VELOX_DOWNLOAD_DIR`, following exactly the pattern
+`persistence::default_data_dir` already established for `VELOX_DATA_DIR`
+(D10) — without touching `persistence.rs` itself, which Issue #18 owns in
+this stacked-branch round. Platform defaults when unset: `XDG_DOWNLOAD_DIR`
+or `$HOME/Downloads` on Linux/BSD, `$HOME/Downloads` on macOS,
+`%USERPROFILE%\Downloads` on Windows — no `dirs` crate added, same D6/D10
+reasoning. No per-download interactive "choose a folder" dialog is offered:
+that would need a native file-picker dependency (e.g. `rfd`) this project
+does not have, and the issue's own guidance for VeloX's env-var-driven
+config pattern (`persistence.rs`'s precedent) points at a configurable
+default directory instead of a picker — read as satisfying "保存先選択" at
+the level this codebase's existing conventions support, not a Chrome-style
+per-file save dialog.
+
+### `ui::window` wiring: why the destination decision cannot go through
+`EventLoopProxy`
+
+`with_download_started_handler`'s closure must return `bool` (and may
+mutate the destination `PathBuf`) synchronously, in the same call — unlike
+every other wry callback in this codebase (D5), there is no way to defer
+this specific decision through a `UserEvent` round trip, since nothing
+reads a response back from the event loop into a blocking callback. So
+`sanitize_filename`/`resolve_download_dir`/`prepare_destination` (all pure
+or thin-IO, needing no `AppState`) run directly inside the closure in
+`ui::window::content_webview_builder`, exactly the same
+"decide-synchronously-then-notify-asynchronously" shape
+`with_navigation_handler` already uses for content blocking (D17) — the
+closure decides, then sends `UserEvent::DownloadStarted` so `app.rs`'s
+single-threaded `AppState` (D5) can register the entry and refresh the
+panel. `DownloadId` issuance stays solely inside `DownloadStore::start`
+(called from `app.rs`, on the main event-loop thread) rather than being
+generated inside the wry callback — there was no need for a second,
+thread-shared id-issuing mechanism (e.g. an `AtomicU64`) when the store
+itself can issue ids the moment `app.rs` processes the event, matching how
+every other id (`TabId`, `HistoryEntry::id`, `BookmarkEntry::id`) is issued
+by its owning store on the main thread, not by whatever callback reported
+the underlying action.
+
+### Correlating `download_completed_handler` back to a `DownloadId`
+
+wry's completed handler is one long-lived closure per webview (registered
+once at webview-build time, not per download), and it hands back only
+`(url, Option<PathBuf>, bool)` — no id of its own, and `path` is `None`
+unconditionally on macOS (`wkwebview/download.rs`'s
+`download_did_finish`/`download_did_fail` always call
+`completed_fn(url, None, success)`), so the correlation cannot always rely
+on the destination path. `DownloadStore::resolve_completion(url,
+destination)` is the pure matching logic this needs: prefer an exact
+destination match among still-`InProgress` entries when a path is given
+(exact on Linux/Windows), otherwise fall back to the oldest still-in-progress
+entry for that URL (a FIFO assumption, exact for the overwhelmingly common
+"one active download per URL at a time" case). **Known limitation**: two
+concurrent downloads of the literal same URL on macOS (where no path is
+ever available to disambiguate) can have their completion events matched to
+the wrong entry — a narrow, documented edge case rather than a silent
+correctness bug, covered by
+`resolve_completion_falls_back_to_oldest_in_progress_for_the_url_without_a_path`
+in `browser::downloads::tests`.
+
+### Opening a completed file / the downloads folder
+
+Both are the same OS primitive — "open this path with the default
+handler" — so one function, `browser::downloads::open_path_command`,
+returns the right `(program, args)` per platform (`xdg-open` on
+Linux/BSD, `open` on macOS, `explorer` on Windows), and `spawn_open` runs
+it via `Command::new(program).args(args)` — **never** `sh -c` or any other
+shell invocation, since `args` carries a path built from a server-supplied
+file name; passing it as a real argument (not interpolated into a shell
+command string) leaves no shell metacharacter for it to be misinterpreted
+as. `ToolbarCommand::OpenDownload` only acts on a `DownloadState::Completed`
+entry (opening an in-progress/failed/cancelled download's file would be
+misleading or point at nothing); `ToolbarCommand::OpenDownloadsFolder`
+`create_dir_all`s the resolved download directory first so opening it
+before anything has ever been downloaded does not surface a confusing
+"no such directory" error. Command construction is unit-tested
+(`open_path_command_never_goes_through_a_shell`, plus a platform-specific
+check for the Linux/BSD branch this project's CI actually compiles);
+actually spawning `xdg-open` is **not** exercised by any test — this
+project's CI/dev environment is headless, so there is no desktop session
+for it to hand a path to; see docs/architecture.md's existing "headless"
+caveats (D18/D22/D25) for the same shape of gap.
+
+### Not persisted to disk
+
+Unlike `HistoryStore`/`BookmarkStore`, `DownloadStore` is in-memory only for
+the life of the process — the issue's acceptance criteria describe a
+session download list ("ダウンロード一覧"), not a cross-restart history, and
+`browser::persistence` is Issue #18's file to rewrite in this stacked round
+(explicitly off limits here). A future issue could add a
+`downloads.json`-style file following exactly `persistence.rs`'s existing
+pattern if cross-restart download history becomes a real requirement; not
+built speculatively here.
+
+### UI: a fourth panel, same mechanism as history/bookmarks (D11)
+
+`ui::toolbar::Panel` gained a `Downloads` variant, opened/closed the same
+way as `History`/`Bookmarks` (`ToolbarCommand::TogglePanel`, growing the
+toolbar webview's own bounds — D11's reasoning applies unchanged, nothing
+new to decide there). `DownloadEntry` derives `Serialize` directly and is
+sent to the toolbar the same way `HistoryEntry`/`BookmarkEntry` are (one
+`PathBuf` field uses a `serialize_with` shim to a lossy string, since
+`serde`'s built-in `PathBuf` impl errors on non-UTF-8 paths whereas the
+toolbar only ever needs something displayable). The panel's row rendering
+is a dedicated `veloxSetDownloads` function rather than reusing the
+existing generic history/bookmark `renderRows` helper: a download row's
+action button depends on state (cancel while `in_progress`, remove once
+terminal) and shows a status line instead of a plain timestamp, which is
+enough of a different shape that forcing it through the same helper would
+have made that helper harder to read for both cases.
+
+### What's unverified
+
+Same headless-environment caveat every prior UI-facing decision in this
+project carries (D18/D22/D25): the panel's visual layout, the pulsing
+in-progress indicator, and an actual file landing in `~/Downloads` from a
+real page have not been eyeballed running VeloX, since this environment has
+no display. What is covered instead: every pure function in
+`browser::downloads` (sanitization, collision avoidance, directory
+resolution's testable branch, command construction) by unit tests, the
+toolbar IPC protocol round-trip (`ui::toolbar::tests`), and the JS/HTML
+hooks' presence (`toolbar_html_declares_expected_hooks`). A human should
+confirm a real download (including the in-progress pulsing dot, opening the
+completed file, and opening the downloads folder) once this lands somewhere
+with a display.

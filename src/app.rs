@@ -14,10 +14,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
+use crate::browser::downloads;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::{
-    metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore, Favicon,
-    FilterList, HistoryEntry, HistoryStore, TabId, Tabs,
+    metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore,
+    DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryEntry, HistoryStore,
+    TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -73,6 +75,30 @@ pub enum UserEvent {
     /// this is a browser-wide action ("open a new tab"), not something that
     /// needs to be routed back to whichever tab asked.
     NewTabRequested(String),
+    /// A content webview's `download_started_handler` accepted a download
+    /// (see docs/decisions.md D28): `destination` is already the final,
+    /// sanitized, collision-avoided path
+    /// (`browser::downloads::prepare_destination`), chosen synchronously
+    /// inside the wry callback before this event is sent. This only ever
+    /// *registers* the download for the UI/`DownloadStore` — the decision
+    /// to accept it already happened in `ui::window`.
+    DownloadStarted {
+        url: String,
+        file_name: String,
+        destination: PathBuf,
+        started_at: u64,
+    },
+    /// A content webview's `download_completed_handler` fired. Carries no
+    /// id of its own — wry does not hand one back — so the handler resolves
+    /// which [`DownloadId`] this refers to via
+    /// `DownloadStore::resolve_completion`. `path` is `Some` on
+    /// Linux/Windows and always `None` on macOS (see docs/decisions.md
+    /// D28); `success` is the authoritative signal either way.
+    DownloadCompleted {
+        url: String,
+        path: Option<PathBuf>,
+        success: bool,
+    },
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -99,6 +125,9 @@ struct AppState {
     /// makes for `Tabs::open_at`/`activate_at`'s own bookkeeping. See
     /// docs/architecture.md, "Performance extension points".
     perf: Option<PerfContext>,
+    /// Session-scoped download list (Issue #16). Not persisted to disk — see
+    /// docs/decisions.md D28.
+    downloads: DownloadStore,
 }
 
 /// What tab-latency logging needs: where to write records, and the epoch
@@ -176,6 +205,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         perf: perf_log
             .clone()
             .map(|log| PerfContext { process_start, log }),
+        downloads: DownloadStore::new(),
     };
 
     event_loop.run(move |event, _target, control_flow| {
@@ -319,7 +349,9 @@ fn record_perf_event(
         | UserEvent::FaviconResolved { .. }
         | UserEvent::OpenDevtoolsRequested
         | UserEvent::ContentShortcut(_)
-        | UserEvent::NewTabRequested(_) => {}
+        | UserEvent::NewTabRequested(_)
+        | UserEvent::DownloadStarted { .. }
+        | UserEvent::DownloadCompleted { .. } => {}
     }
 }
 
@@ -518,6 +550,37 @@ fn handle_user_event(
             handle_content_shortcut(window, state, homepage, shortcut)
         }
         UserEvent::NewTabRequested(url) => open_new_tab(window, state, &url),
+        UserEvent::DownloadStarted {
+            url,
+            file_name,
+            destination,
+            started_at,
+        } => {
+            state
+                .downloads
+                .start(url, file_name, destination, started_at);
+            refresh_downloads_panel(window, state);
+        }
+        UserEvent::DownloadCompleted { url, path, success } => {
+            let now = now_unix();
+            match state.downloads.resolve_completion(&url, path.as_deref()) {
+                Some(id) if success => {
+                    state.downloads.complete(id, now);
+                }
+                Some(id) => {
+                    state
+                        .downloads
+                        .fail(id, "ダウンロードに失敗しました".to_owned(), now);
+                }
+                None => {
+                    eprintln!(
+                        "velox: could not correlate download completion for {url:?} \
+                         (path={path:?}, success={success})"
+                    );
+                }
+            }
+            refresh_downloads_panel(window, state);
+        }
     }
 }
 
@@ -609,6 +672,7 @@ fn handle_toolbar_command(
             sync_bookmark_star(window, state, &url);
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
+            refresh_downloads_panel(window, state);
             sync_tab_strip(window, &state.tabs);
         }
         ToolbarCommand::ToggleBookmark => {
@@ -630,6 +694,7 @@ fn handle_toolbar_command(
             match next {
                 Some(Panel::History) => refresh_history_panel(window, state, config),
                 Some(Panel::Bookmarks) => refresh_bookmarks_panel(window, state),
+                Some(Panel::Downloads) => refresh_downloads_panel(window, state),
                 None => {}
             }
         }
@@ -650,6 +715,17 @@ fn handle_toolbar_command(
                 refresh_bookmarks_panel(window, state);
                 let url = state.tabs.active().current_url().to_owned();
                 sync_bookmark_star(window, state, &url);
+            }
+        }
+        ToolbarCommand::OpenDownload { id } => open_download(state, DownloadId::from(id)),
+        ToolbarCommand::OpenDownloadsFolder => open_downloads_folder(),
+        ToolbarCommand::CancelDownload { id } => {
+            cancel_download(state, DownloadId::from(id));
+            refresh_downloads_panel(window, state);
+        }
+        ToolbarCommand::RemoveDownloadEntry { id } => {
+            if state.downloads.remove(DownloadId::from(id)) {
+                refresh_downloads_panel(window, state);
             }
         }
     }
@@ -896,6 +972,75 @@ fn refresh_bookmarks_panel(window: &BrowserWindow, state: &AppState) {
     log_failure("update bookmarks panel", window.set_bookmarks(&entries));
 }
 
+/// Push the download list to the toolbar, most recently started first.
+fn refresh_downloads_panel(window: &BrowserWindow, state: &AppState) {
+    let entries: Vec<&DownloadEntry> = state.downloads.entries_newest_first().collect();
+    log_failure("update downloads panel", window.set_downloads(&entries));
+}
+
+/// Open a completed download's file with the OS's default handler
+/// (`ToolbarCommand::OpenDownload`). A no-op — logged, not an error — for
+/// an unknown id or a download that has not reached
+/// `DownloadState::Completed`; opening an in-progress/failed/cancelled
+/// download's (possibly partial or nonexistent) file would be misleading.
+fn open_download(state: &AppState, id: DownloadId) {
+    match state.downloads.get(id) {
+        Some(entry) if entry.state == crate::browser::DownloadState::Completed => {
+            log_spawn_failure("open download", downloads::spawn_open(&entry.destination));
+        }
+        Some(_) => eprintln!("velox: open_download: {id:?} has not completed yet"),
+        None => eprintln!("velox: open_download: unknown download {id:?}"),
+    }
+}
+
+/// Open the downloads directory with the OS's default file manager
+/// (`ToolbarCommand::OpenDownloadsFolder`). Creates the directory first
+/// (best-effort) so opening it before anything has ever been downloaded
+/// does not fail with a confusing "no such directory" error.
+fn open_downloads_folder() {
+    let Some(dir) = downloads::resolve_download_dir() else {
+        eprintln!(
+            "velox: open_downloads_folder: could not resolve a downloads directory \
+             (no VELOX_DOWNLOAD_DIR/HOME/USERPROFILE)"
+        );
+        return;
+    };
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        eprintln!("velox: failed to create downloads directory {dir:?}: {err}");
+    }
+    log_spawn_failure("open downloads folder", downloads::spawn_open(&dir));
+}
+
+/// Best-effort cancel of an in-progress download (`ToolbarCommand::CancelDownload`):
+/// marks it `DownloadState::Cancelled` and attempts to delete whatever
+/// partial file exists at its destination. Does **not** stop the underlying
+/// engine transfer — wry 0.56 exposes no API to do that; see
+/// docs/decisions.md D28. A no-op for an unknown id or a download that has
+/// already reached a terminal state.
+fn cancel_download(state: &mut AppState, id: DownloadId) {
+    let Some(destination) = state
+        .downloads
+        .get(id)
+        .map(|entry| entry.destination.clone())
+    else {
+        return;
+    };
+    if state.downloads.cancel(id, now_unix()) {
+        // Best-effort only: if the engine is still writing to this path, it
+        // may recreate the file (or fail silently) after this runs — see
+        // docs/decisions.md D28's "what's unverified"/limitation note.
+        match std::fs::remove_file(&destination) {
+            Ok(()) => {}
+            // Already gone (never actually started writing, or the engine
+            // had not created the file yet) — not an error worth logging.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "velox: failed to remove cancelled download's partial file {destination:?}: {err}"
+            ),
+        }
+    }
+}
+
 fn persist_history(state: &AppState) {
     if let Some(dir) = &state.data_dir {
         log_io_failure(
@@ -939,6 +1084,17 @@ fn log_io_failure(action: &str, result: std::io::Result<()>) {
     }
 }
 
+/// Same as `log_failure`, for `downloads::spawn_open`'s launch-a-process
+/// result. The spawned child is intentionally not waited on or otherwise
+/// tracked — "open this file/folder in some other application" is a
+/// fire-and-forget action, the same as a real desktop browser's own
+/// "show in folder" / "open file" menu entries.
+fn log_spawn_failure(action: &str, result: std::io::Result<std::process::Child>) {
+    if let Err(err) = result {
+        eprintln!("velox: failed to {action}: {err}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,6 +1110,7 @@ mod tests {
             data_dir: None,
             history_enabled,
             perf: None,
+            downloads: DownloadStore::new(),
         }
     }
 
@@ -1055,5 +1212,98 @@ mod tests {
         assert_eq!(state.tabs.active().blocked_count(), 0);
         assert_eq!(state.tabs.get(background_id).unwrap().blocked_count(), 1);
         assert_eq!(state.tabs.active_id(), active_id);
+    }
+
+    // --- Downloads (Issue #16, see docs/decisions.md D28) ---
+
+    fn unique_temp_file(label: &str) -> PathBuf {
+        let unique = format!(
+            "{label}-{:?}-{}",
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        );
+        std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn cancel_download_marks_the_entry_cancelled_and_removes_the_partial_file() {
+        let mut state = state_with_history_enabled(true);
+        let path = unique_temp_file("velox-app-cancel");
+        std::fs::write(&path, b"partial").unwrap();
+
+        let id = state.downloads.start(
+            "https://example.com/f".to_owned(),
+            "f".to_owned(),
+            path.clone(),
+            1,
+        );
+        cancel_download(&mut state, id);
+
+        assert_eq!(
+            state.downloads.get(id).unwrap().state,
+            crate::browser::DownloadState::Cancelled
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn cancel_download_on_an_unknown_id_does_not_panic() {
+        let mut state = state_with_history_enabled(true);
+        // Must not panic; there is no entry to cancel or file to remove.
+        cancel_download(&mut state, DownloadId::from(9999));
+    }
+
+    #[test]
+    fn cancel_download_on_an_already_completed_entry_is_a_noop() {
+        let mut state = state_with_history_enabled(true);
+        let path = unique_temp_file("velox-app-cancel-completed");
+        std::fs::write(&path, b"done").unwrap();
+
+        let id = state.downloads.start(
+            "https://example.com/f".to_owned(),
+            "f".to_owned(),
+            path.clone(),
+            1,
+        );
+        state.downloads.complete(id, 2);
+
+        cancel_download(&mut state, id);
+
+        // Still Completed, not Cancelled — a terminal state must not be
+        // overwritten — and the (already "downloaded") file is left alone.
+        assert_eq!(
+            state.downloads.get(id).unwrap().state,
+            crate::browser::DownloadState::Completed
+        );
+        assert!(path.exists());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn download_started_event_registers_an_entry_and_completed_event_resolves_it() {
+        let mut window_state = state_with_history_enabled(true);
+        window_state.downloads.start(
+            "https://example.com/report.pdf".to_owned(),
+            "report.pdf".to_owned(),
+            PathBuf::from("/tmp/report.pdf"),
+            100,
+        );
+        assert_eq!(window_state.downloads.entries().len(), 1);
+
+        let id = window_state.downloads.entries()[0].id;
+        let resolved = window_state.downloads.resolve_completion(
+            "https://example.com/report.pdf",
+            Some(Path::new("/tmp/report.pdf")),
+        );
+        assert_eq!(resolved, Some(id));
+        assert!(window_state.downloads.complete(id, 200));
+        assert_eq!(
+            window_state.downloads.get(id).unwrap().state,
+            crate::browser::DownloadState::Completed
+        );
     }
 }

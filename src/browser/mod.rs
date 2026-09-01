@@ -11,6 +11,7 @@
 pub mod benchmark;
 pub mod blocklist;
 pub mod bookmarks;
+pub mod downloads;
 pub mod history;
 pub mod metrics;
 pub mod navigation;
@@ -21,6 +22,7 @@ pub mod tabs;
 
 pub use blocklist::FilterList;
 pub use bookmarks::{BookmarkEntry, BookmarkStore};
+pub use downloads::{DownloadEntry, DownloadId, DownloadState, DownloadStore};
 pub use history::{HistoryEntry, HistoryStore};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};

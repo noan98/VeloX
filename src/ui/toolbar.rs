@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::browser::{BookmarkEntry, HistoryEntry};
+use crate::browser::{BookmarkEntry, DownloadEntry, HistoryEntry};
 
 /// The static HTML/CSS/JS that renders the toolbar.
 pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
@@ -29,6 +29,8 @@ pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
 pub enum Panel {
     History,
     Bookmarks,
+    /// The download list added by Issue #16 — see docs/decisions.md D28.
+    Downloads,
 }
 
 /// A command sent from the toolbar UI to the browser.
@@ -107,6 +109,32 @@ pub enum ToolbarCommand {
     },
     /// Activate the last tab in display order (Ctrl/Cmd+9).
     ActivateLastTab,
+
+    // --- Downloads (Issue #16, see docs/decisions.md D28) ---
+    /// Open a completed download's file with the OS's default handler
+    /// (`browser::downloads::open_path_command`). A no-op for an unknown id
+    /// or a download that has not reached `DownloadState::Completed`.
+    OpenDownload {
+        id: u64,
+    },
+    /// Open the downloads directory (`browser::downloads::resolve_download_dir`)
+    /// with the OS's default file manager.
+    OpenDownloadsFolder,
+    /// Best-effort cancel of an in-progress download: marks it
+    /// `DownloadState::Cancelled` and attempts to delete whatever partial
+    /// file exists at its destination. Does **not** stop the underlying
+    /// engine transfer — wry 0.56 exposes no API to do that (see
+    /// docs/decisions.md D28). A no-op for an unknown id or a download that
+    /// already reached a terminal state.
+    CancelDownload {
+        id: u64,
+    },
+    /// Remove one entry from the download list (the "x" next to a row).
+    /// Never touches the file on disk — only bookkeeping, mirroring
+    /// [`Self::DeleteHistoryEntry`]/[`Self::RemoveBookmark`].
+    RemoveDownloadEntry {
+        id: u64,
+    },
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -188,6 +216,7 @@ pub fn set_panel_script(panel: Option<Panel>) -> String {
     let arg = match panel {
         Some(Panel::History) => "\"history\"",
         Some(Panel::Bookmarks) => "\"bookmarks\"",
+        Some(Panel::Downloads) => "\"downloads\"",
         None => "null",
     };
     format!("veloxSetPanel({arg});")
@@ -205,6 +234,15 @@ pub fn set_history_script(entries: &[&HistoryEntry]) -> String {
 /// JS snippet that replaces the bookmarks panel's contents.
 pub fn set_bookmarks_script(entries: &[&BookmarkEntry]) -> String {
     format!("veloxSetBookmarks({});", entries_to_json(entries))
+}
+
+/// JS snippet that replaces the downloads panel's contents. `DownloadEntry`
+/// derives `Serialize` directly (see docs/decisions.md D28) rather than
+/// going through a separate wire-format struct — the same shape
+/// `set_history_script`/`set_bookmarks_script` use for `HistoryEntry`/
+/// `BookmarkEntry`.
+pub fn set_downloads_script(entries: &[&DownloadEntry]) -> String {
+    format!("veloxSetDownloads({});", entries_to_json(entries))
 }
 
 fn entries_to_json<T: Serialize>(entries: &[T]) -> serde_json::Value {
@@ -486,6 +524,66 @@ mod tests {
     }
 
     #[test]
+    fn parses_download_commands() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"open_download","id":9}"#).unwrap(),
+            ToolbarCommand::OpenDownload { id: 9 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"open_downloads_folder"}"#).unwrap(),
+            ToolbarCommand::OpenDownloadsFolder
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"cancel_download","id":9}"#).unwrap(),
+            ToolbarCommand::CancelDownload { id: 9 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"remove_download_entry","id":9}"#).unwrap(),
+            ToolbarCommand::RemoveDownloadEntry { id: 9 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"toggle_panel","panel":"downloads"}"#).unwrap(),
+            ToolbarCommand::TogglePanel {
+                panel: Panel::Downloads
+            }
+        );
+    }
+
+    #[test]
+    fn downloads_panel_script_names_the_panel() {
+        assert_eq!(
+            set_panel_script(Some(Panel::Downloads)),
+            "veloxSetPanel(\"downloads\");"
+        );
+    }
+
+    #[test]
+    fn downloads_script_embeds_entries_as_json() {
+        use crate::browser::{DownloadId, DownloadState};
+
+        let entry = DownloadEntry {
+            id: DownloadId::from(1),
+            url: "https://example.com/report.pdf".to_owned(),
+            file_name: "report.pdf".to_owned(),
+            destination: std::path::PathBuf::from("/home/user/Downloads/report.pdf"),
+            state: DownloadState::InProgress,
+            started_at: 100,
+            finished_at: None,
+            error: None,
+        };
+        let script = set_downloads_script(&[&entry]);
+        assert!(script.starts_with("veloxSetDownloads(["));
+        assert!(script.contains(r#""url":"https://example.com/report.pdf""#));
+        assert!(script.contains(r#""file_name":"report.pdf""#));
+        assert!(script.contains(r#""state":"in_progress""#));
+        assert!(script.contains(r#""destination":"/home/user/Downloads/report.pdf""#));
+        assert!(script.contains(r#""error":null"#));
+
+        let empty = set_downloads_script(&[]);
+        assert_eq!(empty, "veloxSetDownloads([]);".to_owned());
+    }
+
+    #[test]
     fn toolbar_html_declares_expected_hooks() {
         assert!(TOOLBAR_HTML.contains("veloxSetUrl"));
         assert!(TOOLBAR_HTML.contains("veloxSetLoading"));
@@ -515,5 +613,11 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("prev_tab"));
         assert!(TOOLBAR_HTML.contains("activate_tab_by_index"));
         assert!(TOOLBAR_HTML.contains("activate_last_tab"));
+        // Downloads (Issue #16, see docs/decisions.md D28).
+        assert!(TOOLBAR_HTML.contains("veloxSetDownloads"));
+        assert!(TOOLBAR_HTML.contains("open_download"));
+        assert!(TOOLBAR_HTML.contains("open_downloads_folder"));
+        assert!(TOOLBAR_HTML.contains("cancel_download"));
+        assert!(TOOLBAR_HTML.contains("remove_download_entry"));
     }
 }
