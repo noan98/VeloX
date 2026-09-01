@@ -14,11 +14,14 @@
 //! for the tab-management keyboard shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/1-9),
 //! sending the six `ToolbarCommand` variants at the end of the enum below.
 //! This is the trusted-webview half of that feature; the content webview's
-//! untrusted half lives in `ui::window` — see docs/decisions.md D23.
+//! untrusted half lives in `ui::window` — see docs/decisions.md D23. The
+//! same listener also sends `focus_address_bar` for Ctrl/Cmd+L, and the
+//! address bar's own input handler sends `omnibox_input`/`omnibox_close`
+//! for the candidate dropdown (Issue #15, see docs/decisions.md D26).
 
 use serde::{Deserialize, Serialize};
 
-use crate::browser::{BookmarkEntry, HistoryGroup};
+use crate::browser::{BookmarkEntry, Candidate, HistoryGroup};
 
 /// The static HTML/CSS/JS that renders the toolbar.
 pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
@@ -29,6 +32,13 @@ pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
 pub enum Panel {
     History,
     Bookmarks,
+    /// The omnibox candidate dropdown (Issue #15). Reuses the exact same
+    /// toolbar-webview resize/panel machinery as `History`/`Bookmarks`
+    /// (see docs/decisions.md D11) instead of introducing a second one;
+    /// unlike those two it is opened/closed automatically as the user
+    /// types (`ToolbarCommand::OmniboxInput`/`OmniboxClose`), never via
+    /// `TogglePanel`.
+    Omnibox,
 }
 
 /// A command sent from the toolbar UI to the browser.
@@ -115,6 +125,22 @@ pub enum ToolbarCommand {
     },
     /// Activate the last tab in display order (Ctrl/Cmd+9).
     ActivateLastTab,
+    /// Ctrl/Cmd+L: focus the address bar and select its full contents
+    /// (Issue #15). Sent by the toolbar's own keydown listener; the content
+    /// webview's equivalent is `ui::window::ContentShortcut::FocusAddressBar`,
+    /// routed to the same handler in `app.rs`.
+    FocusAddressBar,
+    /// The address bar's text changed (every keystroke); `input` is the raw,
+    /// not-yet-committed text. `app.rs` answers with an updated candidate
+    /// list (`BrowserWindow::set_candidates`) and opens/closes the
+    /// `Panel::Omnibox` dropdown depending on whether it is non-empty.
+    OmniboxInput {
+        input: String,
+    },
+    /// Esc while the omnibox dropdown is open: close it and restore the
+    /// address bar to the active tab's actual current URL, selected and
+    /// focused (mirrors `FocusAddressBar`'s restore step).
+    OmniboxClose,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -177,6 +203,31 @@ pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
     format!("veloxSetTabs({json});")
 }
 
+/// JS snippet that replaces the omnibox candidate dropdown's contents.
+///
+/// `candidates` is embedded as a JSON array (each field of [`Candidate`] is
+/// a plain string/enum tag), the same safe pattern [`set_tabs_script`] uses;
+/// a serialization failure (cannot happen for this type in practice) falls
+/// back to an empty list rather than panicking.
+pub fn set_candidates_script(candidates: &[Candidate]) -> String {
+    let json = serde_json::to_string(candidates).unwrap_or_else(|_| "[]".to_owned());
+    format!("veloxSetCandidates({json});")
+}
+
+/// JS snippet that forces the address bar's text to `url`, focuses it, and
+/// selects its full contents — used for both Ctrl/Cmd+L
+/// (`ToolbarCommand::FocusAddressBar`) and the Esc-restore step
+/// (`ToolbarCommand::OmniboxClose`). Unlike [`set_url_script`] this always
+/// overwrites the field even while it already has focus (that is the whole
+/// point here), so it is a distinct JS entry point rather than a call to
+/// `veloxSetUrl`.
+pub fn set_focus_address_bar_script(url: &str) -> String {
+    format!(
+        "veloxFocusAddressBar({});",
+        serde_json::Value::String(url.to_owned())
+    )
+}
+
 /// JS snippet that toggles the bookmark ("star") button's active state.
 pub fn set_bookmark_active_script(active: bool) -> String {
     format!("veloxSetBookmarkActive({active});")
@@ -196,6 +247,7 @@ pub fn set_panel_script(panel: Option<Panel>) -> String {
     let arg = match panel {
         Some(Panel::History) => "\"history\"",
         Some(Panel::Bookmarks) => "\"bookmarks\"",
+        Some(Panel::Omnibox) => "\"omnibox\"",
         None => "null",
     };
     format!("veloxSetPanel({arg});")
@@ -224,7 +276,7 @@ fn entries_to_json<T: Serialize>(entries: &[T]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::{HistoryDateBucket, HistoryEntry};
+    use crate::browser::{CandidateKind, HistoryDateBucket, HistoryEntry};
 
     #[test]
     fn parses_navigate_command() {
@@ -360,6 +412,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_omnibox_commands() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"focus_address_bar"}"#).unwrap(),
+            ToolbarCommand::FocusAddressBar
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"omnibox_input","input":"rust ownership"}"#).unwrap(),
+            ToolbarCommand::OmniboxInput {
+                input: "rust ownership".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"omnibox_close"}"#).unwrap(),
+            ToolbarCommand::OmniboxClose
+        );
+    }
+
+    #[test]
     fn url_script_escapes_quotes_and_backslashes() {
         let script = set_url_script(r#"https://example.com/?q="a"\b"#);
         assert_eq!(script, r#"veloxSetUrl("https://example.com/?q=\"a\"\\b");"#);
@@ -426,6 +496,44 @@ mod tests {
     }
 
     #[test]
+    fn candidates_script_embeds_a_json_array() {
+        let candidates = vec![
+            Candidate {
+                kind: CandidateKind::NavigateUrl,
+                target_url: "https://example.com/".to_owned(),
+                label: "https://example.com/".to_owned(),
+                detail: None,
+            },
+            Candidate {
+                kind: CandidateKind::Search,
+                target_url: "https://duckduckgo.com/?q=a%22b".to_owned(),
+                label: r#"a"b"#.to_owned(),
+                detail: Some("DuckDuckGo で検索".to_owned()),
+            },
+        ];
+        let script = set_candidates_script(&candidates);
+        assert!(script.starts_with("veloxSetCandidates(["));
+        assert!(script.ends_with("]);"));
+        assert!(script.contains(r#""kind":"navigate_url""#));
+        assert!(script.contains(r#""kind":"search""#));
+        // A quote inside a label must be escaped, not break out of the
+        // array, the same JSON-embedding guarantee `set_tabs_script` gives.
+        assert!(script.contains(r#"a\"b"#));
+        assert!(script.contains(r#""detail":null"#));
+
+        assert_eq!(set_candidates_script(&[]), "veloxSetCandidates([]);");
+    }
+
+    #[test]
+    fn focus_address_bar_script_escapes_quotes_and_backslashes() {
+        let script = set_focus_address_bar_script(r#"https://example.com/?q="a"\b"#);
+        assert_eq!(
+            script,
+            r#"veloxFocusAddressBar("https://example.com/?q=\"a\"\\b");"#
+        );
+    }
+
+    #[test]
     fn bookmark_active_script_is_a_bool_literal() {
         assert_eq!(
             set_bookmark_active_script(true),
@@ -452,6 +560,10 @@ mod tests {
         assert_eq!(
             set_panel_script(Some(Panel::Bookmarks)),
             "veloxSetPanel(\"bookmarks\");"
+        );
+        assert_eq!(
+            set_panel_script(Some(Panel::Omnibox)),
+            "veloxSetPanel(\"omnibox\");"
         );
         assert_eq!(set_panel_script(None), "veloxSetPanel(null);");
     }
@@ -554,5 +666,11 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("prev_tab"));
         assert!(TOOLBAR_HTML.contains("activate_tab_by_index"));
         assert!(TOOLBAR_HTML.contains("activate_last_tab"));
+        // Omnibox (Issue #15): Ctrl/Cmd+L, the candidate dropdown, and Esc.
+        assert!(TOOLBAR_HTML.contains("veloxSetCandidates"));
+        assert!(TOOLBAR_HTML.contains("veloxFocusAddressBar"));
+        assert!(TOOLBAR_HTML.contains("focus_address_bar"));
+        assert!(TOOLBAR_HTML.contains("omnibox_input"));
+        assert!(TOOLBAR_HTML.contains("omnibox_close"));
     }
 }
