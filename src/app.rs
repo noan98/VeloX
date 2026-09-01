@@ -16,8 +16,8 @@ use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
 use crate::browser::perf_log::PerfLog;
 use crate::browser::{
-    metrics, navigation, persistence, BookmarkEntry, BookmarkStore, FilterList, HistoryEntry,
-    HistoryStore, TabId, Tabs,
+    metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore, FilterList,
+    HistoryEntry, HistoryStore, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -38,9 +38,17 @@ pub enum UserEvent {
     LoadStarted(TabId, String),
     /// Tab `.0`'s content webview finished loading this URL.
     LoadFinished(TabId, String),
-    /// `document.title` for the history entry `id` came back from the
-    /// content webview (see `BrowserWindow::fetch_page_title`).
-    PageTitleResolved { id: u64, title: String },
+    /// `document.title` for tab `tab_id` came back from its content webview
+    /// (see `BrowserWindow::fetch_page_title`), for the history entry
+    /// `history_id`. Carries `tab_id` — not just `history_id` — precisely so
+    /// this event can be routed back to the right `Tab` as well as the
+    /// right history entry; a `tab_id` for a tab that has since closed is
+    /// simply ignored (see `Tabs::get_mut`), not a panic.
+    PageTitleResolved {
+        tab_id: TabId,
+        history_id: u64,
+        title: String,
+    },
     /// The active content webview's devtools shortcut (F12 / Cmd+Opt+I)
     /// fired. Sent over a dedicated, tightly-restricted IPC channel, separate
     /// from the toolbar's — see docs/decisions.md D18. Carries no `TabId`:
@@ -451,8 +459,18 @@ fn handle_user_event(
             }
             sync_tab_strip(window, &state.tabs);
         }
-        UserEvent::PageTitleResolved { id, title } => {
-            if state.history.update_title(id, title) {
+        UserEvent::PageTitleResolved {
+            tab_id,
+            history_id,
+            title,
+        } => {
+            // A stale `tab_id` (the tab closed while the title fetch was in
+            // flight) is a safe no-op here — only the history entry still
+            // gets its title.
+            if let Some(tab) = state.tabs.get_mut(tab_id) {
+                tab.set_title(title.clone());
+            }
+            if state.history.update_title(history_id, title) {
                 persist_history(state);
                 refresh_history_panel(window, state, config);
             }
@@ -494,18 +512,21 @@ fn handle_toolbar_command(
             let started = Instant::now();
             let id = state.tabs.open_at(homepage.to_owned(), started);
             log_failure("open tab", window.open_tab(id, homepage));
-            activate_and_refresh(window, state, id);
+            // A brand new tab's webview was just built above; only its
+            // visibility needs to change, never a resume.
+            activate_and_refresh(window, state, id, ActivationEffect::Switch);
             record_tab_latency(state, metrics::TabLatencyKind::Create, id, started);
         }
         ToolbarCommand::CloseTab { id } => {
             let id = TabId::from(id);
-            if let Some(new_active) = state.tabs.close(id) {
+            if let Some((new_active, effect)) = state.tabs.close(id) {
                 window.close_tab(id);
                 // The tab that replaces the one just closed may itself have
                 // been suspended (a background tab can be suspended while
-                // the tab in front of it is closed); `activate_and_refresh`
-                // resumes it if so.
-                activate_and_refresh(window, state, new_active);
+                // the tab in front of it is closed); `effect` already
+                // reflects that (`Tabs::close`), so `activate_and_refresh`
+                // resumes it if needed without re-deriving it here.
+                activate_and_refresh(window, state, new_active, effect);
             }
             // Otherwise: unknown id, or `id` was the only remaining tab —
             // VeloX always keeps at least one tab open.
@@ -513,8 +534,8 @@ fn handle_toolbar_command(
         ToolbarCommand::ActivateTab { id } => {
             let id = TabId::from(id);
             let started = Instant::now();
-            if state.tabs.activate_at(id, started) {
-                activate_and_refresh(window, state, id);
+            if let Some(effect) = state.tabs.activate_at(id, started) {
+                activate_and_refresh(window, state, id, effect);
                 record_tab_latency(state, metrics::TabLatencyKind::Switch, id, started);
             }
         }
@@ -592,25 +613,30 @@ fn handle_toolbar_command(
 /// indicator, bookmark star, block-count badge, tab strip) up to date with
 /// the now-active tab. The caller must have already made `id` the active
 /// tab in `state.tabs` (`activate`/`activate_at`, `open`/`open_at`, or the
-/// replacement tab returned by `close`).
+/// replacement tab returned by `close`) and pass along the
+/// [`ActivationEffect`] that call reported.
 ///
-/// If `id` was suspended, this also resumes it: clears the suspended flag
-/// on the `Tabs` side and rebuilds its content webview (loading its last
-/// known URL) on the `BrowserWindow` side, instead of the plain visibility
-/// toggle used for an already-awake tab.
-fn activate_and_refresh(window: &mut BrowserWindow, state: &mut AppState, id: TabId) {
-    let was_suspended = state.tabs.active().is_suspended();
-    let result = if was_suspended {
-        state.tabs.active_mut().resume();
-        window.resume_tab(id, state.tabs.active().current_url())
-    } else {
-        window.activate_tab(id)
+/// `effect` decides which `BrowserWindow` call applies `id` on the webview
+/// side: [`ActivationEffect::Resume`] rebuilds a suspended tab's dropped
+/// webview (`resume_tab`, loading its last known URL); `Switch` just changes
+/// which already-live webview is visible (`activate_tab`). `Tabs` (not this
+/// function) is what already resolved the tab's state transition — see
+/// `browser::tabs::Tabs::resolve_activation` — so this only has to act on
+/// the answer.
+fn activate_and_refresh(
+    window: &mut BrowserWindow,
+    state: &mut AppState,
+    id: TabId,
+    effect: ActivationEffect,
+) {
+    let result = match effect {
+        ActivationEffect::Resume => window.resume_tab(id, state.tabs.active().current_url()),
+        ActivationEffect::Switch => window.activate_tab(id),
     };
     log_failure(
-        if was_suspended {
-            "resume tab"
-        } else {
-            "activate tab"
+        match effect {
+            ActivationEffect::Resume => "resume tab",
+            ActivationEffect::Switch => "activate tab",
         },
         result,
     );

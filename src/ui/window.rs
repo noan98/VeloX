@@ -21,6 +21,16 @@
 //! [`ContentTab`], which is what lets tab suspension ([`Self::suspend_tab`])
 //! drop a background tab's webview to reclaim memory without reshaping this
 //! struct, and [`Self::resume_tab`] rebuild it later — see [`ContentTab`].
+//!
+//! **Ownership boundary** (see `browser::tab` module doc comment and
+//! docs/decisions.md D20): `BrowserWindow` is the sole owner of every
+//! content `WebView`, keyed by [`crate::browser::TabId`] in `contents`
+//! below. `browser::Tab`/`Tabs` hold the *logical* lifecycle state
+//! (`browser::TabState`: active/background/suspended/restoring) that this
+//! type's `Option<WebView>` per tab must be kept consistent with — but
+//! `browser::` itself never references a `WebView` or any other
+//! `wry`/`tao`/`gtk` type. `app.rs` is what keeps the two in sync, always
+//! updating `Tabs` first and pushing the result here.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -602,7 +612,8 @@ impl BrowserWindow {
                 let title = title.trim();
                 if !title.is_empty() {
                     let _ = proxy.send_event(UserEvent::PageTitleResolved {
-                        id: history_id,
+                        tab_id,
+                        history_id,
                         title: title.to_owned(),
                     });
                 }

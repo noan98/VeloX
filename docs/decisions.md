@@ -795,6 +795,124 @@ for correlating records across separate process runs by wall-clock time. If
 a future consumer needs that, it is a small addition (an absolute
 `SystemTime`-based field alongside `ts_ms`, not a redesign) — revisit if
 Issue #14 or #36 turn out to need cross-run wall-clock correlation.
+## D20: Explicit tab lifecycle state machine, and the `Restoring` state's synchronous collapse
+
+**Scope**: issue #12 ("タブセッション状態とWebViewライフサイクルを整理"). Before
+this issue, a tab's lifecycle was two independent, implicit signals:
+`Tab::suspended: bool` and "is this id `Tabs::active`". Nothing stopped code
+from producing a state that made no sense (e.g. the active tab marked
+suspended), and there was no single place documenting which combinations
+were even meaningful. This issue replaces that with one explicit
+`browser::tab::TabState` enum — `Active` / `Background` / `Suspended` /
+`Restoring` — plus transition methods that reject an invalid move via
+`Result<TabState, InvalidTabTransition>` instead of leaving it to callers to
+avoid by convention.
+
+**The five valid edges** (see `TabState`'s doc comment for the diagram):
+`Active -> Background`, `Background -> Active`, `Restoring -> Active`,
+`Background -> Suspended`, `Suspended -> Restoring`. Every other pair —
+eleven combinations, including every self-transition — is rejected. Two
+existing guards fall out of this for free instead of needing a separate
+check: `Tabs::suspend` no longer special-cases "refuse the active tab" or
+"refuse an already-suspended tab" itself — `TabState::suspend` only accepts
+`Background`, so both cases are simply invalid transitions, caught in the
+same place every other invalid transition is.
+
+**Invariant `Tabs` upholds**: exactly one tab — the one at `Tabs`' internal
+active index — is ever `Active` or `Restoring`; every other tab is
+`Background` or `Suspended`. `Tab`'s transition methods are `pub(super)`,
+so `Tabs` is the only thing that can move a tab between states, and every
+`Tabs` method that changes which tab is active (`open`, `activate`, the
+replacement tab picked by `close`) routes through
+`Tabs::resolve_activation`, which is what upholds the invariant. This is
+also why `idle_background_tabs`/`next_idle_deadline` could drop their old
+`tab.id() != active` check in favor of `tab.state() == TabState::Background`
+— under the invariant, those are the same set of tabs, but the state check
+doesn't need `Tabs` to hand it `active` at all.
+
+**Why `Restoring` exists as a real state instead of being folded into
+`Active`**: resuming a suspended tab conceptually has two steps — "this tab
+was selected while suspended" and "its webview is now live" — and #25
+(session restore / crash recovery) is exactly the kind of future work that
+needs to represent a tab as selected-but-not-yet-showing-anything (e.g.
+while its persisted session is still being read from disk, well before any
+webview exists to rebuild). Modeling that later would mean revisiting this
+same enum a second time. So `Restoring` is defined now, with real edges
+(`Suspended -> Restoring -> Active`) and real unit test coverage for both
+edges independently.
+
+**Why every current caller still collapses it into one call
+(`Tab::resume`)**: `ui::window::BrowserWindow`'s webview rebuild
+(`build_gtk`/`build_as_child` inside `content_webview_builder`, called from
+`resume_tab`) is synchronous — wry hands back a `WebView` or an `Err`
+immediately, there is no "rebuild started, will finish later" callback to
+hook a state change to. Splitting `Suspended -> Restoring` and
+`Restoring -> Active` across two separate `app.rs`-visible calls today would
+add a state transition with no observable gap between its two halves — a
+distinction with no current caller, and therefore nothing to test beyond
+what `Tab::resume`'s own unit tests already assert (that it goes through
+`begin_restore` before landing on `Active`, and that it is rejected if the
+tab was not `Suspended` to begin with). If a future issue makes the rebuild
+genuinely asynchronous, `Tab::begin_restore` and `Tab::activate` already
+exist as the two calls to spread across that gap — this issue is scoped to
+defining that seam, not building the async machinery behind it.
+
+**`ActivationEffect`, and why `browser::tabs` doesn't call into `ui::window`
+itself**: `Tabs::activate`/`activate_at`/`close` return
+`Option<browser::ActivationEffect>` (`Switch` or `Resume`) instead of the
+old bare `bool`/`Option<TabId>`, so `app.rs` knows whether the tab it just
+made active needs `BrowserWindow::activate_tab` (already has a live webview)
+or `BrowserWindow::resume_tab` (webview was dropped, rebuild it) — without
+re-deriving that from `Tab::is_suspended()` after the fact, which would
+already be stale by the time `Tabs` finishes resolving the transition.
+`browser::tabs` still has zero knowledge of `wry`/`ui::window` itself (see
+the ownership boundary below); it only ever reports *which* webview
+operation is needed, never performs one.
+
+**WebView ownership — restated explicitly, not just implied by module
+structure**: `browser::` (including `Tab`/`Tabs`) never holds, imports, or
+references a web engine handle of any kind — no `wry`/`tao`/`gtk` types
+appear anywhere under `src/browser/`, checked simply by `browser::` having
+no such dependency in its `use` statements (`Cargo.toml`'s `wry`/`tao`
+dependencies are only ever imported under `src/ui/` and `src/app.rs`). The
+actual content `WebView` for a tab is owned exclusively by
+`ui::window::BrowserWindow`, in its `contents: HashMap<TabId, ContentTab>`.
+`Tab::state` and `ui::window`'s `ContentTab::webview: Option<WebView>` are
+two independent representations of the same underlying fact (does this
+tab's content currently have a live webview), kept in sync by `app.rs`
+always updating `Tabs` first and then pushing the result into
+`BrowserWindow` (already established by D8; unchanged here) — this issue
+does not merge the two representations into one, since doing so would give
+`browser::` a `wry` dependency, which is exactly the coupling the issue
+asks to avoid ("タブ状態がUI/WebView実装から過度に結合されていない").
+
+**Event delivery safety**: `Tabs::get`/`get_mut` already returned `None` for
+an unknown `TabId` before this issue (never panicked); what this issue adds
+is explicit test coverage for the case the issue calls out by name — a
+`TabId` for a tab that has since been *closed*, not just one that never
+existed (`stale_tab_id_lookups_return_none_instead_of_panicking` in
+`browser::tabs::tests`) — across every `Tabs` method a stale id can reach
+(`get`, `get_mut`, `activate`, `activate_at`, `suspend`, `close`). Separately,
+`UserEvent::PageTitleResolved` gained a `tab_id: TabId` field (previously
+only the history entry's own `u64` id) so a resolved title can be routed
+back to the originating `Tab` (`Tab::title`, new this issue) through the
+same `Tabs::get_mut` — a closed tab's id is silently ignored there exactly
+like every other tab-addressed event.
+
+**New `Tab` fields, and what's deliberately not built on top of them yet**:
+`title: Option<String>` and `favicon: browser::Favicon` (`Unknown` or
+`Url(String)`) are added as state, cleared on every `on_navigation_started`
+so a stale value is never shown as if it described the page now loading.
+`title` is wired up minimally (set from `UserEvent::PageTitleResolved`,
+which was already being fetched for the history panel — see D12) as a
+demonstration that the field is real and reachable, not dead code; actually
+*rendering* a title or favicon in the tab strip is explicitly deferred to
+#11, per the issue's own scope note. `last_active`/`last_active_at` already
+existed (D9) and are unchanged — they double as the "how stale is this
+tab" signal a future #25 restore policy would want, alongside `current_url`
+and `TabState` itself (was this tab suspended when the session ended).
+Actually persisting any of this to disk is #25's own decision to make, not
+this issue's.
 
 ## D21: Benchmark suite (#14) — pure aggregation module + separate, unverifiable-headless runner binary
 
