@@ -433,3 +433,20 @@ disabled path stays effectively free.
 The layering matters more than any single hook: measurements attach to the
 application layer, so swapping or tuning the engine below does not invalidate
 them.
+
+### Benchmark suite (Issue #14)
+
+`src/browser/benchmark.rs` is the consumer side of the JSON Lines schema
+above: it parses `VELOX_PERF_FORMAT=json` output, computes summary
+statistics (median/p95/mean/stddev) over repeated trials, and diffs two
+saved result files for regression detection. Like the rest of
+`src/browser/`, it is pure Rust with no process/WebView dependency, so it is
+fully covered by `cargo test`. `src/bin/velox-bench.rs` is the separate,
+deliberately unverifiable-headless runner binary that actually launches
+`velox` N times and feeds its output through `benchmark.rs`; see
+`docs/benchmarking.md` for the full methodology (scenarios, trial/warmup
+policy, fixed test pages, exact commands, and what could and could not be
+verified in this project's headless dev/CI environment). Issue #36's
+CI regression check is expected to call `velox-bench compare`, whose exit
+code (`0` = no regression, `1` = a metric regressed beyond
+`--threshold-pct`) is the hook it consumes.
