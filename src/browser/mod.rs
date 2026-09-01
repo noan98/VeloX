@@ -15,6 +15,7 @@ pub mod downloads;
 pub mod history;
 pub mod metrics;
 pub mod navigation;
+pub mod omnibox;
 pub mod perf_log;
 pub mod persistence;
 pub mod tab;
@@ -27,5 +28,6 @@ pub use history::{
     date_bucket, group_by_date, search as search_history, HistoryDateBucket, HistoryEntry,
     HistoryGroup, HistoryStore,
 };
+pub use omnibox::{Candidate, CandidateKind, CandidateSource};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};

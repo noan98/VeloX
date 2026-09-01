@@ -1280,6 +1280,126 @@ backends' call sites, and their semantics) and by the existing
 call opening a new VeloX tab has not been observed running, since there is
 no display to run VeloX against here.
 
+## D26: Omnibox foundation (#15) — URL-vs-search split, default search engine, dangerous input, dropdown as a third `Panel`
+
+**Scope**: issue #15 asked for the omnibox *foundation* only — input
+classification, a configurable search engine, a candidate-list UI with the
+two built-in candidates ("load as URL" / "search"), and
+Ctrl/Cmd+L/↑/↓/Enter/Esc. History/bookmark candidates and ranking are #20's
+job; see `docs/architecture.md`'s "Omnibox and search" section for the full
+design and the exact interface #20 builds against
+(`browser::omnibox::CandidateSource`).
+
+**Classification lives beside `normalize_input`, never duplicates it.**
+`browser::navigation::classify_input` is the one function that decides URL
+vs. search (`Intent::Url`/`Intent::Search`/`None`); for the URL case it does
+nothing but call the pre-existing `normalize_input` and wrap the result.
+This was a hard requirement, not just tidiness: `normalize_input` is also
+where scheme allow-listing/rejection lives (`ALLOWED_SCHEMES`, D-nothing —
+predates decision numbering), and having two functions independently decide
+"is this scheme safe to load" is exactly the kind of drift that eventually
+lets something slip through one path and not the other.
+
+**A URL `normalize_input` refuses is refused outright, not retried as a
+search.** `classify_input("javascript://alert(1)")` is `None`, the same as
+`normalize_input`'s own answer — it is *not* turned into "search DuckDuckGo
+for `javascript://alert(1)`". Two reasons: (1) the issue explicitly asks for
+"危険スキームは拒否 (既存の挙動を壊さないこと)", which reads as "refused
+stays refused", not "refused becomes something else"; (2) blurring "this
+input was refused" into "this input was silently reinterpreted" makes the
+one rejection path in `normalize_input` harder to reason about as the
+single source of truth — every other caller of `classify_input` can keep
+assuming `None` means "nothing to do", not "something unexpected happened
+instead." A search query built from percent-encoded text is not itself
+unsafe (it never reaches a scheme check), but the *decision* to silently
+reinterpret a refusal is what this avoids.
+
+**Heuristic for "does a single word look like a URL" — `looks_url_like`**:
+contains `:` or `.`. This is deliberately coarse (a bare word with neither,
+e.g. `rust`, is a search; anything with either is at least attempted as a
+URL via `normalize_input`, which is the real arbiter). The alternative —
+trying to recognize real TLDs, or requiring a minimum label count — adds a
+maintenance burden (a TLD list going stale) for a heuristic that only ever
+gates whether `normalize_input` is *attempted*, never whether something is
+accepted. Not covered by this heuristic and left to `normalize_input`'s
+existing behavior: a single word with a dot but no real TLD (`3.14`) parses
+as a URL syntactically and is treated as one — this predates #15 and is
+unchanged by it.
+
+**Behavior change worth calling out**: before #15,
+`ToolbarCommand::Navigate` called `normalize_input` directly, so typing a
+bare word like `rust` and hitting Enter attempted to load `https://rust/`
+(almost certainly a dead navigation). After #15 it calls
+`app::resolve_navigate_target`, which goes through `classify_input` first,
+so the same input now searches instead. This is the intended fix for the
+issue's "検索語を入力して設定した検索エンジンで検索できる" acceptance
+criterion — not a regression — but is called out explicitly since it does
+change what a real user's existing habits produce.
+
+**Default search engine: DuckDuckGo.** `config::SearchEngine::duckduckgo()`
+(`https://duckduckgo.com/?q={}`), selectable away via `VELOX_SEARCH_ENGINE`
+or a fully custom `VELOX_SEARCH_ENGINE_NAME`/`VELOX_SEARCH_ENGINE_URL` pair.
+Chosen for the same reason VeloX already ships whole-app private browsing
+(D14) and content blocking (D17) rather than leaving both to extensions:
+DuckDuckGo does not build an ad-profile from search history by default,
+which fits a browser whose other defaults already lean toward "does not
+track the user by default" — a coherent product stance, not a bolt-on.
+Google/Bing/Startpage/Ecosia are one-line presets alongside it (`SearchEngine::preset`)
+for anyone who wants a different default without hand-writing a query
+template; nothing about the omnibox itself favors DuckDuckGo beyond being
+the out-of-the-box choice.
+
+**Query encoding: `url::form_urlencoded`, not hand-rolled percent-encoding.**
+`build_search_url` calls `url::form_urlencoded::byte_serialize` (spaces
+become `+`, reserved characters are escaped) rather than writing a
+percent-encoder — `url` is already a dependency (used throughout
+`navigation.rs`) and this is exactly the encoding real search engines expect
+for a `?q=` parameter (`application/x-www-form-urlencoded`), so there is no
+reason to introduce a second, subtly-different encoding scheme by hand.
+
+**Candidate dropdown reuses `Panel`, not a new layout mechanism.** The
+omnibox needs a resizable area under the address bar to show candidate
+rows — exactly what D11 already built for the history/bookmarks panel
+(`BrowserWindow::set_panel`/`sync_layout`, growing the toolbar webview's
+native bounds). Rather than inventing a second grow-the-webview mechanism,
+`ui::toolbar::Panel` gained a third variant, `Omnibox`, and
+`ToolbarCommand::OmniboxInput`/`OmniboxClose` just call the existing
+`set_panel`. This means `window.rs`'s layout code (`effective_toolbar_height`,
+`sync_layout`) needed **zero changes** for this issue — deliberately, since
+`src/ui/window.rs` is a hotspot three issues are editing concurrently this
+cycle. The tradeoff: `Panel` (used by `ToolbarCommand::TogglePanel`, a
+user-facing button toggle) now has a variant no button ever sends; the
+`TogglePanel` handler's `match` treats `Some(Panel::Omnibox)` as a no-op
+alongside `None` rather than pattern-matching it away, since IPC input is
+untrusted and a stray `{"cmd":"toggle_panel","panel":"omnibox"}` must not
+panic.
+
+**Ctrl/Cmd+L wired through both keyboard channels, following D18/D23's
+existing pattern exactly**: `ToolbarCommand::FocusAddressBar` (trusted
+toolbar webview, sent directly from its own capture-phase `keydown`
+listener) and `ui::window::ContentShortcut::FocusAddressBar` (untrusted
+content webview, a new fixed sentinel string
+`velox:focus-address-bar` — never JSON, matching every other content
+shortcut). Both land on one shared `app::focus_address_bar`, which calls a
+new `BrowserWindow::focus_address_bar`: `WebView::focus()` (confirmed
+present on every backend VeloX ships on — WebKitGTK/WKWebView/WebView2 —
+in wry 0.56.1's source under `~/.cargo/registry`) to move native keyboard
+focus to the toolbar webview, then a forced JS update
+(`veloxFocusAddressBar`) that overwrites the address bar's value and
+selects it even while already focused — unlike `veloxSetUrl`, which
+deliberately skips updating a focused field to preserve an in-progress
+edit. The same forced-update function backs `OmniboxClose` (Esc): close the
+dropdown, then restore-and-select the tab's actual current URL, since Esc
+must discard whatever the user was mid-typing.
+
+**What's unverified**: same headless-environment caveat as D22/D25 —
+`WebView::focus()`'s existence and per-backend behavior was confirmed by
+reading wry 0.56.1's source, and the whole feature is covered by unit tests
+for its pure logic (`classify_input`, `build_search_url`, `build_candidates`,
+`resolve_search_engine`) plus the JS-embedding/IPC-parsing tests the rest of
+the toolbar protocol already has, but no one has actually typed into the
+address bar, watched the dropdown open, or pressed Ctrl+L against a running
+window — there is no display to run VeloX against here.
 ## D27: `HistoryEntry` grows `favicon`/`visit_count` — additive to D4's de-duplication, not a redesign of it
 
 **Scope**: issue #18's "URL / title / favicon / visited_at / visit_count"

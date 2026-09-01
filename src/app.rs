@@ -15,9 +15,10 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
 use crate::browser::downloads;
+use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::{
-    metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore,
+    metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkEntry, BookmarkStore,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryEntry, HistoryStore,
     TabId, Tabs,
 };
@@ -610,7 +611,16 @@ fn handle_toolbar_command(
     command: ToolbarCommand,
 ) {
     match command {
-        ToolbarCommand::Navigate { input } => match navigation::normalize_input(&input) {
+        // Resolved via `navigation::classify_input` — the single place that
+        // decides URL vs. search (see docs/decisions.md D26) — rather than
+        // `navigation::normalize_input` directly, so a search query typed
+        // and submitted with no candidate-dropdown interaction still goes
+        // to the search engine instead of being rejected outright. `input`
+        // here is also what a history/bookmark/candidate row click sends
+        // (already a resolved URL, e.g. `Candidate::target_url`):
+        // `classify_input` treats an already-absolute `https://…` URL as
+        // `Intent::Url` unchanged, so this one path serves both cases.
+        ToolbarCommand::Navigate { input } => match resolve_navigate_target(config, &input) {
             Some(url) => {
                 state.tabs.active_mut().on_navigation_started(&url);
                 log_failure("navigate", window.navigate(&url));
@@ -713,7 +723,11 @@ fn handle_toolbar_command(
                 Some(Panel::History) => refresh_history_panel(window, state, config),
                 Some(Panel::Bookmarks) => refresh_bookmarks_panel(window, state),
                 Some(Panel::Downloads) => refresh_downloads_panel(window, state),
-                None => {}
+                // The toolbar's own UI never sends `toggle_panel` for this
+                // variant (it is opened/closed only via
+                // `OmniboxInput`/`OmniboxClose`, which push their own
+                // content); nothing to refresh here even if it somehow was.
+                Some(Panel::Omnibox) | None => {}
             }
         }
         ToolbarCommand::DeleteHistoryEntry { id } => {
@@ -757,7 +771,63 @@ fn handle_toolbar_command(
                 refresh_downloads_panel(window, state);
             }
         }
+        // --- Omnibox (Issue #15) ---
+        ToolbarCommand::FocusAddressBar => focus_address_bar(window, state),
+        ToolbarCommand::OmniboxInput { input } => {
+            // No `CandidateSource`s yet — #20 wires history/bookmark
+            // sources in here (see `browser::omnibox::CandidateSource`'s
+            // doc comment for exactly what it implements).
+            let candidates = omnibox::build_candidates(
+                &input,
+                &config.search_engine.name,
+                &config.search_engine.query_template,
+                &[],
+                omnibox::DEFAULT_CANDIDATE_LIMIT,
+            );
+            let open = if candidates.is_empty() {
+                None
+            } else {
+                Some(Panel::Omnibox)
+            };
+            log_failure("toggle omnibox panel", window.set_panel(open));
+            log_failure(
+                "update omnibox candidates",
+                window.set_candidates(&candidates),
+            );
+        }
+        ToolbarCommand::OmniboxClose => {
+            log_failure("close omnibox", window.set_panel(None));
+            focus_address_bar(window, state);
+        }
     }
+}
+
+/// Resolve what `ToolbarCommand::Navigate`'s raw `input` should actually
+/// load: [`navigation::classify_input`] decides URL vs. search, and a
+/// search intent is turned into the configured search engine's URL via
+/// [`navigation::build_search_url`]. `None` covers every way this can fail
+/// to resolve — empty input, a rejected scheme, or (in practice never, since
+/// `Config`'s template always contains the required placeholder) a broken
+/// search-engine template.
+fn resolve_navigate_target(config: &Config, input: &str) -> Option<String> {
+    match navigation::classify_input(input)? {
+        Intent::Url(url) => Some(url),
+        Intent::Search(query) => {
+            navigation::build_search_url(&config.search_engine.query_template, &query)
+        }
+    }
+}
+
+/// Focus the toolbar's address bar and select the active tab's current URL
+/// — shared by `ToolbarCommand::FocusAddressBar` (Ctrl/Cmd+L from the
+/// toolbar), `ContentShortcut::FocusAddressBar` (Ctrl/Cmd+L from a content
+/// webview), and `ToolbarCommand::OmniboxClose` (Esc, which also needs the
+/// address bar restored to the real current URL).
+fn focus_address_bar(window: &mut BrowserWindow, state: &AppState) {
+    log_failure(
+        "focus address bar",
+        window.focus_address_bar(state.tabs.active().current_url()),
+    );
 }
 
 /// Open a new tab at `url` and make it active. The one path every "open a
@@ -872,6 +942,7 @@ fn handle_content_shortcut(
             let effect = state.tabs.activate_last(started);
             apply_activation(window, state, effect, started);
         }
+        ContentShortcut::FocusAddressBar => focus_address_bar(window, state),
     }
 }
 
