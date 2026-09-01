@@ -2,12 +2,13 @@
 //!
 //! Most of this module is plain Rust state and pure functions, which keeps
 //! it unit-testable without spawning a window: `navigation`, `tab`,
-//! `history` and `bookmarks` hold no filesystem or UI dependency.
-//! `persistence` and `perf_log` are the exceptions — thin, deliberately
-//! "dumb" IO layers (JSON files for `persistence`; stderr/a file for
-//! `perf_log`'s [`metrics::PerfRecord`] lines); see their module doc
-//! comments.
+//! `history`, `bookmarks` and `benchmark` hold no filesystem or UI
+//! dependency. `persistence` and `perf_log` are the exceptions — thin,
+//! deliberately "dumb" IO layers (JSON files for `persistence`; stderr/a
+//! file for `perf_log`'s [`metrics::PerfRecord`] lines); see their module
+//! doc comments.
 
+pub mod benchmark;
 pub mod blocklist;
 pub mod bookmarks;
 pub mod history;

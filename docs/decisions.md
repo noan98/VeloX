@@ -795,3 +795,96 @@ for correlating records across separate process runs by wall-clock time. If
 a future consumer needs that, it is a small addition (an absolute
 `SystemTime`-based field alongside `ts_ms`, not a redesign) — revisit if
 Issue #14 or #36 turn out to need cross-run wall-clock correlation.
+
+## D21: Benchmark suite (#14) — pure aggregation module + separate, unverifiable-headless runner binary
+
+**Scope**: Issue #14's acceptance criteria on top of D16/D19's perf-metrics
+foundation: run the same benchmark multiple times, compute a representative
+value (median/p95), save results and compare against a past run, and record
+the benchmark conditions in docs. This project's dev/CI environment is
+headless (no display), so "actually launch VeloX and measure it" cannot be
+exercised or verified here — the design has to make that limitation not
+block the acceptance criteria that *can* be verified.
+
+**Split into a pure module (`src/browser/benchmark.rs`) and a separate
+runner binary (`src/bin/velox-bench.rs`), the same shape as
+`browser::metrics` / `browser::perf_log`**: the acceptance criteria that
+matter most — "run repeatedly", "compute a representative value", "compare
+saved results" — are all pure arithmetic over already-produced JSON Lines,
+with no dependency on a display, a running VeloX process, or the OS process
+tree. Putting that arithmetic in `src/browser/` (rather than inline in a
+`src/bin/` binary) means `cargo test` exercises every acceptance criterion
+that is testable at all, in this headless environment, with no `#[ignore]`s
+and no skipped tests. The runner binary is intentionally thin: spawn the
+`velox` binary, wait, read back its `VELOX_PERF_OUTPUT` file, hand it to
+`benchmark::aggregate_trials`. It cannot be exercised end-to-end here (the
+child process fails to create a window — observed as a GTK init panic in
+this container), but that failure path was smoke-tested to confirm
+`velox-bench` itself does not crash and does not write a fabricated
+"successful" result: it reports zero collected records and exits `1`. The
+`aggregate`/`compare`/`list-scenarios` subcommands need no display at all
+and were smoke-tested directly with synthetic JSON Lines fixtures.
+
+**Scenario catalog is data, not behavior**: `benchmark::scenario::Scenario`
+enumerates the fixed set Issue #14 names (cold/warm startup, first page
+load, navigation, tab create/switch, and one `TabCountMemory(n)` variant per
+`n` in `[1, 5, 10, 20, 50]`), plus `is_unattended()` marking which three of
+those `velox-bench run` can drive without any interaction beyond "launch and
+wait". This is the one source of truth `velox-bench list-scenarios` and
+`docs/benchmarking.md` both read from, so the scenario list cannot drift
+between the CLI's `--scenario` validation and the documentation.
+
+**No automation hook added for tab creation/navigation from outside the
+process**: driving those from `velox-bench` would need either a CLI flag
+(e.g. "open N tabs at startup") or an external IPC surface into
+`app::handle_toolbar_command`, and this Issue's tasking explicitly forbids
+touching `src/app.rs`/`src/browser/tab.rs`/`src/browser/tabs.rs` (concurrent
+Issue #12 rework of the same files). Rather than route around that with a
+parallel, un-reviewed mechanism, those scenarios are implemented as data
+model + aggregation only; real measurement is deferred to manual collection
+(documented in `docs/benchmarking.md`) or a follow-up Issue that can safely
+touch `app.rs` once #12 lands. `Scenario::is_unattended()` makes this
+boundary explicit and enforced (`velox-bench run` refuses the other
+scenarios with a message pointing at `aggregate`) rather than silently
+producing an empty/misleading result.
+
+**Comparison uses the median as the single regression signal, not p95**:
+`compare()` reduces each side to one number (`Stats::median`) per metric and
+flags a regression when the percentage increase exceeds a caller-supplied
+threshold. `p95` is kept in the saved `Stats` for manual inspection but not
+used as the automated pass/fail signal — on a shared/noisy runner (the kind
+Issue #36's CI is likely to use) the 95th percentile of a small trial count
+is exactly the tail that jitters the most, which would make the regression
+check noisy rather than useful. This is a judgment call worth revisiting
+once #36 has real CI-runner noise data to look at.
+
+**No new dependency; hand-rolled RFC 3339 timestamp formatting**: CLI
+argument parsing in `velox-bench` follows the same `--flag value` policy as
+`Config::from_env_and_args` (D6: every dependency needs a clear, singular
+job; a CLI-parsing crate is not worth it for four subcommands). Filling
+`RunEnvironment::generated_at` needs a wall-clock date, and no time/calendar
+crate is in the dependency tree; `benchmark::format_unix_time_utc` uses
+Howard Hinnant's public-domain `civil_from_days` algorithm (a few lines of
+integer arithmetic converting a day count into a proleptic-Gregorian date),
+verified in this module's tests against `date -u -d @<epoch> ...` output for
+several known timestamps. Kept as a pure `i64 -> String` function (not
+reading `SystemTime` itself) so it stays deterministically testable; only
+`velox-bench`'s `main` reads the real clock.
+
+**Fixed test pages are static local HTML, not network URLs**: Issue #14
+asks for "固定したテストページ/シナリオ" (fixed test pages/scenarios).
+`scripts/bench/pages/{minimal,text,dom_heavy}.html` are static, offline,
+`file://`-openable fixtures (a near-empty page, a 200-paragraph text page,
+and a 5000-node DOM page) rather than real internet URLs, so a benchmark run
+never depends on network conditions or a third-party site's own performance
+changing out from under a comparison.
+
+**Cost / revisit condition**: the two biggest open gaps are (1) no verified
+real-world startup/navigation/tab numbers from this project, since the dev
+environment cannot launch VeloX at all, and (2) no automated driver for
+tab-count/navigation scenarios. Both should be revisited together: whoever
+next touches `app.rs` after Issue #12 lands is well-positioned to add a
+minimal "open N tabs at startup" CLI hook that `velox-bench` can drive, and
+the first real GUI-capable run of `velox-bench run` should be treated as
+this project's first authoritative baseline numbers, not something to
+backfill by estimation.
