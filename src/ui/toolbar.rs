@@ -18,7 +18,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::browser::{BookmarkEntry, DownloadEntry, HistoryEntry};
+use crate::browser::{BookmarkEntry, DownloadEntry, HistoryGroup};
 
 /// The static HTML/CSS/JS that renders the toolbar.
 pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
@@ -82,6 +82,14 @@ pub enum ToolbarCommand {
     },
     /// Remove every history entry ("clear history" in the panel).
     ClearHistory,
+    /// The history panel's search box changed. `query` is the raw typed
+    /// text; an empty `query` means "search cleared", which `app.rs`
+    /// answers by going back to the normal recency-ordered panel instead of
+    /// an (empty, since `browser::history::search` treats `""` as "match
+    /// nothing" — see docs/decisions.md D30) search result list.
+    SearchHistory {
+        query: String,
+    },
     /// Remove one bookmark (the "x" next to a row in the bookmarks panel).
     RemoveBookmark {
         id: u64,
@@ -222,13 +230,15 @@ pub fn set_panel_script(panel: Option<Panel>) -> String {
     format!("veloxSetPanel({arg});")
 }
 
-/// JS snippet that replaces the history panel's contents.
+/// JS snippet that replaces the history panel's contents, as date-grouped
+/// sections (see `browser::history::group_by_date` / docs/decisions.md D29).
 ///
-/// Entries are serialized as JSON, which embeds as-is inside `evaluate_script`
-/// (an array/object JSON literal is valid JS syntax); URLs and titles never
-/// need separate escaping the way [`set_url_script`]'s bare string does.
-pub fn set_history_script(entries: &[&HistoryEntry]) -> String {
-    format!("veloxSetHistory({});", entries_to_json(entries))
+/// Groups (and their nested entries) are serialized as JSON, which embeds
+/// as-is inside `evaluate_script` (an array/object JSON literal is valid JS
+/// syntax); URLs and titles never need separate escaping the way
+/// [`set_url_script`]'s bare string does.
+pub fn set_history_script(groups: &[HistoryGroup<'_>]) -> String {
+    format!("veloxSetHistory({});", entries_to_json(groups))
 }
 
 /// JS snippet that replaces the bookmarks panel's contents.
@@ -252,6 +262,7 @@ fn entries_to_json<T: Serialize>(entries: &[T]) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::{HistoryDateBucket, HistoryEntry};
 
     #[test]
     fn parses_navigate_command() {
@@ -339,6 +350,18 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"clear_history"}"#).unwrap(),
             ToolbarCommand::ClearHistory
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"search_history","query":"rust"}"#).unwrap(),
+            ToolbarCommand::SearchHistory {
+                query: "rust".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"search_history","query":""}"#).unwrap(),
+            ToolbarCommand::SearchHistory {
+                query: String::new()
+            }
         );
         assert_eq!(
             parse_command(r#"{"cmd":"remove_bookmark","id":7}"#).unwrap(),
@@ -472,17 +495,26 @@ mod tests {
     }
 
     #[test]
-    fn history_script_embeds_entries_as_json() {
+    fn history_script_embeds_groups_and_entries_as_json() {
         let entry = HistoryEntry {
             id: 1,
             url: "https://example.com/".to_owned(),
             title: Some("Example".to_owned()),
             visited_at: 100,
+            favicon: Some("https://example.com/favicon.ico".to_owned()),
+            visit_count: 3,
         };
-        let script = set_history_script(&[&entry]);
+        let groups = [HistoryGroup {
+            bucket: HistoryDateBucket::Today,
+            entries: vec![&entry],
+        }];
+        let script = set_history_script(&groups);
         assert!(script.starts_with("veloxSetHistory("));
+        assert!(script.contains(r#""bucket":"today""#));
         assert!(script.contains(r#""url":"https://example.com/""#));
         assert!(script.contains(r#""title":"Example""#));
+        assert!(script.contains(r#""favicon":"https://example.com/favicon.ico""#));
+        assert!(script.contains(r#""visit_count":3"#));
     }
 
     #[test]
@@ -492,8 +524,14 @@ mod tests {
             url: r#"https://example.com/?q="a"</script>"#.to_owned(),
             title: Some(r#"a"b\c"#.to_owned()),
             visited_at: 1,
+            favicon: None,
+            visit_count: 1,
         };
-        let script = set_history_script(&[&entry]);
+        let groups = [HistoryGroup {
+            bucket: HistoryDateBucket::Older,
+            entries: vec![&entry],
+        }];
+        let script = set_history_script(&groups);
         // A double quote inside a JSON string value must be escaped, so the
         // string never terminates early.
         assert!(script.contains(r#"\"a\""#));
@@ -603,6 +641,7 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("toggle_panel"));
         assert!(TOOLBAR_HTML.contains("delete_history_entry"));
         assert!(TOOLBAR_HTML.contains("clear_history"));
+        assert!(TOOLBAR_HTML.contains("search_history"));
         assert!(TOOLBAR_HTML.contains("remove_bookmark"));
         // Keyboard shortcuts (see docs/decisions.md D23): the toolbar's own
         // capture-phase keydown listener, for when the address bar/panel

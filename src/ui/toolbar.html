@@ -250,6 +250,28 @@
     font-size: 12px;
     color: var(--dim-fg);
   }
+  .panel-search {
+    flex: none;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .panel-search input {
+    box-sizing: border-box;
+    width: 100%;
+    height: 26px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--field-bg);
+    color: var(--fg);
+    font-size: 12px;
+  }
+  .panel-group-header {
+    padding: 6px 12px 2px;
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--dim-fg);
+  }
   .panel-rows {
     flex: 1;
     min-height: 0;
@@ -370,6 +392,10 @@
       <span>履歴</span>
       <button id="history-clear">すべて削除</button>
     </div>
+    <div class="panel-search">
+      <input id="history-search" type="text" spellcheck="false" autocomplete="off"
+             placeholder="履歴を検索 (URL・タイトル)" />
+    </div>
     <div id="history-rows" class="panel-rows"></div>
   </div>
   <div id="panel-bookmarks" class="panel-list" hidden>
@@ -396,6 +422,7 @@
   const bookmarksPanelEl = document.getElementById("panel-bookmarks");
   const historyRowsEl = document.getElementById("history-rows");
   const bookmarksRowsEl = document.getElementById("bookmarks-rows");
+  const historySearchEl = document.getElementById("history-search");
   const downloadsPanelEl = document.getElementById("panel-downloads");
   const downloadsRowsEl = document.getElementById("downloads-rows");
 
@@ -422,6 +449,21 @@
   });
   document.getElementById("history-clear").addEventListener("click", () => {
     send({ cmd: "clear_history" });
+  });
+  /* Sent on every keystroke; `app.rs` treats an empty query as "search
+     cleared" and falls back to the normal recency-ordered panel — see
+     docs/decisions.md D30. The panel's own dataset is small enough (capped
+     at config.history_panel_limit server-side either way) that no
+     client-side debounce is needed. */
+  historySearchEl.addEventListener("input", () => {
+    send({ cmd: "search_history", query: historySearchEl.value });
+  });
+  historySearchEl.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      historySearchEl.value = "";
+      send({ cmd: "search_history", query: "" });
+      historySearchEl.blur();
+    }
   });
   document.getElementById("downloads-toggle").addEventListener("click", () => {
     send({ cmd: "toggle_panel", panel: "downloads" });
@@ -574,6 +616,40 @@
     }
   }
 
+  /* One history/bookmark row. Shared by the flat bookmarks list and the
+     date-grouped history list below. */
+  function createPanelRow(entry, opts) {
+    const row = document.createElement("div");
+    row.className = "panel-row";
+
+    const link = document.createElement("button");
+    link.className = "panel-row-link";
+    link.textContent = entry.title && entry.title.length > 0 ? entry.title : entry.url;
+    /* visit_count (Issue #18/D27) is surfaced here rather than as its own
+       column: it is "reload count of this entry", a detail worth a look on
+       hover, not a number every row needs to shout. */
+    link.title = entry.visit_count > 1
+      ? `${entry.url} (訪問回数: ${entry.visit_count})`
+      : entry.url;
+    link.addEventListener("click", () => send({ cmd: "navigate", input: entry.url }));
+
+    const meta = document.createElement("span");
+    meta.className = "panel-row-meta";
+    meta.textContent = formatTimestamp(opts.timestamp(entry));
+
+    const del = document.createElement("button");
+    del.className = "panel-row-delete";
+    del.textContent = "×";
+    del.title = "削除";
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      send(opts.deleteMessage(entry));
+    });
+
+    row.append(link, meta, del);
+    return row;
+  }
+
   function renderRows(container, entries, opts) {
     container.replaceChildren();
     if (entries.length === 0) {
@@ -584,35 +660,47 @@
       return;
     }
     for (const entry of entries) {
-      const row = document.createElement("div");
-      row.className = "panel-row";
-
-      const link = document.createElement("button");
-      link.className = "panel-row-link";
-      link.textContent = entry.title && entry.title.length > 0 ? entry.title : entry.url;
-      link.title = entry.url;
-      link.addEventListener("click", () => send({ cmd: "navigate", input: entry.url }));
-
-      const meta = document.createElement("span");
-      meta.className = "panel-row-meta";
-      meta.textContent = formatTimestamp(opts.timestamp(entry));
-
-      const del = document.createElement("button");
-      del.className = "panel-row-delete";
-      del.textContent = "×";
-      del.title = "削除";
-      del.addEventListener("click", (event) => {
-        event.stopPropagation();
-        send(opts.deleteMessage(entry));
-      });
-
-      row.append(link, meta, del);
-      container.appendChild(row);
+      container.appendChild(createPanelRow(entry, opts));
     }
   }
 
-  window.veloxSetHistory = (entries) => {
-    renderRows(historyRowsEl, entries, {
+  /* bucket names match `browser::history::HistoryDateBucket`'s
+     `#[serde(rename_all = "snake_case")]` wire format exactly. */
+  const HISTORY_BUCKET_LABELS = {
+    today: "今日",
+    yesterday: "昨日",
+    last_7_days: "過去7日",
+    older: "それ以前",
+  };
+
+  /* `groups` is `[{ bucket, entries: [...] }, ...]`, as built by
+     `browser::history::group_by_date` and sent by
+     `ui::toolbar::set_history_script` — see docs/decisions.md D29. Renders
+     one section heading per group, in the order Rust already grouped them
+     (newest first, so today/yesterday/last-7-days/older in that order). */
+  function renderHistoryGroups(container, groups, opts) {
+    container.replaceChildren();
+    const total = groups.reduce((sum, group) => sum + group.entries.length, 0);
+    if (total === 0) {
+      const empty = document.createElement("div");
+      empty.className = "panel-empty";
+      empty.textContent = opts.emptyText;
+      container.appendChild(empty);
+      return;
+    }
+    for (const group of groups) {
+      const header = document.createElement("div");
+      header.className = "panel-group-header";
+      header.textContent = HISTORY_BUCKET_LABELS[group.bucket] || group.bucket;
+      container.appendChild(header);
+      for (const entry of group.entries) {
+        container.appendChild(createPanelRow(entry, opts));
+      }
+    }
+  }
+
+  window.veloxSetHistory = (groups) => {
+    renderHistoryGroups(historyRowsEl, groups, {
       emptyText: "履歴はありません",
       timestamp: (entry) => entry.visited_at,
       deleteMessage: (entry) => ({ cmd: "delete_history_entry", id: entry.id }),

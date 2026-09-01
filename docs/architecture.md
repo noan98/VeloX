@@ -104,14 +104,32 @@ gates via `AppState::history_enabled` — see docs/decisions.md D13 and the
 "Private browsing" section below. Recording is not limited to the active
 tab: every tab's `LoadFinished` runs through this same path, so a page
 finishing in a background tab is recorded too. The entry is
-created with `title: None` immediately (the store's own de-duplication
-collapses a reload into updating that same entry rather than creating a
-new one); `BrowserWindow::fetch_page_title` then asynchronously reads
-`document.title` from *that tab's* content webview (a no-op if the tab is
-suspended and has none) and reports it back as
-`UserEvent::PageTitleResolved { id, title }`, which fills in the title once
-it arrives (see docs/decisions.md D12 for why this is async and
-best-effort).
+created with `title: None`/`favicon: None` and `visit_count: 1` immediately
+(the store's own de-duplication collapses a reload into updating that same
+entry — bumping `visit_count` — rather than creating a new one; see
+docs/decisions.md D27 for what `visit_count` does and does not count).
+`BrowserWindow::fetch_page_title`/`fetch_favicon` then asynchronously read
+`document.title` and a favicon URL from *that tab's* content webview (a
+no-op if the tab is suspended and has none) and report them back as
+`UserEvent::PageTitleResolved`/`FaviconResolved { tab_id, history_id, .. }`,
+which fill in the title/favicon once they arrive (see docs/decisions.md D12
+for why this is async and best-effort, D22 for the favicon-URL-only
+contract, D27 for threading `history_id` through the favicon fetch the same
+way the title fetch already does).
+
+**Date-grouped listing and search** (docs/decisions.md D29/D30) are pure
+functions in `browser::history` — `date_bucket`/`group_by_date` classify
+entries into 今日/昨日/過去7日/それ以前 sections relative to an injected
+`now` (UTC calendar days, no timezone crate); `search` is a
+case-insensitive URL/title substring filter over the whole store, not just
+the panel's visible window. `ui::window::BrowserWindow::set_history` calls
+`group_by_date` and hands the toolbar already-grouped, already-labeled data
+(`ui::toolbar::HistoryGroup`/`HistoryDateBucket`); the toolbar's
+`veloxSetHistory` only walks and renders it, doing no date arithmetic of
+its own. `ToolbarCommand::SearchHistory { query }` (sent on every keystroke
+in the panel's search box) is the other input to the same rendering path;
+an empty query falls back to the normal recency list rather than an
+(empty) search result.
 
 **The history/bookmarks panel** is UI inside the *toolbar* webview, not a
 separate page — opening it grows the toolbar webview's own bounds rather
@@ -120,7 +138,8 @@ webviews cannot do. See docs/decisions.md D11 for the alternatives
 considered and `ui::window::effective_toolbar_height` /
 `BrowserWindow::set_panel` for the mechanics. `ToolbarCommand` gained
 `ToggleBookmark`, `TogglePanel { panel }`, `DeleteHistoryEntry { id }`,
-`ClearHistory`, and `RemoveBookmark { id }`; opening a history/bookmark
+`ClearHistory`, `SearchHistory { query }`, and `RemoveBookmark { id }`;
+opening a history/bookmark
 entry reuses the existing `Navigate { input }` command (the stored URL is
 already normalized, so it round-trips through `navigation::normalize_input`
 unchanged) rather than adding a dedicated "open" command.

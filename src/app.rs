@@ -52,10 +52,17 @@ pub enum UserEvent {
         title: String,
     },
     /// Tab `tab_id`'s favicon URL came back from its content webview (see
-    /// `BrowserWindow::fetch_favicon`). See docs/decisions.md D22: this is
-    /// only ever a URL to try, never image bytes — the toolbar webview's own
-    /// `<img>` tag performs the actual (async, non-blocking) fetch.
-    FaviconResolved { tab_id: TabId, url: String },
+    /// `BrowserWindow::fetch_favicon`), for the history entry `history_id`
+    /// (`0` when there is none — see `PageTitleResolved`'s doc comment,
+    /// same sentinel, same reasoning, added for the history favicon in
+    /// #18/D27). See docs/decisions.md D22: this is only ever a URL to try,
+    /// never image bytes — the toolbar webview's own `<img>` tag performs
+    /// the actual (async, non-blocking) fetch.
+    FaviconResolved {
+        tab_id: TabId,
+        history_id: u64,
+        url: String,
+    },
     /// The active content webview's devtools shortcut (F12 / Cmd+Opt+I)
     /// fired. Sent over a dedicated, tightly-restricted IPC channel, separate
     /// from the toolbar's — see docs/decisions.md D18. Carries no `TabId`:
@@ -510,7 +517,10 @@ fn handle_user_event(
                     "fetch page title",
                     window.fetch_page_title(id, history_id.unwrap_or(0)),
                 );
-                log_failure("fetch favicon", window.fetch_favicon(id));
+                log_failure(
+                    "fetch favicon",
+                    window.fetch_favicon(id, history_id.unwrap_or(0)),
+                );
             }
             if id == state.tabs.active_id() {
                 if !url.is_empty() {
@@ -537,12 +547,20 @@ fn handle_user_event(
                 refresh_history_panel(window, state, config);
             }
         }
-        UserEvent::FaviconResolved { tab_id, url } => {
+        UserEvent::FaviconResolved {
+            tab_id,
+            history_id,
+            url,
+        } => {
             // A stale `tab_id` (the tab closed while the fetch was in
             // flight) is a safe no-op — mirrors `PageTitleResolved` above.
             if let Some(tab) = state.tabs.get_mut(tab_id) {
-                tab.set_favicon_url(url);
+                tab.set_favicon_url(url.clone());
                 sync_tab_strip(window, &state.tabs);
+            }
+            if state.history.update_favicon(history_id, url) {
+                persist_history(state);
+                refresh_history_panel(window, state, config);
             }
         }
         UserEvent::OpenDevtoolsRequested => window.open_devtools(),
@@ -708,6 +726,17 @@ fn handle_toolbar_command(
             state.history.clear();
             persist_history(state);
             refresh_history_panel(window, state, config);
+        }
+        ToolbarCommand::SearchHistory { query } => {
+            // An empty query means "search cleared" (see
+            // `browser::history::search`'s doc comment and D30) — go back
+            // to the normal recency-ordered panel rather than rendering an
+            // intentionally-empty search result list.
+            if query.trim().is_empty() {
+                refresh_history_panel(window, state, config);
+            } else {
+                search_history_panel(window, state, config, &query);
+            }
         }
         ToolbarCommand::RemoveBookmark { id } => {
             if state.bookmarks.remove(id) {
@@ -956,14 +985,36 @@ fn sync_bookmark_star(window: &BrowserWindow, state: &AppState, url: &str) {
 }
 
 /// Push the most recent `config.history_panel_limit` history entries to the
-/// toolbar, newest first.
+/// toolbar, newest first, grouped into date sections (see
+/// `browser::history::group_by_date` / docs/decisions.md D29) relative to
+/// "now". Also the fallback the panel returns to when the search box is
+/// cleared (see `ToolbarCommand::SearchHistory` below).
 fn refresh_history_panel(window: &BrowserWindow, state: &AppState, config: &Config) {
     let entries: Vec<&HistoryEntry> = state
         .history
         .entries_newest_first()
         .take(config.history_panel_limit)
         .collect();
-    log_failure("update history panel", window.set_history(&entries));
+    log_failure(
+        "update history panel",
+        window.set_history(&entries, now_unix()),
+    );
+}
+
+/// Push the history entries matching `query` (see
+/// `browser::history::HistoryStore::search` / docs/decisions.md D30) to the
+/// toolbar, capped to `config.history_panel_limit` like the normal panel.
+fn search_history_panel(window: &BrowserWindow, state: &AppState, config: &Config, query: &str) {
+    let entries: Vec<&HistoryEntry> = state
+        .history
+        .search(query)
+        .into_iter()
+        .take(config.history_panel_limit)
+        .collect();
+    log_failure(
+        "update history panel (search)",
+        window.set_history(&entries, now_unix()),
+    );
 }
 
 /// Push every bookmark to the toolbar, newest first.
