@@ -1945,3 +1945,200 @@ categorically wrong for VeloX" one: session restore (#25) or a future
 full-text search feature could reasonably tip this the other way, at which
 point this decision should be revisited rather than assumed permanent.
 **No new crate was added by this issue.**
+
+## D32: Bookmark folders (#19) — flat `folder_id` reference, one layer, no nesting
+
+**Scope**: issue #19's "フォルダ" requirement. Two shapes were on the table:
+
+- **A tree** (folders can contain folders, `Folder { id, parent_id: Option<u64>, ... }`),
+  matching how Chrome/Firefox actually let you organize bookmarks.
+- **A single flat layer** (chosen): `BookmarkFolder { id, name, created_at }`
+  in a separate `Vec` on `BookmarkStore`, and `BookmarkEntry` gains
+  `folder_id: Option<u64>` — `None` is the root, `Some(id)` is exactly one
+  folder, and a folder can never contain another folder.
+
+**Why flat**: the issue only asks that bookmarks can be "整理できる"
+(organized), not that folders nest arbitrarily deep — the acceptance
+criteria (`フォルダへ整理できる`) reads as satisfied by one level. A tree
+adds real cost on every side this issue also has to build: `BookmarkStore`
+would need cycle-safety checks on `parent_id` (an entry can't become its own
+ancestor), `BookmarkStore::remove_folder` would need to decide whether
+removing a folder cascades to its subfolders or reparents them too, the
+bookmarks-panel UI would need a collapsible tree widget instead of the flat
+grouped-list-with-headers this issue already uses for the history panel
+(D29's date buckets are exactly that shape), and the bookmark bar (D35)
+would need nested flyout menus instead of one level of dropdown. None of
+that machinery is free, and nothing in the issue asks for it. A flat layer
+gets "group bookmarks under a named folder" with none of it: `folder_id`
+is either `None` or a real folder's id, full stop — [`BookmarkStore::edit`]
+enforces that invariant by falling back to `None` for an unknown id rather
+than trusting the caller, and [`BookmarkStore::remove_folder`] reparents
+every entry in a removed folder back to the root rather than needing a
+cascade-vs-reparent decision for subfolders that cannot exist.
+
+**Consequence for the UI**: the bookmarks panel renders root-level
+bookmarks first, then one section per folder (mirroring the history panel's
+date-bucket sections), and the bookmark bar renders root bookmarks as
+direct buttons plus one button-with-dropdown per folder — see D35. Neither
+needs a tree widget.
+
+**Revisit if**: a future issue's users actually ask for sub-folders (nesting
+folders inside folders); at that point `folder_id` on `BookmarkEntry` would
+need to become `parent_id` on `BookmarkFolder` instead (folders referencing
+folders, not entries referencing folders directly), which is a genuine
+data-model change, not an additive one — better to make that call once
+there is real demand for it than to speculatively build the tree now.
+
+## D33: Bookmark editing — reuses `navigation::normalize_input`, rejects duplicate URLs
+
+**Scope**: issue #19's "編集" requirement (title/URL/folder).
+
+`ToolbarCommand::EditBookmark`'s `url` field is raw, untrusted text from the
+panel's inline edit form — exactly like `ToolbarCommand::Navigate`'s `input`
+field is raw text from the address bar. `app.rs`'s handler for it calls
+`browser::navigation::normalize_input(&url)` — the *same* function, not a
+second copy of scheme allow-listing — before ever touching
+`BookmarkStore::edit`; a `None` result (empty input, an unparseable URL, or
+a rejected scheme like `javascript:`/`ftp:`) rejects the whole edit and
+leaves the bookmark unchanged, logged to stderr the same way a rejected
+`Navigate` is. This keeps "which schemes VeloX will ever load" defined in
+exactly one place (the module doc comment on `navigation::normalize_input`
+already says as much), rather than letting a bookmark edit become a second,
+easy-to-forget path for a `javascript:` URL to end up persisted to
+`bookmarks.json` and then handed to `webview.load_url` the next time that
+bookmark is opened.
+
+`BookmarkStore::edit` itself stays a pure function over an already-validated
+`String` — it never parses a URL — and enforces the *other* invariant the
+module doc comment already establishes: bookmarks are de-duplicated by URL.
+Editing an entry's URL to one that another bookmark already owns is
+refused (`BookmarkEditError::DuplicateUrl`), the same as two `add()` calls
+for the same URL never producing two entries. `app.rs` always re-pushes the
+bookmarks panel/bar after an edit attempt, success or failure, so the
+panel's inline edit form closes and reverts to showing the entry's actual
+(possibly unchanged) state either way — there is no separate "tell the UI
+the edit failed" round trip; the next full-state push *is* the correction,
+matching how every other rejected mutation in this codebase (a blocked
+navigation, a rejected search-engine template) is surfaced.
+
+## D34: Manual bookmark reordering — swap the `Vec`, no separate position field; favicon keyed by URL, captured at fetch time
+
+**Scope**: issue #19's "並び替え" requirement, plus giving `BookmarkEntry` a
+`favicon` the same way #18 gave `HistoryEntry` one.
+
+**Reordering**: `BookmarkStore::entries` was already an ordered `Vec` (the
+existing `entries_newest_first()` just reverses it for display). Rather
+than adding a separate `position: u32`/`order` field that would need to be
+kept in sync with the vector on every insert/remove/edit, `move_up`/
+`move_down` physically swap the entry with its nearest neighbor *in the
+same folder/root scope* — `entries.iter().rposition`/`position` scanning
+outward from the entry's own index, skipping over entries that belong to a
+different folder. The vector's order **is** the display/manual order, full
+stop, so there is nothing to desynchronize and no migration concern for a
+pre-#19 `bookmarks.json` (its entries were already in *some* vector order —
+creation order — which now doubles as their initial manual order with zero
+special-casing). The cost is `O(n)` neighbor lookups instead of `O(1)`
+position-field swaps, which is irrelevant at bookmark-collection sizes
+(nowhere near history's 5000-entry cap, and no cap is even needed here).
+One consequence, called out directly in the panel/bar UI: the bookmarks
+panel and bar switch from `entries_newest_first()` (D-nothing, the original
+#4 behavior) to `entries_in(folder_id)` (manual/vector order) for display —
+introducing manual reordering and then still showing newest-first would
+mean "move up" visibly moves a row *down* on screen. `entries_newest_first`
+itself is left in place (still correct, still tested) for any future caller
+that wants pure recency rather than manual order.
+
+**Favicon**: `BookmarkEntry` grows `favicon: Option<String>` exactly like
+`HistoryEntry` did in #18/D27 — `#[serde(default)]` so a pre-#19
+`bookmarks.json` (no `favicon`/`folder_id` keys at all) still loads — and is
+filled the same way, via `UserEvent::FaviconResolved`. The one wrinkle: a
+history entry has a stable `history_id` known *before* the async favicon
+fetch starts (D12's fire-and-forget pattern), so the result can be applied
+to the right entry no matter what the tab does in the meantime. A bookmark
+has no such id to hand the fetch — whether the current page is even
+bookmarked, and which bookmark id it would be, isn't fixed at fetch time
+the way "this specific history entry" is. Two options: re-read the tab's
+`current_url()` when the favicon result comes back, or capture the page URL
+up front. Re-reading after the fact is a race — the tab may have navigated
+again while the fetch was in flight, misattributing a stale favicon to
+whatever page happens to be current when the callback fires. So
+`FaviconResolved` grows a `page_url: String` field, set once from the `url`
+already in hand at the `LoadFinished` call site (`BrowserWindow::fetch_favicon`'s
+new third parameter) — the exact page the fetch was actually started for.
+`BookmarkStore::update_favicon_by_url(url, favicon)` then looks up by that
+URL, mirroring `remove_by_url`'s existing keyed-by-URL shape rather than
+`HistoryStore::update_favicon`'s keyed-by-id one, since a bookmark truly has
+no other id available at this call site the way a history entry's
+`history_id` is.
+
+## D35: Bookmark bar — a third, additive layout component, not a `Panel`; session-only visibility
+
+**Scope**: issue #19's "ブックマークバー" requirement, and where it sits
+relative to D11's existing panel machinery.
+
+**Why not `Panel::BookmarkBar`**: D11 already established one pattern for
+"more toolbar-webview real estate on demand" — grow `toolbar_height` by
+`panel_height` while a `Panel` is open, treating `History`/`Bookmarks`/
+`Downloads`/`Omnibox` as mutually exclusive (opening one closes whichever
+was open). The bookmark bar does not fit that shape: the issue asks for an
+*always-can-be-on* strip, and it needs to coexist with an open panel — a
+user should be able to have the bookmark bar showing *and* the history
+panel open at the same time, the bar sitting above the panel, not one
+replacing the other. Making it a `Panel` variant would either break that
+(closing the bookmark bar every time a real panel opens) or require
+special-casing one `Panel` variant to not participate in the
+close-the-other-one toggle — more surprising than just giving it its own,
+independent, additive slot.
+
+**Layout**: `ui::window::effective_toolbar_height` gained two new
+parameters, `bookmark_bar_height`/`bookmark_bar_visible`, and now *sums*
+whichever of the bar and an open panel are currently on, instead of the
+single `if panel_open { … }` branch D11 introduced:
+`toolbar_height + (bar_visible ? bar_height : 0) + (panel_open ? panel_height : 0)`.
+`BrowserWindow` tracks `bookmark_bar_visible` in a `Cell<bool>`, the same
+interior-mutability reasoning D11 already documented for `open_panel`
+(`sync_layout` runs from the window-resize handler with only `&BrowserWindow`).
+A new `Config::bookmark_bar_height` (default 30px, roughly one tab-strip
+row) joins `Config::panel_height` as a compile-time-defaulted layout
+constant — no new environment variable, matching how `panel_height` itself
+has none.
+
+**Rendering many bookmarks without breaking the layout**: unlike the tab
+strip (D22's "shrink, then scroll" — tabs are fixed-width chrome, so
+shrinking them first delays scrolling), a bookmark bar's buttons are
+free-form title text of arbitrary length; shrinking them toward zero width
+would make them unreadable long before it would ever avoid a scrollbar. So
+the bar takes D22's *other* half only: `#bookmark-bar { overflow-x: auto;
+white-space: nowrap; }` with each `.bookmark-bar-item { flex: none;
+max-width: 160px; text-overflow: ellipsis; }` — items keep a readable,
+capped width and the strip scrolls horizontally once they overflow it,
+exactly like the tab strip does once every tab has already shrunk to its
+own floor. A folder (D32: one flat layer) renders as one such item whose
+click toggles a small absolutely-positioned dropdown listing its entries,
+rather than expanding inline and pushing every later bookmark sideways —
+keeps the bar's own height fixed at `bookmark_bar_height` regardless of how
+many entries a given folder holds.
+
+**Visibility is session-only, not persisted**: Ctrl/Cmd+Shift+B and the
+toolbar's bar-toggle button both flip `BrowserWindow::bookmark_bar_visible`
+for the life of the running process; there is no fourth on-disk file (or a
+new key stitched into `bookmarks.json`, which would conflate "bookmark
+data" with "a UI preference" in the one file that is supposed to hold only
+the former) to remember the choice across restarts. This mirrors how
+`Panel` open/closed state itself has never been persisted, and keeps this
+issue from having to invent a general settings-persistence layer (there is
+none yet) just to remember one boolean. **Revisit if** a future issue adds
+a real settings/preferences store for other reasons — persisting the bar's
+visibility would then be a trivial addition to it, not a reason to build
+that store now.
+
+**Keyboard shortcuts**: Ctrl/Cmd+D (`ToggleBookmark`) and Ctrl/Cmd+Shift+B
+(`ToggleBookmarkBar`) both follow the exact two-channel delivery pattern
+D18/D23 already established — a fixed-sentinel-string IPC message
+(`velox:toggle-bookmark` / `velox:toggle-bookmark-bar`) from an injected
+content-webview script for when a page has focus, and a structured
+`ToolbarCommand` from the toolbar's own trusted keydown listener for when
+the address bar/panel has focus — both funneled into the same
+`toggle_current_bookmark`/`toggle_bookmark_bar` functions in `app.rs` so
+there is exactly one implementation of each action regardless of which
+webview observed the keypress.

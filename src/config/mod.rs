@@ -127,6 +127,12 @@ pub struct Config {
     /// Height of the history/bookmarks dropdown panel (logical pixels) when
     /// open; added to `toolbar_height` while a panel is showing.
     pub panel_height: u32,
+    /// Height of the always-visible bookmark bar (logical pixels) when
+    /// showing; added to `toolbar_height` independently of `panel_height`
+    /// (see docs/decisions.md D35 — the bar and a panel can both be
+    /// showing at once, their heights stack rather than replacing each
+    /// other).
+    pub bookmark_bar_height: u32,
     /// Hard cap on the number of entries kept in the history store. `0`
     /// means unlimited.
     pub history_max_entries: usize,
@@ -170,6 +176,10 @@ impl Default for Config {
             content_blocking_enabled: true,
             extra_blocklist_path: None,
             panel_height: 320,
+            // A single row, roughly the height of a tab-strip row (see
+            // ui/toolbar.html's #bookmark-bar rule) — enough for one line of
+            // bookmark buttons.
+            bookmark_bar_height: 30,
             history_max_entries: 5000,
             history_panel_limit: 200,
             auto_suspend_after: None,
@@ -331,6 +341,7 @@ mod tests {
         assert!(config.toolbar_height > 0);
         assert!(config.window_height > config.toolbar_height);
         assert!(config.panel_height > 0);
+        assert!(config.bookmark_bar_height > 0);
         assert!(config.history_panel_limit > 0);
         // Automatic suspension must be opt-in: a fresh checkout should never
         // surprise a user by suspending a tab on its own.

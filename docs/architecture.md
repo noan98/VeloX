@@ -144,6 +144,34 @@ entry reuses the existing `Navigate { input }` command (the stored URL is
 already normalized, so it round-trips through `navigation::normalize_input`
 unchanged) rather than adding a dedicated "open" command.
 
+**Bookmark organisation** (docs/decisions.md D32-D34) lives entirely in
+`browser::bookmarks`. Folders are a *flat* reference — `BookmarkEntry`
+carries `folder_id: Option<u64>` into a separate `BookmarkFolder` list, one
+level deep with no nesting; D32 records why a tree was not worth its UI and
+cycle-checking cost for this issue's requirements. Deleting a folder
+re-parents its bookmarks to the root rather than cascading. Editing goes
+through `BookmarkStore::edit`, which pushes a changed URL through
+`navigation::normalize_input` so the address-bar rules (rejected schemes,
+normalization) apply identically here; a rejected or duplicate URL is
+reported back as `BookmarkEditError` instead of being stored. Display order
+is the `Vec`'s own element order — `move_up`/`move_down` swap with the
+adjacent entry *within the same folder or the root*, so no explicit sort-key
+field exists to keep consistent. `BookmarkEntry::favicon` is filled by the
+same `UserEvent::FaviconResolved` path the history store uses, keyed by page
+URL rather than by entry id (D34).
+
+**The bookmark bar is not a `Panel`.** A panel is transient and mutually
+exclusive with the other panels; the bar is a persistent strip that
+coexists with whichever panel is open. `ui::window::effective_toolbar_height`
+therefore *adds* `Config::bookmark_bar_height` and `Config::panel_height`
+independently rather than treating them as alternatives, and both shrink the
+content webview (D35). Many bookmarks degrade the same way many tabs do —
+shrink, then `overflow-x: auto` scroll (D22) — and a folder opens as a
+dropdown inside the toolbar webview. Visibility is Ctrl/Cmd+Shift+B, wired
+through both shortcut channels (D18/D23) like every other VeloX shortcut,
+and is **session-only**: there is no settings-persistence layer yet, so the
+bar's shown/hidden state resets on restart (see #30).
+
 ## Private browsing
 
 Private browsing (#7) is a **whole-app** mode, not a per-window one — see

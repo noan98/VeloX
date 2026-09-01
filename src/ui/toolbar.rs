@@ -21,7 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::browser::{BookmarkEntry, Candidate, DownloadEntry, HistoryGroup};
+use crate::browser::{BookmarkEntry, BookmarkStore, Candidate, DownloadEntry, HistoryGroup};
 
 /// The static HTML/CSS/JS that renders the toolbar.
 pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
@@ -169,6 +169,52 @@ pub enum ToolbarCommand {
     /// address bar to the active tab's actual current URL, selected and
     /// focused (mirrors `FocusAddressBar`'s restore step).
     OmniboxClose,
+
+    // --- Bookmark folders, editing, reordering, and the bookmark bar
+    //     (Issue #19, see docs/decisions.md D32/D33/D34/D35) ---
+    /// Update an existing bookmark's title/URL/folder (the panel's inline
+    /// edit form). `title` is the raw, not-yet-trimmed text — `app.rs` maps
+    /// an empty/whitespace-only value to `None`. `url` is re-validated
+    /// through `browser::navigation::normalize_input` before it ever
+    /// reaches `BookmarkStore::edit` (D33); a rejected URL leaves the
+    /// bookmark unchanged. `folder_id` is `None` for "move to root".
+    EditBookmark {
+        id: u64,
+        title: String,
+        url: String,
+        folder_id: Option<u64>,
+    },
+    /// Create a new bookmark folder ("＋ フォルダ" in the panel). An
+    /// empty/whitespace-only `name` is ignored.
+    CreateBookmarkFolder {
+        name: String,
+    },
+    /// Rename an existing bookmark folder. An empty/whitespace-only `name`
+    /// is ignored (same rule as `CreateBookmarkFolder`).
+    RenameBookmarkFolder {
+        id: u64,
+        name: String,
+    },
+    /// Delete a bookmark folder. The bookmarks that were in it move to the
+    /// root rather than being deleted (see
+    /// `browser::bookmarks::BookmarkStore::remove_folder`).
+    RemoveBookmarkFolder {
+        id: u64,
+    },
+    /// Move a bookmark one rank earlier within its folder/root scope (the
+    /// panel's "↑" button). A no-op for an unknown id or an entry already
+    /// first in its scope.
+    MoveBookmarkUp {
+        id: u64,
+    },
+    /// Same as `MoveBookmarkUp`, one rank later ("↓").
+    MoveBookmarkDown {
+        id: u64,
+    },
+    /// Toggle the always-visible bookmark bar (Ctrl/Cmd+Shift+B, or its
+    /// toolbar button) — distinct from `TogglePanel`, since the bar is a
+    /// permanent strip, not a dropdown panel (see docs/decisions.md D35).
+    ToggleBookmarkBar,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -192,6 +238,48 @@ pub struct TabSummary {
     /// to reclaim memory — see docs/decisions.md D9). The tab strip shows
     /// this distinctly so the user can tell a dormant tab from a live one.
     pub suspended: bool,
+}
+
+/// One folder's worth of bookmarks, as sent to the toolbar JS inside a
+/// [`BookmarksView`] — see docs/decisions.md D32.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BookmarkFolderView<'a> {
+    pub id: u64,
+    pub name: &'a str,
+    pub entries: Vec<&'a BookmarkEntry>,
+}
+
+/// The full bookmark tree pushed to both the bookmarks panel
+/// (`veloxSetBookmarks`) and the bookmark bar (`veloxSetBookmarkBar`) — the
+/// same view, rendered two different ways by the toolbar's own JS. `root` is
+/// every bookmark with no folder, `folders` is every folder with its own
+/// bookmarks nested inside — a single flat layer, folders never nest inside
+/// each other (docs/decisions.md D32). Both `root` and each folder's
+/// `entries` are already in manual display order (docs/decisions.md D34).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BookmarksView<'a> {
+    pub root: Vec<&'a BookmarkEntry>,
+    pub folders: Vec<BookmarkFolderView<'a>>,
+}
+
+impl<'a> BookmarksView<'a> {
+    /// Build the view straight from a [`BookmarkStore`] — the one place
+    /// `app.rs` needs to construct this, shared by the panel and bar
+    /// refresh paths so they can never drift apart.
+    pub fn from_store(store: &'a BookmarkStore) -> Self {
+        Self {
+            root: store.entries_in(None).collect(),
+            folders: store
+                .folders()
+                .iter()
+                .map(|folder| BookmarkFolderView {
+                    id: folder.id,
+                    name: folder.name.as_str(),
+                    entries: store.entries_in(Some(folder.id)).collect(),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Parse a raw IPC message body into a [`ToolbarCommand`].
@@ -293,9 +381,29 @@ pub fn set_history_script(groups: &[HistoryGroup<'_>]) -> String {
     format!("veloxSetHistory({});", entries_to_json(groups))
 }
 
-/// JS snippet that replaces the bookmarks panel's contents.
-pub fn set_bookmarks_script(entries: &[&BookmarkEntry]) -> String {
-    format!("veloxSetBookmarks({});", entries_to_json(entries))
+/// JS snippet that replaces the bookmarks panel's contents (folders and
+/// their entries — see [`BookmarksView`]).
+pub fn set_bookmarks_script(view: &BookmarksView<'_>) -> String {
+    format!("veloxSetBookmarks({});", value_to_json(view))
+}
+
+/// JS snippet that replaces the always-visible bookmark bar's contents.
+/// Same [`BookmarksView`] payload as [`set_bookmarks_script`] — the toolbar
+/// JS renders it two different ways (a scrollable list vs. a horizontal
+/// strip with per-folder dropdowns), rather than Rust building two
+/// differently-shaped payloads for what is, underneath, the exact same data
+/// (see docs/decisions.md D35).
+pub fn set_bookmark_bar_script(view: &BookmarksView<'_>) -> String {
+    format!("veloxSetBookmarkBar({});", value_to_json(view))
+}
+
+/// JS snippet that shows or hides the bookmark bar strip (Ctrl/Cmd+Shift+B /
+/// `ToolbarCommand::ToggleBookmarkBar`). Purely a CSS toggle inside the
+/// toolbar webview — `BrowserWindow::set_bookmark_bar_visible` is what
+/// additionally resizes the webview's native bounds to match (see
+/// docs/decisions.md D35).
+pub fn set_bookmark_bar_visible_script(visible: bool) -> String {
+    format!("veloxSetBookmarkBarVisible({visible});")
 }
 
 /// JS snippet that replaces the downloads panel's contents. `DownloadEntry`
@@ -309,6 +417,12 @@ pub fn set_downloads_script(entries: &[&DownloadEntry]) -> String {
 
 fn entries_to_json<T: Serialize>(entries: &[T]) -> serde_json::Value {
     serde_json::to_value(entries).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+}
+
+/// Same fallback-on-failure behavior as [`entries_to_json`], for a single
+/// (non-slice) value such as [`BookmarksView`].
+fn value_to_json<T: Serialize>(value: &T) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
 }
 
 #[cfg(test)]
@@ -651,25 +765,131 @@ mod tests {
     }
 
     #[test]
-    fn bookmarks_script_embeds_entries_as_json() {
+    fn bookmarks_script_embeds_the_view_as_json() {
         let entry = BookmarkEntry {
             id: 1,
             url: "https://example.com/".to_owned(),
             title: None,
             created_at: 100,
+            folder_id: None,
+            favicon: None,
         };
-        let script = set_bookmarks_script(&[&entry]);
+        let view = BookmarksView {
+            root: vec![&entry],
+            folders: vec![],
+        };
+        let script = set_bookmarks_script(&view);
         assert!(script.starts_with("veloxSetBookmarks("));
         assert!(script.contains(r#""url":"https://example.com/""#));
         assert!(script.contains(r#""title":null"#));
+        assert!(script.contains(r#""root":["#));
+        assert!(script.contains(r#""folders":[]"#));
+    }
+
+    #[test]
+    fn bookmark_bar_script_embeds_the_view_and_folders_with_their_own_entries() {
+        let folder_entry = BookmarkEntry {
+            id: 2,
+            url: "https://b.example/".to_owned(),
+            title: Some("B".to_owned()),
+            created_at: 200,
+            folder_id: Some(9),
+            favicon: Some("https://b.example/favicon.ico".to_owned()),
+        };
+        let view = BookmarksView {
+            root: vec![],
+            folders: vec![BookmarkFolderView {
+                id: 9,
+                name: "仕事",
+                entries: vec![&folder_entry],
+            }],
+        };
+        let script = set_bookmark_bar_script(&view);
+        assert!(script.starts_with("veloxSetBookmarkBar("));
+        assert!(script.contains(r#""name":"仕事""#));
+        assert!(script.contains(r#""url":"https://b.example/""#));
+        assert!(script.contains(r#""favicon":"https://b.example/favicon.ico""#));
+    }
+
+    #[test]
+    fn bookmark_bar_visible_script_is_a_bool_literal() {
+        assert_eq!(
+            set_bookmark_bar_visible_script(true),
+            "veloxSetBookmarkBarVisible(true);"
+        );
+        assert_eq!(
+            set_bookmark_bar_visible_script(false),
+            "veloxSetBookmarkBarVisible(false);"
+        );
     }
 
     #[test]
     fn empty_entry_list_serializes_to_an_empty_array() {
         assert_eq!(set_history_script(&[]), "veloxSetHistory([]);".to_owned());
+        let empty_view = BookmarksView {
+            root: vec![],
+            folders: vec![],
+        };
         assert_eq!(
-            set_bookmarks_script(&[]),
-            "veloxSetBookmarks([]);".to_owned()
+            set_bookmarks_script(&empty_view),
+            r#"veloxSetBookmarks({"folders":[],"root":[]});"#.to_owned()
+        );
+    }
+
+    #[test]
+    fn parses_bookmark_folder_edit_and_reorder_commands() {
+        assert_eq!(
+            parse_command(
+                r#"{"cmd":"edit_bookmark","id":1,"title":"New","url":"https://example.com/","folder_id":2}"#
+            )
+            .unwrap(),
+            ToolbarCommand::EditBookmark {
+                id: 1,
+                title: "New".to_owned(),
+                url: "https://example.com/".to_owned(),
+                folder_id: Some(2),
+            }
+        );
+        assert_eq!(
+            parse_command(
+                r#"{"cmd":"edit_bookmark","id":1,"title":"","url":"https://example.com/","folder_id":null}"#
+            )
+            .unwrap(),
+            ToolbarCommand::EditBookmark {
+                id: 1,
+                title: String::new(),
+                url: "https://example.com/".to_owned(),
+                folder_id: None,
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"create_bookmark_folder","name":"仕事"}"#).unwrap(),
+            ToolbarCommand::CreateBookmarkFolder {
+                name: "仕事".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"rename_bookmark_folder","id":3,"name":"新名前"}"#).unwrap(),
+            ToolbarCommand::RenameBookmarkFolder {
+                id: 3,
+                name: "新名前".to_owned()
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"remove_bookmark_folder","id":3}"#).unwrap(),
+            ToolbarCommand::RemoveBookmarkFolder { id: 3 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"move_bookmark_up","id":5}"#).unwrap(),
+            ToolbarCommand::MoveBookmarkUp { id: 5 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"move_bookmark_down","id":5}"#).unwrap(),
+            ToolbarCommand::MoveBookmarkDown { id: 5 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"toggle_bookmark_bar"}"#).unwrap(),
+            ToolbarCommand::ToggleBookmarkBar
         );
     }
 
@@ -776,5 +996,16 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("focus_address_bar"));
         assert!(TOOLBAR_HTML.contains("omnibox_input"));
         assert!(TOOLBAR_HTML.contains("omnibox_close"));
+        // Bookmark folders, editing, reordering, and the bookmark bar
+        // (Issue #19, see docs/decisions.md D32/D33/D34/D35).
+        assert!(TOOLBAR_HTML.contains("veloxSetBookmarkBar"));
+        assert!(TOOLBAR_HTML.contains("veloxSetBookmarkBarVisible"));
+        assert!(TOOLBAR_HTML.contains("edit_bookmark"));
+        assert!(TOOLBAR_HTML.contains("create_bookmark_folder"));
+        assert!(TOOLBAR_HTML.contains("rename_bookmark_folder"));
+        assert!(TOOLBAR_HTML.contains("remove_bookmark_folder"));
+        assert!(TOOLBAR_HTML.contains("move_bookmark_up"));
+        assert!(TOOLBAR_HTML.contains("move_bookmark_down"));
+        assert!(TOOLBAR_HTML.contains("toggle_bookmark_bar"));
     }
 }
