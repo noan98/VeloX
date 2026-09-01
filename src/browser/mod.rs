@@ -19,5 +19,5 @@ pub mod tabs;
 pub use blocklist::FilterList;
 pub use bookmarks::{BookmarkEntry, BookmarkStore};
 pub use history::{HistoryEntry, HistoryStore};
-pub use tab::{Tab, TabId};
-pub use tabs::Tabs;
+pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
+pub use tabs::{ActivationEffect, Tabs};

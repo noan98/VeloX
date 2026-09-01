@@ -77,8 +77,10 @@ macOS/Windows they are true child webviews (`build_as_child`).
 VeloX deliberately does **not** duplicate the engine's session history for
 back/forward. The engine already tracks redirects, `pushState`, anchors
 etc.; a parallel Rust history would drift from reality. `Tab` mirrors only
-what the UI needs (current URL, loading flag) — one `Tab` per open tab, held
-in `Tabs`.
+what the UI needs (current URL, title, favicon, loading flag, lifecycle
+state) — one `Tab` per open tab, held in `Tabs`. See "Tab lifecycle state"
+below for the state model and docs/decisions.md D19 for the reasoning
+behind it.
 
 The app-level **visit history** (a persisted "where have I been" log,
 separate from the above) and **bookmarks** are a different concern entirely
@@ -257,55 +259,133 @@ in this iteration.
   tab open: closing the last remaining tab is a no-op.
 - Tab ids (`browser::TabId`, a `u64` newtype) are assigned once by `Tabs` and
   never reused, so a stale id from a delayed `close_tab`/`activate_tab`
-  message simply matches nothing instead of hitting the wrong tab.
+  message, or one for a tab that has since closed, simply matches nothing
+  (`Tabs::get`/`get_mut` return `None`) instead of hitting the wrong tab or
+  panicking.
 - `BrowserWindow` owns one content `WebView` per tab (`HashMap<TabId,
   ContentTab>`) plus which tab is active. Opening a tab builds a new content
   webview bound to that `TabId` (its navigation/load handlers close over the
-  id, so their `UserEvent`s are tagged); activating a tab hides the
-  previously active webview and shows the target one via `set_visible` +
-  `set_bounds` — the webview itself is never destroyed, which is what keeps
-  scroll position and form input intact across a tab switch. The toolbar
-  webview is shared by all tabs.
+  id, so their `UserEvent`s are tagged, including `PageTitleResolved`'s
+  `tab_id`); activating a tab hides the previously active webview and shows
+  the target one via `set_visible` + `set_bounds` — the webview itself is
+  never destroyed, which is what keeps scroll position and form input intact
+  across a tab switch. The toolbar webview is shared by all tabs. **This is
+  the ownership boundary the whole state model below is built around**:
+  `browser::` (`Tab`/`Tabs`) never references a `wry`/`tao`/`gtk` type —
+  `ui::window::BrowserWindow` is the sole owner of any actual `WebView`,
+  keyed by `TabId`. See docs/decisions.md D19.
 - `ToolbarCommand` gained `NewTab`, `CloseTab { id }`, and
   `ActivateTab { id }` — purely additive to the existing serde enum. The
   toolbar pushes tab state back with `TabSummary`/`veloxSetTabs`, rendered as
   the tab strip above the address bar (`src/ui/toolbar.html`).
+
+## Tab lifecycle state
+
+`browser::tab::TabState` is an explicit enum — `Active` / `Background` /
+`Suspended` / `Restoring` — replacing what used to be an implicit
+`suspended: bool` plus "is this id `Tabs`' active index". See
+docs/decisions.md D19 for the full design rationale; this section is the
+quick-reference summary.
+
+```text
+       ┌────────────┐  another tab activated   ┌────────────┐
+       │   Active    │ ────────────────────────►│ Background │
+       │ (visible,   │◄──────────────────────── │ (awake,    │
+       │  webview    │   this tab activated      │  webview   │
+       │  live)      │                           │  live)     │
+       └──────┬──────┘                           └──────┬─────┘
+              │ (only reachable via Restoring)          │ idle timeout /
+              │                                          │ manual suspend
+       ┌──────┴──────┐   webview rebuilt          ┌──────▼─────┐
+       │  Restoring  │◄────────────────────────── │  Suspended │
+       │ (selected,  │   this tab selected         │ (webview   │
+       │  webview    │                             │  dropped)  │
+       │  rebuilding)│                             └────────────┘
+       └─────────────┘
+```
+
+- **Invariant**: exactly one tab — the one `Tabs::active_id()` points at —
+  is ever `Active` or `Restoring`; every other tab is `Background` or
+  `Suspended`. `Tab`'s transition methods are `pub(super)`, so `Tabs` is the
+  only thing that can move a tab between states, and every `Tabs` method
+  that changes which tab is active (`open`, `activate`/`activate_at`, the
+  replacement tab a `close` picks) upholds this invariant via a shared
+  private helper (`Tabs::resolve_activation`).
+- **Invalid transitions are rejected, not just avoided by convention**:
+  each edge above is a separate `TabState` method returning
+  `Result<TabState, InvalidTabTransition>`; anything not drawn (including
+  every self-transition) is an `Err`. This is what lets
+  `Tabs::suspend` drop its old "refuse the active tab" / "refuse an
+  already-suspended tab" special cases — `TabState::suspend` only accepts
+  `Background`, so both are simply invalid transitions now, caught in the
+  one place every other invalid transition is.
+- **`Restoring` is real, not a synonym for `Active`**, so a future
+  asynchronous session restore (#25) has a state for "selected, but nothing
+  is showing yet" instead of needing to add one later. Every current caller
+  still collapses `Suspended -> Restoring -> Active` into one call
+  (`Tab::resume`), because today's webview rebuild
+  (`ui::window::BrowserWindow::resume_tab`) is synchronous — there is no
+  observable gap between the two edges yet, just the seam for one.
+- **`ActivationEffect`**: `Tabs::activate`/`activate_at`/`close` return
+  `Option<browser::ActivationEffect>` (`Switch` or `Resume`) instead of a
+  bare `bool`, so `app.rs` knows whether to call
+  `BrowserWindow::activate_tab` (already-live webview, just show it) or
+  `BrowserWindow::resume_tab` (webview was dropped, rebuild it) without
+  re-deriving that from `Tab::is_suspended()` after `Tabs` has already
+  resolved the transition.
+- **New `Tab` fields**: `title: Option<String>` and `favicon: browser::Favicon`
+  (`Unknown` or `Url(String)`), both cleared on every
+  `Tab::on_navigation_started` so a stale value from the previous page is
+  never shown as current. `title` is set from
+  `UserEvent::PageTitleResolved` (which already carries a `tab_id` for
+  exactly this); *rendering* either in the tab strip is left to #11. These,
+  plus the pre-existing `last_active`/`last_active_at` (D9) and
+  `current_url`, are the state a future #25 session-restore feature is
+  expected to read from — persistence format/schema is #25's own decision,
+  not defined here.
+
 ## Tab suspension
 
 Status: manual suspension shipped, automatic suspension implemented and
 opt-in (default off). See docs/decisions.md D9 for the full rationale,
-including the WebKitGTK/WKWebView/WebView2 cache-control investigation.
+including the WebKitGTK/WKWebView/WebView2 cache-control investigation, and
+D19 for how suspension fits into the `TabState` model above.
 
 - **What "suspended" means**: `ContentTab::webview` (`ui::window`) is
   `Option<WebView>`; suspending a tab `take()`s and drops it
   (`BrowserWindow::suspend_tab`), reclaiming the memory the webview held.
-  `browser::tab::Tab` mirrors this with a `suspended` flag and keeps
-  `current_url` — the only state that survives. Scroll position,
-  in-progress form input, and session history (back/forward) are lost, the
-  same trade-off already accepted for tab *close* — suspension is a deeper
-  version of the same idea, not a new category of data loss.
+  `browser::tab::Tab` mirrors this with `TabState::Suspended` and keeps
+  `current_url` (plus `title`/`favicon`, which were never engine-owned to
+  begin with) — the state that survives. Scroll position, in-progress form
+  input, and session history (back/forward) are lost, the same trade-off
+  already accepted for tab *close* — suspension is a deeper version of the
+  same idea, not a new category of data loss.
 - **Never the active tab**: both the manual command and the automatic sweep
-  refuse to suspend the currently active tab — `browser::tabs::Tabs::suspend`
-  enforces this on the state side, `BrowserWindow::suspend_tab` defensively
-  checks again on the webview side. The visible tab always needs a live
-  webview.
+  refuse to suspend the currently active tab. This now falls directly out of
+  the `TabState` transition rules (`Background -> Suspended` is the only
+  valid edge into `Suspended`) rather than a separate check in
+  `browser::tabs::Tabs::suspend`; `BrowserWindow::suspend_tab` still
+  defensively checks again on the webview side.
 - **Resuming**: reactivating a suspended tab (clicking it in the tab strip,
   or it becoming active because the tab in front of it closed) rebuilds the
   webview and reloads `current_url` — `BrowserWindow::resume_tab` is exactly
   `open_tab` followed by `activate_tab`, since rebuilding a dropped webview
   for a `TabId` the app already knows about is the same operation as
-  building the first one for a brand new tab.
+  building the first one for a brand new tab. `Tabs` reports this case as
+  `ActivationEffect::Resume` so `app.rs` knows to call `resume_tab` instead
+  of `activate_tab`.
 - **Manual suspension**: `ToolbarCommand::SuspendTab { id }`, sent by a
   per-tab button in the tab strip (hidden for the active tab and for a tab
   already suspended, since clicking the tab itself resumes it — no separate
-  "resume" affordance is needed). `TabSummary` carries a `suspended` flag so
+  "resume" affordance is needed). `TabSummary` carries a `suspended` flag
+  (`Tab::is_suspended()`, shorthand for `state() == TabState::Suspended`) so
   the strip can render dormant tabs distinctly (dimmed, a 💤 marker).
 - **Automatic suspension**: `Config::auto_suspend_after: Option<Duration>`
   (default `None`, i.e. disabled) is the idle threshold — how long a
   background tab must have sat unviewed before it is eligible. The pure
   policy logic lives entirely in `browser::tabs::Tabs`:
-  `idle_background_tabs(now, idle_after)` (which background, non-suspended
-  tabs have crossed the threshold) and `next_idle_deadline(idle_after)` (the
+  `idle_background_tabs(now, idle_after)` (which `Background`-state tabs
+  have crossed the threshold) and `next_idle_deadline(idle_after)` (the
   soonest a still-awake background tab will cross it), both clock-injected
   (`now: Instant` passed in, never read internally) so they are
   unit-testable without sleeping a real thread. `app::run`'s event loop
@@ -316,8 +396,11 @@ including the WebKitGTK/WKWebView/WebView2 cache-control investigation.
   being the active tab, recorded by `Tabs::activate_at`/`open_at` (thin
   wrappers around the existing `activate`/`open` that additionally stamp the
   *outgoing* active tab before switching) — see `Tab::mark_backgrounded`.
-  The currently active tab's timestamp is never read, since the active tab
-  is always excluded from suspension candidates regardless of its value.
+  This is independent of the `TabState` transition itself (some tests
+  intentionally use the plain `activate`/`open`, which skip the clock
+  stamp but still run the state transition correctly). The currently active
+  tab's timestamp is never read, since the active tab is always excluded
+  from suspension candidates regardless of its value.
 
 ## Performance extension points
 
