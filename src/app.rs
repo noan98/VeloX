@@ -15,12 +15,12 @@ use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
 use crate::browser::{
-    metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore, FilterList,
-    HistoryEntry, HistoryStore, TabId, Tabs,
+    metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore, Favicon,
+    FilterList, HistoryEntry, HistoryStore, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
-use crate::ui::BrowserWindow;
+use crate::ui::{BrowserWindow, ContentShortcut};
 
 /// Events forwarded from webview callbacks into the main event loop.
 #[derive(Debug, Clone)]
@@ -48,6 +48,11 @@ pub enum UserEvent {
         history_id: u64,
         title: String,
     },
+    /// Tab `tab_id`'s favicon URL came back from its content webview (see
+    /// `BrowserWindow::fetch_favicon`). See docs/decisions.md D21: this is
+    /// only ever a URL to try, never image bytes — the toolbar webview's own
+    /// `<img>` tag performs the actual (async, non-blocking) fetch.
+    FaviconResolved { tab_id: TabId, url: String },
     /// The active content webview's devtools shortcut (F12 / Cmd+Opt+I)
     /// fired. Sent over a dedicated, tightly-restricted IPC channel, separate
     /// from the toolbar's — see docs/decisions.md D18. Carries no `TabId`:
@@ -55,6 +60,18 @@ pub enum UserEvent {
     /// tab itself, matching how the shortcut is only ever wired into the
     /// webview the user is actually looking at.
     OpenDevtoolsRequested,
+    /// One of the tab-management keyboard shortcuts fired while a content
+    /// webview had focus (see `ui::window::ContentShortcut` and
+    /// docs/decisions.md D18/D22). Sent over the same kind of dedicated,
+    /// untrusted IPC channel as `OpenDevtoolsRequested`, for the same reason.
+    ContentShortcut(ContentShortcut),
+    /// A content webview asked to open a new window for `url` — a
+    /// `target="_blank"` link or `window.open()` — which VeloX always
+    /// answers by opening `url` as a new tab instead (see
+    /// docs/decisions.md D24). Carries no `TabId`: like the shortcuts above,
+    /// this is a browser-wide action ("open a new tab"), not something that
+    /// needs to be routed back to whichever tab asked.
+    NewTabRequested(String),
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -237,7 +254,10 @@ fn record_perf_event(
         UserEvent::LoadStarted(..)
         | UserEvent::NavigationBlocked(..)
         | UserEvent::PageTitleResolved { .. }
-        | UserEvent::OpenDevtoolsRequested => {}
+        | UserEvent::FaviconResolved { .. }
+        | UserEvent::OpenDevtoolsRequested
+        | UserEvent::ContentShortcut(_)
+        | UserEvent::NewTabRequested(_) => {}
     }
 }
 
@@ -349,13 +369,23 @@ fn handle_user_event(
                 // the active one: a background tab finishing a load is a
                 // real visit too (see docs/decisions.md D13 and the "Visit
                 // history and bookmarks" section of docs/architecture.md).
-                if let Some(history_id) =
-                    record_visit_if_enabled(state, &url, config.history_max_entries)
-                {
+                let history_id = record_visit_if_enabled(state, &url, config.history_max_entries);
+                if history_id.is_some() {
                     persist_history(state);
                     refresh_history_panel(window, state, config);
-                    log_failure("fetch page title", window.fetch_page_title(id, history_id));
                 }
+                // Title/favicon are tab-strip state, independent of whether
+                // this visit was recorded to history — private mode (no
+                // history recording) still wants a readable tab strip (see
+                // docs/decisions.md D21). `0` is a safe sentinel
+                // `history_id` when there is none: `HistoryStore` ids start
+                // at 1, so `HistoryStore::update_title` simply finds nothing
+                // to update rather than touching an unrelated entry.
+                log_failure(
+                    "fetch page title",
+                    window.fetch_page_title(id, history_id.unwrap_or(0)),
+                );
+                log_failure("fetch favicon", window.fetch_favicon(id));
             }
             if id == state.tabs.active_id() {
                 if !url.is_empty() {
@@ -382,7 +412,19 @@ fn handle_user_event(
                 refresh_history_panel(window, state, config);
             }
         }
+        UserEvent::FaviconResolved { tab_id, url } => {
+            // A stale `tab_id` (the tab closed while the fetch was in
+            // flight) is a safe no-op — mirrors `PageTitleResolved` above.
+            if let Some(tab) = state.tabs.get_mut(tab_id) {
+                tab.set_favicon_url(url);
+                sync_tab_strip(window, &state.tabs);
+            }
+        }
         UserEvent::OpenDevtoolsRequested => window.open_devtools(),
+        UserEvent::ContentShortcut(shortcut) => {
+            handle_content_shortcut(window, state, homepage, shortcut)
+        }
+        UserEvent::NewTabRequested(url) => open_new_tab(window, state, &url),
     }
 }
 
@@ -415,32 +457,36 @@ fn handle_toolbar_command(
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
         ToolbarCommand::OpenDevtools => window.open_devtools(),
-        ToolbarCommand::NewTab => {
-            let id = state.tabs.open_at(homepage.to_owned(), Instant::now());
-            log_failure("open tab", window.open_tab(id, homepage));
-            // A brand new tab's webview was just built above; only its
-            // visibility needs to change, never a resume.
-            activate_and_refresh(window, state, id, ActivationEffect::Switch);
-        }
-        ToolbarCommand::CloseTab { id } => {
-            let id = TabId::from(id);
-            if let Some((new_active, effect)) = state.tabs.close(id) {
-                window.close_tab(id);
-                // The tab that replaces the one just closed may itself have
-                // been suspended (a background tab can be suspended while
-                // the tab in front of it is closed); `effect` already
-                // reflects that (`Tabs::close`), so `activate_and_refresh`
-                // resumes it if needed without re-deriving it here.
-                activate_and_refresh(window, state, new_active, effect);
-            }
-            // Otherwise: unknown id, or `id` was the only remaining tab —
-            // VeloX always keeps at least one tab open.
-        }
+        ToolbarCommand::NewTab => open_new_tab(window, state, homepage),
+        ToolbarCommand::CloseTab { id } => close_tab(window, state, TabId::from(id)),
         ToolbarCommand::ActivateTab { id } => {
             let id = TabId::from(id);
             if let Some(effect) = state.tabs.activate_at(id, Instant::now()) {
                 activate_and_refresh(window, state, id, effect);
             }
+        }
+        ToolbarCommand::CloseActiveTab => {
+            let id = state.tabs.active_id();
+            close_tab(window, state, id);
+        }
+        ToolbarCommand::ReopenClosedTab => reopen_closed_tab(window, state),
+        ToolbarCommand::NextTab => {
+            let effect = state.tabs.activate_relative(1, Instant::now());
+            apply_activation(window, state, effect);
+        }
+        ToolbarCommand::PrevTab => {
+            let effect = state.tabs.activate_relative(-1, Instant::now());
+            apply_activation(window, state, effect);
+        }
+        ToolbarCommand::ActivateTabByIndex { index } => {
+            let effect = state
+                .tabs
+                .activate_by_position(index as usize, Instant::now());
+            apply_activation(window, state, effect);
+        }
+        ToolbarCommand::ActivateLastTab => {
+            let effect = state.tabs.activate_last(Instant::now());
+            apply_activation(window, state, effect);
         }
         ToolbarCommand::SuspendTab { id } => {
             let id = TabId::from(id);
@@ -512,6 +558,109 @@ fn handle_toolbar_command(
     }
 }
 
+/// Open a new tab at `url` and make it active. The one path every "open a
+/// new tab" trigger funnels through — `ToolbarCommand::NewTab` (homepage),
+/// `ContentShortcut::NewTab` (homepage), and `UserEvent::NewTabRequested`
+/// (a `target="_blank"`/`window.open()` URL, see docs/decisions.md D24) —
+/// so the webview-build-then-activate sequence is written once.
+fn open_new_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
+    let id = state.tabs.open_at(url.to_owned(), Instant::now());
+    log_failure("open tab", window.open_tab(id, url));
+    // A brand new tab's webview was just built above; only its visibility
+    // needs to change, never a resume.
+    activate_and_refresh(window, state, id, ActivationEffect::Switch);
+}
+
+/// Close tab `id` — the shared implementation behind the toolbar's own
+/// close button (`ToolbarCommand::CloseTab`), Ctrl/Cmd+W from either the
+/// toolbar or the content webview (`CloseActiveTab`/
+/// `ContentShortcut::CloseTab`, both of which resolve `id` to the active
+/// tab before calling this). A no-op — matching `Tabs::close` — for an
+/// unknown id or the last remaining tab.
+fn close_tab(window: &mut BrowserWindow, state: &mut AppState, id: TabId) {
+    if let Some((new_active, effect)) = state.tabs.close(id) {
+        window.close_tab(id);
+        // The tab that replaces the one just closed may itself have been
+        // suspended (a background tab can be suspended while the tab in
+        // front of it is closed); `effect` already reflects that
+        // (`Tabs::close`), so `activate_and_refresh` resumes it if needed
+        // without re-deriving it here.
+        activate_and_refresh(window, state, new_active, effect);
+    }
+    // Otherwise: unknown id, or `id` was the only remaining tab — VeloX
+    // always keeps at least one tab open.
+}
+
+/// Reopen the most recently closed tab (Ctrl/Cmd+Shift+T, from either the
+/// toolbar or the content webview). A no-op if nothing has been closed yet
+/// (see `browser::tabs::Tabs::reopen_closed`).
+fn reopen_closed_tab(window: &mut BrowserWindow, state: &mut AppState) {
+    let Some(id) = state.tabs.reopen_closed(Instant::now()) else {
+        return;
+    };
+    let url = state
+        .tabs
+        .get(id)
+        .map(|tab| tab.current_url().to_owned())
+        .unwrap_or_default();
+    log_failure("reopen tab", window.open_tab(id, &url));
+    activate_and_refresh(window, state, id, ActivationEffect::Switch);
+}
+
+/// Apply an activation `effect` already resolved by one of `Tabs`'
+/// relative/positional activation methods (`activate_relative`,
+/// `activate_by_position`, `activate_last`) against the tab that is now
+/// active. `None` (nothing to apply — e.g. `ActivateTabByIndex` for a
+/// position with no tab) is a silent no-op.
+fn apply_activation(
+    window: &mut BrowserWindow,
+    state: &mut AppState,
+    effect: Option<ActivationEffect>,
+) {
+    if let Some(effect) = effect {
+        let id = state.tabs.active_id();
+        activate_and_refresh(window, state, id, effect);
+    }
+}
+
+/// Dispatch one content-webview keyboard shortcut (see
+/// `ui::window::ContentShortcut` and docs/decisions.md D18/D22) to the same
+/// tab operations the toolbar's own equivalent commands use — every branch
+/// here mirrors one `ToolbarCommand` arm in `handle_toolbar_command`.
+fn handle_content_shortcut(
+    window: &mut BrowserWindow,
+    state: &mut AppState,
+    homepage: &str,
+    shortcut: ContentShortcut,
+) {
+    match shortcut {
+        ContentShortcut::NewTab => open_new_tab(window, state, homepage),
+        ContentShortcut::CloseTab => {
+            let id = state.tabs.active_id();
+            close_tab(window, state, id);
+        }
+        ContentShortcut::ReopenClosedTab => reopen_closed_tab(window, state),
+        ContentShortcut::NextTab => {
+            let effect = state.tabs.activate_relative(1, Instant::now());
+            apply_activation(window, state, effect);
+        }
+        ContentShortcut::PrevTab => {
+            let effect = state.tabs.activate_relative(-1, Instant::now());
+            apply_activation(window, state, effect);
+        }
+        ContentShortcut::ActivateTabAt(position) => {
+            let effect = state
+                .tabs
+                .activate_by_position(position as usize, Instant::now());
+            apply_activation(window, state, effect);
+        }
+        ContentShortcut::ActivateLastTab => {
+            let effect = state.tabs.activate_last(Instant::now());
+            apply_activation(window, state, effect);
+        }
+    }
+}
+
 /// Show `id` in the window, then bring the toolbar (address bar, loading
 /// indicator, bookmark star, block-count badge, tab strip) up to date with
 /// the now-active tab. The caller must have already made `id` the active
@@ -561,6 +710,11 @@ fn sync_tab_strip(window: &BrowserWindow, tabs: &Tabs) {
         .map(|tab| toolbar::TabSummary {
             id: tab.id().get(),
             url: tab.current_url().to_owned(),
+            title: tab.title().map(str::to_owned),
+            favicon: match tab.favicon() {
+                Favicon::Url(url) => Some(url.clone()),
+                Favicon::Unknown => None,
+            },
             loading: tab.is_loading(),
             active: tab.id() == active_id,
             suspended: tab.is_suspended(),

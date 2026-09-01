@@ -811,3 +811,277 @@ tab" signal a future #25 restore policy would want, alongside `current_url`
 and `TabState` itself (was this tab suspended when the session ended).
 Actually persisting any of this to disk is #25's own decision to make, not
 this issue's.
+
+## D21: Tab strip — title/favicon rendering, favicon resolution, and shrink-then-scroll
+
+**Scope**: issue #11 ("複数タブ管理を実用レベルまで拡張"), the parts of it that
+are tab-strip presentation rather than tab lifecycle (D20 already covers the
+state machine `Tab::title`/`Tab::favicon` were added for).
+
+**Title**: `TabSummary` grew a `title: Option<String>` field, mirroring
+`Tab::title()`. `sync_tab_strip` (`app.rs`) copies it straight across; the
+toolbar's `veloxSetTabs` picks `tab.title || tab.url || "New Tab"` as the
+label, same fallback chain the tab's tooltip (`el.title`) uses. Nothing
+about *when* a title is fetched changed except one gap this issue also
+closes: `fetch_page_title` used to only run when `record_visit_if_enabled`
+returned a real `history_id`, i.e. never in private mode (D13/D14) — so a
+private-mode tab strip would have shown bare URLs forever. It now always
+runs, passing `0` as `history_id` when there is none to attach the title to;
+`HistoryStore::update_title` starts issuing ids at `1`, so `0` is a safe
+sentinel that simply finds nothing to update rather than colliding with a
+real entry — see `app.rs`'s `UserEvent::LoadFinished` handler.
+
+**Favicon — resolving a URL vs. fetching an image, and why that split
+matters for "don't block on network"**: the issue's constraint is that
+favicon retrieval must never block on external network I/O, and VeloX adds
+no HTTP client dependency (D6). The design splits the work in two, matching
+where each half is already cheap:
+
+1. **Resolving *which* URL to try** is synchronous, in-page JS — no network
+   trip. `ui::window::RESOLVE_FAVICON_SCRIPT` runs via the same
+   `evaluate_script_with_callback` fire-and-forget pattern D12 established
+   for page titles (`BrowserWindow::fetch_favicon`, called right alongside
+   `fetch_page_title` on `LoadFinished`): it looks for
+   `document.querySelector('link[rel~="icon"][href]')` (matching `icon`,
+   `shortcut icon`, `apple-touch-icon`, etc. — `rel~=` is a whitespace-token
+   match) and reads its already-browser-resolved-to-absolute `.href`;
+   failing that, it falls back to `new URL("/favicon.ico", location.href)`.
+   The whole thing is wrapped in `try { … } catch { return ""; }`, and an
+   empty result is dropped rather than reported — never a crash, per the
+   issue's "取得失敗は...握りつぶしてログするだけ". The result comes back as
+   `UserEvent::FaviconResolved { tab_id, url }`, applied via
+   `Tab::set_favicon_url` exactly like a resolved title.
+2. **Actually fetching the image** is left entirely to the toolbar webview's
+   own `<img src="...">` tag once `veloxSetTabs` renders it — a real browser
+   engine's normal async image loading, off the main Rust thread's back
+   entirely. `TabSummary.favicon: Option<String>` carries only the URL from
+   step 1; Rust never touches the image bytes. A failed load (404, timeout,
+   unreachable host) fires the `<img>`'s own `error` event, which just
+   removes the element (`.tab-favicon` CSS comment) — no broken-image icon,
+   no Rust-side error path needed at all.
+
+**Consequence for the toolbar webview's incognito setting**: before this
+issue, only content webviews were `with_incognito(private)` — the toolbar
+was documented as never needing it because it "only ever loads our own
+embedded HTML, never site content" (D15). Favicon `<img>` tags break that:
+the toolbar webview now makes real requests to page-controlled origins. In
+private mode, letting those persist cookies/cache the private-browsing
+promise (D14) says nothing survives would be a real leak. Fix: the toolbar
+webview's `WebViewBuilder` also gets `.with_incognito(config.private)` now
+(`BrowserWindow::new`); non-private mode is unaffected (favicons render and
+cache normally). No content-blocking is applied to favicon image requests —
+out of scope for this issue; a future issue could route them through
+`FilterList` too if that turns out to matter in practice.
+
+**Tab width and scrolling**: `#tabstrip` already had `overflow-x: auto`
+(D8); what it lacked was Chrome/Firefox's "shrink before you scroll"
+behavior — with the old `.tab { flex: none; min-width: 80px; }`, tabs never
+shrank below their natural content width, so 10+ tabs jumped straight to a
+wide scrollable strip with no narrowing step. Fix, entirely CSS: `#tabs`
+(the flex row holding the `.tab` elements, itself a flex item of
+`#tabstrip` alongside the fixed-size `#new-tab` button) is now
+`flex: 1 1 auto; min-width: 0`, and each `.tab` is `flex: 1 1 180px;
+max-width: 180px; min-width: 60px`. Tabs shrink together, proportionally,
+down to 60px as more are opened; only once every open tab is already at
+60px does the combined width exceed `#tabstrip`'s box and its
+`overflow-x: auto` start scrolling. This is a standard CSS pattern (a
+`min-width` floor on flex-shrinking children inside a scrollable ancestor)
+and needed no new dependency. Verified by reading the rule, not by running
+it — see the "headless" caveat below.
+
+**What's still unverified**: this repo's CI/dev environment is headless
+(`docs/architecture.md`'s webview-in-a-real-window model has no display to
+attach to here), so the actual pixel behavior — tabs visibly narrowing,
+scrolling smoothly past 10+ tabs, a favicon actually rendering — has not
+been eyeballed in a running VeloX. What's covered instead: the CSS rules
+themselves (present and structured as described above), the JS/Rust
+plumbing (`TabSummary`/`veloxSetTabs` serialization round-trip, unit-tested
+in `src/ui/toolbar.rs`), and the underlying `browser::tabs::Tabs` state
+handling many tabs without panicking or losing the single-active-tab
+invariant (`many_tabs_stay_internally_consistent` in
+`browser::tabs::tests`). A human should confirm the visual result once this
+lands somewhere with a display.
+
+## D22: Tab-management keyboard shortcuts — same delivery pattern as D18, two trust boundaries
+
+**Scope**: issue #11's Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9.
+
+**Delivery mechanism reused wholesale from D18**: the content webview is a
+native child widget; once it has keyboard focus, tao's window-level
+`WindowEvent::KeyboardInput`/accelerators do not see the keypress (D18's
+"why an injected script over a tao accelerator" applies unchanged — nothing
+new to investigate there, and this issue does not reopen that question).
+`ui::window::tab_shortcut_script()` is a second `with_initialization_script`
+injected alongside `devtools_shortcut_script()` into every content webview
+(same `content_webview_builder`, so it applies to the initial tab, a
+newly-opened tab, and a tab rebuilt on resume, exactly like D18's
+reasoning): a capture-phase `keydown` listener that matches
+Ctrl/Cmd(+Shift)+key combinations and posts one of a fixed set of sentinel
+strings (`"velox:new-tab"`, `"velox:close-tab"`,
+`"velox:reopen-closed-tab"`, `"velox:next-tab"`, `"velox:prev-tab"`,
+`"velox:activate-tab-1"`..`"velox:activate-tab-8"`,
+`"velox:activate-tab-last"`) over `window.ipc`.
+
+**Both modifiers, always, rather than branching on OS**: the issue asks for
+Cmd on macOS and Ctrl on Linux/Windows to both work. Rather than sniffing
+the platform in JS (`navigator.platform` is itself unreliable/deprecated)
+or building two separate scripts, the listener simply checks
+`event.ctrlKey || event.metaKey`. This trivially satisfies "handle both" —
+Cmd never fires outside macOS and Ctrl-as-a-browser-shortcut is harmless
+(if slightly extra) to also accept there — without any OS-detection code to
+get wrong. `docs/architecture.md`'s "OS 固有 API を抽象化する" principle is
+met by there being no OS-specific branch to abstract in the first place.
+
+**Trust boundary — two parsers, not one grown wider**: D18 already
+established that the content webview's IPC channel must never become a
+second `ToolbarCommand`-style structured-command parser, since page content
+is untrusted. This issue's shortcut messages are exact-string sentinels
+only — `ui::window::parse_content_shortcut` is a closed `match` over the
+fixed set above (including 8 literal `"velox:activate-tab-N"` arms, not a
+runtime-formatted comparison, so there is no string-building on the hot
+path and no way for a near-miss string to be accepted); anything else,
+including any attempt at JSON, is silently ignored, same as
+`OPEN_DEVTOOLS_MESSAGE`. The result is `ui::window::ContentShortcut`, a
+small enum carrying **no `TabId`** — every variant means "act on the active
+tab", resolved in `app.rs` from `Tabs::active_id()`, mirroring how
+`OpenDevtoolsRequested` already never trusted the sending webview's
+identity either. This sidesteps a real question (which of possibly several
+content webviews "is" the source of a shortcut?) by observing it doesn't
+need answering: only the visible, focused webview can plausibly receive a
+real keypress, so "the active tab" and "the tab that sent this" already
+coincide in practice, and treating it as always-the-active-tab keeps the
+handler simple and consistent with D18's precedent.
+
+The toolbar webview is trusted first-party chrome (same status as its
+existing `ToolbarCommand` channel), so its half of this feature — a second
+capture-phase `keydown` listener in `toolbar.html`, for when the address
+bar/panel has focus rather than the page — sends real structured
+`ToolbarCommand` variants (`CloseActiveTab`, `ReopenClosedTab`, `NextTab`,
+`PrevTab`, `ActivateTabByIndex { index }`, `ActivateLastTab`) through the
+existing trusted channel, no sentinel strings involved. `app.rs` dispatches
+both the toolbar's structured commands and the content webview's sentinel
+shortcuts to the *same* small set of shared functions
+(`open_new_tab`/`close_tab`/`reopen_closed_tab`/`apply_activation`), so the
+two trust boundaries stay separate at the parsing layer while sharing every
+line of actual tab-management logic underneath.
+
+**Why `CloseActiveTab` and not "just reuse `CloseTab { id }`"**: the
+content webview's untrusted channel cannot supply an `id` at all (nothing
+page-supplied is trusted as data, per D18), and the toolbar's own keyboard
+listener does not need to resolve one either if the shortcut's meaning is
+already "the active tab" — so `ToolbarCommand` grew a dedicated
+`CloseActiveTab` variant instead of asking either JS side to compute an id
+`app.rs` already knows how to resolve itself.
+
+## D23: Closed-tab stack (Ctrl/Cmd+Shift+T) — bounded LIFO of URLs, in `browser::tabs`
+
+**Scope**: issue #11's "最後に閉じたタブの復元", tracked as its own decision
+because the issue explicitly calls for pure, unit-tested logic here rather
+than folding it silently into `Tabs::close`.
+
+`browser::tabs::ClosedTabs` (private to the module — `Tabs` is the only
+thing that touches it) is a `Vec<String>` of closed tabs' URLs, capped at
+`ClosedTabs::CAP = 20` (an arbitrary but generous bound: comfortably more
+than anyone reopens in one sitting, without growing unboundedly across a
+long session of opening/closing many tabs). `push` evicts the oldest entry
+(`Vec::remove(0)`) once at capacity; `pop` (via `Vec::pop`, so the
+most-recently-pushed URL comes back first) is the LIFO read. `Tabs::close`
+is the single choke point that feeds it — every successful close, whichever
+of the three ways it was triggered (the tab strip's "×", `CloseActiveTab`,
+or `ContentShortcut::CloseTab`) all end up calling `Tabs::close` — pushes
+the closing tab's `current_url()` before removing it; a refused close (the
+last remaining tab, or an unknown id) pushes nothing, so it is not
+reopenable. `Tabs::reopen_closed(now)` pops one URL and is otherwise
+identical to `Self::open_at` — a reopened tab is a brand new tab/webview at
+that URL, never a restoration of scroll position, form input, or session
+history, since all of that was already gone the moment the original
+webview was dropped on close (same "a suspended/closed tab's webview is
+just gone" stance D9 takes for suspension). `app.rs`'s `reopen_closed_tab`
+then does exactly what `open_new_tab` does for a brand new tab: build the
+webview (`BrowserWindow::open_tab`) and activate it.
+
+Not implemented: any attempt to dedupe against a tab that is already open
+at the same URL, or to persist the stack across a restart. Both are
+reasonable follow-ups but outside this issue's "実装すべき差分" list; #25
+(session restore) is the natural place persistence would eventually belong,
+since it already owns the question of what tab state survives a restart.
+
+## D24: `target="_blank"`/`window.open()` — wry 0.56's `with_new_window_req_handler`, confirmed from source
+
+**Scope**: issue #11 asked this to be verified against the actual wry 0.56
+source in `~/.cargo/registry` before writing any code, not assumed. This
+records what was actually found there
+(`~/.cargo/registry/src/index.crates.io-*/wry-0.56.1/src/{lib.rs,
+webkitgtk/mod.rs, webview2/mod.rs, wkwebview/class/wry_web_view_ui_delegate.rs}`).
+
+**The API exists and is available on every backend VeloX targets**:
+`WebViewBuilder::with_new_window_req_handler(impl Fn(String,
+NewWindowFeatures) -> NewWindowResponse + 'static)` (`src/lib.rs`) is wired
+up identically in shape across all three backends VeloX ships on:
+
+- **WebKitGTK** (`src/webkitgtk/mod.rs`, `connect_create` on the webview's
+  `create` signal): fires synchronously for both `window.open()` and
+  `target="_blank"` link activation, handing back the requested URL
+  (`action.request().uri()`) before any native window is created.
+- **WebView2** (`src/webview2/mod.rs`, `add_NewWindowRequested`): fires for
+  the same two triggers, extracting the URL via `args.Uri(...)`. The
+  callback runs through `Self::dispatch_handler` (Windows' documented
+  reentrancy requirement for this event — calling back into WebView2
+  synchronously from inside its own callback would deadlock) but still
+  resolves on the same event loop, before the deferred `args` completes.
+- **WKWebView** (`src/wkwebview/class/wry_web_view_ui_delegate.rs`,
+  `webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:`):
+  same two triggers, URL from `action.request().URL()`.
+
+All three converge on the same three-way `NewWindowResponse`:
+
+- `Allow` — the *default* platform behavior: a brand new, bare native
+  window/webview outside VeloX's own window/tab model entirely (a second
+  `gtk::ApplicationWindow` on Linux, a `NSWindow` on macOS, WebView2's own
+  default handling on Windows). No toolbar, no tab strip entry, nothing
+  VeloX's `Tabs`/`BrowserWindow` know about — exactly the "新規タブとして
+  扱う" outcome the issue does *not* want.
+- `Create { webview }` — the caller constructs the platform-native webview
+  itself (`webkit2gtk::WebView`, `ICoreWebView2`, or
+  `Retained<WKWebView>`) and hands it back, with the requirement that it
+  share the opener's environment/configuration
+  (`WebViewBuilderExtUnix::with_related_view` /
+  `WebViewBuilderExtWindows::with_environment` /
+  `WebViewBuilderExtMacos::with_webview_configuration`, per each platform
+  module's own doc comments). This would let a `window.open()` result
+  become a real second content webview VeloX manages — but doing so needs
+  three platform-specific code paths, each threading a *different* opener
+  handle (`NewWindowOpener`'s per-platform `webview`/`environment`/
+  `target_configuration` fields) through to a matching
+  `WebViewBuilderExt*` call, and there is no cross-platform way to build a
+  wry `WebView` from a "please match this specific opener" webview
+  attribute without those extension traits. That is meaningfully more
+  surface than this issue needs.
+- `Deny` — refuse the new webview/window outright; the backend does nothing
+  further with the request.
+
+**Decision: `Deny`, plus opening the URL as a normal new VeloX tab from Rust
+— not `Create`**. Every `content_webview_builder` call (so every tab, not
+just the initial one) returns `NewWindowResponse::Deny` from its
+`with_new_window_req_handler` closure, having first sent the URL out as
+`UserEvent::NewTabRequested(url)`. `app.rs` handles that exactly like
+`ToolbarCommand::NewTab`, just with the requested URL instead of the
+homepage (`open_new_tab`, shared by both) — a completely ordinary new tab,
+built the same way any other tab is, with its own `TabId`, its own entry in
+`BrowserWindow::contents`, content blocking, devtools, and the shortcut
+scripts all applying exactly as they do to every other tab. This satisfies
+the issue's "基本ケースが新規タブとして扱える" acceptance criterion without
+needing `Create`'s per-platform opener-sharing plumbing — the one piece of
+this issue's scope deliberately kept small. A future issue could pursue
+`Create` if there turns out to be a concrete need for the new tab to share
+the opener's storage partition/session (e.g. an OAuth popup flow that
+expects `window.opener` semantics) that a plain new tab does not provide;
+nothing here forecloses that later.
+
+**What's unverified**: same headless-environment caveat as D21 — this was
+confirmed by reading wry's source (the handler signature, the three
+backends' call sites, and their semantics) and by the existing
+`ToolbarCommand::NewTab` code path this reuses being already covered by
+`app.rs`'s tests, but a real `target="_blank"` click or `window.open()`
+call opening a new VeloX tab has not been observed running, since there is
+no display to run VeloX against here.

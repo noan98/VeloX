@@ -9,6 +9,12 @@
 //! Tabs are identified to the toolbar by a plain `u64` (the toolbar's JS has
 //! no notion of `browser::TabId`); `app.rs` converts between the two at the
 //! boundary.
+//!
+//! The toolbar document also runs its own capture-phase `keydown` listener
+//! for the tab-management keyboard shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/1-9),
+//! sending the six `ToolbarCommand` variants at the end of the enum below.
+//! This is the trusted-webview half of that feature; the content webview's
+//! untrusted half lives in `ui::window` — see docs/decisions.md D22.
 
 use serde::{Deserialize, Serialize};
 
@@ -78,6 +84,29 @@ pub enum ToolbarCommand {
     RemoveBookmark {
         id: u64,
     },
+    /// Close the currently active tab (Ctrl/Cmd+W). Unlike [`Self::CloseTab`]
+    /// this carries no `id`: it is what both the toolbar's own keyboard
+    /// capture and the content webview's shortcut channel
+    /// (`ui::window::ContentShortcut::CloseTab`) send, since neither needs
+    /// to know the active tab's id itself — `app.rs` resolves it from
+    /// `Tabs::active_id()`.
+    CloseActiveTab,
+    /// Reopen the most recently closed tab (Ctrl/Cmd+Shift+T). A no-op if
+    /// nothing has been closed yet (see `browser::tabs::Tabs::reopen_closed`).
+    ReopenClosedTab,
+    /// Activate the next tab in display order, wrapping around
+    /// (Ctrl/Cmd+Tab).
+    NextTab,
+    /// Activate the previous tab in display order, wrapping around
+    /// (Ctrl/Cmd+Shift+Tab).
+    PrevTab,
+    /// Activate the tab at this 1-based display position (Ctrl/Cmd+1..8).
+    /// A no-op if there is no tab at that position.
+    ActivateTabByIndex {
+        index: u32,
+    },
+    /// Activate the last tab in display order (Ctrl/Cmd+9).
+    ActivateLastTab,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -85,6 +114,16 @@ pub enum ToolbarCommand {
 pub struct TabSummary {
     pub id: u64,
     pub url: String,
+    /// The page title last reported for this tab (`Tab::title`), if any has
+    /// arrived yet. The tab strip falls back to `url` when this is `None` —
+    /// see docs/decisions.md D21.
+    pub title: Option<String>,
+    /// A URL the tab strip can point an `<img>` at for this tab's favicon
+    /// (`Tab::favicon`'s `Url` case; `Unknown` becomes `None` here). Loading
+    /// it is left entirely to the toolbar webview's own `<img>` tag — see
+    /// docs/decisions.md D21 for why that, not a Rust-side HTTP fetch, is
+    /// what actually retrieves the image.
+    pub favicon: Option<String>,
     pub loading: bool,
     pub active: bool,
     /// Whether the tab is suspended (its content webview has been dropped
@@ -270,6 +309,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_keyboard_shortcut_commands() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"close_active_tab"}"#).unwrap(),
+            ToolbarCommand::CloseActiveTab
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"reopen_closed_tab"}"#).unwrap(),
+            ToolbarCommand::ReopenClosedTab
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"next_tab"}"#).unwrap(),
+            ToolbarCommand::NextTab
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"prev_tab"}"#).unwrap(),
+            ToolbarCommand::PrevTab
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"activate_tab_by_index","index":3}"#).unwrap(),
+            ToolbarCommand::ActivateTabByIndex { index: 3 }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"activate_last_tab"}"#).unwrap(),
+            ToolbarCommand::ActivateLastTab
+        );
+    }
+
+    #[test]
     fn url_script_escapes_quotes_and_backslashes() {
         let script = set_url_script(r#"https://example.com/?q="a"\b"#);
         assert_eq!(script, r#"veloxSetUrl("https://example.com/?q=\"a\"\\b");"#);
@@ -293,6 +360,8 @@ mod tests {
             TabSummary {
                 id: 1,
                 url: "https://a.example/".to_owned(),
+                title: Some("A\"s page".to_owned()),
+                favicon: Some("https://a.example/favicon.ico".to_owned()),
                 loading: false,
                 active: true,
                 suspended: false,
@@ -300,6 +369,8 @@ mod tests {
             TabSummary {
                 id: 2,
                 url: "https://b.example/?q=\"x\"".to_owned(),
+                title: None,
+                favicon: None,
                 loading: true,
                 active: false,
                 suspended: false,
@@ -307,6 +378,8 @@ mod tests {
             TabSummary {
                 id: 3,
                 url: "https://c.example/".to_owned(),
+                title: None,
+                favicon: None,
                 loading: false,
                 active: false,
                 suspended: true,
@@ -318,6 +391,12 @@ mod tests {
         // Quotes inside a URL must be escaped, not break out of the array.
         assert!(script.contains(r#"\"x\""#));
         assert!(script.contains(r#""suspended":true"#));
+        // A title containing a quote is escaped the same way, not broken out.
+        assert!(script.contains(r#"A\"s page"#));
+        assert!(script.contains(r#""favicon":"https://a.example/favicon.ico""#));
+        // No title/favicon yet serializes as JSON null, not an empty string.
+        assert!(script.contains(r#""title":null"#));
+        assert!(script.contains(r#""favicon":null"#));
 
         let empty = set_tabs_script(&[]);
         assert_eq!(empty, "veloxSetTabs([]);");
@@ -427,5 +506,14 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("delete_history_entry"));
         assert!(TOOLBAR_HTML.contains("clear_history"));
         assert!(TOOLBAR_HTML.contains("remove_bookmark"));
+        // Keyboard shortcuts (see docs/decisions.md D22): the toolbar's own
+        // capture-phase keydown listener, for when the address bar/panel
+        // (not the content webview) has focus.
+        assert!(TOOLBAR_HTML.contains("close_active_tab"));
+        assert!(TOOLBAR_HTML.contains("reopen_closed_tab"));
+        assert!(TOOLBAR_HTML.contains("next_tab"));
+        assert!(TOOLBAR_HTML.contains("prev_tab"));
+        assert!(TOOLBAR_HTML.contains("activate_tab_by_index"));
+        assert!(TOOLBAR_HTML.contains("activate_last_tab"));
     }
 }

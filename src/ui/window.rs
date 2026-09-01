@@ -60,6 +60,81 @@ type LogicalRect = (u32, u32, u32, u32);
 /// [`ToolbarCommand`]: crate::ui::toolbar::ToolbarCommand
 const OPEN_DEVTOOLS_MESSAGE: &str = "velox:open-devtools";
 
+// --- Tab-management keyboard shortcuts (see docs/decisions.md D22) ---
+//
+// Fixed sentinel strings for the content webview's shortcut IPC channel,
+// alongside `OPEN_DEVTOOLS_MESSAGE` above. As with devtools, this channel
+// exists because the content webview is untrusted page content: it can
+// never grow into a second `ToolbarCommand`-style structured-command parser
+// (see docs/decisions.md D18), so every message here is compared by exact
+// string equality only, never deserialized.
+const NEW_TAB_MESSAGE: &str = "velox:new-tab";
+const CLOSE_TAB_MESSAGE: &str = "velox:close-tab";
+const REOPEN_CLOSED_TAB_MESSAGE: &str = "velox:reopen-closed-tab";
+const NEXT_TAB_MESSAGE: &str = "velox:next-tab";
+const PREV_TAB_MESSAGE: &str = "velox:prev-tab";
+const ACTIVATE_LAST_TAB_MESSAGE: &str = "velox:activate-tab-last";
+/// Prefix shared by the eight `velox:activate-tab-1` .. `velox:activate-tab-8`
+/// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
+/// [`parse_content_shortcut`].
+const ACTIVATE_TAB_MESSAGE_PREFIX: &str = "velox:activate-tab-";
+
+/// A tab-management keyboard shortcut reported by the content webview's
+/// shortcut IPC channel (see [`parse_content_shortcut`]).
+///
+/// Deliberately carries no [`TabId`]: every variant here acts on "the
+/// active tab" (`browser::Tabs::active_id()` and friends), resolved
+/// server-side in `app.rs` — mirroring how [`UserEvent::OpenDevtoolsRequested`]
+/// already always resolves the active tab rather than trusting the sending
+/// webview's identity (see docs/decisions.md D18). This also sidesteps a
+/// subtlety: only the visible, focused webview can realistically be the
+/// source of a real keypress, so there is no meaningful "which tab sent
+/// this" question to answer in the first place.
+///
+/// [`UserEvent::OpenDevtoolsRequested`]: crate::app::UserEvent::OpenDevtoolsRequested
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentShortcut {
+    /// Ctrl/Cmd+T.
+    NewTab,
+    /// Ctrl/Cmd+W.
+    CloseTab,
+    /// Ctrl/Cmd+Shift+T.
+    ReopenClosedTab,
+    /// Ctrl/Cmd+Tab.
+    NextTab,
+    /// Ctrl/Cmd+Shift+Tab.
+    PrevTab,
+    /// Ctrl/Cmd+1..8: activate the tab at this 1-based display position.
+    ActivateTabAt(u8),
+    /// Ctrl/Cmd+9: activate the last tab.
+    ActivateLastTab,
+}
+
+/// Parse one content-webview shortcut IPC message body. `None` for anything
+/// that is not an exact match for one of the fixed sentinel strings above —
+/// including, deliberately, any attempt at parsing it as JSON or otherwise
+/// treating it as structured data (see [`ContentShortcut`]'s doc comment and
+/// docs/decisions.md D18/D22).
+fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
+    match body {
+        NEW_TAB_MESSAGE => Some(ContentShortcut::NewTab),
+        CLOSE_TAB_MESSAGE => Some(ContentShortcut::CloseTab),
+        REOPEN_CLOSED_TAB_MESSAGE => Some(ContentShortcut::ReopenClosedTab),
+        NEXT_TAB_MESSAGE => Some(ContentShortcut::NextTab),
+        PREV_TAB_MESSAGE => Some(ContentShortcut::PrevTab),
+        ACTIVATE_LAST_TAB_MESSAGE => Some(ContentShortcut::ActivateLastTab),
+        "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
+        "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
+        "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
+        "velox:activate-tab-4" => Some(ContentShortcut::ActivateTabAt(4)),
+        "velox:activate-tab-5" => Some(ContentShortcut::ActivateTabAt(5)),
+        "velox:activate-tab-6" => Some(ContentShortcut::ActivateTabAt(6)),
+        "velox:activate-tab-7" => Some(ContentShortcut::ActivateTabAt(7)),
+        "velox:activate-tab-8" => Some(ContentShortcut::ActivateTabAt(8)),
+        _ => None,
+    }
+}
+
 /// Initialization script injected into the content webview to capture the
 /// devtools shortcut (F12, or Cmd+Opt+I on macOS) even while the page has
 /// focus, and forward it to Rust over [`OPEN_DEVTOOLS_MESSAGE`].
@@ -87,6 +162,80 @@ fn devtools_shortcut_script() -> String {
 }})();"#
     )
 }
+
+/// Initialization script that captures the tab-management keyboard
+/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9) while the content
+/// webview has focus, forwarding a fixed sentinel string per shortcut over
+/// the same untrusted IPC channel devtools uses (see [`ContentShortcut`] and
+/// docs/decisions.md D18/D22 for why this is a separate injected script
+/// rather than a tao-level accelerator).
+///
+/// `event.ctrlKey || event.metaKey` accepts both modifiers on every
+/// platform instead of branching on OS (macOS is Cmd, Linux/Windows is
+/// Ctrl) — the simplest way to "handle both", and harmless since Cmd simply
+/// never fires outside macOS and vice versa.
+fn tab_shortcut_script() -> String {
+    format!(
+        r#"(() => {{
+  "use strict";
+  window.addEventListener("keydown", (event) => {{
+    const mod = event.ctrlKey || event.metaKey;
+    if (!mod) {{
+      return;
+    }}
+    let message = null;
+    if (!event.altKey && !event.shiftKey) {{
+      if (event.key === "t" || event.key === "T") {{
+        message = "{NEW_TAB_MESSAGE}";
+      }} else if (event.key === "w" || event.key === "W") {{
+        message = "{CLOSE_TAB_MESSAGE}";
+      }} else if (event.key === "Tab") {{
+        message = "{NEXT_TAB_MESSAGE}";
+      }} else if (event.key === "9") {{
+        message = "{ACTIVATE_LAST_TAB_MESSAGE}";
+      }} else if (event.key >= "1" && event.key <= "8") {{
+        message = "{ACTIVATE_TAB_MESSAGE_PREFIX}" + event.key;
+      }}
+    }} else if (event.shiftKey && !event.altKey) {{
+      if (event.key === "t" || event.key === "T") {{
+        message = "{REOPEN_CLOSED_TAB_MESSAGE}";
+      }} else if (event.key === "Tab") {{
+        message = "{PREV_TAB_MESSAGE}";
+      }}
+    }}
+    if (message === null) {{
+      return;
+    }}
+    event.preventDefault();
+    if (window.ipc) {{
+      window.ipc.postMessage(message);
+    }}
+  }}, true);
+}})();"#
+    )
+}
+
+/// Initialization script that resolves this page's favicon URL on demand:
+/// its `<link rel="icon">` (or the closest relative, `rel~="icon"`, which
+/// also matches `shortcut icon`/`apple-touch-icon` etc.) if the page
+/// declares one, otherwise a same-origin `/favicon.ico` guess. Only ever
+/// invoked via [`BrowserWindow::fetch_favicon`]'s
+/// `evaluate_script_with_callback` — not injected as a standing listener —
+/// so this returns a value rather than posting a message. See
+/// docs/decisions.md D21 for why resolving *a URL* is all this does: the
+/// actual image fetch is left entirely to the toolbar webview's own `<img>`
+/// tag, never performed here or anywhere else in Rust.
+const RESOLVE_FAVICON_SCRIPT: &str = r#"(() => {
+  try {
+    const link = document.querySelector('link[rel~="icon"][href]');
+    if (link && link.href) {
+      return link.href;
+    }
+    return new URL("/favicon.ico", location.href).href;
+  } catch (err) {
+    return "";
+  }
+})();"#;
 
 /// Split the window area into a toolbar strip and the content area below it.
 fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, LogicalRect) {
@@ -255,6 +404,14 @@ impl BrowserWindow {
         let toolbar_builder = WebViewBuilder::new()
             .with_bounds(to_bounds(toolbar_rect))
             .with_html(toolbar::TOOLBAR_HTML)
+            // The toolbar now loads more than our own embedded HTML: a
+            // tab's favicon is rendered as a plain `<img>` pointed at a
+            // page-controlled URL (see docs/decisions.md D21), so in
+            // private mode this webview must be just as ephemeral as every
+            // content webview (docs/decisions.md D14/D15) — otherwise a
+            // favicon fetch could persist cookies/cache private browsing is
+            // supposed to leave no trace of.
+            .with_incognito(config.private)
             .with_ipc_handler(move |request| {
                 let _ = ipc_proxy.send_event(UserEvent::ToolbarMessage(request.into_body()));
             });
@@ -620,6 +777,35 @@ impl BrowserWindow {
             }
         })
     }
+
+    /// Asynchronously resolve tab `tab_id`'s favicon URL (see
+    /// [`RESOLVE_FAVICON_SCRIPT`]) and report it back as
+    /// [`UserEvent::FaviconResolved`].
+    ///
+    /// Same shape and same reasoning as [`Self::fetch_page_title`] (see
+    /// docs/decisions.md D12/D21): a no-op for an unknown or suspended tab,
+    /// fire-and-forget (a superseded navigation just means a stale answer
+    /// gets applied late), and this only ever resolves a URL string — the
+    /// actual favicon image fetch happens later, asynchronously, as a plain
+    /// `<img src>` load in the toolbar webview, never here.
+    pub fn fetch_favicon(&self, tab_id: TabId) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        let proxy = self.proxy.clone();
+        webview.evaluate_script_with_callback(RESOLVE_FAVICON_SCRIPT, move |raw| {
+            if let Some(url) = extract_js_string_result(&raw) {
+                if !url.is_empty() {
+                    let _ = proxy.send_event(UserEvent::FaviconResolved { tab_id, url });
+                }
+            }
+        })
+    }
 }
 
 /// `WebView::evaluate_script_with_callback` hands back the JS result
@@ -656,17 +842,20 @@ fn content_webview_builder<'a>(
     let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
+    let new_window_proxy = proxy.clone();
     WebViewBuilder::new()
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
         // Ephemeral (non-persistent) cookies/storage/cache for the page
         // content itself; see docs/decisions.md D15 for the per-platform
         // backing (WebKitGTK ephemeral WebContext / WKWebsiteDataStore
-        // nonPersistentDataStore / WebView2 private-mode controller option)
-        // and why the toolbar webview does not need this (it only ever loads
-        // our own embedded HTML, never site content). Every tab's webview
-        // goes through this builder, so tabs opened later - and suspended
-        // tabs rebuilt on resume - stay ephemeral too.
+        // nonPersistentDataStore / WebView2 private-mode controller option).
+        // The toolbar webview now gets the same treatment for the same
+        // reason (see the `with_incognito` call on `toolbar_builder` in
+        // `BrowserWindow::new`) since #11's favicon rendering gave it its
+        // own path to page-controlled URLs. Every tab's webview goes through
+        // this builder, so tabs opened later - and suspended tabs rebuilt on
+        // resume - stay ephemeral too.
         .with_incognito(private)
         // DevTools (see docs/decisions.md D18): every content webview built
         // through this one function — the initial tab, a newly opened tab,
@@ -676,6 +865,12 @@ fn content_webview_builder<'a>(
         // or how the webview came to exist.
         .with_devtools(true)
         .with_initialization_script(devtools_shortcut_script())
+        // Tab-management keyboard shortcuts (see docs/decisions.md D22):
+        // same treatment, same trust boundary, same untrusted IPC channel
+        // below — just a second injected script and a second fixed set of
+        // sentinel strings, rather than growing the devtools one to mean two
+        // different things.
+        .with_initialization_script(tab_shortcut_script())
         .with_navigation_handler(move |url| {
             if content_blocking_enabled && blocklist.is_blocked(&url) {
                 let _ = block_proxy.send_event(UserEvent::NavigationBlocked(id, url));
@@ -692,12 +887,31 @@ fn content_webview_builder<'a>(
             let _ = load_proxy.send_event(event);
         })
         .with_ipc_handler(move |request| {
-            // See OPEN_DEVTOOLS_MESSAGE: this content-webview IPC channel is
-            // untrusted and deliberately does nothing but this one
-            // exact-match check — it never deserializes page-supplied data.
-            if request.body().as_str() == OPEN_DEVTOOLS_MESSAGE {
+            // Untrusted content-webview IPC channel (see OPEN_DEVTOOLS_MESSAGE
+            // and ContentShortcut's doc comment): every branch here is either
+            // one fixed exact-match string comparison or a lookup into a
+            // fixed, closed set of them — never JSON parsing, never anything
+            // page-supplied treated as structured data.
+            let body = request.body().as_str();
+            if body == OPEN_DEVTOOLS_MESSAGE {
                 let _ = devtools_proxy.send_event(UserEvent::OpenDevtoolsRequested);
+            } else if let Some(shortcut) = parse_content_shortcut(body) {
+                let _ = devtools_proxy.send_event(UserEvent::ContentShortcut(shortcut));
             }
+        })
+        // `target="_blank"` links and `window.open()` (see docs/decisions.md
+        // D24): wry's `with_new_window_req_handler` fires synchronously with
+        // the requested URL on every backend (WebKitGTK's `create` signal,
+        // WebView2's `NewWindowRequested`, WKWebView's
+        // `createWebViewWithConfiguration:...`). We always `Deny` — never
+        // `Allow` (a bare native window outside VeloX's tab model) or
+        // `Create` (would need a platform-specific webview sharing the
+        // opener's configuration; see D24) — and instead open the URL as a
+        // new VeloX tab ourselves, the same way `ToolbarCommand::NewTab`
+        // does but at the requested URL instead of the homepage.
+        .with_new_window_req_handler(move |url, _features| {
+            let _ = new_window_proxy.send_event(UserEvent::NewTabRequested(url));
+            wry::NewWindowResponse::Deny
         })
 }
 
@@ -780,5 +994,85 @@ mod tests {
         assert_eq!(extract_js_string_result("null"), None);
         assert_eq!(extract_js_string_result(""), None);
         assert_eq!(extract_js_string_result("42"), None);
+    }
+
+    #[test]
+    fn tab_shortcut_script_captures_expected_combos_in_capture_phase() {
+        let script = tab_shortcut_script();
+        for message in [
+            NEW_TAB_MESSAGE,
+            CLOSE_TAB_MESSAGE,
+            REOPEN_CLOSED_TAB_MESSAGE,
+            NEXT_TAB_MESSAGE,
+            PREV_TAB_MESSAGE,
+            ACTIVATE_LAST_TAB_MESSAGE,
+        ] {
+            assert!(
+                script.contains(message),
+                "script is missing sentinel {message:?}"
+            );
+        }
+        assert!(script.contains(ACTIVATE_TAB_MESSAGE_PREFIX));
+        assert!(script.contains("event.ctrlKey || event.metaKey"));
+        assert!(script.contains("}, true);"));
+    }
+
+    #[test]
+    fn parse_content_shortcut_matches_every_sentinel_exactly() {
+        assert_eq!(
+            parse_content_shortcut(NEW_TAB_MESSAGE),
+            Some(ContentShortcut::NewTab)
+        );
+        assert_eq!(
+            parse_content_shortcut(CLOSE_TAB_MESSAGE),
+            Some(ContentShortcut::CloseTab)
+        );
+        assert_eq!(
+            parse_content_shortcut(REOPEN_CLOSED_TAB_MESSAGE),
+            Some(ContentShortcut::ReopenClosedTab)
+        );
+        assert_eq!(
+            parse_content_shortcut(NEXT_TAB_MESSAGE),
+            Some(ContentShortcut::NextTab)
+        );
+        assert_eq!(
+            parse_content_shortcut(PREV_TAB_MESSAGE),
+            Some(ContentShortcut::PrevTab)
+        );
+        assert_eq!(
+            parse_content_shortcut(ACTIVATE_LAST_TAB_MESSAGE),
+            Some(ContentShortcut::ActivateLastTab)
+        );
+        for n in 1u8..=8 {
+            assert_eq!(
+                parse_content_shortcut(&format!("velox:activate-tab-{n}")),
+                Some(ContentShortcut::ActivateTabAt(n))
+            );
+        }
+    }
+
+    #[test]
+    fn parse_content_shortcut_rejects_anything_not_an_exact_known_sentinel() {
+        // Never treated as JSON/structured data, and never a prefix/fuzzy
+        // match — see docs/decisions.md D18/D22.
+        for body in [
+            "",
+            "velox:new-tab ",
+            "VELOX:NEW-TAB",
+            "velox:activate-tab-0",
+            "velox:activate-tab-9",
+            "velox:activate-tab-99",
+            "velox:activate-tab-",
+            r#"{"cmd":"new_tab"}"#,
+            "velox:open-devtools",
+        ] {
+            assert_eq!(parse_content_shortcut(body), None, "body was {body:?}");
+        }
+    }
+
+    #[test]
+    fn favicon_script_falls_back_to_a_same_origin_guess() {
+        assert!(RESOLVE_FAVICON_SCRIPT.contains("link[rel~=\"icon\"]"));
+        assert!(RESOLVE_FAVICON_SCRIPT.contains("/favicon.ico"));
     }
 }
