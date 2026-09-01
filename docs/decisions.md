@@ -693,6 +693,108 @@ a tab opened later, and a suspended tab rebuilt on resume — so the F12
 shortcut keeps working no matter when or how a given webview came to exist,
 rather than only on the webview that existed at `BrowserWindow::new` time.
 
+## D19: Performance metrics, part 2 — tab latency, structured output, one record type
+
+**Scope**: Issue #13's remaining acceptance criteria on top of D16/Issue #3
+(startup timestamps, page-load duration, and RSS sampling already existed):
+tab create/switch latency, a machine-readable output format for a future CI
+benchmark (Issue #14/#36), and a common record shape across all five event
+kinds.
+
+**Tab latency — no new timer type, bracket `Instant::now()` in `app.rs`**:
+`PageLoadTimer` exists because a page load's start (`NavigationStarted`) and
+end (`LoadFinished`) are two separate, asynchronous webview callbacks that
+can interleave across tabs — the timer has to survive between them. A tab
+create (`ToolbarCommand::NewTab`) or switch (`ActivateTab`) has no such gap:
+`window.open_tab`/`activate_tab`/`resume_tab` are synchronous wry calls, so
+by the time `app::handle_toolbar_command`'s match arm returns, the new
+webview is usable (or the switch is visible). So the "timer" is just two
+`Instant::now()` reads in the same stack frame — no state to carry between
+events, hence no `TabLatencyTimer` type in `browser::metrics`, only
+`TabLatencyKind` (an enum tagging which of the two operations a
+`Duration` measures) plus `PerfRecord::tab_latency` to format it. This also
+satisfies the "keep new logic out of `tab.rs`/`tabs.rs`/`app.rs`'s dispatch
+structure" constraint from the concurrent tab-model rework (Issue #12): the
+edit in `app.rs` is two brackets around existing calls plus one new
+`AppState::perf: Option<PerfContext>` field, not a new abstraction layered
+into the tab model.
+
+`AppState::perf` (not a function parameter threaded through
+`handle_user_event`/`handle_toolbar_command`) is where the "off path costs
+nothing" guarantee lives: `record_tab_latency` returns immediately on
+`None` with no `Instant::now()` call, and the one `Instant::now()` it does
+need for `started` is not a new cost either — `Tabs::open_at`/`activate_at`
+already require an `Instant` argument for their own idle-tracking
+bookkeeping (`docs/architecture.md`, "Automatic tab suspension"), regardless
+of whether perf metrics are on. Putting the capability on `AppState` instead
+of a parameter also meant zero signature changes to the existing dispatch
+functions — matching the "minimal, hook-only edits to `app.rs`" constraint
+from the Issue #13 tasking (the concurrent Issue #12 branch touches the same
+file's tab-handling code).
+
+**One record type — `PerfRecord`, not five ad hoc log lines**: all five
+event kinds (`startup`, `page_load`, `tab_create`, `tab_switch`, `rss`) are
+built through one enum, `metrics::PerfRecord`, with two renderers:
+`to_text()` (byte-for-byte identical to what this project logged before
+Issue #13, for the three pre-existing kinds — see the parity tests in
+`browser/metrics.rs`) and `to_json(elapsed)` (a JSON object always
+containing `"event"` and `"ts_ms"`, plus per-event fields — schema in
+`docs/architecture.md`, "Performance extension points"). This is a typed
+Rust enum rather than the fully generic "event name + labels: Vec<(&str,
+String)> + numbers: Vec<(&str, f64)>" shape the issue sketches; the actual
+design goal — a future parser only has to understand one uniform
+`{event, ts_ms, ...}` JSON shape instead of five different ad hoc lines —
+is met by the *output*, and a closed enum keeps every event's fields
+type-checked and the exhaustive `match` in `to_text`/`to_json` a compile
+error if a new event is ever added without updating both renderers. Flagged
+here as a judgment call worth a second look in review, since "共通のレコード
+型" could reasonably be read as asking for the fully generic shape instead.
+
+**Two formats via one `PerfFormat` enum, not a second parallel logging
+path**: `VELOX_PERF_FORMAT=text|json` (default `text`) selects
+`PerfRecord::to_text`/`to_json_line` inside one write call
+(`perf_log::PerfLog::write`), so enabling JSON output can never desync from
+what text mode logs — both are two branches over the same `PerfRecord`
+value, not two independently-maintained log statements. `text` intentionally
+keeps the pre-Issue-#13 `velox[perf] ...` wording exactly (including the
+`velox[perf] ` prefix, added once at the `PerfLog::write` call site rather
+than per-record) so nothing already parsing/grepping it breaks. `json` drops
+that prefix — each line must parse as JSON on its own for Issue #14/#36 to
+consume it directly — and documents that a shared stderr stream still
+interleaves plain `velox: ...` diagnostics, so a JSON consumer reading
+stderr (rather than a dedicated `VELOX_PERF_OUTPUT` file) must skip
+lines that fail to parse rather than assume every line is a record.
+
+**`VELOX_PERF_OUTPUT=<path>` — a new IO module, not new logic in
+`browser::metrics`**: `browser::metrics`'s module doc comment promises pure,
+window-independent logic with no IO; opening/writing a file is IO. Rather
+than break that promise or bolt file-handling onto `app.rs` directly, a new
+module, `browser::perf_log` (`PerfLog`), takes on exactly the role
+`persistence.rs` already plays for history/bookmarks: a small, deliberately
+"dumb" IO layer with no policy of its own. It is opened once in
+`app::build_perf_log` (append mode; falls back to stderr and logs why on
+open failure, never a fatal error) and shared as an `Arc<PerfLog>` between
+the main event loop and the RSS sampler thread, with a `Mutex<Sink>` inside
+so two threads writing at the same instant cannot interleave into one
+unparsable line.
+
+**Why not a new dependency (e.g. a structured-logging or tracing crate)**:
+the actual need — one flat JSON object per line, five known event shapes —
+is a few dozen lines against the `serde`/`serde_json` this project already
+depends on for toolbar IPC (see D6, "every dependency has one clear job").
+A tracing/logging framework would add a much larger surface (subscribers,
+spans, filtering) for a feature this scoped, and would not obviously make
+the "off path costs nothing" guarantee any easier to keep than the
+`Option`-gated design already in place.
+
+**Cost / revisit condition**: `ts_ms` is elapsed time since process start
+(an `Instant`-derived, monotonic-within-one-run value), not a wall-clock
+timestamp — sufficient for Issue #14's within-run benchmarking use case
+(ordering and relative timing of events in one process's lifetime), but not
+for correlating records across separate process runs by wall-clock time. If
+a future consumer needs that, it is a small addition (an absolute
+`SystemTime`-based field alongside `ts_ms`, not a redesign) — revisit if
+Issue #14 or #36 turn out to need cross-run wall-clock correlation.
 ## D20: Explicit tab lifecycle state machine, and the `Restoring` state's synchronous collapse
 
 **Scope**: issue #12 ("タブセッション状態とWebViewライフサイクルを整理"). Before
@@ -812,6 +914,98 @@ and `TabState` itself (was this tab suspended when the session ended).
 Actually persisting any of this to disk is #25's own decision to make, not
 this issue's.
 
+## D21: Benchmark suite (#14) — pure aggregation module + separate, unverifiable-headless runner binary
+
+**Scope**: Issue #14's acceptance criteria on top of D16/D19's perf-metrics
+foundation: run the same benchmark multiple times, compute a representative
+value (median/p95), save results and compare against a past run, and record
+the benchmark conditions in docs. This project's dev/CI environment is
+headless (no display), so "actually launch VeloX and measure it" cannot be
+exercised or verified here — the design has to make that limitation not
+block the acceptance criteria that *can* be verified.
+
+**Split into a pure module (`src/browser/benchmark.rs`) and a separate
+runner binary (`src/bin/velox-bench.rs`), the same shape as
+`browser::metrics` / `browser::perf_log`**: the acceptance criteria that
+matter most — "run repeatedly", "compute a representative value", "compare
+saved results" — are all pure arithmetic over already-produced JSON Lines,
+with no dependency on a display, a running VeloX process, or the OS process
+tree. Putting that arithmetic in `src/browser/` (rather than inline in a
+`src/bin/` binary) means `cargo test` exercises every acceptance criterion
+that is testable at all, in this headless environment, with no `#[ignore]`s
+and no skipped tests. The runner binary is intentionally thin: spawn the
+`velox` binary, wait, read back its `VELOX_PERF_OUTPUT` file, hand it to
+`benchmark::aggregate_trials`. It cannot be exercised end-to-end here (the
+child process fails to create a window — observed as a GTK init panic in
+this container), but that failure path was smoke-tested to confirm
+`velox-bench` itself does not crash and does not write a fabricated
+"successful" result: it reports zero collected records and exits `1`. The
+`aggregate`/`compare`/`list-scenarios` subcommands need no display at all
+and were smoke-tested directly with synthetic JSON Lines fixtures.
+
+**Scenario catalog is data, not behavior**: `benchmark::scenario::Scenario`
+enumerates the fixed set Issue #14 names (cold/warm startup, first page
+load, navigation, tab create/switch, and one `TabCountMemory(n)` variant per
+`n` in `[1, 5, 10, 20, 50]`), plus `is_unattended()` marking which three of
+those `velox-bench run` can drive without any interaction beyond "launch and
+wait". This is the one source of truth `velox-bench list-scenarios` and
+`docs/benchmarking.md` both read from, so the scenario list cannot drift
+between the CLI's `--scenario` validation and the documentation.
+
+**No automation hook added for tab creation/navigation from outside the
+process**: driving those from `velox-bench` would need either a CLI flag
+(e.g. "open N tabs at startup") or an external IPC surface into
+`app::handle_toolbar_command`, and this Issue's tasking explicitly forbids
+touching `src/app.rs`/`src/browser/tab.rs`/`src/browser/tabs.rs` (concurrent
+Issue #12 rework of the same files). Rather than route around that with a
+parallel, un-reviewed mechanism, those scenarios are implemented as data
+model + aggregation only; real measurement is deferred to manual collection
+(documented in `docs/benchmarking.md`) or a follow-up Issue that can safely
+touch `app.rs` once #12 lands. `Scenario::is_unattended()` makes this
+boundary explicit and enforced (`velox-bench run` refuses the other
+scenarios with a message pointing at `aggregate`) rather than silently
+producing an empty/misleading result.
+
+**Comparison uses the median as the single regression signal, not p95**:
+`compare()` reduces each side to one number (`Stats::median`) per metric and
+flags a regression when the percentage increase exceeds a caller-supplied
+threshold. `p95` is kept in the saved `Stats` for manual inspection but not
+used as the automated pass/fail signal — on a shared/noisy runner (the kind
+Issue #36's CI is likely to use) the 95th percentile of a small trial count
+is exactly the tail that jitters the most, which would make the regression
+check noisy rather than useful. This is a judgment call worth revisiting
+once #36 has real CI-runner noise data to look at.
+
+**No new dependency; hand-rolled RFC 3339 timestamp formatting**: CLI
+argument parsing in `velox-bench` follows the same `--flag value` policy as
+`Config::from_env_and_args` (D6: every dependency needs a clear, singular
+job; a CLI-parsing crate is not worth it for four subcommands). Filling
+`RunEnvironment::generated_at` needs a wall-clock date, and no time/calendar
+crate is in the dependency tree; `benchmark::format_unix_time_utc` uses
+Howard Hinnant's public-domain `civil_from_days` algorithm (a few lines of
+integer arithmetic converting a day count into a proleptic-Gregorian date),
+verified in this module's tests against `date -u -d @<epoch> ...` output for
+several known timestamps. Kept as a pure `i64 -> String` function (not
+reading `SystemTime` itself) so it stays deterministically testable; only
+`velox-bench`'s `main` reads the real clock.
+
+**Fixed test pages are static local HTML, not network URLs**: Issue #14
+asks for "固定したテストページ/シナリオ" (fixed test pages/scenarios).
+`scripts/bench/pages/{minimal,text,dom_heavy}.html` are static, offline,
+`file://`-openable fixtures (a near-empty page, a 200-paragraph text page,
+and a 5000-node DOM page) rather than real internet URLs, so a benchmark run
+never depends on network conditions or a third-party site's own performance
+changing out from under a comparison.
+
+**Cost / revisit condition**: the two biggest open gaps are (1) no verified
+real-world startup/navigation/tab numbers from this project, since the dev
+environment cannot launch VeloX at all, and (2) no automated driver for
+tab-count/navigation scenarios. Both should be revisited together: whoever
+next touches `app.rs` after Issue #12 lands is well-positioned to add a
+minimal "open N tabs at startup" CLI hook that `velox-bench` can drive, and
+the first real GUI-capable run of `velox-bench run` should be treated as
+this project's first authoritative baseline numbers, not something to
+backfill by estimation.
 ## D22: Tab strip — title/favicon rendering, favicon resolution, and shrink-then-scroll
 
 **Scope**: issue #11 ("複数タブ管理を実用レベルまで拡張"), the parts of it that
