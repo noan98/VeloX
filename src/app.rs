@@ -7,13 +7,14 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 
+use crate::browser::perf_log::PerfLog;
 use crate::browser::{
     metrics, navigation, persistence, ActivationEffect, BookmarkEntry, BookmarkStore, FilterList,
     HistoryEntry, HistoryStore, TabId, Tabs,
@@ -74,6 +75,22 @@ struct AppState {
     /// exists — see `record_visit_if_enabled` below and docs/decisions.md
     /// D13.
     history_enabled: bool,
+    /// Tab-create/switch latency logging (Issue #13). `None` when
+    /// `config.perf_metrics` is off, in which case `record_tab_latency`
+    /// below is a single `Option::is_none` check — no extra `Instant::now()`
+    /// call beyond the one `ToolbarCommand::NewTab`/`ActivateTab` already
+    /// makes for `Tabs::open_at`/`activate_at`'s own bookkeeping. See
+    /// docs/architecture.md, "Performance extension points".
+    perf: Option<PerfContext>,
+}
+
+/// What tab-latency logging needs: where to write records, and the epoch
+/// (`process_start`) their `ts_ms` timestamps are relative to. Kept
+/// separate from `PerfLog` itself so a `None` here (metrics off) costs
+/// nothing beyond the `Option`.
+struct PerfContext {
+    process_start: Instant,
+    log: Arc<PerfLog>,
 }
 
 /// Build the window and run the event loop. Only returns on setup failure;
@@ -101,15 +118,17 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         startup.mark_window_created(Instant::now());
     }
 
-    if config.perf_metrics {
-        if let Some(interval) = config.perf_rss_interval {
-            spawn_rss_sampler(interval);
-        }
+    // Built once, shared with the RSS sampler thread and every perf-logging
+    // call site in this file via `Arc::clone`; `None` when metrics are off,
+    // matching `startup`'s `.then(...)` short-circuit above.
+    let perf_log: Option<Arc<PerfLog>> = config.perf_metrics.then(|| build_perf_log(&config));
+
+    if let (Some(interval), Some(log)) = (config.perf_rss_interval, perf_log.clone()) {
+        spawn_rss_sampler(interval, log, process_start);
     }
 
     let homepage = config.homepage.clone();
     let auto_suspend_after = config.auto_suspend_after;
-    let perf_metrics_enabled = config.perf_metrics;
     // One timer per tab: background tabs load concurrently with the active
     // one, so a single shared timer would have their loads overwrite each
     // other's start times.
@@ -137,6 +156,9 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         bookmarks,
         data_dir,
         history_enabled: !config.private,
+        perf: perf_log
+            .clone()
+            .map(|log| PerfContext { process_start, log }),
     };
 
     event_loop.run(move |event, _target, control_flow| {
@@ -155,8 +177,14 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
                 if std::env::var_os("VELOX_DEBUG").is_some() {
                     eprintln!("velox[debug]: {user_event:?}");
                 }
-                if perf_metrics_enabled {
-                    record_perf_event(&mut startup, &mut page_load_timers, &user_event);
+                if let Some(log) = perf_log.as_deref() {
+                    record_perf_event(
+                        &mut startup,
+                        &mut page_load_timers,
+                        log,
+                        process_start,
+                        &user_event,
+                    );
                 }
                 handle_user_event(&mut window, &mut state, &config, &homepage, user_event);
             }
@@ -198,19 +226,46 @@ fn build_blocklist(config: &Config) -> FilterList {
     list
 }
 
-/// Update startup/page-load metrics state for one [`UserEvent`], logging to
-/// stderr whenever a measurement completes. Only called when
-/// `config.perf_metrics` is on, so every branch here is allowed a clock read
-/// (the off-path never reaches this function at all).
+/// Build the [`PerfLog`] performance events are written through: a file at
+/// `config.perf_output_path` if one was requested and could be opened,
+/// stderr otherwise. Only called when `config.perf_metrics` is on.
+fn build_perf_log(config: &Config) -> Arc<PerfLog> {
+    match &config.perf_output_path {
+        Some(path) => match PerfLog::to_file(config.perf_format, Path::new(path)) {
+            Ok(log) => Arc::new(log),
+            Err(err) => {
+                eprintln!(
+                    "velox: failed to open perf output file {path:?}: {err}; \
+                     falling back to stderr"
+                );
+                Arc::new(PerfLog::stderr(config.perf_format))
+            }
+        },
+        None => Arc::new(PerfLog::stderr(config.perf_format)),
+    }
+}
+
+/// Update startup/page-load metrics state for one [`UserEvent`], writing a
+/// [`metrics::PerfRecord`] through `perf_log` whenever a measurement
+/// completes. Only called when `config.perf_metrics` is on (see `run`'s
+/// event loop), so every branch here is allowed a clock read — the off-path
+/// never reaches this function at all.
 fn record_perf_event(
     startup: &mut Option<metrics::StartupTimestamps>,
     page_load_timers: &mut HashMap<TabId, metrics::PageLoadTimer>,
+    perf_log: &PerfLog,
+    process_start: Instant,
     event: &UserEvent,
 ) {
     match event {
         UserEvent::ToolbarMessage(body) => {
             if matches!(toolbar::parse_command(body), Ok(ToolbarCommand::Ready)) {
-                mark_startup(startup, metrics::StartupTimestamps::mark_toolbar_ready);
+                mark_startup(
+                    startup,
+                    perf_log,
+                    process_start,
+                    metrics::StartupTimestamps::mark_toolbar_ready,
+                );
             }
         }
         UserEvent::NavigationStarted(id, _) => {
@@ -220,17 +275,24 @@ fn record_perf_event(
                 .start(Instant::now());
         }
         UserEvent::LoadFinished(id, url) => {
+            let now = Instant::now();
             if let Some(duration) = page_load_timers
                 .get_mut(id)
-                .and_then(|timer| timer.finish(Instant::now()))
+                .and_then(|timer| timer.finish(now))
             {
-                eprintln!("velox[perf] {}", metrics::format_page_load(url, duration));
+                let elapsed = now.saturating_duration_since(process_start);
+                perf_log.write(
+                    &metrics::PerfRecord::page_load(url.as_str(), duration),
+                    elapsed,
+                );
             }
             // The first page to finish anywhere is time-to-first-page; a
             // background tab cannot beat the initial one to it, since it
             // can only be opened after the window is up.
             mark_startup(
                 startup,
+                perf_log,
+                process_start,
                 metrics::StartupTimestamps::mark_first_load_finished,
             );
         }
@@ -242,30 +304,61 @@ fn record_perf_event(
 }
 
 /// Apply one startup-checkpoint mark and, once the full report is
-/// available, print it and clear `startup` so it is only reported once.
+/// available, write it through `perf_log` and clear `startup` so it is only
+/// reported once.
 fn mark_startup(
     startup: &mut Option<metrics::StartupTimestamps>,
+    perf_log: &PerfLog,
+    process_start: Instant,
     mark: fn(&mut metrics::StartupTimestamps, Instant),
 ) {
     let Some(timestamps) = startup.as_mut() else {
         return;
     };
-    mark(timestamps, Instant::now());
+    let now = Instant::now();
+    mark(timestamps, now);
     if let Some(report) = timestamps.report() {
-        eprintln!("velox[perf] {report}");
+        let elapsed = now.saturating_duration_since(process_start);
+        perf_log.write(&metrics::PerfRecord::startup(report), elapsed);
         *startup = None;
     }
 }
 
+/// Log a tab-create/switch latency record if performance metrics are on
+/// (`state.perf` is `Some`); a single `Option::is_none` check with no
+/// `Instant::now()` call otherwise. `started` is the timestamp the caller
+/// captured right before the operation it is timing.
+fn record_tab_latency(
+    state: &AppState,
+    kind: metrics::TabLatencyKind,
+    id: TabId,
+    started: Instant,
+) {
+    let Some(perf) = &state.perf else {
+        return;
+    };
+    let now = Instant::now();
+    let duration = now.saturating_duration_since(started);
+    let elapsed = now.saturating_duration_since(perf.process_start);
+    perf.log.write(
+        &metrics::PerfRecord::tab_latency(kind, id.get(), duration),
+        elapsed,
+    );
+}
+
 /// Spawn a background thread that periodically samples this process's
-/// (and its descendants') RSS and logs it to stderr. Runs for the lifetime
-/// of the process; only ever spawned when `config.perf_metrics` and
-/// `config.perf_rss_interval` are both set, so it costs nothing otherwise.
-fn spawn_rss_sampler(interval: Duration) {
+/// (and its descendants') RSS and writes it through `log`. Runs for the
+/// lifetime of the process; only ever spawned when `config.perf_metrics`
+/// and `config.perf_rss_interval` are both set, so it costs nothing
+/// otherwise.
+fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Instant) {
     let pid = std::process::id();
     std::thread::spawn(move || loop {
         match metrics::sample_process_tree_rss(pid) {
-            Ok(sample) => eprintln!("velox[perf] {sample}"),
+            Ok(sample) => {
+                let elapsed = Instant::now().saturating_duration_since(process_start);
+                log.write(&metrics::PerfRecord::rss(sample), elapsed);
+            }
             Err(err) => eprintln!("velox: rss sampling failed: {err}"),
         }
         std::thread::sleep(interval);
@@ -416,11 +509,13 @@ fn handle_toolbar_command(
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
         ToolbarCommand::OpenDevtools => window.open_devtools(),
         ToolbarCommand::NewTab => {
-            let id = state.tabs.open_at(homepage.to_owned(), Instant::now());
+            let started = Instant::now();
+            let id = state.tabs.open_at(homepage.to_owned(), started);
             log_failure("open tab", window.open_tab(id, homepage));
             // A brand new tab's webview was just built above; only its
             // visibility needs to change, never a resume.
             activate_and_refresh(window, state, id, ActivationEffect::Switch);
+            record_tab_latency(state, metrics::TabLatencyKind::Create, id, started);
         }
         ToolbarCommand::CloseTab { id } => {
             let id = TabId::from(id);
@@ -438,8 +533,10 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::ActivateTab { id } => {
             let id = TabId::from(id);
-            if let Some(effect) = state.tabs.activate_at(id, Instant::now()) {
+            let started = Instant::now();
+            if let Some(effect) = state.tabs.activate_at(id, started) {
                 activate_and_refresh(window, state, id, effect);
+                record_tab_latency(state, metrics::TabLatencyKind::Switch, id, started);
             }
         }
         ToolbarCommand::SuspendTab { id } => {
@@ -690,6 +787,7 @@ mod tests {
             bookmarks: BookmarkStore::new(),
             data_dir: None,
             history_enabled,
+            perf: None,
         }
     }
 
@@ -745,6 +843,34 @@ mod tests {
     fn new_tab_has_no_blocked_navigations_in_app_state() {
         let state = state_with_history_enabled(true);
         assert_eq!(state.tabs.active().blocked_count(), 0);
+    }
+
+    #[test]
+    fn record_tab_latency_is_a_noop_when_perf_metrics_are_off() {
+        let state = state_with_history_enabled(true);
+        assert!(state.perf.is_none());
+        // Must not panic; there is nothing to assert on beyond that, since
+        // "off" means no write happens at all.
+        record_tab_latency(
+            &state,
+            metrics::TabLatencyKind::Create,
+            state.tabs.active_id(),
+            Instant::now(),
+        );
+    }
+
+    #[test]
+    fn record_tab_latency_writes_through_perf_log_when_metrics_are_on() {
+        let mut state = state_with_history_enabled(true);
+        state.perf = Some(PerfContext {
+            process_start: Instant::now(),
+            log: Arc::new(PerfLog::stderr(metrics::PerfFormat::Text)),
+        });
+        let id = state.tabs.active_id();
+        let started = Instant::now();
+        // Exercises the write path end-to-end (stderr sink); nothing to
+        // assert on the output itself here, but this must not panic.
+        record_tab_latency(&state, metrics::TabLatencyKind::Switch, id, started);
     }
 
     #[test]

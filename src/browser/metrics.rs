@@ -3,17 +3,29 @@
 //! unit-testable without a window (see `docs/architecture.md`, "Performance
 //! extension points").
 //!
-//! Three independent pieces, matching Issue #3:
+//! Pieces, matching Issue #3 (the four independent ones) and Issue #13 (the
+//! two tab-latency additions, plus [`PerfRecord`]/[`PerfFormat`] unifying
+//! all five into one loggable shape):
 //!
 //! - [`StartupTimestamps`] — the four startup checkpoints (process start,
 //!   window created, toolbar ready, first page loaded).
 //! - [`PageLoadTimer`] — brackets one `NavigationStarted` .. `LoadFinished`
 //!   pair into a [`Duration`].
+//! - [`TabLatencyKind`] — tags a tab-create or tab-switch [`Duration`],
+//!   measured by the caller bracketing `Instant::now()` around the
+//!   synchronous webview call in `app.rs` (no timer type needed here, unlike
+//!   `PageLoadTimer`: start and finish happen in the same call stack).
 //! - [`sample_process_tree_rss`] — a standalone, public function that
 //!   samples the RSS of a process and all of its descendants. It does not
 //!   depend on `Config` or the running app, so it can be called from
 //!   anywhere (e.g. from a future tab-suspension feature verifying that
 //!   suspending a tab actually shrinks the process tree).
+//! - [`PerfRecord`] — wraps any of the above into one event with a name and
+//!   a monotonic timestamp, rendered as either the original plain-text line
+//!   ([`PerfRecord::to_text`]) or a JSON Lines record
+//!   ([`PerfRecord::to_json_line`]) per [`PerfFormat`]. See
+//!   `docs/architecture.md`, "Performance extension points" for the schema
+//!   Issue #14's benchmark runner is expected to parse.
 //!
 //! Enabling/disabling instrumentation is the caller's job (see
 //! `Config::perf_metrics` and `app::run`): this module never reads env vars
@@ -24,6 +36,8 @@ use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::time::{Duration, Instant};
+
+use serde_json::json;
 
 // ---------------------------------------------------------------------
 // Startup timestamps
@@ -264,6 +278,206 @@ fn collect_descendants(root: u32, processes: &HashMap<u32, ProcInfo>) -> Vec<u32
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------
+// Tab-latency events (Issue #13)
+// ---------------------------------------------------------------------
+
+/// Which tab operation a [`PerfRecord::TabLatency`] measures.
+///
+/// Unlike [`PageLoadTimer`], no timer type is needed: `NewTab`/`ActivateTab`
+/// are handled synchronously in `app.rs` (the new webview is usable, or the
+/// switch is visible, by the time the handler returns), so the caller just
+/// brackets `Instant::now()` around the existing call and hands the
+/// resulting [`Duration`] straight to [`PerfRecord::tab_latency`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabLatencyKind {
+    /// `ToolbarCommand::NewTab` to the new tab's webview being usable.
+    Create,
+    /// `ToolbarCommand::ActivateTab` to the switch (including resuming a
+    /// suspended tab, see `app::activate_and_refresh`) being visible.
+    Switch,
+}
+
+impl TabLatencyKind {
+    fn event_name(self) -> &'static str {
+        match self {
+            TabLatencyKind::Create => "tab_create",
+            TabLatencyKind::Switch => "tab_switch",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// Unified event record + output format (Issue #13)
+// ---------------------------------------------------------------------
+
+/// Which shape [`PerfRecord::write`]-style callers should render lines in.
+/// `Text` (the default) reproduces the exact `velox[perf] ...` lines this
+/// project has always logged (Issue #3 / D16) so enabling metrics never
+/// changes anyone's existing log-scraping. `Json` emits one JSON object per
+/// line (JSON Lines) instead — no `velox[perf] ` prefix, since a future
+/// consumer (Issue #14's benchmark runner, Issue #36's CI regression check)
+/// needs every line to parse as JSON on its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PerfFormat {
+    #[default]
+    Text,
+    Json,
+}
+
+impl PerfFormat {
+    /// Parse `VELOX_PERF_FORMAT`'s raw value (`"text"`/`"json"`,
+    /// case-insensitive, surrounding whitespace ignored). Anything else —
+    /// unset, empty, or unrecognized — falls back to `Text`, matching this
+    /// project's "never fail a run over a bad env var" convention (see
+    /// `Config::resolve_perf_env`).
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("json") => PerfFormat::Json,
+            _ => PerfFormat::Text,
+        }
+    }
+}
+
+/// One structured performance-log event: a name, a monotonic timestamp
+/// (elapsed time since process start), and event-specific fields — the
+/// common shape [`StartupReport`], page-load, tab-latency and
+/// [`RssSample`] events are all rendered through, so a future consumer only
+/// has to understand one record shape instead of five ad hoc log lines. See
+/// `docs/architecture.md`, "Performance extension points" for the exact
+/// JSON schema.
+#[derive(Debug, Clone)]
+pub enum PerfRecord {
+    Startup(StartupReport),
+    PageLoad {
+        url: String,
+        duration: Duration,
+    },
+    TabLatency {
+        kind: TabLatencyKind,
+        tab_id: u64,
+        duration: Duration,
+    },
+    Rss(RssSample),
+}
+
+impl PerfRecord {
+    pub fn startup(report: StartupReport) -> Self {
+        PerfRecord::Startup(report)
+    }
+
+    pub fn page_load(url: impl Into<String>, duration: Duration) -> Self {
+        PerfRecord::PageLoad {
+            url: url.into(),
+            duration,
+        }
+    }
+
+    pub fn tab_latency(kind: TabLatencyKind, tab_id: u64, duration: Duration) -> Self {
+        PerfRecord::TabLatency {
+            kind,
+            tab_id,
+            duration,
+        }
+    }
+
+    pub fn rss(sample: RssSample) -> Self {
+        PerfRecord::Rss(sample)
+    }
+
+    /// The event name used by both output formats (`"startup"`,
+    /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"rss"`).
+    pub fn event_name(&self) -> &'static str {
+        match self {
+            PerfRecord::Startup(_) => "startup",
+            PerfRecord::PageLoad { .. } => "page_load",
+            PerfRecord::TabLatency { kind, .. } => kind.event_name(),
+            PerfRecord::Rss(_) => "rss",
+        }
+    }
+
+    /// The original plain-text line for this record (no `velox[perf] `
+    /// prefix — callers have always added that themselves at the log call
+    /// site; see `app::record_perf_event`), byte-for-byte identical to what
+    /// this project logged before Issue #13 for the three pre-existing
+    /// event kinds.
+    pub fn to_text(&self) -> String {
+        match self {
+            PerfRecord::Startup(report) => report.to_string(),
+            PerfRecord::PageLoad { url, duration } => format_page_load(url, *duration),
+            PerfRecord::TabLatency {
+                kind,
+                tab_id,
+                duration,
+            } => format!(
+                "{} id={tab_id} duration={}",
+                kind.event_name(),
+                format_duration(*duration)
+            ),
+            PerfRecord::Rss(sample) => sample.to_string(),
+        }
+    }
+
+    /// This record as a `serde_json::Value` object: always `"event"` and
+    /// `"ts_ms"` (`elapsed` since process start, in fractional
+    /// milliseconds — monotonic across one run because it derives from
+    /// [`Instant`]), plus event-specific numeric/string fields.
+    pub fn to_json(&self, elapsed: Duration) -> serde_json::Value {
+        let mut fields = serde_json::Map::new();
+        fields.insert("event".to_owned(), json!(self.event_name()));
+        fields.insert("ts_ms".to_owned(), json!(ms(elapsed)));
+        match self {
+            PerfRecord::Startup(report) => {
+                fields.insert(
+                    "window_created_ms".to_owned(),
+                    json!(ms(report.to_window_created)),
+                );
+                fields.insert(
+                    "toolbar_ready_ms".to_owned(),
+                    json!(ms(report.to_toolbar_ready)),
+                );
+                fields.insert(
+                    "first_load_ms".to_owned(),
+                    json!(ms(report.to_first_load_finished)),
+                );
+            }
+            PerfRecord::PageLoad { url, duration } => {
+                fields.insert("url".to_owned(), json!(url));
+                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+            }
+            PerfRecord::TabLatency {
+                tab_id, duration, ..
+            } => {
+                fields.insert("tab_id".to_owned(), json!(tab_id));
+                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+            }
+            PerfRecord::Rss(sample) => {
+                fields.insert("pid".to_owned(), json!(sample.root_pid));
+                fields.insert("process_count".to_owned(), json!(sample.process_count));
+                fields.insert("total_rss_bytes".to_owned(), json!(sample.total_rss_bytes));
+            }
+        }
+        serde_json::Value::Object(fields)
+    }
+
+    /// [`Self::to_json`] serialized to one line, no trailing newline (JSON
+    /// Lines). Serializing a `Value` built entirely from finite numbers and
+    /// UTF-8 strings, as `to_json` always builds it, cannot realistically
+    /// fail; the fallback below only guards against that assumption ever
+    /// becoming false, so a perf-log write can never panic the caller.
+    pub fn to_json_line(&self, elapsed: Duration) -> String {
+        serde_json::to_string(&self.to_json(elapsed))
+            .unwrap_or_else(|_| format!("{{\"event\":{:?}}}", self.event_name()))
+    }
+}
+
+/// Fractional milliseconds, rounded to one decimal place — matches the
+/// precision [`format_duration`] already prints in text mode, so a reader
+/// comparing the two formats side by side sees the same numbers.
+fn ms(duration: Duration) -> f64 {
+    (duration.as_secs_f64() * 1000.0 * 10.0).round() / 10.0
 }
 
 #[cfg(target_os = "linux")]
@@ -616,5 +830,125 @@ mod tests {
     fn unknown_pid_is_reported_as_not_found() {
         let result = sample_process_tree_rss(u32::MAX);
         assert!(matches!(result, Err(RssError::ProcessNotFound(pid)) if pid == u32::MAX));
+    }
+
+    // -- PerfFormat -----------------------------------------------------
+
+    #[test]
+    fn perf_format_parses_json_case_insensitively() {
+        assert_eq!(PerfFormat::parse(Some("json")), PerfFormat::Json);
+        assert_eq!(PerfFormat::parse(Some("JSON")), PerfFormat::Json);
+        assert_eq!(PerfFormat::parse(Some("  Json  ")), PerfFormat::Json);
+    }
+
+    #[test]
+    fn perf_format_defaults_to_text_for_anything_else() {
+        assert_eq!(PerfFormat::parse(None), PerfFormat::Text);
+        assert_eq!(PerfFormat::parse(Some("")), PerfFormat::Text);
+        assert_eq!(PerfFormat::parse(Some("text")), PerfFormat::Text);
+        assert_eq!(PerfFormat::parse(Some("xml")), PerfFormat::Text);
+    }
+
+    // -- PerfRecord: text output matches the pre-Issue-#13 lines ---------
+
+    #[test]
+    fn perf_record_startup_text_matches_legacy_display() {
+        let report = StartupReport {
+            to_window_created: Duration::from_millis(10),
+            to_toolbar_ready: Duration::from_millis(20),
+            to_first_load_finished: Duration::from_millis(30),
+        };
+        let expected = report.to_string();
+        assert_eq!(PerfRecord::startup(report).to_text(), expected);
+        assert_eq!(PerfRecord::startup(report).event_name(), "startup");
+    }
+
+    #[test]
+    fn perf_record_page_load_text_matches_legacy_format_function() {
+        let record = PerfRecord::page_load("https://example.com/", Duration::from_millis(250));
+        assert_eq!(
+            record.to_text(),
+            format_page_load("https://example.com/", Duration::from_millis(250))
+        );
+        assert_eq!(record.event_name(), "page_load");
+    }
+
+    #[test]
+    fn perf_record_rss_text_matches_legacy_display() {
+        let sample = RssSample {
+            root_pid: 42,
+            process_count: 3,
+            total_rss_bytes: 2 * 1024 * 1024,
+        };
+        let expected = sample.to_string();
+        assert_eq!(PerfRecord::rss(sample).to_text(), expected);
+        assert_eq!(PerfRecord::rss(sample).event_name(), "rss");
+    }
+
+    #[test]
+    fn perf_record_tab_latency_text_is_readable() {
+        let record = PerfRecord::tab_latency(TabLatencyKind::Create, 7, Duration::from_millis(15));
+        assert_eq!(record.to_text(), "tab_create id=7 duration=15.0ms");
+        assert_eq!(record.event_name(), "tab_create");
+
+        let record =
+            PerfRecord::tab_latency(TabLatencyKind::Switch, 7, Duration::from_micros(3100));
+        assert_eq!(record.to_text(), "tab_switch id=7 duration=3.1ms");
+        assert_eq!(record.event_name(), "tab_switch");
+    }
+
+    // -- PerfRecord: JSON Lines output ------------------------------------
+
+    #[test]
+    fn perf_record_json_always_has_event_and_ts_ms() {
+        let record = PerfRecord::page_load("https://example.com/", Duration::from_millis(250));
+        let value = record.to_json(Duration::from_millis(1234));
+        assert_eq!(value["event"], "page_load");
+        assert_eq!(value["ts_ms"], 1234.0);
+        assert_eq!(value["url"], "https://example.com/");
+        assert_eq!(value["duration_ms"], 250.0);
+    }
+
+    #[test]
+    fn perf_record_json_line_is_valid_single_line_json() {
+        let record = PerfRecord::tab_latency(TabLatencyKind::Switch, 3, Duration::from_millis(5));
+        let line = record.to_json_line(Duration::ZERO);
+        assert!(!line.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&line).expect("valid JSON");
+        assert_eq!(parsed["event"], "tab_switch");
+        assert_eq!(parsed["tab_id"], 3);
+        assert_eq!(parsed["duration_ms"], 5.0);
+    }
+
+    #[test]
+    fn perf_record_startup_json_has_all_three_checkpoints() {
+        let report = StartupReport {
+            to_window_created: Duration::from_millis(10),
+            to_toolbar_ready: Duration::from_millis(20),
+            to_first_load_finished: Duration::from_millis(30),
+        };
+        let value = PerfRecord::startup(report).to_json(Duration::from_millis(30));
+        assert_eq!(value["window_created_ms"], 10.0);
+        assert_eq!(value["toolbar_ready_ms"], 20.0);
+        assert_eq!(value["first_load_ms"], 30.0);
+    }
+
+    #[test]
+    fn perf_record_rss_json_has_pid_process_count_and_bytes() {
+        let sample = RssSample {
+            root_pid: 42,
+            process_count: 3,
+            total_rss_bytes: 2 * 1024 * 1024,
+        };
+        let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
+        assert_eq!(value["pid"], 42);
+        assert_eq!(value["process_count"], 3);
+        assert_eq!(value["total_rss_bytes"], 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn ms_rounds_to_one_decimal_place() {
+        assert_eq!(ms(Duration::from_micros(1_549)), 1.5);
+        assert_eq!(ms(Duration::ZERO), 0.0);
     }
 }

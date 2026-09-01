@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use crate::browser::metrics::PerfFormat;
+
 /// Default interval between process-tree RSS samples when performance
 /// metrics are enabled but no explicit interval was requested.
 const DEFAULT_PERF_RSS_INTERVAL: Duration = Duration::from_millis(5000);
@@ -45,6 +47,21 @@ pub struct Config {
     /// [`crate::browser::metrics::sample_process_tree_rss`] is always
     /// available regardless of this setting.
     pub perf_rss_interval: Option<Duration>,
+    /// Output format for perf log lines (Issue #13): [`PerfFormat::Text`],
+    /// the original `velox[perf] ...` lines, or [`PerfFormat::Json`], one
+    /// JSON object per line (JSON Lines) for a future CI benchmark runner
+    /// to parse — see `docs/architecture.md`, "Performance extension
+    /// points" for the schema. Only consulted when `perf_metrics` is on.
+    /// Selected via `VELOX_PERF_FORMAT=json|text`; unset or unrecognized
+    /// falls back to `Text`.
+    pub perf_format: PerfFormat,
+    /// Optional file to append perf log lines to instead of stderr. `None`
+    /// (the default) keeps writing to stderr — pre-Issue #13 behavior.
+    /// Set via `VELOX_PERF_OUTPUT=<path>`; only consulted when
+    /// `perf_metrics` is on. `app::run` attempts to open it once; if that
+    /// fails, perf logging falls back to stderr rather than losing metrics
+    /// or crashing (see `browser::perf_log::PerfLog`).
+    pub perf_output_path: Option<String>,
     /// Height of the history/bookmarks dropdown panel (logical pixels) when
     /// open; added to `toolbar_height` while a panel is showing.
     pub panel_height: u32,
@@ -91,6 +108,8 @@ impl Default for Config {
             private: false,
             perf_metrics: false,
             perf_rss_interval: None,
+            perf_format: PerfFormat::Text,
+            perf_output_path: None,
         }
     }
 }
@@ -108,6 +127,12 @@ impl Config {
     ///   interval in milliseconds. `0` disables periodic sampling while
     ///   still logging startup/page-load metrics. Not a valid number falls
     ///   back to the default interval.
+    /// - `VELOX_PERF_FORMAT` — only consulted when `VELOX_PERF_METRICS` is
+    ///   set; `json` selects [`PerfFormat::Json`] (JSON Lines), anything
+    ///   else (including unset) keeps the default [`PerfFormat::Text`].
+    /// - `VELOX_PERF_OUTPUT` — only consulted when `VELOX_PERF_METRICS` is
+    ///   set; a file path to append perf lines to instead of stderr. Unset
+    ///   or empty keeps stderr.
     ///
     /// No CLI-parsing crate is introduced for this (see docs/decisions.md
     /// D6); `args` is expected to be the process arguments with argv\[0\]
@@ -118,10 +143,19 @@ impl Config {
         let interval_raw = std::env::var("VELOX_PERF_RSS_INTERVAL_MS").ok();
         let (perf_metrics, perf_rss_interval) =
             resolve_perf_env(metrics_requested, interval_raw.as_deref());
+        let format_raw = std::env::var("VELOX_PERF_FORMAT").ok();
+        let output_raw = std::env::var("VELOX_PERF_OUTPUT").ok();
+        let (perf_format, perf_output_path) = resolve_perf_output(
+            metrics_requested,
+            format_raw.as_deref(),
+            output_raw.as_deref(),
+        );
         Self {
             private,
             perf_metrics,
             perf_rss_interval,
+            perf_format,
+            perf_output_path,
             ..Self::default()
         }
     }
@@ -153,6 +187,28 @@ fn resolve_perf_env(
     (true, interval)
 }
 
+/// Pure decision logic behind [`Config::from_env_and_args`]'s
+/// `perf_format`/`perf_output_path`, factored out for the same reason as
+/// [`resolve_perf_env`]. When metrics are not requested, both env vars are
+/// ignored — matches `resolve_perf_env`'s "no overrides while off" rule, so
+/// a `VELOX_PERF_FORMAT=json` left set in a shell does not silently change
+/// behavior the moment someone else adds `VELOX_PERF_METRICS=1` elsewhere.
+fn resolve_perf_output(
+    metrics_requested: bool,
+    format_raw: Option<&str>,
+    output_raw: Option<&str>,
+) -> (PerfFormat, Option<String>) {
+    if !metrics_requested {
+        return (PerfFormat::Text, None);
+    }
+    let format = PerfFormat::parse(format_raw);
+    let output_path = output_raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    (format, output_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,6 +227,8 @@ mod tests {
         assert!(!config.private);
         assert!(!config.perf_metrics);
         assert_eq!(config.perf_rss_interval, None);
+        assert_eq!(config.perf_format, PerfFormat::Text);
+        assert_eq!(config.perf_output_path, None);
     }
 
     #[test]
@@ -204,6 +262,38 @@ mod tests {
         assert_eq!(
             resolve_perf_env(true, Some("not-a-number")),
             (true, Some(DEFAULT_PERF_RSS_INTERVAL))
+        );
+    }
+
+    #[test]
+    fn perf_output_ignored_while_metrics_off() {
+        assert_eq!(
+            resolve_perf_output(false, Some("json"), Some("/tmp/perf.jsonl")),
+            (PerfFormat::Text, None)
+        );
+    }
+
+    #[test]
+    fn perf_output_defaults_to_text_and_stderr() {
+        assert_eq!(
+            resolve_perf_output(true, None, None),
+            (PerfFormat::Text, None)
+        );
+    }
+
+    #[test]
+    fn perf_output_parses_json_format_and_output_path() {
+        assert_eq!(
+            resolve_perf_output(true, Some("json"), Some("/tmp/perf.jsonl")),
+            (PerfFormat::Json, Some("/tmp/perf.jsonl".to_owned()))
+        );
+    }
+
+    #[test]
+    fn perf_output_empty_path_is_treated_as_unset() {
+        assert_eq!(
+            resolve_perf_output(true, Some("json"), Some("   ")),
+            (PerfFormat::Json, None)
         );
     }
 
