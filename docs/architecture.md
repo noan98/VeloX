@@ -321,22 +321,35 @@ including the WebKitGTK/WKWebView/WebView2 cache-control investigation.
 
 ## Performance extension points
 
-Implemented in `browser::metrics` (see D16 in `docs/decisions.md`), gated by
-`Config::perf_metrics` / `Config::perf_rss_interval` (opt-in via
-`VELOX_PERF_METRICS=1`, `VELOX_PERF_RSS_INTERVAL_MS`, same pattern as
-`VELOX_DEBUG`). All arithmetic/formatting/process-tree-walking is pure Rust
-in `src/browser/metrics.rs`, unit-tested without a window.
+Implemented in `browser::metrics` (see D16/D19 in `docs/decisions.md`),
+gated by `Config::perf_metrics` (opt-in via `VELOX_PERF_METRICS=1`, same
+pattern as `VELOX_DEBUG`). All arithmetic/formatting/process-tree-walking is
+pure Rust in `src/browser/metrics.rs`, unit-tested without a window; the one
+IO exception is `src/browser/perf_log.rs` (`PerfLog`), which actually writes
+the lines — mirrors `persistence.rs`'s role for history/bookmarks.
 
 - **Startup time**: `main.rs` captures `process_start` before building
   `Config`, and passes it into `app::run`. `metrics::StartupTimestamps`
   records window creation, the toolbar's first `Ready`, and the first
-  `LoadFinished` (≈ time-to-first-page) against it; `app::run` prints one
-  `velox[perf] startup …` line to stderr once all three have fired.
+  `LoadFinished` (≈ time-to-first-page) against it; `app::run` writes one
+  `startup` record once all three have fired.
 - **Page load time**: `UserEvent::NavigationStarted` → `LoadFinished` is
-  bracketed by `metrics::PageLoadTimer` in `app::run`, logging one
-  `velox[perf] page_load …` line per load. Timers are kept per `TabId`, so
-  a background tab loading concurrently with the active one does not
-  overwrite its start time.
+  bracketed by `metrics::PageLoadTimer` in `app::run`, writing one
+  `page_load` record per load. Timers are kept per `TabId`, so a background
+  tab loading concurrently with the active one does not overwrite its start
+  time.
+- **Tab create/switch time** (Issue #13): `ToolbarCommand::NewTab` and
+  `ActivateTab` are handled synchronously in `app::handle_toolbar_command`
+  (the new webview is usable, or the switch visible, by the time the
+  handler returns), so no timer type is needed — the handler just brackets
+  `Instant::now()` around the existing `Tabs::open_at`/`activate_at` +
+  `BrowserWindow` calls and hands the `Duration` to
+  `metrics::PerfRecord::tab_latency`, writing one `tab_create` or
+  `tab_switch` record. `AppState::perf` is `None` when metrics are off, so
+  the only cost on that path is the `Option::is_none` check in
+  `app::record_tab_latency` — no extra `Instant::now()` beyond the one
+  `open_at`/`activate_at` already takes for their own idle-tracking, which
+  runs regardless of metrics.
 - **Memory**: `metrics::sample_process_tree_rss(pid)` walks the whole
   process tree (WebKit's network/render helpers included) and sums RSS. It
   is a standalone public function with no dependency on `Config` or the
@@ -345,19 +358,77 @@ in `src/browser/metrics.rs`, unit-tested without a window.
   releases that process-tree's share of RSS, and measuring the before/after
   delta with this function is its first real use case (see
   docs/decisions.md D9). When `perf_rss_interval` is set, `app::run` also
-  spawns a background thread that samples it periodically and logs
-  `velox[perf] rss …` lines. Implementation reads `/proc` directly on Linux
+  spawns a background thread that samples it periodically and writes one
+  `rss` record per sample. Implementation reads `/proc` directly on Linux
   (no extra dependency); other Unix falls back to parsing `ps` output;
   Windows is not implemented yet (`RssError::Unsupported`).
-- **Tab switch time**: `BrowserWindow::activate_tab` is the single code path
-  for switching the visible tab, so it can be timed trivially — not
-  instrumented yet.
-- The `Config` struct is the home for these toggles; `Config::from_env_and_args`
-  layers the environment-variable overrides onto `Config::default`.
+- The `Config` struct is the home for all of these toggles;
+  `Config::from_env_and_args` layers the environment-variable overrides onto
+  `Config::default`.
 
-When metrics are off, `app::run` never spawns the RSS thread and every
-checkpoint is a single `Option`-is-`None` check with no `Instant::now()`
-call — the disabled path stays effectively free.
+### Output format and destination (Issue #13)
+
+All five event kinds above go through one type, `metrics::PerfRecord`,
+written by a shared `perf_log::PerfLog` (stderr by default, or a file — see
+below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
+`tab_create`, `tab_switch`, `rss`.
+
+- **`VELOX_PERF_FORMAT=text|json`** (default `text`; unset/unrecognized also
+  falls back to `text`): selects `Config::perf_format`.
+  - `text` reproduces the exact `velox[perf] <event> key=value ...` lines
+    this project logged before Issue #13 — enabling metrics, or switching
+    formats, never changes this format for anyone already scraping it.
+    Example lines:
+    ```text
+    velox[perf] startup window_created=12.3ms toolbar_ready=45.6ms first_page=120.0ms
+    velox[perf] page_load url=https://example.com/ duration=250.0ms
+    velox[perf] tab_create id=3 duration=15.2ms
+    velox[perf] tab_switch id=3 duration=3.1ms
+    velox[perf] rss pid=4821 processes=5 total_mib=312.4
+    ```
+  - `json` emits one JSON object per line (JSON Lines) — **this is the
+    format Issue #14's benchmark runner and Issue #36's CI regression check
+    should parse.** No `velox[perf] ` prefix, so every line parses as JSON
+    on its own; a consumer reading a shared stderr stream (rather than a
+    dedicated `VELOX_PERF_OUTPUT` file) should still skip any line that
+    fails to parse, since other `velox: ...` diagnostics interleave on the
+    same stream. Every record has `event` (string) and `ts_ms` (float,
+    milliseconds elapsed since process start — monotonic within one run,
+    since it derives from `Instant`), plus:
+
+    | `event`      | fields |
+    |--------------|--------|
+    | `startup`    | `window_created_ms`, `toolbar_ready_ms`, `first_load_ms` (float ms) |
+    | `page_load`  | `url` (string), `duration_ms` (float ms) |
+    | `tab_create` | `tab_id` (uint), `duration_ms` (float ms) |
+    | `tab_switch` | `tab_id` (uint), `duration_ms` (float ms) |
+    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint) |
+
+    Example lines:
+    ```json
+    {"event":"startup","first_load_ms":120.0,"toolbar_ready_ms":45.6,"ts_ms":120.0,"window_created_ms":12.3}
+    {"event":"page_load","duration_ms":250.0,"ts_ms":5310.2,"url":"https://example.com/"}
+    {"event":"tab_create","duration_ms":15.2,"tab_id":3,"ts_ms":8420.9}
+    {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"ts_ms":10000.0}
+    ```
+    (Field order is whatever `serde_json` produces — alphabetical, since
+    this project does not enable the `preserve_order` feature — a
+    conforming JSON parser must not depend on it.)
+- **`VELOX_PERF_OUTPUT=<path>`**: append perf lines to `<path>` instead of
+  stderr — gives Issue #14 a stable file to read without needing to capture
+  the whole process's stderr. `app::build_perf_log` opens it once, in
+  append mode, at startup; if that fails (bad path, no permission), it logs
+  the failure and falls back to stderr rather than losing metrics or
+  crashing. Unset (the default) keeps stderr.
+- Both are only consulted when `VELOX_PERF_METRICS` is set — matching
+  `VELOX_PERF_RSS_INTERVAL_MS`'s existing "no overrides while off" rule — so
+  a stray `VELOX_PERF_FORMAT=json` left in a shell does not silently change
+  behavior the moment metrics are turned on elsewhere.
+
+When metrics are off, `app::run` never spawns the RSS thread, never builds a
+`PerfLog`, and every checkpoint (startup, page load, tab create/switch) is a
+single `Option`-is-`None` check with no extra `Instant::now()` call — the
+disabled path stays effectively free.
 
 The layering matters more than any single hook: measurements attach to the
 application layer, so swapping or tuning the engine below does not invalidate
