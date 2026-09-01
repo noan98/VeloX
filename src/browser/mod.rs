@@ -22,7 +22,7 @@ pub mod tab;
 pub mod tabs;
 
 pub use blocklist::FilterList;
-pub use bookmarks::{BookmarkEntry, BookmarkStore};
+pub use bookmarks::{BookmarkEditError, BookmarkEntry, BookmarkFolder, BookmarkStore};
 pub use downloads::{DownloadEntry, DownloadId, DownloadState, DownloadStore};
 pub use history::{
     date_bucket, group_by_date, search as search_history, HistoryDateBucket, HistoryEntry,

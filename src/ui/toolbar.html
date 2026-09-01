@@ -218,6 +218,95 @@
   }
   .private-badge[hidden] { display: none; }
 
+  /* Bookmark bar (Issue #19, see docs/decisions.md D35): an always-visible
+     strip, not a dropdown panel — it never covers the panel below (its
+     height is added to the native toolbar height independently, see
+     `ui::window::effective_toolbar_height`). `overflow-x: auto` handles
+     "many bookmarks" the same way the tab strip's own horizontal scroll
+     does (docs/decisions.md D22), just without the shrink step: bookmark
+     labels are free-form text, not fixed-width tabs, so scrolling alone —
+     no CSS flex-shrink trick — is what keeps the layout from breaking. */
+  #bookmark-bar {
+    flex: 0 0 30px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    overflow-x: auto;
+    overflow-y: hidden;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+  }
+  #bookmark-bar[hidden] { display: none; }
+  .bookmark-bar-item {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    height: 22px;
+    max-width: 160px;
+    padding: 0 8px;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fg);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .bookmark-bar-item:hover { background: rgba(128, 128, 128, 0.2); }
+  .bookmark-bar-item span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .bookmark-bar-favicon {
+    flex: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
+  }
+  .bookmark-bar-folder { position: relative; }
+  .bookmark-bar-dropdown {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    margin-top: 2px;
+    min-width: 160px;
+    max-width: 260px;
+    max-height: 60vh;
+    overflow-y: auto;
+    background: var(--field-bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    z-index: 10;
+    padding: 4px 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .bookmark-bar-dropdown[hidden] { display: none; }
+  .bookmark-bar-dropdown-item {
+    display: block;
+    width: 100%;
+    box-sizing: border-box;
+    text-align: left;
+    padding: 6px 12px;
+    border: none;
+    background: none;
+    color: var(--fg);
+    font-size: 12px;
+    cursor: pointer;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .bookmark-bar-dropdown-item:hover { background: var(--row-hover); }
+
   #panel {
     flex: 1;
     min-height: 0;
@@ -319,6 +408,114 @@
     font-size: 12px;
     color: var(--dim-fg);
     text-align: center;
+  }
+
+  /* Bookmarks panel: folders, editing, favicon, and manual reordering
+     (Issue #19, see docs/decisions.md D32/D33/D34). */
+  .bookmark-new-folder {
+    flex: none;
+    display: flex;
+    gap: 6px;
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .bookmark-new-folder input {
+    flex: 1;
+    box-sizing: border-box;
+    height: 26px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--field-bg);
+    color: var(--fg);
+    font-size: 12px;
+  }
+  .bookmark-new-folder button {
+    flex: none;
+    width: auto;
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.15);
+    font-size: 12px;
+  }
+  .bookmark-favicon {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+  }
+  .panel-row-move {
+    flex: none;
+    width: 18px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--dim-fg);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .panel-row-move:hover { background: rgba(128, 128, 128, 0.3); }
+  .panel-row-edit {
+    flex: none;
+    width: 20px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--dim-fg);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .panel-row-edit:hover { background: rgba(128, 128, 128, 0.3); }
+  .bookmark-folder-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding-right: 6px;
+  }
+  .bookmark-folder-actions {
+    flex: none;
+    display: flex;
+    gap: 2px;
+  }
+  .bookmark-edit-row {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 34px;
+    padding: 6px 8px;
+    gap: 4px;
+  }
+  .bookmark-edit-row input,
+  .bookmark-edit-row select {
+    box-sizing: border-box;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    background: var(--field-bg);
+    color: var(--fg);
+    font-size: 12px;
+  }
+  .bookmark-edit-title { flex: 1 1 40%; min-width: 80px; }
+  .bookmark-edit-url { flex: 1 1 40%; min-width: 100px; }
+  .bookmark-edit-folder { flex: 0 0 auto; }
+  .bookmark-edit-row .panel-row-link {
+    flex: none;
+    width: auto;
+    padding: 0 8px;
+    height: 24px;
+    border-radius: 4px;
+    background: rgba(128, 128, 128, 0.15);
+    text-align: center;
+  }
+  .bookmark-folder-rename-input {
+    flex: 1;
   }
 
   /* Downloads panel (Issue #16, see docs/decisions.md D28). Each row is
@@ -423,11 +620,13 @@
          placeholder="Enter a URL, e.g. example.com" />
   <span id="block-count" title="Blocked ad/tracker requests" hidden>0</span>
   <button id="devtools" title="Open DevTools (F12)">&#9881;</button>
-  <button id="bookmark-star" title="ブックマークに追加/削除">&#9733;</button>
+  <button id="bookmark-star" title="ブックマークに追加/削除 (Ctrl/Cmd+D)">&#9733;</button>
   <button id="history-toggle" title="履歴">&#128337;</button>
   <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
+  <button id="bookmark-bar-toggle" title="ブックマークバーの表示切替 (Ctrl/Cmd+Shift+B)">&#9644;</button>
   <button id="downloads-toggle" title="ダウンロード">&#11015;</button>
 </div>
+<div id="bookmark-bar" hidden></div>
 <div id="panel" hidden>
   <div id="panel-history" class="panel-list">
     <div class="panel-header">
@@ -443,6 +642,11 @@
   <div id="panel-bookmarks" class="panel-list" hidden>
     <div class="panel-header">
       <span>ブックマーク</span>
+    </div>
+    <div class="bookmark-new-folder">
+      <input id="new-folder-name" type="text" spellcheck="false" autocomplete="off"
+             placeholder="新しいフォルダ名" />
+      <button id="new-folder-create">＋ フォルダ</button>
     </div>
     <div id="bookmarks-rows" class="panel-rows"></div>
   </div>
@@ -472,6 +676,8 @@
   const downloadsRowsEl = document.getElementById("downloads-rows");
   const omniboxPanelEl = document.getElementById("panel-omnibox");
   const omniboxRowsEl = document.getElementById("omnibox-rows");
+  const bookmarkBarEl = document.getElementById("bookmark-bar");
+  const newFolderNameEl = document.getElementById("new-folder-name");
 
   /* Omnibox candidate dropdown state (Issue #15): the candidate list Rust
      last pushed via veloxSetCandidates, and which row (if any) Up/Down has
@@ -551,6 +757,25 @@
     send({ cmd: "open_downloads_folder" });
   });
 
+  /* Bookmark folders and the bookmark bar (Issue #19, see
+     docs/decisions.md D32/D35). */
+  document.getElementById("bookmark-bar-toggle").addEventListener("click", () => {
+    send({ cmd: "toggle_bookmark_bar" });
+  });
+  function submitNewFolder() {
+    const name = newFolderNameEl.value;
+    if (name.trim().length > 0) {
+      send({ cmd: "create_bookmark_folder", name });
+      newFolderNameEl.value = "";
+    }
+  }
+  document.getElementById("new-folder-create").addEventListener("click", submitNewFolder);
+  newFolderNameEl.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      submitNewFolder();
+    }
+  });
+
   /* Tab-management keyboard shortcuts (see docs/decisions.md D22). This is
      the trusted-webview half: the toolbar (address bar, panels) is our own
      HTML, so it can send structured commands directly through the normal
@@ -584,12 +809,18 @@
         // contents. Harmless to send even when the address bar already has
         // focus — veloxFocusAddressBar always re-selects.
         message = { cmd: "focus_address_bar" };
+      } else if (event.key === "d" || event.key === "D") {
+        // Ctrl/Cmd+D (Issue #19): bookmark/unbookmark the current page.
+        message = { cmd: "toggle_bookmark" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {
         message = { cmd: "reopen_closed_tab" };
       } else if (event.key === "Tab") {
         message = { cmd: "prev_tab" };
+      } else if (event.key === "b" || event.key === "B") {
+        // Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar.
+        message = { cmd: "toggle_bookmark_bar" };
       }
     }
     if (message === null) {
@@ -799,12 +1030,328 @@
       deleteMessage: (entry) => ({ cmd: "delete_history_entry", id: entry.id }),
     });
   };
-  window.veloxSetBookmarks = (entries) => {
-    renderRows(bookmarksRowsEl, entries, {
-      emptyText: "ブックマークはありません",
-      timestamp: (entry) => entry.created_at,
-      deleteMessage: (entry) => ({ cmd: "remove_bookmark", id: entry.id }),
+  /* Bookmarks panel: folders, inline editing, manual reordering, and
+     favicons (Issue #19, see docs/decisions.md D32/D33/D34). `view` is
+     `{ root: [...], folders: [{ id, name, entries: [...] }, ...] }`, as
+     built by `toolbar::BookmarksView` and sent by
+     `ui::toolbar::set_bookmarks_script`/`set_bookmark_bar_script` — the
+     panel and the bar below both render this exact same shape, just
+     differently. `folderOptions` (every folder's `{id, name}`, flattened
+     once per render) is threaded into each row so its edit form's folder
+     `<select>` can list every folder regardless of which section the row is
+     currently rendered in. */
+  function bookmarkFolderOptions(view) {
+    return view.folders.map((folder) => ({ id: folder.id, name: folder.name }));
+  }
+
+  function createBookmarkRow(entry, folderOptions) {
+    const row = document.createElement("div");
+    row.className = "panel-row bookmark-row";
+
+    if (entry.favicon) {
+      const icon = document.createElement("img");
+      icon.className = "bookmark-favicon";
+      icon.src = entry.favicon;
+      icon.alt = "";
+      icon.addEventListener("error", () => icon.remove());
+      row.appendChild(icon);
+    }
+
+    const link = document.createElement("button");
+    link.className = "panel-row-link";
+    link.textContent = entry.title && entry.title.length > 0 ? entry.title : entry.url;
+    link.title = entry.url;
+    link.addEventListener("click", () => send({ cmd: "navigate", input: entry.url }));
+    row.appendChild(link);
+
+    const up = document.createElement("button");
+    up.className = "panel-row-move";
+    up.title = "上へ移動";
+    up.textContent = "↑";
+    up.addEventListener("click", (event) => {
+      event.stopPropagation();
+      send({ cmd: "move_bookmark_up", id: entry.id });
     });
+    row.appendChild(up);
+
+    const down = document.createElement("button");
+    down.className = "panel-row-move";
+    down.title = "下へ移動";
+    down.textContent = "↓";
+    down.addEventListener("click", (event) => {
+      event.stopPropagation();
+      send({ cmd: "move_bookmark_down", id: entry.id });
+    });
+    row.appendChild(down);
+
+    const edit = document.createElement("button");
+    edit.className = "panel-row-edit";
+    edit.title = "編集";
+    edit.textContent = "✎";
+    edit.addEventListener("click", (event) => {
+      event.stopPropagation();
+      row.replaceWith(createBookmarkEditRow(entry, folderOptions));
+    });
+    row.appendChild(edit);
+
+    const del = document.createElement("button");
+    del.className = "panel-row-delete";
+    del.title = "削除";
+    del.textContent = "×";
+    del.addEventListener("click", (event) => {
+      event.stopPropagation();
+      send({ cmd: "remove_bookmark", id: entry.id });
+    });
+    row.appendChild(del);
+
+    return row;
+  }
+
+  function createBookmarkEditRow(entry, folderOptions) {
+    const row = document.createElement("div");
+    row.className = "panel-row bookmark-edit-row";
+
+    const titleInput = document.createElement("input");
+    titleInput.className = "bookmark-edit-title";
+    titleInput.type = "text";
+    titleInput.spellcheck = false;
+    titleInput.autocomplete = "off";
+    titleInput.value = entry.title || "";
+    titleInput.placeholder = "タイトル";
+
+    const urlInput = document.createElement("input");
+    urlInput.className = "bookmark-edit-url";
+    urlInput.type = "text";
+    urlInput.spellcheck = false;
+    urlInput.autocomplete = "off";
+    urlInput.value = entry.url;
+    urlInput.placeholder = "URL";
+
+    const folderSelect = document.createElement("select");
+    folderSelect.className = "bookmark-edit-folder";
+    const rootOption = document.createElement("option");
+    rootOption.value = "";
+    rootOption.textContent = "（ルート）";
+    folderSelect.appendChild(rootOption);
+    for (const folder of folderOptions) {
+      const option = document.createElement("option");
+      option.value = String(folder.id);
+      option.textContent = folder.name;
+      if (entry.folder_id === folder.id) {
+        option.selected = true;
+      }
+      folderSelect.appendChild(option);
+    }
+
+    const save = document.createElement("button");
+    save.className = "panel-row-link";
+    save.textContent = "保存";
+    save.addEventListener("click", () => {
+      const folderId = folderSelect.value === "" ? null : Number(folderSelect.value);
+      send({
+        cmd: "edit_bookmark",
+        id: entry.id,
+        title: titleInput.value,
+        url: urlInput.value,
+        folder_id: folderId,
+      });
+    });
+    row.append(titleInput, urlInput, folderSelect, save);
+
+    const cancel = document.createElement("button");
+    cancel.className = "panel-row-delete";
+    cancel.title = "キャンセル";
+    cancel.textContent = "×";
+    cancel.addEventListener("click", () => {
+      // No server round-trip needed: nothing was sent yet, so the entry we
+      // already have is still accurate — just rebuild the display row from
+      // it.
+      row.replaceWith(createBookmarkRow(entry, folderOptions));
+    });
+    row.appendChild(cancel);
+
+    return row;
+  }
+
+  function createBookmarkFolderHeader(folder) {
+    const header = document.createElement("div");
+    header.className = "panel-group-header bookmark-folder-header";
+
+    const label = document.createElement("span");
+    label.className = "bookmark-folder-name";
+    label.textContent = folder.name;
+    header.appendChild(label);
+
+    const actions = document.createElement("span");
+    actions.className = "bookmark-folder-actions";
+
+    const rename = document.createElement("button");
+    rename.className = "panel-row-edit";
+    rename.title = "フォルダ名を変更";
+    rename.textContent = "✎";
+    rename.addEventListener("click", () => {
+      header.replaceWith(createBookmarkFolderRenameHeader(folder));
+    });
+    actions.appendChild(rename);
+
+    const del = document.createElement("button");
+    del.className = "panel-row-delete";
+    del.title = "フォルダを削除（中のブックマークはルートへ移動します）";
+    del.textContent = "×";
+    del.addEventListener("click", () => {
+      send({ cmd: "remove_bookmark_folder", id: folder.id });
+    });
+    actions.appendChild(del);
+
+    header.appendChild(actions);
+    return header;
+  }
+
+  function createBookmarkFolderRenameHeader(folder) {
+    const header = document.createElement("div");
+    header.className = "panel-group-header bookmark-folder-header";
+
+    const input = document.createElement("input");
+    input.className = "bookmark-folder-rename-input";
+    input.type = "text";
+    input.spellcheck = false;
+    input.autocomplete = "off";
+    input.value = folder.name;
+    header.appendChild(input);
+
+    const save = document.createElement("button");
+    save.className = "panel-row-edit";
+    save.title = "保存";
+    save.textContent = "✓";
+    save.addEventListener("click", () => {
+      if (input.value.trim().length > 0) {
+        send({ cmd: "rename_bookmark_folder", id: folder.id, name: input.value });
+      } else {
+        header.replaceWith(createBookmarkFolderHeader(folder));
+      }
+    });
+    header.appendChild(save);
+
+    const cancel = document.createElement("button");
+    cancel.className = "panel-row-delete";
+    cancel.title = "キャンセル";
+    cancel.textContent = "×";
+    cancel.addEventListener("click", () => {
+      header.replaceWith(createBookmarkFolderHeader(folder));
+    });
+    header.appendChild(cancel);
+
+    return header;
+  }
+
+  window.veloxSetBookmarks = (view) => {
+    bookmarksRowsEl.replaceChildren();
+    const folderOptions = bookmarkFolderOptions(view);
+    const isEmpty = view.root.length === 0 && view.folders.length === 0;
+    if (isEmpty) {
+      const empty = document.createElement("div");
+      empty.className = "panel-empty";
+      empty.textContent = "ブックマークはありません";
+      bookmarksRowsEl.appendChild(empty);
+      return;
+    }
+    for (const entry of view.root) {
+      bookmarksRowsEl.appendChild(createBookmarkRow(entry, folderOptions));
+    }
+    for (const folder of view.folders) {
+      bookmarksRowsEl.appendChild(createBookmarkFolderHeader(folder));
+      for (const entry of folder.entries) {
+        bookmarksRowsEl.appendChild(createBookmarkRow(entry, folderOptions));
+      }
+    }
+  };
+
+  /* The always-visible bookmark bar (Issue #19, see docs/decisions.md D35).
+     Same `view` shape as `veloxSetBookmarks` above, rendered as a
+     horizontal strip: root bookmarks are direct buttons, each folder is a
+     button that opens a small dropdown of its own entries on click (a
+     single flat layer, matching the data model — docs/decisions.md D32). */
+  function createBookmarkBarButton(entry) {
+    const button = document.createElement("button");
+    button.className = "bookmark-bar-item";
+    button.title = entry.url;
+    button.addEventListener("click", () => send({ cmd: "navigate", input: entry.url }));
+
+    if (entry.favicon) {
+      const icon = document.createElement("img");
+      icon.className = "bookmark-bar-favicon";
+      icon.src = entry.favicon;
+      icon.alt = "";
+      icon.addEventListener("error", () => icon.remove());
+      button.appendChild(icon);
+    }
+
+    const label = document.createElement("span");
+    label.textContent = entry.title && entry.title.length > 0 ? entry.title : entry.url;
+    button.appendChild(label);
+
+    return button;
+  }
+
+  function closeAllBookmarkBarDropdowns() {
+    bookmarkBarEl.querySelectorAll(".bookmark-bar-dropdown").forEach((dropdown) => {
+      dropdown.hidden = true;
+    });
+  }
+  // A click anywhere outside a folder button's own dropdown closes it — the
+  // usual pattern for a small popover menu.
+  document.addEventListener("click", closeAllBookmarkBarDropdowns);
+
+  function createBookmarkBarFolder(folder) {
+    const wrapper = document.createElement("div");
+    wrapper.className = "bookmark-bar-item bookmark-bar-folder";
+
+    const label = document.createElement("span");
+    label.textContent = folder.name + " ▾";
+    wrapper.appendChild(label);
+
+    const dropdown = document.createElement("div");
+    dropdown.className = "bookmark-bar-dropdown";
+    dropdown.hidden = true;
+    if (folder.entries.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "bookmark-bar-dropdown-item";
+      empty.textContent = "（空のフォルダ）";
+      dropdown.appendChild(empty);
+    } else {
+      for (const entry of folder.entries) {
+        const item = document.createElement("button");
+        item.className = "bookmark-bar-dropdown-item";
+        item.textContent = entry.title && entry.title.length > 0 ? entry.title : entry.url;
+        item.title = entry.url;
+        item.addEventListener("click", () => send({ cmd: "navigate", input: entry.url }));
+        dropdown.appendChild(item);
+      }
+    }
+    wrapper.appendChild(dropdown);
+
+    wrapper.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const wasHidden = dropdown.hidden;
+      closeAllBookmarkBarDropdowns();
+      dropdown.hidden = !wasHidden;
+    });
+
+    return wrapper;
+  }
+
+  window.veloxSetBookmarkBar = (view) => {
+    bookmarkBarEl.replaceChildren();
+    for (const entry of view.root) {
+      bookmarkBarEl.appendChild(createBookmarkBarButton(entry));
+    }
+    for (const folder of view.folders) {
+      bookmarkBarEl.appendChild(createBookmarkBarFolder(folder));
+    }
+  };
+
+  window.veloxSetBookmarkBarVisible = (visible) => {
+    bookmarkBarEl.hidden = !visible;
   };
 
   /* Downloads (Issue #16, see docs/decisions.md D28). A dedicated renderer

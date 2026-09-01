@@ -18,9 +18,8 @@ use crate::browser::downloads;
 use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::{
-    metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkEntry, BookmarkStore,
-    DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryEntry, HistoryStore,
-    TabId, Tabs,
+    metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore, DownloadEntry,
+    DownloadId, DownloadStore, Favicon, FilterList, HistoryEntry, HistoryStore, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -62,6 +61,13 @@ pub enum UserEvent {
     FaviconResolved {
         tab_id: TabId,
         history_id: u64,
+        /// The page this favicon belongs to, as of when the fetch was
+        /// started (see `BrowserWindow::fetch_favicon`'s doc comment) — used
+        /// to also update a bookmarked page's favicon
+        /// (`BookmarkStore::update_favicon_by_url`, Issue #19, see
+        /// docs/decisions.md D34), since a bookmark is keyed by URL, not by
+        /// tab or history id.
+        page_url: String,
         url: String,
     },
     /// The active content webview's devtools shortcut (F12 / Cmd+Opt+I)
@@ -520,7 +526,7 @@ fn handle_user_event(
                 );
                 log_failure(
                     "fetch favicon",
-                    window.fetch_favicon(id, history_id.unwrap_or(0)),
+                    window.fetch_favicon(id, history_id.unwrap_or(0), url.clone()),
                 );
             }
             if id == state.tabs.active_id() {
@@ -551,6 +557,7 @@ fn handle_user_event(
         UserEvent::FaviconResolved {
             tab_id,
             history_id,
+            page_url,
             url,
         } => {
             // A stale `tab_id` (the tab closed while the fetch was in
@@ -559,9 +566,16 @@ fn handle_user_event(
                 tab.set_favicon_url(url.clone());
                 sync_tab_strip(window, &state.tabs);
             }
-            if state.history.update_favicon(history_id, url) {
+            if state.history.update_favicon(history_id, url.clone()) {
                 persist_history(state);
                 refresh_history_panel(window, state, config);
+            }
+            // Issue #19/D34: a bookmarked page's favicon updates the same
+            // way, keyed by URL (a bookmark has no history/tab id of its
+            // own to correlate against).
+            if state.bookmarks.update_favicon_by_url(&page_url, url) {
+                persist_bookmarks(state);
+                refresh_bookmarks_panel(window, state);
             }
         }
         UserEvent::OpenDevtoolsRequested => window.open_devtools(),
@@ -695,6 +709,10 @@ fn handle_toolbar_command(
                 window.set_loading(state.tabs.active().is_loading()),
             );
             log_failure("show private indicator", window.set_private(config.private));
+            log_failure(
+                "initialize bookmark bar visibility",
+                window.set_bookmark_bar_visible(window.bookmark_bar_visible()),
+            );
             sync_block_count(window, &state.tabs);
             let url = state.tabs.active().current_url().to_owned();
             sync_bookmark_star(window, state, &url);
@@ -703,15 +721,7 @@ fn handle_toolbar_command(
             refresh_downloads_panel(window, state);
             sync_tab_strip(window, &state.tabs);
         }
-        ToolbarCommand::ToggleBookmark => {
-            let url = state.tabs.active().current_url().to_owned();
-            let title = known_title_for(&state.history, &url);
-            let now = now_unix();
-            let active = state.bookmarks.toggle(&url, title, now);
-            persist_bookmarks(state);
-            log_failure("update bookmark star", window.set_bookmark_active(active));
-            refresh_bookmarks_panel(window, state);
-        }
+        ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, state),
         ToolbarCommand::TogglePanel { panel } => {
             let next = if window.open_panel() == Some(panel) {
                 None
@@ -799,7 +809,99 @@ fn handle_toolbar_command(
             log_failure("close omnibox", window.set_panel(None));
             focus_address_bar(window, state);
         }
+        // --- Bookmark folders, editing, reordering, and the bookmark bar
+        //     (Issue #19, see docs/decisions.md D32/D33/D34/D35) ---
+        ToolbarCommand::EditBookmark {
+            id,
+            title,
+            url,
+            folder_id,
+        } => {
+            let title = {
+                let trimmed = title.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            };
+            // D33: the one place a bookmark's URL is (re)validated — the
+            // exact same `navigate::normalize_input` every other URL in
+            // VeloX goes through, so an edit can never smuggle in a
+            // rejected scheme (e.g. `javascript:`) that `Navigate` itself
+            // would refuse.
+            match navigation::normalize_input(&url) {
+                Some(normalized) => {
+                    if let Err(err) = state.bookmarks.edit(id, title, normalized, folder_id) {
+                        eprintln!("velox: rejected bookmark edit for id {id}: {err:?}");
+                    } else {
+                        persist_bookmarks(state);
+                    }
+                }
+                None => {
+                    eprintln!("velox: rejected bookmark edit for id {id}: invalid URL {url:?}");
+                }
+            }
+            // Always refreshed, success or failure, so the panel's inline
+            // edit form closes and shows the entry's actual (possibly
+            // unchanged) state either way.
+            refresh_bookmarks_panel(window, state);
+            let active_url = state.tabs.active().current_url().to_owned();
+            sync_bookmark_star(window, state, &active_url);
+        }
+        ToolbarCommand::CreateBookmarkFolder { name } => {
+            let name = name.trim();
+            if !name.is_empty() {
+                state.bookmarks.create_folder(name.to_owned(), now_unix());
+                persist_bookmarks(state);
+            }
+            refresh_bookmarks_panel(window, state);
+        }
+        ToolbarCommand::RenameBookmarkFolder { id, name } => {
+            let name = name.trim();
+            if !name.is_empty() && state.bookmarks.rename_folder(id, name.to_owned()) {
+                persist_bookmarks(state);
+            }
+            refresh_bookmarks_panel(window, state);
+        }
+        ToolbarCommand::RemoveBookmarkFolder { id } => {
+            if state.bookmarks.remove_folder(id) {
+                persist_bookmarks(state);
+            }
+            refresh_bookmarks_panel(window, state);
+        }
+        ToolbarCommand::MoveBookmarkUp { id } => {
+            if state.bookmarks.move_up(id) {
+                persist_bookmarks(state);
+                refresh_bookmarks_panel(window, state);
+            }
+        }
+        ToolbarCommand::MoveBookmarkDown { id } => {
+            if state.bookmarks.move_down(id) {
+                persist_bookmarks(state);
+                refresh_bookmarks_panel(window, state);
+            }
+        }
+        ToolbarCommand::ToggleBookmarkBar => toggle_bookmark_bar(window),
     }
+}
+
+/// Bookmark/unbookmark the active tab's current page (the star button,
+/// `ToolbarCommand::ToggleBookmark`, and Ctrl/Cmd+D from either the toolbar
+/// or a content webview — `ContentShortcut::ToggleBookmark` — all funnel
+/// through here).
+fn toggle_current_bookmark(window: &mut BrowserWindow, state: &mut AppState) {
+    let url = state.tabs.active().current_url().to_owned();
+    let title = known_title_for(&state.history, &url);
+    let now = now_unix();
+    let active = state.bookmarks.toggle(&url, title, now);
+    persist_bookmarks(state);
+    log_failure("update bookmark star", window.set_bookmark_active(active));
+    refresh_bookmarks_panel(window, state);
+}
+
+/// Show/hide the bookmark bar (Ctrl/Cmd+Shift+B from either the toolbar or a
+/// content webview, and the toolbar's own bar-toggle button all funnel
+/// through here).
+fn toggle_bookmark_bar(window: &mut BrowserWindow) {
+    let next = !window.bookmark_bar_visible();
+    log_failure("toggle bookmark bar", window.set_bookmark_bar_visible(next));
 }
 
 /// Resolve what `ToolbarCommand::Navigate`'s raw `input` should actually
@@ -943,6 +1045,8 @@ fn handle_content_shortcut(
             apply_activation(window, state, effect, started);
         }
         ContentShortcut::FocusAddressBar => focus_address_bar(window, state),
+        ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, state),
+        ContentShortcut::ToggleBookmarkBar => toggle_bookmark_bar(window),
     }
 }
 
@@ -1088,10 +1192,15 @@ fn search_history_panel(window: &BrowserWindow, state: &AppState, config: &Confi
     );
 }
 
-/// Push every bookmark to the toolbar, newest first.
+/// Push the current bookmark tree (root entries + folders, each in manual
+/// display order — see docs/decisions.md D32/D34) to both the bookmarks
+/// panel and the always-visible bookmark bar. The two surfaces render the
+/// exact same [`toolbar::BookmarksView`], built once here, so they can never
+/// show a different bookmark set from each other.
 fn refresh_bookmarks_panel(window: &BrowserWindow, state: &AppState) {
-    let entries: Vec<&BookmarkEntry> = state.bookmarks.entries_newest_first().collect();
-    log_failure("update bookmarks panel", window.set_bookmarks(&entries));
+    let view = toolbar::BookmarksView::from_store(&state.bookmarks);
+    log_failure("update bookmarks panel", window.set_bookmarks(&view));
+    log_failure("update bookmark bar", window.set_bookmark_bar(&view));
 }
 
 /// Push the download list to the toolbar, most recently started first.

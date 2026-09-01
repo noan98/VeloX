@@ -44,9 +44,7 @@ use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
 use crate::browser::downloads;
-use crate::browser::{
-    group_by_date, BookmarkEntry, Candidate, DownloadEntry, FilterList, HistoryEntry, TabId,
-};
+use crate::browser::{group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, TabId};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -81,6 +79,12 @@ const ACTIVATE_LAST_TAB_MESSAGE: &str = "velox:activate-tab-last";
 /// Ctrl/Cmd+L (Issue #15): focus the address bar. See
 /// `ContentShortcut::FocusAddressBar` and docs/decisions.md D26.
 const FOCUS_ADDRESS_BAR_MESSAGE: &str = "velox:focus-address-bar";
+/// Ctrl/Cmd+D (Issue #19): bookmark/unbookmark the current page. See
+/// `ContentShortcut::ToggleBookmark` and docs/decisions.md D35.
+const TOGGLE_BOOKMARK_MESSAGE: &str = "velox:toggle-bookmark";
+/// Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar. See
+/// `ContentShortcut::ToggleBookmarkBar` and docs/decisions.md D35.
+const TOGGLE_BOOKMARK_BAR_MESSAGE: &str = "velox:toggle-bookmark-bar";
 /// Prefix shared by the eight `velox:activate-tab-1` .. `velox:activate-tab-8`
 /// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
 /// [`parse_content_shortcut`].
@@ -120,6 +124,16 @@ pub enum ContentShortcut {
     /// `ui::toolbar::ToolbarCommand::FocusAddressBar` — both are handled by
     /// the same shared function in `app.rs`.
     FocusAddressBar,
+    /// Ctrl/Cmd+D (Issue #19): bookmark/unbookmark the current page. The
+    /// content-webview half of `ui::toolbar::ToolbarCommand::ToggleBookmark`
+    /// — both are handled by the same shared function in `app.rs`. See
+    /// docs/decisions.md D35.
+    ToggleBookmark,
+    /// Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar. The
+    /// content-webview half of
+    /// `ui::toolbar::ToolbarCommand::ToggleBookmarkBar`. See
+    /// docs/decisions.md D35.
+    ToggleBookmarkBar,
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
@@ -136,6 +150,8 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         PREV_TAB_MESSAGE => Some(ContentShortcut::PrevTab),
         ACTIVATE_LAST_TAB_MESSAGE => Some(ContentShortcut::ActivateLastTab),
         FOCUS_ADDRESS_BAR_MESSAGE => Some(ContentShortcut::FocusAddressBar),
+        TOGGLE_BOOKMARK_MESSAGE => Some(ContentShortcut::ToggleBookmark),
+        TOGGLE_BOOKMARK_BAR_MESSAGE => Some(ContentShortcut::ToggleBookmarkBar),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
         "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
@@ -210,12 +226,16 @@ fn tab_shortcut_script() -> String {
         message = "{ACTIVATE_TAB_MESSAGE_PREFIX}" + event.key;
       }} else if (event.key === "l" || event.key === "L") {{
         message = "{FOCUS_ADDRESS_BAR_MESSAGE}";
+      }} else if (event.key === "d" || event.key === "D") {{
+        message = "{TOGGLE_BOOKMARK_MESSAGE}";
       }}
     }} else if (event.shiftKey && !event.altKey) {{
       if (event.key === "t" || event.key === "T") {{
         message = "{REOPEN_CLOSED_TAB_MESSAGE}";
       }} else if (event.key === "Tab") {{
         message = "{PREV_TAB_MESSAGE}";
+      }} else if (event.key === "b" || event.key === "B") {{
+        message = "{TOGGLE_BOOKMARK_BAR_MESSAGE}";
       }}
     }}
     if (message === null) {{
@@ -260,19 +280,34 @@ fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, L
     (toolbar_rect, content_rect)
 }
 
-/// How tall the toolbar webview needs to be: just the tab strip + address
-/// bar rows, or that plus room for an open history/bookmarks panel.
+/// How tall the toolbar webview needs to be: the tab strip + address bar
+/// rows, plus room for the bookmark bar when it is showing, plus room for
+/// an open history/bookmarks/downloads/omnibox panel when one is open.
 ///
-/// The panel lives inside the toolbar webview (not a content webview), so
-/// opening it means growing the toolbar webview's own native bounds rather
-/// than drawing an overlay — see docs/decisions.md D11 and the "Visit
-/// history and bookmarks" section of docs/architecture.md.
-fn effective_toolbar_height(toolbar_height: u32, panel_height: u32, panel_open: bool) -> u32 {
-    if panel_open {
-        toolbar_height.saturating_add(panel_height)
-    } else {
-        toolbar_height
+/// Both the panel and the bookmark bar live inside the toolbar webview (not
+/// a content webview), so showing either means growing the toolbar
+/// webview's own native bounds rather than drawing an overlay — see
+/// docs/decisions.md D11 for the panel and D35 for why the bookmark bar is
+/// a *third*, independent, always-can-be-on component here rather than
+/// reusing the panel machinery: unlike a panel, the bar is meant to stay
+/// visible while a panel is also open (both are simple additional rows in
+/// the toolbar webview's own flex column), so their heights are summed, not
+/// treated as alternatives.
+fn effective_toolbar_height(
+    toolbar_height: u32,
+    panel_height: u32,
+    panel_open: bool,
+    bookmark_bar_height: u32,
+    bookmark_bar_visible: bool,
+) -> u32 {
+    let mut height = toolbar_height;
+    if bookmark_bar_visible {
+        height = height.saturating_add(bookmark_bar_height);
     }
+    if panel_open {
+        height = height.saturating_add(panel_height);
+    }
+    height
 }
 
 fn to_bounds((x, y, width, height): LogicalRect) -> Rect {
@@ -309,10 +344,21 @@ pub struct BrowserWindow {
     toolbar: WebView,
     toolbar_height: u32,
     panel_height: u32,
+    /// Height of the bookmark bar row when it is visible (Issue #19, see
+    /// docs/decisions.md D35) — added to `toolbar_height` the same way
+    /// `panel_height` is, but independently of whether a panel is also
+    /// open.
+    bookmark_bar_height: u32,
     /// Which history/bookmarks panel is currently open, if any. Interior
     /// mutability is needed because `sync_layout` (called from the window
     /// resize handler, which only has `&BrowserWindow`) must account for it.
     open_panel: Cell<Option<Panel>>,
+    /// Whether the bookmark bar is currently showing. Session-only — not
+    /// persisted across restarts (see docs/decisions.md D35) — starting
+    /// `false` so a fresh window never grows past `toolbar_height` before
+    /// the user has asked for the bar. Interior mutability for the same
+    /// `sync_layout` reason as `open_panel`.
+    bookmark_bar_visible: Cell<bool>,
     /// Kept so panel-driven UI updates (`fetch_page_title`) can send
     /// [`UserEvent`]s back into the event loop after `new` has returned.
     proxy: EventLoopProxy<UserEvent>,
@@ -465,7 +511,9 @@ impl BrowserWindow {
             toolbar,
             toolbar_height: config.toolbar_height,
             panel_height: config.panel_height,
+            bookmark_bar_height: config.bookmark_bar_height,
             open_panel: Cell::new(None),
+            bookmark_bar_visible: Cell::new(false),
             proxy,
             contents,
             active: Some(initial_tab),
@@ -487,6 +535,8 @@ impl BrowserWindow {
             self.toolbar_height,
             self.panel_height,
             self.open_panel.get().is_some(),
+            self.bookmark_bar_height,
+            self.bookmark_bar_visible.get(),
         );
         split_layout(size.width, size.height, toolbar_height)
     }
@@ -772,10 +822,36 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_history_script(&groups))
     }
 
-    /// Replace the bookmarks panel's contents.
-    pub fn set_bookmarks(&self, entries: &[&BookmarkEntry]) -> wry::Result<()> {
+    /// Replace the bookmarks panel's contents (folders and their entries).
+    pub fn set_bookmarks(&self, view: &toolbar::BookmarksView<'_>) -> wry::Result<()> {
         self.toolbar
-            .evaluate_script(&toolbar::set_bookmarks_script(entries))
+            .evaluate_script(&toolbar::set_bookmarks_script(view))
+    }
+
+    /// Replace the always-visible bookmark bar's contents (Issue #19, see
+    /// docs/decisions.md D35). Same underlying data as [`Self::set_bookmarks`]
+    /// — `app.rs` builds one [`toolbar::BookmarksView`] per refresh and
+    /// pushes it to both.
+    pub fn set_bookmark_bar(&self, view: &toolbar::BookmarksView<'_>) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_bookmark_bar_script(view))
+    }
+
+    /// Whether the bookmark bar is currently showing.
+    pub fn bookmark_bar_visible(&self) -> bool {
+        self.bookmark_bar_visible.get()
+    }
+
+    /// Show or hide the bookmark bar: resizes the toolbar webview to make
+    /// (or reclaim) room, the same way [`Self::set_panel`] does for a
+    /// dropdown panel, and updates the toolbar's DOM to match. See
+    /// docs/decisions.md D35 for why this is independent of `set_panel`
+    /// rather than another [`Panel`] variant.
+    pub fn set_bookmark_bar_visible(&self, visible: bool) -> wry::Result<()> {
+        self.bookmark_bar_visible.set(visible);
+        self.sync_layout()?;
+        self.toolbar
+            .evaluate_script(&toolbar::set_bookmark_bar_visible_script(visible))
     }
 
     /// Replace the downloads panel's contents (Issue #16, see
@@ -830,7 +906,14 @@ impl BrowserWindow {
     /// [`UserEvent::FaviconResolved`] for the history entry `history_id` (as
     /// well as the tab strip) — `0` is a safe sentinel for "no history
     /// entry" the same way [`Self::fetch_page_title`] uses it, since
-    /// `HistoryStore` ids start at 1.
+    /// `HistoryStore` ids start at 1. `page_url` is the page this favicon
+    /// belongs to (its URL as of *this* load, captured by the caller before
+    /// the fetch starts) — carried through to
+    /// [`UserEvent::FaviconResolved`] so `app.rs` can also update a
+    /// bookmark's favicon (`BookmarkStore::update_favicon_by_url`, keyed by
+    /// URL, not id — see docs/decisions.md D34) without needing to re-read
+    /// the tab's (possibly by-then-stale, if the tab navigated again in the
+    /// meantime) current URL.
     ///
     /// Same shape and same reasoning as [`Self::fetch_page_title`] (see
     /// docs/decisions.md D12/D22/D27): a no-op for an unknown or suspended
@@ -838,7 +921,12 @@ impl BrowserWindow {
     /// answer gets applied late), and this only ever resolves a URL string —
     /// the actual favicon image fetch happens later, asynchronously, as a
     /// plain `<img src>` load in the toolbar webview, never here.
-    pub fn fetch_favicon(&self, tab_id: TabId, history_id: u64) -> wry::Result<()> {
+    pub fn fetch_favicon(
+        &self,
+        tab_id: TabId,
+        history_id: u64,
+        page_url: String,
+    ) -> wry::Result<()> {
         let webview = match self
             .contents
             .get(&tab_id)
@@ -854,6 +942,7 @@ impl BrowserWindow {
                     let _ = proxy.send_event(UserEvent::FaviconResolved {
                         tab_id,
                         history_id,
+                        page_url: page_url.clone(),
                         url,
                     });
                 }
@@ -1102,8 +1191,22 @@ mod tests {
 
     #[test]
     fn effective_height_adds_panel_height_only_when_open() {
-        assert_eq!(effective_toolbar_height(48, 320, false), 48);
-        assert_eq!(effective_toolbar_height(48, 320, true), 368);
+        assert_eq!(effective_toolbar_height(48, 320, false, 30, false), 48);
+        assert_eq!(effective_toolbar_height(48, 320, true, 30, false), 368);
+    }
+
+    #[test]
+    fn effective_height_adds_bookmark_bar_height_only_when_visible() {
+        assert_eq!(effective_toolbar_height(48, 320, false, 30, true), 78);
+        assert_eq!(effective_toolbar_height(48, 320, false, 30, false), 48);
+    }
+
+    #[test]
+    fn effective_height_sums_bar_and_panel_when_both_are_showing() {
+        // The bar and a panel are independent, additive components (see
+        // docs/decisions.md D35) — not alternatives like `set_panel`'s own
+        // variants are.
+        assert_eq!(effective_toolbar_height(48, 320, true, 30, true), 398);
     }
 
     #[test]
@@ -1132,6 +1235,8 @@ mod tests {
             PREV_TAB_MESSAGE,
             ACTIVATE_LAST_TAB_MESSAGE,
             FOCUS_ADDRESS_BAR_MESSAGE,
+            TOGGLE_BOOKMARK_MESSAGE,
+            TOGGLE_BOOKMARK_BAR_MESSAGE,
         ] {
             assert!(
                 script.contains(message),
@@ -1172,6 +1277,14 @@ mod tests {
         assert_eq!(
             parse_content_shortcut(FOCUS_ADDRESS_BAR_MESSAGE),
             Some(ContentShortcut::FocusAddressBar)
+        );
+        assert_eq!(
+            parse_content_shortcut(TOGGLE_BOOKMARK_MESSAGE),
+            Some(ContentShortcut::ToggleBookmark)
+        );
+        assert_eq!(
+            parse_content_shortcut(TOGGLE_BOOKMARK_BAR_MESSAGE),
+            Some(ContentShortcut::ToggleBookmarkBar)
         );
         for n in 1u8..=8 {
             assert_eq!(
