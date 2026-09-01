@@ -186,12 +186,20 @@ state change is observable in one place (`app.rs`).
 
 ## URL input → page display
 
-1. User types into the address bar and presses Enter.
-2. Toolbar JS sends `{"cmd":"navigate","input":"<raw text>"}` over IPC.
+1. User types into the address bar and presses Enter (or picks a candidate
+   from the omnibox dropdown — see "Omnibox and search" below).
+2. Toolbar JS sends `{"cmd":"navigate","input":"<raw text or a candidate's
+   already-resolved target_url>"}` over IPC.
 3. `ui::toolbar::parse_command` deserializes it into `ToolbarCommand::Navigate`.
-4. `browser::navigation::normalize_input` turns the text into a URL
-   (`example.com` → `https://example.com/`; unsupported/unparseable input is
-   rejected and the address bar snaps back).
+4. `app::resolve_navigate_target` resolves `input` to a loadable URL:
+   `browser::navigation::classify_input` decides URL vs. search, and for a
+   search a query goes through `browser::navigation::build_search_url` with
+   `Config::search_engine`'s template. Either way this bottoms out in
+   `browser::navigation::normalize_input` — the one place that turns text
+   into a URL (`example.com` → `https://example.com/`) and rejects
+   unsupported/unparseable input. See "Omnibox and search" below for the
+   full URL-vs-search story; a rejected/empty result snaps the address bar
+   back to the page actually loaded.
 5. `BrowserWindow::navigate` calls `WebView::load_url`.
 6. The engine fires navigation/load callbacks; they arrive as `UserEvent`s,
    update `Tab`, and are pushed back into the toolbar
@@ -205,6 +213,81 @@ Startup ordering: the toolbar sends `{"cmd":"ready"}` once its document is
 loaded, and the app answers with the current state. Without this handshake
 the first `veloxSetUrl` could run before the toolbar's JS exists (the content
 page starts loading in parallel).
+
+## Omnibox and search
+
+Issue #15 turns the address bar into an omnibox: URL-vs-search
+classification, a configurable search engine, and a candidate dropdown
+driven by keyboard (↑/↓/Enter/Esc) or the mouse. Issue #20 layers
+history/bookmark candidates and ranking on top — see "What #20 builds on"
+below.
+
+**URL vs. search — `browser::navigation::classify_input`.** Every piece of
+omnibox input goes through this one function (`Intent::Url(String)` or
+`Intent::Search(String)`, or `None` for empty/refused input), never a second
+copy of the decision:
+
+- Empty/whitespace-only input → `None`.
+- A leading `?` forces a search (`?rust` → search for `rust`), regardless of
+  what follows.
+- More than one whitespace-separated word → always a search
+  (`rust ownership`) — hand-typed URLs never contain a literal space.
+- A single "word" is attempted as a URL only when it looks like one (an
+  explicit scheme, or a dotted/colon-qualified host —
+  `example.com`/`localhost:3000`/`about:blank`); `normalize_input` is the
+  *only* place that actually parses/normalizes/rejects it, so scheme
+  allow-listing still lives in exactly one function. A URL `normalize_input`
+  refuses (unsupported scheme, unparseable) yields `None` here too — it is
+  never silently retried as a search (see docs/decisions.md D26).
+- A single word that does not look like a URL at all (`rust`) is a search —
+  a bare word is almost always meant as a query, not a domain with an
+  assumed TLD.
+
+**Search engine — `config::SearchEngine`.** A name plus a query template URL
+containing the literal placeholder `{}` (default:
+`https://duckduckgo.com/?q={}` — see docs/decisions.md D26 for why
+DuckDuckGo). `browser::navigation::build_search_url(template, query)`
+percent-encodes `query` via `url::form_urlencoded` (never hand-rolled) and
+substitutes it in, only handing back the result if it parses as an
+`http`/`https` URL. Selectable via `VELOX_SEARCH_ENGINE` (a preset:
+`duckduckgo`/`google`/`bing`/`startpage`/`ecosia`) or a fully custom
+`VELOX_SEARCH_ENGINE_NAME`/`VELOX_SEARCH_ENGINE_URL` pair — see
+`Config::from_env_and_args`.
+
+**Candidates — `browser::omnibox`.** `build_candidates(input, engine_name,
+engine_template, sources, limit)` always starts from `classify_input`: a URL
+intent contributes a `NavigateUrl` candidate plus a `Search` candidate for
+the same text (mirrors how mainstream browsers offer both when input is
+URL-shaped but ambiguous); a search intent contributes just the `Search`
+candidate. Every `Candidate::target_url` is already fully resolved, so
+executing one is exactly `ToolbarCommand::Navigate { input: candidate.target_url
+}` — the same path a plain Enter with no dropdown interaction takes,
+`classify_input` treating an already-absolute URL as `Intent::Url` unchanged.
+
+**What #20 builds on**: implement `browser::omnibox::CandidateSource`
+(`fn candidates(&self, input: &str, limit: usize) -> Vec<Candidate>`, one
+per history/bookmark source, ranked best-first) against
+`browser::HistoryStore`/`BookmarkStore`, then pass `&[&history_source,
+&bookmark_source]` into `build_candidates` from `app.rs`'s
+`ToolbarCommand::OmniboxInput` handler (today it passes `&[]`). No other
+signature changes — see the trait's doc comment in `browser/omnibox.rs` for
+the exact contract (candidates already ranked, `target_url` already a
+normalized/loadable URL, respect the `limit` argument).
+
+**UI wiring.** The candidate dropdown reuses the exact same toolbar-webview
+resize mechanism the history/bookmarks panel already has (`ui::toolbar::Panel`,
+`BrowserWindow::set_panel`/`sync_layout` — see D11) as a third `Panel::Omnibox`
+variant, rather than inventing separate layout code: `app.rs` opens/closes it
+from whether `build_candidates` returned anything, driven by every address-bar
+keystroke (`ToolbarCommand::OmniboxInput`). Row selection (↑/↓) is purely
+client-side in the toolbar's own JS — only Enter/click, which need the chosen
+candidate's `target_url`, and each keystroke, which needs a fresh candidate
+list, round-trip to Rust. Ctrl/Cmd+L (focus + select-all) and Esc (close +
+restore the real current URL) are wired through both keyboard-shortcut
+channels the same way every other shortcut is (`ToolbarCommand::FocusAddressBar`/
+`OmniboxClose` from the trusted toolbar webview,
+`ui::window::ContentShortcut::FocusAddressBar` from the untrusted content
+webview — see D18/D23), both handled by one shared `app::focus_address_bar`.
 
 ## Content blocking
 

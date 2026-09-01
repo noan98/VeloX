@@ -11,6 +11,68 @@ use crate::browser::metrics::PerfFormat;
 /// metrics are enabled but no explicit interval was requested.
 const DEFAULT_PERF_RSS_INTERVAL: Duration = Duration::from_millis(5000);
 
+/// One selectable search engine: a display name plus the query template URL
+/// the omnibox builds a search request from (see
+/// `browser::navigation::build_search_url`). `query_template` must contain
+/// the literal placeholder `{}`, replaced with the percent-encoded query
+/// text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchEngine {
+    pub name: String,
+    pub query_template: String,
+}
+
+impl SearchEngine {
+    fn new(name: &str, query_template: &str) -> Self {
+        Self {
+            name: name.to_owned(),
+            query_template: query_template.to_owned(),
+        }
+    }
+
+    /// VeloX's default — see docs/decisions.md D26 for why DuckDuckGo was
+    /// chosen over Google/Bing/etc.
+    pub fn duckduckgo() -> Self {
+        Self::new("DuckDuckGo", "https://duckduckgo.com/?q={}")
+    }
+
+    pub fn google() -> Self {
+        Self::new("Google", "https://www.google.com/search?q={}")
+    }
+
+    pub fn bing() -> Self {
+        Self::new("Bing", "https://www.bing.com/search?q={}")
+    }
+
+    pub fn startpage() -> Self {
+        Self::new("Startpage", "https://www.startpage.com/sp/search?query={}")
+    }
+
+    pub fn ecosia() -> Self {
+        Self::new("Ecosia", "https://www.ecosia.org/search?q={}")
+    }
+
+    /// Look up one of the built-in presets by name (case-insensitive; a
+    /// couple of common short aliases are accepted alongside the full
+    /// name). `None` for anything unrecognized.
+    fn preset(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "duckduckgo" | "ddg" => Some(Self::duckduckgo()),
+            "google" => Some(Self::google()),
+            "bing" => Some(Self::bing()),
+            "startpage" => Some(Self::startpage()),
+            "ecosia" => Some(Self::ecosia()),
+            _ => None,
+        }
+    }
+}
+
+impl Default for SearchEngine {
+    fn default() -> Self {
+        Self::duckduckgo()
+    }
+}
+
 /// Application configuration, currently compile-time defaults plus a handful
 /// of environment-variable overrides (see [`Config::from_env_and_args`]).
 #[derive(Debug, Clone)]
@@ -87,6 +149,12 @@ pub struct Config {
     /// `true`, every content webview runs with an ephemeral (non-persistent)
     /// data store and page visits are not recorded to `HistoryStore`.
     pub private: bool,
+    /// The search engine the omnibox sends non-URL input to (see
+    /// docs/decisions.md D26 and `browser::navigation::classify_input`).
+    /// Selectable via `VELOX_SEARCH_ENGINE` (a preset name) or
+    /// `VELOX_SEARCH_ENGINE_NAME`/`VELOX_SEARCH_ENGINE_URL` (a fully custom
+    /// engine) — see [`Config::from_env_and_args`].
+    pub search_engine: SearchEngine,
 }
 
 impl Default for Config {
@@ -106,6 +174,7 @@ impl Default for Config {
             history_panel_limit: 200,
             auto_suspend_after: None,
             private: false,
+            search_engine: SearchEngine::default(),
             perf_metrics: false,
             perf_rss_interval: None,
             perf_format: PerfFormat::Text,
@@ -133,6 +202,15 @@ impl Config {
     /// - `VELOX_PERF_OUTPUT` — only consulted when `VELOX_PERF_METRICS` is
     ///   set; a file path to append perf lines to instead of stderr. Unset
     ///   or empty keeps stderr.
+    /// - `VELOX_SEARCH_ENGINE` — select a built-in preset by name
+    ///   (`duckduckgo`/`ddg`, `google`, `bing`, `startpage`, `ecosia`;
+    ///   case-insensitive). Unset or unrecognized keeps the default
+    ///   ([`SearchEngine::duckduckgo`]).
+    /// - `VELOX_SEARCH_ENGINE_NAME` / `VELOX_SEARCH_ENGINE_URL` — a fully
+    ///   custom engine, taking priority over `VELOX_SEARCH_ENGINE` when
+    ///   *both* are set to a non-empty value and the URL contains the `{}`
+    ///   placeholder; otherwise this pair is ignored and `VELOX_SEARCH_ENGINE`
+    ///   (or the default) applies instead.
     ///
     /// No CLI-parsing crate is introduced for this (see docs/decisions.md
     /// D6); `args` is expected to be the process arguments with argv\[0\]
@@ -150,8 +228,14 @@ impl Config {
             format_raw.as_deref(),
             output_raw.as_deref(),
         );
+        let search_engine = resolve_search_engine(
+            std::env::var("VELOX_SEARCH_ENGINE").ok().as_deref(),
+            std::env::var("VELOX_SEARCH_ENGINE_NAME").ok().as_deref(),
+            std::env::var("VELOX_SEARCH_ENGINE_URL").ok().as_deref(),
+        );
         Self {
             private,
+            search_engine,
             perf_metrics,
             perf_rss_interval,
             perf_format,
@@ -159,6 +243,33 @@ impl Config {
             ..Self::default()
         }
     }
+}
+
+/// Pure decision logic behind [`Config::from_env_and_args`]'s
+/// `search_engine` field, factored out for the same testability reason as
+/// [`resolve_perf_env`]. A valid custom name+URL pair wins over the preset
+/// name; an invalid or partial custom pair is ignored rather than causing a
+/// hard failure, falling back to the preset (or the default) instead — a
+/// typo'd `VELOX_SEARCH_ENGINE_URL` should never stop the browser from
+/// starting.
+fn resolve_search_engine(
+    preset_raw: Option<&str>,
+    custom_name: Option<&str>,
+    custom_url: Option<&str>,
+) -> SearchEngine {
+    let custom_name = custom_name.map(str::trim).filter(|s| !s.is_empty());
+    let custom_url = custom_url.map(str::trim).filter(|s| !s.is_empty());
+    if let (Some(name), Some(template)) = (custom_name, custom_url) {
+        if template.contains("{}") {
+            return SearchEngine {
+                name: name.to_owned(),
+                query_template: template.to_owned(),
+            };
+        }
+    }
+    preset_raw
+        .and_then(SearchEngine::preset)
+        .unwrap_or_default()
 }
 
 /// Whether private browsing should be enabled given the raw ingredients
@@ -229,6 +340,7 @@ mod tests {
         assert_eq!(config.perf_rss_interval, None);
         assert_eq!(config.perf_format, PerfFormat::Text);
         assert_eq!(config.perf_output_path, None);
+        assert_eq!(config.search_engine, SearchEngine::duckduckgo());
     }
 
     #[test]
@@ -325,5 +437,93 @@ mod tests {
         let config = Config::default();
         assert!(config.content_blocking_enabled);
         assert_eq!(config.extra_blocklist_path, None);
+    }
+
+    #[test]
+    fn search_engine_defaults_to_duckduckgo_with_no_overrides() {
+        assert_eq!(
+            resolve_search_engine(None, None, None),
+            SearchEngine::duckduckgo()
+        );
+    }
+
+    #[test]
+    fn search_engine_preset_is_case_insensitive_with_aliases() {
+        assert_eq!(
+            resolve_search_engine(Some("Google"), None, None),
+            SearchEngine::google()
+        );
+        assert_eq!(
+            resolve_search_engine(Some("DDG"), None, None),
+            SearchEngine::duckduckgo()
+        );
+        assert_eq!(
+            resolve_search_engine(Some("bing"), None, None),
+            SearchEngine::bing()
+        );
+        assert_eq!(
+            resolve_search_engine(Some("startpage"), None, None),
+            SearchEngine::startpage()
+        );
+        assert_eq!(
+            resolve_search_engine(Some("ecosia"), None, None),
+            SearchEngine::ecosia()
+        );
+    }
+
+    #[test]
+    fn unrecognized_preset_name_falls_back_to_the_default() {
+        assert_eq!(
+            resolve_search_engine(Some("altavista"), None, None),
+            SearchEngine::duckduckgo()
+        );
+    }
+
+    #[test]
+    fn custom_engine_takes_priority_over_a_preset() {
+        let custom = resolve_search_engine(
+            Some("google"),
+            Some("My Engine"),
+            Some("https://example.com/search?q={}"),
+        );
+        assert_eq!(
+            custom,
+            SearchEngine {
+                name: "My Engine".to_owned(),
+                query_template: "https://example.com/search?q={}".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn custom_engine_without_the_placeholder_is_ignored() {
+        assert_eq!(
+            resolve_search_engine(
+                Some("google"),
+                Some("My Engine"),
+                Some("https://example.com/search?q=fixed"),
+            ),
+            SearchEngine::google()
+        );
+    }
+
+    #[test]
+    fn partial_custom_engine_override_is_ignored() {
+        assert_eq!(
+            resolve_search_engine(None, Some("My Engine"), None),
+            SearchEngine::duckduckgo()
+        );
+        assert_eq!(
+            resolve_search_engine(None, None, Some("https://example.com/search?q={}")),
+            SearchEngine::duckduckgo()
+        );
+    }
+
+    #[test]
+    fn empty_custom_engine_values_are_treated_as_unset() {
+        assert_eq!(
+            resolve_search_engine(Some("google"), Some("  "), Some("  ")),
+            SearchEngine::google()
+        );
     }
 }

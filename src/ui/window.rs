@@ -42,7 +42,7 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
-use crate::browser::{BookmarkEntry, FilterList, HistoryEntry, TabId};
+use crate::browser::{BookmarkEntry, Candidate, FilterList, HistoryEntry, TabId};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -74,6 +74,9 @@ const REOPEN_CLOSED_TAB_MESSAGE: &str = "velox:reopen-closed-tab";
 const NEXT_TAB_MESSAGE: &str = "velox:next-tab";
 const PREV_TAB_MESSAGE: &str = "velox:prev-tab";
 const ACTIVATE_LAST_TAB_MESSAGE: &str = "velox:activate-tab-last";
+/// Ctrl/Cmd+L (Issue #15): focus the address bar. See
+/// `ContentShortcut::FocusAddressBar` and docs/decisions.md D26.
+const FOCUS_ADDRESS_BAR_MESSAGE: &str = "velox:focus-address-bar";
 /// Prefix shared by the eight `velox:activate-tab-1` .. `velox:activate-tab-8`
 /// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
 /// [`parse_content_shortcut`].
@@ -108,6 +111,11 @@ pub enum ContentShortcut {
     ActivateTabAt(u8),
     /// Ctrl/Cmd+9: activate the last tab.
     ActivateLastTab,
+    /// Ctrl/Cmd+L (Issue #15): focus the address bar and select its
+    /// contents. The content-webview half of
+    /// `ui::toolbar::ToolbarCommand::FocusAddressBar` — both are handled by
+    /// the same shared function in `app.rs`.
+    FocusAddressBar,
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
@@ -123,6 +131,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         NEXT_TAB_MESSAGE => Some(ContentShortcut::NextTab),
         PREV_TAB_MESSAGE => Some(ContentShortcut::PrevTab),
         ACTIVATE_LAST_TAB_MESSAGE => Some(ContentShortcut::ActivateLastTab),
+        FOCUS_ADDRESS_BAR_MESSAGE => Some(ContentShortcut::FocusAddressBar),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
         "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
@@ -195,6 +204,8 @@ fn tab_shortcut_script() -> String {
         message = "{ACTIVATE_LAST_TAB_MESSAGE}";
       }} else if (event.key >= "1" && event.key <= "8") {{
         message = "{ACTIVATE_TAB_MESSAGE_PREFIX}" + event.key;
+      }} else if (event.key === "l" || event.key === "L") {{
+        message = "{FOCUS_ADDRESS_BAR_MESSAGE}";
       }}
     }} else if (event.shiftKey && !event.altKey) {{
       if (event.key === "t" || event.key === "T") {{
@@ -703,6 +714,27 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_bookmark_active_script(active))
     }
 
+    /// Focus the toolbar webview and force the address bar to show `url`,
+    /// selected — Ctrl/Cmd+L (`FocusAddressBar`) and the Esc-restore step
+    /// (`OmniboxClose`) in `app.rs` both call this. `self.toolbar.focus()`
+    /// moves native/OS keyboard focus to the toolbar webview (needed when a
+    /// content webview had it, e.g. Ctrl+L pressed while looking at a
+    /// page); the address bar already having focus makes this a harmless
+    /// no-op re-focus.
+    pub fn focus_address_bar(&self, url: &str) -> wry::Result<()> {
+        self.toolbar.focus()?;
+        self.toolbar
+            .evaluate_script(&toolbar::set_focus_address_bar_script(url))
+    }
+
+    /// Replace the omnibox candidate dropdown's contents (Issue #15). Does
+    /// not itself open/close `Panel::Omnibox` — the caller (`app.rs`)
+    /// decides that from whether `candidates` is empty, via `set_panel`.
+    pub fn set_candidates(&self, candidates: &[Candidate]) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_candidates_script(candidates))
+    }
+
     /// Show or hide the toolbar's always-visible private-browsing indicator.
     pub fn set_private(&self, private: bool) -> wry::Result<()> {
         self.toolbar
@@ -1006,6 +1038,7 @@ mod tests {
             NEXT_TAB_MESSAGE,
             PREV_TAB_MESSAGE,
             ACTIVATE_LAST_TAB_MESSAGE,
+            FOCUS_ADDRESS_BAR_MESSAGE,
         ] {
             assert!(
                 script.contains(message),
@@ -1042,6 +1075,10 @@ mod tests {
         assert_eq!(
             parse_content_shortcut(ACTIVATE_LAST_TAB_MESSAGE),
             Some(ContentShortcut::ActivateLastTab)
+        );
+        assert_eq!(
+            parse_content_shortcut(FOCUS_ADDRESS_BAR_MESSAGE),
+            Some(ContentShortcut::FocusAddressBar)
         );
         for n in 1u8..=8 {
             assert_eq!(

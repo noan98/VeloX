@@ -298,6 +298,49 @@
     color: var(--dim-fg);
     text-align: center;
   }
+
+  /* Omnibox candidate dropdown (Issue #15). Shares #panel's toolbar-resize
+     mechanism with the history/bookmarks panels (see docs/decisions.md
+     D11/D26), so it needs no layout rules of its own beyond the row style
+     below — `.panel-list`/`.panel-rows` already fit it. */
+  .candidate-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    height: 34px;
+    padding: 0 12px;
+    border: none;
+    background: none;
+    color: var(--fg);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .candidate-row:hover, .candidate-row.selected { background: var(--row-hover); }
+  .candidate-icon {
+    flex: none;
+    width: 16px;
+    text-align: center;
+    color: var(--dim-fg);
+    font-size: 13px;
+  }
+  .candidate-label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .candidate-detail {
+    flex: none;
+    max-width: 40%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    color: var(--dim-fg);
+  }
 </style>
 </head>
 <body>
@@ -335,6 +378,9 @@
     </div>
     <div id="bookmarks-rows" class="panel-rows"></div>
   </div>
+  <div id="panel-omnibox" class="panel-list" hidden>
+    <div id="omnibox-rows" class="panel-rows"></div>
+  </div>
 </div>
 <script>
   "use strict";
@@ -346,6 +392,17 @@
   const bookmarksPanelEl = document.getElementById("panel-bookmarks");
   const historyRowsEl = document.getElementById("history-rows");
   const bookmarksRowsEl = document.getElementById("bookmarks-rows");
+  const omniboxPanelEl = document.getElementById("panel-omnibox");
+  const omniboxRowsEl = document.getElementById("omnibox-rows");
+
+  /* Omnibox candidate dropdown state (Issue #15): the candidate list Rust
+     last pushed via veloxSetCandidates, and which row (if any) Up/Down has
+     highlighted. Purely client-side — arrow-key movement never round-trips
+     to Rust, only Enter/click (which need the chosen candidate's
+     target_url) and every keystroke (which needs a fresh candidate list)
+     do. */
+  let currentCandidates = [];
+  let selectedIndex = -1;
 
   document.getElementById("back").addEventListener("click", () => send({ cmd: "back" }));
   document.getElementById("forward").addEventListener("click", () => send({ cmd: "forward" }));
@@ -354,9 +411,32 @@
   document.getElementById("new-tab").addEventListener("click", () => send({ cmd: "new_tab" }));
   urlInput.addEventListener("keydown", (e) => {
     if (e.key === "Enter") {
-      send({ cmd: "navigate", input: urlInput.value });
+      // A highlighted candidate (Up/Down) wins; otherwise fall back to the
+      // raw typed text, which Rust classifies the same way building the
+      // candidate list did (see navigation::classify_input) — plain Enter
+      // with no dropdown interaction still gets the right URL/search
+      // behavior.
+      const chosen =
+        selectedIndex >= 0 && currentCandidates[selectedIndex]
+          ? currentCandidates[selectedIndex].target_url
+          : urlInput.value;
+      send({ cmd: "navigate", input: chosen });
       urlInput.blur();
+    } else if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (currentCandidates.length > 0) {
+        e.preventDefault();
+        const delta = e.key === "ArrowDown" ? 1 : -1;
+        selectedIndex =
+          (selectedIndex + delta + currentCandidates.length) % currentCandidates.length;
+        updateCandidateSelection();
+      }
+    } else if (e.key === "Escape") {
+      e.preventDefault();
+      send({ cmd: "omnibox_close" });
     }
+  });
+  urlInput.addEventListener("input", () => {
+    send({ cmd: "omnibox_input", input: urlInput.value });
   });
 
   document.getElementById("bookmark-star").addEventListener("click", () => {
@@ -400,6 +480,11 @@
         message = { cmd: "activate_last_tab" };
       } else if (event.key >= "1" && event.key <= "8") {
         message = { cmd: "activate_tab_by_index", index: Number(event.key) };
+      } else if (event.key === "l" || event.key === "L") {
+        // Ctrl/Cmd+L (Issue #15): focus the address bar and select its
+        // contents. Harmless to send even when the address bar already has
+        // focus — veloxFocusAddressBar always re-selects.
+        message = { cmd: "focus_address_bar" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {
@@ -421,6 +506,14 @@
       urlInput.value = url;
     }
   };
+  /* Ctrl/Cmd+L and the Esc-restore step (Issue #15): unlike veloxSetUrl
+     above, this always overwrites the field and (re)selects it, even while
+     it already has focus — that is the point of both operations. */
+  window.veloxFocusAddressBar = (url) => {
+    urlInput.value = url;
+    urlInput.focus();
+    urlInput.select();
+  };
   window.veloxSetLoading = (loading) => {
     document.getElementById("toolbar").classList.toggle("loading", loading);
   };
@@ -440,6 +533,7 @@
     panelEl.hidden = panel === null;
     historyPanelEl.hidden = panel !== "history";
     bookmarksPanelEl.hidden = panel !== "bookmarks";
+    omniboxPanelEl.hidden = panel !== "omnibox";
   };
 
   /* Full re-render of the tab strip from the current tab list. Simpler and
@@ -565,6 +659,63 @@
       timestamp: (entry) => entry.created_at,
       deleteMessage: (entry) => ({ cmd: "remove_bookmark", id: entry.id }),
     });
+  };
+
+  /* Omnibox candidate dropdown (Issue #15). One icon per Candidate.kind
+     (see browser::omnibox::CandidateKind); history/bookmark are rendered
+     already since #20 only has to start sending those kinds, not add UI
+     support for them. */
+  const CANDIDATE_ICONS = {
+    navigate_url: "→" /* → */,
+    search: "\u{1F50D}" /* 🔍 */,
+    history: "\u{1F553}" /* 🕓 */,
+    bookmark: "★" /* ★ */,
+  };
+
+  function renderCandidateRows() {
+    omniboxRowsEl.replaceChildren();
+    currentCandidates.forEach((candidate, index) => {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "candidate-row" + (index === selectedIndex ? " selected" : "");
+      // mousedown (not click), with preventDefault, so the input never
+      // loses focus before the candidate is acted on — the usual pattern
+      // for a suggestions dropdown that sits under a still-focused field.
+      row.addEventListener("mousedown", (event) => {
+        event.preventDefault();
+        send({ cmd: "navigate", input: candidate.target_url });
+      });
+
+      const icon = document.createElement("span");
+      icon.className = "candidate-icon";
+      icon.textContent = CANDIDATE_ICONS[candidate.kind] || "";
+      row.appendChild(icon);
+
+      const label = document.createElement("span");
+      label.className = "candidate-label";
+      label.textContent = candidate.label;
+      row.appendChild(label);
+
+      if (candidate.detail) {
+        const detail = document.createElement("span");
+        detail.className = "candidate-detail";
+        detail.textContent = candidate.detail;
+        row.appendChild(detail);
+      }
+
+      omniboxRowsEl.appendChild(row);
+    });
+  }
+
+  function updateCandidateSelection() {
+    const rows = omniboxRowsEl.querySelectorAll(".candidate-row");
+    rows.forEach((row, index) => row.classList.toggle("selected", index === selectedIndex));
+  }
+
+  window.veloxSetCandidates = (candidates) => {
+    currentCandidates = candidates;
+    selectedIndex = -1;
+    renderCandidateRows();
   };
 
   /* Ask Rust for the current state: the content page may have started
