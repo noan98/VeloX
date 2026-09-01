@@ -13,11 +13,14 @@ pub mod blocklist;
 pub mod bookmarks;
 pub mod downloads;
 pub mod history;
+pub mod input_history;
 pub mod metrics;
 pub mod navigation;
 pub mod omnibox;
+pub mod omnibox_candidates;
 pub mod perf_log;
 pub mod persistence;
+pub mod ranking;
 pub mod tab;
 pub mod tabs;
 
@@ -28,6 +31,8 @@ pub use history::{
     date_bucket, group_by_date, search as search_history, HistoryDateBucket, HistoryEntry,
     HistoryGroup, HistoryStore,
 };
+pub use input_history::{InputHistoryEntry, InputHistoryStore};
 pub use omnibox::{Candidate, CandidateKind, CandidateSource};
+pub use omnibox_candidates::{HistoryBookmarkSource, InputHistorySource};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};

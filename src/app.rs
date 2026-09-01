@@ -18,8 +18,9 @@ use crate::browser::downloads;
 use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::{
-    metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore, DownloadEntry,
-    DownloadId, DownloadStore, Favicon, FilterList, HistoryEntry, HistoryStore, TabId, Tabs,
+    input_history, metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore,
+    DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
+    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -121,9 +122,16 @@ struct AppState {
     tabs: Tabs,
     history: HistoryStore,
     bookmarks: BookmarkStore,
-    /// Where `history`/`bookmarks` are persisted; `None` when no data
-    /// directory could be resolved (see `persistence::default_data_dir`),
-    /// in which case both stores stay in-memory only for this run.
+    /// Previously-submitted search queries (Issue #20) — see
+    /// docs/decisions.md D38. Gated by `history_enabled` for recording the
+    /// same way `history`/`bookmarks` are, but — like `history` — still
+    /// read from for candidates in private mode; see
+    /// `record_input_history_if_enabled` and D39.
+    input_history: InputHistoryStore,
+    /// Where `history`/`bookmarks`/`input_history` are persisted; `None`
+    /// when no data directory could be resolved (see
+    /// `persistence::default_data_dir`), in which case all three stores
+    /// stay in-memory only for this run.
     data_dir: Option<PathBuf>,
     /// Single choke point for whether page visits are written to
     /// `history`. Mirrors `Config::private` for the life of the process
@@ -209,11 +217,16 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         .as_deref()
         .map(persistence::load_bookmarks)
         .unwrap_or_default();
+    let input_history = data_dir
+        .as_deref()
+        .map(persistence::load_input_history)
+        .unwrap_or_default();
 
     let mut state = AppState {
         tabs,
         history,
         bookmarks,
+        input_history,
         data_dir,
         history_enabled: !config.private,
         perf: perf_log
@@ -634,23 +647,38 @@ fn handle_toolbar_command(
         // (already a resolved URL, e.g. `Candidate::target_url`):
         // `classify_input` treats an already-absolute `https://…` URL as
         // `Intent::Url` unchanged, so this one path serves both cases.
-        ToolbarCommand::Navigate { input } => match resolve_navigate_target(config, &input) {
-            Some(url) => {
-                state.tabs.active_mut().on_navigation_started(&url);
-                log_failure("navigate", window.navigate(&url));
-                // A panel entry click drives this same command; close
-                // whichever panel was open now that the user has acted on it.
-                log_failure("close panel", window.set_panel(None));
+        ToolbarCommand::Navigate { input } => {
+            // Issue #20: remember a search query the user actually typed
+            // and submitted (not a candidate-row click already resolved to
+            // a URL — `classify_input` on an already-absolute `https://…`
+            // target_url yields `Intent::Url`, never `Intent::Search`, so
+            // this naturally only fires for raw typed text — see
+            // docs/decisions.md D38).
+            let intent = navigation::classify_input(&input);
+            if let Some(Intent::Search(query)) = &intent {
+                record_input_history_if_enabled(state, query, input_history::DEFAULT_MAX_ENTRIES);
+                persist_input_history(state);
             }
-            None => {
-                eprintln!("velox: cannot navigate to {input:?}");
-                // Snap the address bar back to the page we are actually on.
-                log_failure(
-                    "restore address bar",
-                    window.set_url_display(state.tabs.active().current_url()),
-                );
+            match resolve_intent(config, intent) {
+                Some(url) => {
+                    state.tabs.active_mut().on_navigation_started(&url);
+                    log_failure("navigate", window.navigate(&url));
+                    // A panel entry click drives this same command; close
+                    // whichever panel was open now that the user has acted
+                    // on it.
+                    log_failure("close panel", window.set_panel(None));
+                }
+                None => {
+                    eprintln!("velox: cannot navigate to {input:?}");
+                    // Snap the address bar back to the page we are actually
+                    // on.
+                    log_failure(
+                        "restore address bar",
+                        window.set_url_display(state.tabs.active().current_url()),
+                    );
+                }
             }
-        },
+        }
         ToolbarCommand::Back => log_failure("go back", window.go_back()),
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
@@ -749,6 +777,11 @@ fn handle_toolbar_command(
         ToolbarCommand::ClearHistory => {
             state.history.clear();
             persist_history(state);
+            // Issue #20 (D38): typed search-query history is part of the
+            // same "what have I been doing" privacy surface as page-visit
+            // history, so clearing one clears both.
+            state.input_history.clear();
+            persist_input_history(state);
             refresh_history_panel(window, state, config);
         }
         ToolbarCommand::SearchHistory { query } => {
@@ -784,14 +817,31 @@ fn handle_toolbar_command(
         // --- Omnibox (Issue #15) ---
         ToolbarCommand::FocusAddressBar => focus_address_bar(window, state),
         ToolbarCommand::OmniboxInput { input } => {
-            // No `CandidateSource`s yet — #20 wires history/bookmark
-            // sources in here (see `browser::omnibox::CandidateSource`'s
-            // doc comment for exactly what it implements).
+            // Issue #20: history/bookmark matches, then previously-typed
+            // search queries, ranked by `browser::ranking` — see
+            // docs/decisions.md D36-D39. Both sources read `state.history`/
+            // `state.bookmarks`/`state.input_history` as they stand right
+            // now regardless of `state.history_enabled` (private mode
+            // blocks new *writes* to these stores, not reads of what was
+            // already recorded before it started — see D39), so this needs
+            // no extra gating of its own.
+            let now = now_unix();
+            let history_bookmark_source = HistoryBookmarkSource {
+                history: &state.history,
+                bookmarks: &state.bookmarks,
+                now,
+            };
+            let input_history_source = InputHistorySource {
+                store: &state.input_history,
+                search_engine_name: &config.search_engine.name,
+                search_query_template: &config.search_engine.query_template,
+                now,
+            };
             let candidates = omnibox::build_candidates(
                 &input,
                 &config.search_engine.name,
                 &config.search_engine.query_template,
-                &[],
+                &[&history_bookmark_source, &input_history_source],
                 omnibox::DEFAULT_CANDIDATE_LIMIT,
             );
             let open = if candidates.is_empty() {
@@ -904,15 +954,21 @@ fn toggle_bookmark_bar(window: &mut BrowserWindow) {
     log_failure("toggle bookmark bar", window.set_bookmark_bar_visible(next));
 }
 
-/// Resolve what `ToolbarCommand::Navigate`'s raw `input` should actually
-/// load: [`navigation::classify_input`] decides URL vs. search, and a
-/// search intent is turned into the configured search engine's URL via
-/// [`navigation::build_search_url`]. `None` covers every way this can fail
-/// to resolve — empty input, a rejected scheme, or (in practice never, since
-/// `Config`'s template always contains the required placeholder) a broken
-/// search-engine template.
-fn resolve_navigate_target(config: &Config, input: &str) -> Option<String> {
-    match navigation::classify_input(input)? {
+/// Resolve an already-classified [`Intent`] to a loadable URL: a URL intent
+/// passes through unchanged, a search intent is turned into the configured
+/// search engine's URL via [`navigation::build_search_url`]. `None` covers
+/// every way this can fail to resolve — empty/refused input, or (in
+/// practice never, since `Config`'s template always contains the required
+/// placeholder) a broken search-engine template.
+///
+/// Split out from `classify_input` (rather than folding the classification
+/// in here, as a single `resolve_navigate_target(config, input)` used to)
+/// so `ToolbarCommand::Navigate`'s handler can classify `input` once and
+/// reuse the same [`Intent`] both to resolve the destination and — new in
+/// Issue #20 — to decide whether the raw input was a search query worth
+/// remembering in `InputHistoryStore` (see docs/decisions.md D38).
+fn resolve_intent(config: &Config, intent: Option<Intent>) -> Option<String> {
+    match intent? {
         Intent::Url(url) => Some(url),
         Intent::Search(query) => {
             navigation::build_search_url(&config.search_engine.query_template, &query)
@@ -1142,6 +1198,20 @@ fn record_visit_if_enabled(state: &mut AppState, url: &str, max_entries: usize) 
     )
 }
 
+/// Record a submitted search query to `state.input_history`, gated by the
+/// exact same `history_enabled` choke point `record_visit_if_enabled` uses
+/// (Issue #20 — see docs/decisions.md D38/D39: input history is part of
+/// the same privacy surface as page-visit history, so it follows the same
+/// whole-app private-browsing rule — recording is skipped, but entries
+/// recorded before private mode was entered stay readable for candidates,
+/// same as `HistoryStore`).
+fn record_input_history_if_enabled(state: &mut AppState, text: &str, max_entries: usize) {
+    if !state.history_enabled {
+        return;
+    }
+    state.input_history.record(text, now_unix(), max_entries);
+}
+
 /// Best-effort title for `url` from what history already knows, used when
 /// bookmarking a page so the bookmark shows a name instead of a bare URL.
 fn known_title_for(history: &HistoryStore, url: &str) -> Option<String> {
@@ -1290,6 +1360,15 @@ fn persist_bookmarks(state: &AppState) {
     }
 }
 
+fn persist_input_history(state: &AppState) {
+    if let Some(dir) = &state.data_dir {
+        log_io_failure(
+            "save input history",
+            persistence::save_input_history(dir, &state.input_history),
+        );
+    }
+}
+
 /// Current time as a unix timestamp (seconds). Falls back to `0` on a clock
 /// set before 1970, which should never happen in practice; kept infallible
 /// so callers never need to thread a `Result` through for it.
@@ -1338,6 +1417,7 @@ mod tests {
             tabs: Tabs::new("https://example.com/"),
             history: HistoryStore::new(),
             bookmarks: BookmarkStore::new(),
+            input_history: InputHistoryStore::new(),
             data_dir: None,
             history_enabled,
             perf: None,
