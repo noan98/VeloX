@@ -61,6 +61,10 @@
     display: flex;
     align-items: flex-end;
     gap: 4px;
+    /* Shrinks to fit the space left by #new-tab before #tabstrip's own
+       overflow-x:auto kicks in — see the .tab rule below and
+       docs/decisions.md D21 ("tab width / scrolling for many tabs"). */
+    flex: 1 1 auto;
     min-width: 0;
   }
   .tab {
@@ -68,13 +72,17 @@
     align-items: center;
     gap: 6px;
     height: 28px;
+    /* flex-shrink lets tabs narrow together, down to min-width, as more of
+       them are opened; only once every tab is already at min-width does
+       #tabstrip's horizontal scrollbar take over (10+ tabs stay reachable
+       either way — narrower first, then scrollable). */
+    flex: 1 1 180px;
     max-width: 180px;
-    min-width: 80px;
-    padding: 0 6px 0 10px;
+    min-width: 60px;
+    padding: 0 6px 0 8px;
     border-radius: 8px 8px 0 0;
     background: var(--tab-bg);
     cursor: default;
-    flex: none;
   }
   .tab.active { background: var(--field-bg); }
   .tab.loading .tab-label::before { content: "\21BB\a0"; }
@@ -82,6 +90,15 @@
      Dimmed so it reads as dormant, distinct from an ordinary background tab. */
   .tab.suspended { opacity: 0.55; }
   .tab.suspended .tab-label::before { content: "\1F4A4\a0"; } /* 💤 */
+  .tab-favicon {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+    /* Best-effort image (see docs/decisions.md D21): removed from the DOM
+       entirely on a load error (e.g. no such favicon.ico), so a failed
+       fetch never leaves a broken-image icon in the tab strip. */
+  }
   .tab-label {
     flex: 1;
     min-width: 0;
@@ -355,6 +372,49 @@
     send({ cmd: "clear_history" });
   });
 
+  /* Tab-management keyboard shortcuts (see docs/decisions.md D22). This is
+     the trusted-webview half: the toolbar (address bar, panels) is our own
+     HTML, so it can send structured commands directly through the normal
+     `send()` channel above, unlike the content webview's untrusted half
+     (`ui::window`'s fixed-sentinel-string channel). Both halves exist
+     because whichever webview currently has keyboard focus is the only one
+     that actually observes the keydown (see docs/decisions.md D18's
+     "why an injected script over a tao accelerator").
+     `event.ctrlKey || event.metaKey` deliberately accepts both modifiers on
+     every platform rather than branching on OS, so Ctrl also works on
+     macOS and Cmd is harmlessly ignored elsewhere. */
+  window.addEventListener("keydown", (event) => {
+    const mod = event.ctrlKey || event.metaKey;
+    if (!mod) {
+      return;
+    }
+    let message = null;
+    if (!event.altKey && !event.shiftKey) {
+      if (event.key === "t" || event.key === "T") {
+        message = { cmd: "new_tab" };
+      } else if (event.key === "w" || event.key === "W") {
+        message = { cmd: "close_active_tab" };
+      } else if (event.key === "Tab") {
+        message = { cmd: "next_tab" };
+      } else if (event.key === "9") {
+        message = { cmd: "activate_last_tab" };
+      } else if (event.key >= "1" && event.key <= "8") {
+        message = { cmd: "activate_tab_by_index", index: Number(event.key) };
+      }
+    } else if (event.shiftKey && !event.altKey) {
+      if (event.key === "t" || event.key === "T") {
+        message = { cmd: "reopen_closed_tab" };
+      } else if (event.key === "Tab") {
+        message = { cmd: "prev_tab" };
+      }
+    }
+    if (message === null) {
+      return;
+    }
+    event.preventDefault();
+    send(message);
+  }, true);
+
   /* Called from Rust via evaluate_script. Keep the user's in-progress edit. */
   window.veloxSetUrl = (url) => {
     if (document.activeElement !== urlInput) {
@@ -393,12 +453,27 @@
         + (tab.active ? " active" : "")
         + (tab.loading ? " loading" : "")
         + (tab.suspended ? " suspended" : "");
-      el.title = tab.url + (tab.suspended ? " (suspended)" : "");
+      const displayName = tab.title || tab.url || "New Tab";
+      el.title = displayName + (tab.suspended ? " (suspended)" : "");
       el.addEventListener("click", () => send({ cmd: "activate_tab", id: tab.id }));
+
+      /* Best-effort favicon (see docs/decisions.md D21): Rust only ever
+         hands us a URL to try (a page's own <link rel="icon">, or an
+         origin/favicon.ico guess); the actual fetch is this <img> tag's own
+         async network load, so a slow or failing icon never blocks
+         rendering the rest of the tab strip. */
+      if (tab.favicon) {
+        const icon = document.createElement("img");
+        icon.className = "tab-favicon";
+        icon.src = tab.favicon;
+        icon.alt = "";
+        icon.addEventListener("error", () => icon.remove());
+        el.appendChild(icon);
+      }
 
       const label = document.createElement("span");
       label.className = "tab-label";
-      label.textContent = tab.url || "New Tab";
+      label.textContent = displayName;
       el.appendChild(label);
 
       /* Suspending only makes sense for a background tab that is still

@@ -278,6 +278,32 @@ in this iteration.
   `ActivateTab { id }` — purely additive to the existing serde enum. The
   toolbar pushes tab state back with `TabSummary`/`veloxSetTabs`, rendered as
   the tab strip above the address bar (`src/ui/toolbar.html`).
+- **Tab strip presentation (#11)**: `TabSummary` also carries `title` and
+  `favicon` (a URL, not image bytes — resolving it is synchronous in-page JS,
+  fetching the image is the toolbar webview's own `<img>` tag, never a
+  Rust-side network call; see docs/decisions.md D22). The tab strip's CSS
+  shrinks tabs down to a minimum width as more are opened before its
+  existing `overflow-x: auto` starts scrolling.
+- **Keyboard shortcuts (#11)**: Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9 are
+  delivered the same way DevTools' F12 is (D18) — an injected capture-phase
+  script in the content webview, since a focused child webview never lets a
+  tao-level accelerator see the keypress — plus a second, independent
+  listener in the trusted toolbar webview for when the address bar has
+  focus instead. See docs/decisions.md D23 for the two channels' different
+  trust boundaries (sentinel strings vs. structured `ToolbarCommand`s) and
+  why both funnel into the same handful of shared `app.rs` functions.
+- **Reopen closed tab (#11)**: `browser::tabs::Tabs` keeps a small, capped,
+  pure LIFO stack of recently closed tabs' URLs (`ClosedTabs`,
+  docs/decisions.md D24), fed by `Tabs::close` and drained by
+  `Tabs::reopen_closed` — reopening always starts a fresh tab/webview at the
+  remembered URL, never a restoration of the closed tab's actual session
+  state.
+- **`target="_blank"`/`window.open()` (#11)**: every content webview's
+  `with_new_window_req_handler` denies the platform's own new-window/tab
+  handling and instead reports the requested URL as
+  `UserEvent::NewTabRequested`, which `app.rs` opens as an ordinary new
+  VeloX tab — see docs/decisions.md D25 for the wry-0.56-source-confirmed
+  API survey behind that choice.
 
 ## Tab lifecycle state
 

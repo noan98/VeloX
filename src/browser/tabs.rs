@@ -35,6 +35,46 @@ pub enum ActivationEffect {
     Resume,
 }
 
+/// A bounded LIFO stack of recently closed tabs' URLs, for
+/// Ctrl/Cmd+Shift+T ("reopen closed tab").
+///
+/// Deliberately just a list of URLs: a closed tab's webview (scroll
+/// position, in-progress form input, JS-side session history) is already
+/// gone by the time it lands here (see [`Tabs::close`]), so reopening always
+/// starts a fresh tab at that URL rather than restoring anything richer.
+/// Pure and UI-independent, like the rest of this module, so the cap and
+/// LIFO ordering are unit-tested without a `Tabs`.
+#[derive(Debug, Default)]
+struct ClosedTabs {
+    /// Oldest entry first, most recently closed last (so `pop` — via
+    /// `Vec::pop` — returns the most recently closed tab, matching a LIFO
+    /// stack). Trimmed from the front once [`Self::CAP`] is exceeded.
+    urls: Vec<String>,
+}
+
+impl ClosedTabs {
+    /// Maximum number of closed tabs remembered at once. An arbitrary but
+    /// generous bound — comfortably more than a user would reopen in one
+    /// sitting — that keeps this from growing without limit across a long
+    /// session of opening and closing many tabs.
+    const CAP: usize = 20;
+
+    /// Record a just-closed tab's URL. If already at capacity, the oldest
+    /// remembered entry is dropped to make room.
+    fn push(&mut self, url: impl Into<String>) {
+        if self.urls.len() >= Self::CAP {
+            self.urls.remove(0);
+        }
+        self.urls.push(url.into());
+    }
+
+    /// Take the most recently closed URL, if any, removing it from the
+    /// stack (reopening a tab does not leave it available to reopen again).
+    fn pop(&mut self) -> Option<String> {
+        self.urls.pop()
+    }
+}
+
 /// An ordered set of tabs with exactly one active tab.
 ///
 /// VeloX always keeps at least one tab open: [`Tabs::close`] refuses to
@@ -45,6 +85,9 @@ pub struct Tabs {
     tabs: Vec<Tab>,
     active: usize,
     next_id: u64,
+    /// Recently closed tabs' URLs, for [`Self::reopen_closed`]. See
+    /// [`ClosedTabs`].
+    closed: ClosedTabs,
 }
 
 impl Tabs {
@@ -56,6 +99,7 @@ impl Tabs {
             tabs: vec![Tab::new(id, initial_url)],
             active: 0,
             next_id,
+            closed: ClosedTabs::default(),
         }
     }
 
@@ -156,6 +200,11 @@ impl Tabs {
         }
         let index = self.index_of(id)?;
         let closing_active = index == self.active;
+        // Every successful close — from the tab strip's own "x", or from a
+        // keyboard shortcut (`CloseActiveTab`/`ContentShortcut::CloseTab`) —
+        // goes through this one method, so this is the single choke point
+        // that feeds `reopen_closed` (Ctrl/Cmd+Shift+T).
+        self.closed.push(self.tabs[index].current_url().to_owned());
         self.tabs.remove(index);
         if index < self.active {
             // A tab to the left of the active one shifted everything after
@@ -202,6 +251,59 @@ impl Tabs {
         self.index_of(id)?;
         self.active_mut().mark_backgrounded(now);
         self.activate(id)
+    }
+
+    /// Activate the tab at display-order index `index` (0-based), marking
+    /// the outgoing tab backgrounded at `now` — the shared implementation
+    /// behind [`Self::activate_relative`], [`Self::activate_by_position`]
+    /// and [`Self::activate_last`]. `None` if `index` is out of range.
+    fn activate_index_at(&mut self, index: usize, now: Instant) -> Option<ActivationEffect> {
+        let id = self.tabs.get(index)?.id();
+        self.activate_at(id, now)
+    }
+
+    /// Activate the tab `delta` positions away from the currently active tab
+    /// in display order, wrapping around at either end (e.g. `delta = 1` is
+    /// "next tab" — Ctrl/Cmd+Tab; `delta = -1` is "previous tab" —
+    /// Ctrl/Cmd+Shift+Tab). `Tabs` is never empty, so this always succeeds.
+    pub fn activate_relative(&mut self, delta: i64, now: Instant) -> Option<ActivationEffect> {
+        let len = self.tabs.len() as i64;
+        // Double-mod (`% len` then `+ len) % len`) to land in `0..len` even
+        // when `self.active as i64 + delta` is negative, since Rust's `%`
+        // keeps the sign of its left operand rather than always returning a
+        // non-negative result.
+        let index = ((self.active as i64 + delta) % len + len) % len;
+        self.activate_index_at(index as usize, now)
+    }
+
+    /// Activate the tab at 1-based display-order position `position` (the
+    /// Ctrl/Cmd+1..8 shortcuts). `None` if there is no tab at that position
+    /// (fewer tabs open than `position`, or `position == 0`).
+    pub fn activate_by_position(
+        &mut self,
+        position: usize,
+        now: Instant,
+    ) -> Option<ActivationEffect> {
+        let index = position.checked_sub(1)?;
+        self.activate_index_at(index, now)
+    }
+
+    /// Activate the last tab in display order (the Ctrl/Cmd+9 shortcut,
+    /// mirroring most browsers' "always the last tab, however many there
+    /// are" behavior for that key rather than a literal "9th tab").
+    pub fn activate_last(&mut self, now: Instant) -> Option<ActivationEffect> {
+        self.activate_index_at(self.tabs.len() - 1, now)
+    }
+
+    /// Reopen the most recently closed tab (Ctrl/Cmd+Shift+T), making it the
+    /// active tab — exactly like [`Self::open_at`], since a reopened tab is
+    /// a brand new tab/webview at a remembered URL, not a restoration of the
+    /// old one's session state (see [`ClosedTabs`]). `None`, leaving `Tabs`
+    /// untouched, when nothing has been closed yet (or every closed tab has
+    /// already been reopened).
+    pub fn reopen_closed(&mut self, now: Instant) -> Option<TabId> {
+        let url = self.closed.pop()?;
+        Some(self.open_at(url, now))
     }
 
     /// Bring the tab at `index` — already installed as [`Self::active`] by
@@ -275,6 +377,7 @@ impl Tabs {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tab::Favicon;
     use super::*;
 
     fn ids(tabs: &Tabs) -> Vec<TabId> {
@@ -650,5 +753,322 @@ mod tests {
         // Once suspended, b no longer contributes a deadline.
         assert!(tabs.suspend(b));
         assert_eq!(tabs.next_idle_deadline(idle_after), None);
+    }
+
+    // --- Closed-tab stack (Ctrl/Cmd+Shift+T) ---
+
+    #[test]
+    fn closed_tabs_stack_pushes_and_pops_lifo() {
+        let mut closed = ClosedTabs::default();
+        assert_eq!(closed.pop(), None);
+
+        closed.push("https://a.example/");
+        closed.push("https://b.example/");
+        closed.push("https://c.example/");
+
+        // Most recently pushed comes back first.
+        assert_eq!(closed.pop().as_deref(), Some("https://c.example/"));
+        assert_eq!(closed.pop().as_deref(), Some("https://b.example/"));
+        assert_eq!(closed.pop().as_deref(), Some("https://a.example/"));
+        assert_eq!(closed.pop(), None);
+    }
+
+    #[test]
+    fn closed_tabs_stack_drops_the_oldest_entry_once_over_capacity() {
+        let mut closed = ClosedTabs::default();
+        for i in 0..ClosedTabs::CAP + 3 {
+            closed.push(format!("https://{i}.example/"));
+        }
+        // The three oldest (0, 1, 2) were evicted; the most recent CAP
+        // entries survive, most-recently-closed first.
+        for i in (3..ClosedTabs::CAP + 3).rev() {
+            assert_eq!(closed.pop(), Some(format!("https://{i}.example/")));
+        }
+        assert_eq!(closed.pop(), None);
+    }
+
+    #[test]
+    fn closing_a_tab_makes_it_reopenable() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let b = tabs.open("https://b.example/");
+        tabs.close(b).unwrap();
+
+        let reopened = tabs.reopen_closed(Instant::now()).unwrap();
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs.active_id(), reopened);
+        assert_eq!(
+            tabs.get(reopened).unwrap().current_url(),
+            "https://b.example/"
+        );
+        // Not the same id as the tab that was closed — ids are never reused.
+        assert_ne!(reopened, b);
+    }
+
+    #[test]
+    fn reopen_closed_is_none_when_nothing_has_been_closed() {
+        let mut tabs = Tabs::new("https://a.example/");
+        assert_eq!(tabs.reopen_closed(Instant::now()), None);
+        assert_eq!(tabs.len(), 1);
+    }
+
+    #[test]
+    fn reopen_closed_replays_closes_in_lifo_order() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/");
+        tabs.close(b).unwrap();
+        tabs.close(c).unwrap();
+
+        // c was closed last, so it comes back first.
+        let first = tabs.reopen_closed(Instant::now()).unwrap();
+        assert_eq!(tabs.get(first).unwrap().current_url(), "https://c.example/");
+        let second = tabs.reopen_closed(Instant::now()).unwrap();
+        assert_eq!(
+            tabs.get(second).unwrap().current_url(),
+            "https://b.example/"
+        );
+        assert_eq!(tabs.reopen_closed(Instant::now()), None);
+    }
+
+    #[test]
+    fn closing_the_only_other_tab_does_not_leave_it_reopenable_when_close_is_refused() {
+        // Closing the last remaining tab is refused (see
+        // `closing_the_last_tab_is_a_no_op`); it must not have been pushed
+        // onto the closed-tab stack either.
+        let mut tabs = Tabs::new("https://a.example/");
+        let only = tabs.active_id();
+        assert_eq!(tabs.close(only), None);
+        assert_eq!(tabs.reopen_closed(Instant::now()), None);
+    }
+
+    // --- Relative/positional activation (keyboard shortcuts) ---
+
+    #[test]
+    fn activate_relative_moves_forward_and_wraps_around() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/"); // active
+        assert_eq!(tabs.active_id(), c);
+
+        assert_eq!(
+            tabs.activate_relative(1, Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        assert_eq!(tabs.active_id(), a); // wrapped past the end
+        assert_eq!(
+            tabs.activate_relative(1, Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        assert_eq!(tabs.active_id(), b);
+    }
+
+    #[test]
+    fn activate_relative_moves_backward_and_wraps_around() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let _b = tabs.open("https://b.example/");
+        let _c = tabs.open("https://c.example/");
+        tabs.activate(a);
+
+        assert_eq!(
+            tabs.activate_relative(-1, Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        // Wrapped backward past the start, landing on the last tab.
+        assert_eq!(tabs.active_id(), _c);
+    }
+
+    #[test]
+    fn activate_relative_is_a_no_op_with_a_single_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let only = tabs.active_id();
+        assert_eq!(
+            tabs.activate_relative(1, Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        assert_eq!(tabs.active_id(), only);
+    }
+
+    #[test]
+    fn activate_by_position_uses_one_based_display_order() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/");
+        assert_eq!(ids(&tabs), vec![a, b, c]);
+
+        assert_eq!(
+            tabs.activate_by_position(1, Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        assert_eq!(tabs.active_id(), a);
+        assert_eq!(
+            tabs.activate_by_position(3, Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        assert_eq!(tabs.active_id(), c);
+    }
+
+    #[test]
+    fn activate_by_position_is_none_out_of_range() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        tabs.open("https://b.example/");
+
+        assert_eq!(tabs.activate_by_position(0, Instant::now()), None);
+        assert_eq!(tabs.activate_by_position(99, Instant::now()), None);
+        // Neither out-of-range attempt changed the active tab.
+        assert_eq!(tabs.active_id(), tabs.iter().nth(1).unwrap().id());
+        let _ = a;
+    }
+
+    #[test]
+    fn activate_last_targets_the_rightmost_tab_regardless_of_count() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/");
+        tabs.activate(a);
+
+        assert_eq!(
+            tabs.activate_last(Instant::now()),
+            Some(ActivationEffect::Switch)
+        );
+        assert_eq!(tabs.active_id(), c);
+    }
+
+    #[test]
+    fn activate_relative_resumes_a_suspended_target() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/"); // active
+        tabs.activate(a); // b now background
+        assert!(tabs.suspend(b));
+
+        assert_eq!(
+            tabs.activate_relative(1, Instant::now()),
+            Some(ActivationEffect::Resume)
+        );
+        assert_eq!(tabs.active_id(), b);
+        assert!(!tabs.get(b).unwrap().is_suspended());
+    }
+
+    // --- Many tabs: acceptance criterion "10個以上のタブを安定して操作できる" ---
+
+    #[test]
+    fn many_tabs_stay_internally_consistent() {
+        let mut tabs = Tabs::new("https://0.example/");
+        let mut opened = vec![tabs.active_id()];
+        for i in 1..15 {
+            opened.push(tabs.open(format!("https://{i}.example/")));
+        }
+        assert_eq!(tabs.len(), 15);
+        // Every id is distinct.
+        let mut sorted = opened.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 15);
+        // Exactly one tab reports itself Active; the rest are Background.
+        let active_count = tabs
+            .iter()
+            .filter(|t| t.state() == TabState::Active)
+            .count();
+        assert_eq!(active_count, 1);
+        assert_eq!(
+            tabs.iter()
+                .filter(|t| t.state() == TabState::Background)
+                .count(),
+            14
+        );
+
+        // Close every other tab and keep checking the same invariant holds.
+        for &id in opened.iter().step_by(2) {
+            tabs.close(id);
+            assert_eq!(
+                tabs.iter()
+                    .filter(|t| t.state() == TabState::Active)
+                    .count(),
+                1
+            );
+        }
+        // 15 tabs, every other one closed (indices 0,2,..,14 — 8 tabs): 7 left.
+        assert_eq!(tabs.len(), 7);
+    }
+
+    // --- Isolation between tabs: acceptance criterion
+    // "各タブの状態が混線しない" ---
+
+    #[test]
+    fn mutating_one_tab_never_touches_another_tabs_state() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/"); // active
+
+        // Drive very different state into each tab.
+        tabs.get_mut(a)
+            .unwrap()
+            .on_navigation_blocked("https://ad.example/");
+        tabs.get_mut(b).unwrap().set_title("B's title");
+        tabs.get_mut(b)
+            .unwrap()
+            .set_favicon_url("https://b.example/favicon.ico");
+        tabs.get_mut(c)
+            .unwrap()
+            .on_navigation_started("https://c.example/next");
+
+        // a: only the block counter moved.
+        let ta = tabs.get(a).unwrap();
+        assert_eq!(ta.blocked_count(), 1);
+        assert_eq!(ta.current_url(), "https://a.example/");
+        assert_eq!(ta.title(), None);
+        assert_eq!(ta.favicon(), &Favicon::Unknown);
+
+        // b: only the title/favicon moved, and it is still Background.
+        let tb = tabs.get(b).unwrap();
+        assert_eq!(tb.blocked_count(), 0);
+        assert_eq!(tb.title(), Some("B's title"));
+        assert_eq!(
+            tb.favicon(),
+            &Favicon::Url("https://b.example/favicon.ico".to_owned())
+        );
+        assert_eq!(tb.state(), TabState::Background);
+
+        // c: only the URL/loading state moved (navigation clears
+        // title/favicon, but c never had any set).
+        let tc = tabs.get(c).unwrap();
+        assert_eq!(tc.current_url(), "https://c.example/next");
+        assert!(tc.is_loading());
+        assert_eq!(tc.blocked_count(), 0);
+        assert_eq!(tabs.active_id(), c);
+    }
+
+    #[test]
+    fn background_tab_navigation_does_not_disturb_the_active_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        tabs.get_mut(a)
+            .unwrap()
+            .on_load_finished("https://a.example/");
+        let b = tabs.open("https://b.example/"); // active
+        tabs.activate(a); // b now background
+
+        // A background tab keeps loading/navigating on its own.
+        tabs.get_mut(b)
+            .unwrap()
+            .on_navigation_started("https://b.example/other");
+        tabs.get_mut(b)
+            .unwrap()
+            .on_load_finished("https://b.example/other");
+
+        assert_eq!(tabs.active_id(), a);
+        assert_eq!(tabs.active().current_url(), "https://a.example/");
+        assert!(!tabs.active().is_loading());
+        assert_eq!(
+            tabs.get(b).unwrap().current_url(),
+            "https://b.example/other"
+        );
     }
 }

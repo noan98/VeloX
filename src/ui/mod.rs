@@ -6,4 +6,4 @@
 pub mod toolbar;
 pub mod window;
 
-pub use window::BrowserWindow;
+pub use window::{BrowserWindow, ContentShortcut};
