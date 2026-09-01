@@ -1279,3 +1279,243 @@ backends' call sites, and their semantics) and by the existing
 `app.rs`'s tests, but a real `target="_blank"` click or `window.open()`
 call opening a new VeloX tab has not been observed running, since there is
 no display to run VeloX against here.
+
+## D27: `HistoryEntry` grows `favicon`/`visit_count` — additive to D4's de-duplication, not a redesign of it
+
+**Scope**: issue #18's "URL / title / favicon / visited_at / visit_count"
+and "訪問回数を数える". Phase 1 (#4, PR #54) already shipped `id`, `url`,
+`title`, `visited_at` plus consecutive-visit de-duplication and a hard
+entry cap; this only had to add the two missing fields and decide what
+`visit_count` means given the de-duplication `record_visit` already does.
+
+**The two live options, and why the log-preserving one won**: the issue
+text spells out the choice directly — collapse every visit to a URL into
+one row (a true "1 URL = 1 history entry" model, closer to how a bookmark
+store already works), or keep the existing append-only visit log and layer
+a count on top. Collapsing globally would have meant `record_visit`
+scanning (or index-mapping) the *entire* store for a matching URL on every
+visit instead of only ever looking at `entries.last()`, discarding the
+existing chronological "list of visits, oldest first" shape three of the
+existing tests directly assert on
+(`does_not_collapse_non_consecutive_repeat_visits`,
+`newest_first_reverses_visit_order`, `ids_stay_unique_across_a_clear`), and
+raising a new question this issue does not ask to answer: does re-visiting
+an old URL move it back to the top of a "1 row per URL" list, or keep it at
+its original position? Neither answer is obviously right, and guessing one
+risks conflicting with #15's forthcoming omnibox suggestions (which will
+likely want "most recently visited" ordering from this same store).
+
+**Decision: keep the append-only log, add `visit_count` to what
+`record_visit`'s existing consecutive-collapse already does.** A visit
+that collapses into the store's last entry (the existing "reload, or the
+engine re-reporting the same page" case — see the D4-era doc comment this
+module already carried) now also increments that entry's `visit_count`
+(`saturating_add(1)`, so a pathological reload loop cannot overflow into a
+panic); a visit that starts a fresh entry (including a *repeat* visit to a
+URL already elsewhere in the log — browsing away and back) still starts at
+`visit_count: 1`, exactly as it always has for `title`/`visited_at`. In
+other words: **this is additive to D4's de-duplication, not a behavior
+change to it** — every pre-existing `record_visit` test still holds
+unmodified (`does_not_collapse_non_consecutive_repeat_visits` now also
+asserts both surviving entries sit at `visit_count: 1`, not that the count
+itself changed). The honest cost of this choice: `visit_count` answers "how
+many times in a row was this exact entry re-hit" (useful for "this page
+got reloaded/redirected-back-to a bunch just now"), not "how many times
+total has this URL ever been visited across the whole log" (which would
+need summing across entries — `browser::history::search`/`group_by_date`
+below do not attempt this, and nothing in the issue's acceptance criteria
+asks for a global per-URL total). A future issue wanting that number has an
+easy path: fold `HistoryStore::entries()` by URL at read time, no store
+schema change required, since the per-visit log is preserved.
+
+**`favicon: Option<String>`, filled in the same lifecycle as `title`**:
+`record_visit` never receives a favicon (mirrors how it never receives a
+title beyond the reload-preserves-existing case) — a fresh entry starts
+`favicon: None`, and `HistoryStore::update_favicon(id, url)` fills it in
+later, a line-for-line mirror of `update_title`. The wiring reuses #11's
+existing favicon-resolution pipeline (D22) rather than adding a second one:
+`UserEvent::FaviconResolved` already carries a `tab_id`; it now also
+carries a `history_id`, threaded through `BrowserWindow::fetch_favicon`
+exactly the way `PageTitleResolved`/`fetch_page_title` already thread
+`history_id` through for the title — same `0`-is-"no entry" sentinel (valid
+because `HistoryStore` ids start at `1`), same fire-and-forget semantics,
+same "stale tab_id is a safe no-op" reasoning. `app.rs`'s single
+`LoadFinished` call site now calls `fetch_favicon(id, history_id)` instead
+of `fetch_favicon(id)` — one call site, one extra argument, no new event
+plumbing.
+
+**Migration**: `history.json` written by the pre-#18 store has no
+`favicon`/`visit_count` keys at all. Both new fields carry
+`#[serde(default)]` (`favicon` to `None`; `visit_count` via
+`#[serde(default = "default_visit_count")]` to `1`, since an entry that
+exists was visited at least once) rather than requiring a version tag or a
+hand-written upgrade pass — `serde_json`'s ordinary "missing key uses the
+field's default" behavior is the entire migration, and it is exercised by
+a dedicated test
+(`pre_issue_18_history_json_without_favicon_or_visit_count_still_loads`)
+that deserializes a literal old-shaped JSON string. `persistence.rs`'s
+existing "corrupt/unreadable file degrades to an empty store, never a
+crash" behavior (D-less, just the module's stated contract) is unaffected
+and untouched — this migration only had to matter for a file that *does*
+still parse as valid JSON, just an older shape of it.
+
+## D29: History date grouping (今日/昨日/過去7日/それ以前) — UTC calendar days from `std::time`, no `chrono`
+
+**Scope**: issue #18's date-grouped history list, explicitly required to be
+"純粋関数として実装し、現在時刻を引数で注入して単体テストできる形" and to
+stay on `std::time` rather than adding `chrono`/a timezone-aware crate.
+
+**Day boundaries are computed in UTC, not the machine's local timezone**:
+`browser::history::date_bucket(visited_at: u64, now: u64)` divides both
+unix-second timestamps by `86_400` to get a day number, then buckets by
+`today - day`. This is a real, named simplification, not an oversight: unix
+timestamps are timezone-agnostic by construction, and turning one into "the
+calendar day a human in timezone X would call this" needs a timezone
+database (IANA tzdata, DST rules, etc.) that neither `std::time` nor this
+repo's dependency set provides (see D10's "no `dirs`-style crate" policy,
+extended here to "no `chrono`/`tz`-aware crate" for the same "each
+dependency needs a defensible reason" bar from CLAUDE.md). A user west of
+UTC will occasionally see a visit from "yesterday evening, local time"
+still under 昨日 rather than 今日 relative to their own midnight (and the
+reverse east of UTC) — an off-by-up-to-a-day boundary fuzziness Chrome/
+Firefox's chrome-privileged, OS-timezone-aware history UIs do not have. If
+this fuzziness turns out to matter in practice, the fix is scoped entirely
+to `date_bucket` (its signature already isolates "what day is `now`" from
+everything else) — nothing about `group_by_date`'s grouping logic, the wire
+format, or the toolbar JS would need to change.
+
+**Pure functions, `now` always injected — never `SystemTime::now()` inside
+the logic itself**: `date_bucket` takes `now: u64` as a plain argument, and
+`group_by_date` threads it through unchanged; neither ever calls
+`SystemTime::now()`/`Instant::now()` itself. This is what makes
+`date_bucket_classifies_today_yesterday_last_7_days_and_older` (and its
+future-timestamp/clamping sibling) able to pin `now` to an exact,
+arbitrary-multiple-of-a-day value and assert every boundary exactly, the
+same "pure logic vs. IO/clock at the edges" split this codebase already
+uses for `history_max_entries`/de-duplication (D4) and the perf-metrics
+timestamp plumbing. The one call to a real clock
+(`app::now_unix()`, already existing) happens at the `app.rs` call site
+(`refresh_history_panel`/`search_history_panel`), same as every other place
+this file needs "now".
+
+**Bucket boundaries — today (diff 0) / yesterday (diff 1) / last 7 days
+(diff 2..=6) / older (diff ≥7)**: chosen so "過去7日" reads naturally as "the
+last 7 distinct calendar days including today and yesterday", matching how
+a Japanese user is likely to read the label, rather than counting
+literally-7-more-days on top of today+yesterday (which would read as a
+9-day window and strain the label). A `visited_at` at or after `now` (clock
+skew, or a system clock that moved backward between recording and display)
+clamps to `Today` instead of underflowing `today - day` — defensive against
+a corrupted/tampered `history.json` carrying a future timestamp, consistent
+with this repo's "malformed persisted data must never panic" stance.
+
+**Grouping, and where the boundary between Rust and JS sits**:
+`group_by_date` merges *consecutive* entries sharing a bucket into one
+`HistoryGroup`, assuming (but not requiring — a differently-ordered input
+just yields more, still-correct groups rather than panicking)
+newest-first input. `ui::window::BrowserWindow::set_history` calls it and
+`ui::toolbar::set_history_script` serializes `&[HistoryGroup]` directly —
+so the toolbar's `veloxSetHistory(groups)` receives already-grouped,
+already-labeled (`HistoryDateBucket`'s `#[serde(rename_all =
+"snake_case")]`, e.g. `"last_7_days"`) data and only has to walk it and
+render one heading per group plus its rows; no date arithmetic happens in
+JS at all. This keeps the one piece of logic the issue asked to be
+pure-function-tested actually in Rust, rather than duplicated (and
+untested) in `toolbar.html`.
+
+## D30: History search — case-insensitive URL/title substring match, pure function over the full store
+
+**Scope**: issue #18's "履歴検索: URLとタイトルに対する部分一致検索(大文字
+小文字を無視)", required as "純粋関数 + 単体テスト".
+
+**A free function, `HistoryStore::search` is a one-line wrapper**:
+`browser::history::search(entries: impl IntoIterator<Item = &HistoryEntry>,
+query: &str) -> Vec<&HistoryEntry>` lowercases `query` once and keeps any
+entry whose `url` or `title` (`Option::is_some_and`, so a `None` title is
+never a match, not a panic) contains it as a substring after also
+lowercasing that field. `HistoryStore::search(&self, query)` just calls it
+over `self.entries_newest_first()`. Same "pure logic function first, store
+method as a thin wrapper" split D27/D29 already establish, so the matching
+rule itself is testable without constructing a `HistoryStore` at all if a
+future caller (e.g. #15's omnibox suggestions) wants it over some other
+slice of entries.
+
+**An empty query matches nothing, not everything**: deliberately chosen so
+the return value alone tells a caller which of two states the panel should
+be in — "search box is empty, show the recency panel" vs. "search
+box has text, show these (possibly zero) results" — without a caller
+needing a second `is_empty()` check on the query alongside the result.
+`app.rs`'s `ToolbarCommand::SearchHistory` handler is exactly that caller:
+an empty/whitespace-only `query` re-runs `refresh_history_panel` (the
+normal recency list) instead of calling `search` and rendering its
+(guaranteed-empty) result.
+
+**Search runs over the whole store, not just the panel's visible window**:
+the toolbar only ever pushes `config.history_panel_limit` (200 by default)
+most-recent entries to the history panel's normal view, but a search sent
+via the new `ToolbarCommand::SearchHistory { query }` calls
+`HistoryStore::search` — which walks every entry the store holds, capped to
+`config.history_panel_limit` only when *rendering* the result — so a match
+buried well past the 200 most recent visits is still findable. This reuses
+the existing IPC round-trip pattern every other panel action already uses
+(`toolbar.html`'s search `<input>` sends `search_history` on every
+keystroke; `app.rs` re-pushes `veloxSetHistory` with the filtered,
+still-date-grouped result) rather than shipping the entire history log to
+the toolbar webview once and filtering client-side, which would not scale
+past `history_max_entries` (5000) and would duplicate the case-folding
+logic in JS.
+
+## D31: Persistence stays JSON files — SQLite considered and declined for this issue's scope
+
+**Scope**: issue #18's "SQLite等の採用判断をdocs/decisions.mdに記録",
+explicitly listed as an implementation item rather than an acceptance
+criterion — this issue does not require switching, only requires the
+decision and its reasoning to be recorded.
+
+**What SQLite would buy here**: indexed lookup instead of the current
+linear scan (`Vec<HistoryEntry>`, `O(n)` for `search`/de-duplication-by-
+last-entry/id lookup), and true atomic, partial-failure-safe writes
+(`INSERT`/`UPDATE` inside a transaction) in place of `write_json`'s
+"serialize the whole store, `fs::write` the whole file" approach, which — as
+`persistence.rs`'s own doc comment already concedes — is not crash-atomic:
+a process killed mid-`fs::write` can leave a truncated `history.json` (the
+existing `corrupt_file_falls_back_to_an_empty_store` test covers surviving
+that, not preventing it).
+
+**What SQLite would cost**: `rusqlite` (or an equivalent) is a real new
+dependency — a C library either vendored (its `bundled` feature, adding
+sqlite3's C sources to every build) or linked against the system's
+`libsqlite3` (adding a to-document system-dependency requirement alongside
+the existing WebKitGTK one, on top of the two platforms — macOS/Windows —
+this repo currently builds on with *zero* extra system packages). It also
+means every `browser::history`/`browser::bookmarks` method currently
+returning a plain value now returns a `rusqlite::Result`, `persistence.rs`
+grows connection-pooling/migration-versioning concerns a flat JSON file
+never had, and the entire unit-test suite for both stores (all of
+`browser::history::tests`/`browser::bookmarks::tests`, currently pure
+in-memory `Vec` manipulation with no IO) would need an on-disk or
+`:memory:` SQLite handle per test instead.
+
+**Decision: keep JSON files. Re-evaluate only if `history_max_entries`
+(currently 5000, `Config::default`) grows by an order of magnitude or the
+panel needs a query SQLite is uniquely suited for (e.g. a real full-text
+index) that a linear scan cannot serve interactively.** At 5000 entries, a
+full `entries_newest_first()` walk for `search` (D30) or the consecutive-
+url check in `record_visit` is a scan over, worst case, a few hundred KB of
+in-memory `HistoryEntry` structs — sub-millisecond on any hardware this
+runs on, nowhere near a threshold where an indexed query would be
+user-visibly faster. `write_json`'s whole-file rewrite on every mutation is
+the same story: a full JSON serialization of 5000 entries is a small,
+fast operation, not the write-amplification concern it would be at, say,
+500,000 entries. Weighed against CLAUDE.md's "依存クレートは必要最小限"
+policy and D10's established preference (env-var-resolved paths over a
+`dirs` crate, for the exact same "a few dozen lines beats a new dependency
+at this scale" reasoning) — a new dependency's `Cargo.lock` diff, added
+build-time system requirement, and the amount of `persistence.rs`/
+`browser::history`/`browser::bookmarks` this issue would otherwise have had
+to migrate wholesale is not worth it for a workload JSON already serves
+adequately. This is a workload-scale argument, explicitly not a "SQLite is
+categorically wrong for VeloX" one: session restore (#25) or a future
+full-text search feature could reasonably tip this the other way, at which
+point this decision should be revisited rather than assumed permanent.
+**No new crate was added by this issue.**

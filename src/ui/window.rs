@@ -42,7 +42,7 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
-use crate::browser::{BookmarkEntry, FilterList, HistoryEntry, TabId};
+use crate::browser::{group_by_date, BookmarkEntry, FilterList, HistoryEntry, TabId};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -726,10 +726,14 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_panel_script(panel))
     }
 
-    /// Replace the history panel's contents.
-    pub fn set_history(&self, entries: &[&HistoryEntry]) -> wry::Result<()> {
+    /// Replace the history panel's contents, grouped into date sections
+    /// (今日/昨日/過去7日/それ以前 — see docs/decisions.md D29) relative to
+    /// `now` (unix seconds). `entries` is expected newest-first, e.g. from
+    /// `HistoryStore::entries_newest_first` or `HistoryStore::search`.
+    pub fn set_history(&self, entries: &[&HistoryEntry], now: u64) -> wry::Result<()> {
+        let groups = group_by_date(entries.iter().copied(), now);
         self.toolbar
-            .evaluate_script(&toolbar::set_history_script(entries))
+            .evaluate_script(&toolbar::set_history_script(&groups))
     }
 
     /// Replace the bookmarks panel's contents.
@@ -780,15 +784,18 @@ impl BrowserWindow {
 
     /// Asynchronously resolve tab `tab_id`'s favicon URL (see
     /// [`RESOLVE_FAVICON_SCRIPT`]) and report it back as
-    /// [`UserEvent::FaviconResolved`].
+    /// [`UserEvent::FaviconResolved`] for the history entry `history_id` (as
+    /// well as the tab strip) — `0` is a safe sentinel for "no history
+    /// entry" the same way [`Self::fetch_page_title`] uses it, since
+    /// `HistoryStore` ids start at 1.
     ///
     /// Same shape and same reasoning as [`Self::fetch_page_title`] (see
-    /// docs/decisions.md D12/D22): a no-op for an unknown or suspended tab,
-    /// fire-and-forget (a superseded navigation just means a stale answer
-    /// gets applied late), and this only ever resolves a URL string — the
-    /// actual favicon image fetch happens later, asynchronously, as a plain
-    /// `<img src>` load in the toolbar webview, never here.
-    pub fn fetch_favicon(&self, tab_id: TabId) -> wry::Result<()> {
+    /// docs/decisions.md D12/D22/D27): a no-op for an unknown or suspended
+    /// tab, fire-and-forget (a superseded navigation just means a stale
+    /// answer gets applied late), and this only ever resolves a URL string —
+    /// the actual favicon image fetch happens later, asynchronously, as a
+    /// plain `<img src>` load in the toolbar webview, never here.
+    pub fn fetch_favicon(&self, tab_id: TabId, history_id: u64) -> wry::Result<()> {
         let webview = match self
             .contents
             .get(&tab_id)
@@ -801,7 +808,11 @@ impl BrowserWindow {
         webview.evaluate_script_with_callback(RESOLVE_FAVICON_SCRIPT, move |raw| {
             if let Some(url) = extract_js_string_result(&raw) {
                 if !url.is_empty() {
-                    let _ = proxy.send_event(UserEvent::FaviconResolved { tab_id, url });
+                    let _ = proxy.send_event(UserEvent::FaviconResolved {
+                        tab_id,
+                        history_id,
+                        url,
+                    });
                 }
             }
         })

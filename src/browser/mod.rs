@@ -21,6 +21,9 @@ pub mod tabs;
 
 pub use blocklist::FilterList;
 pub use bookmarks::{BookmarkEntry, BookmarkStore};
-pub use history::{HistoryEntry, HistoryStore};
+pub use history::{
+    date_bucket, group_by_date, search as search_history, HistoryDateBucket, HistoryEntry,
+    HistoryGroup, HistoryStore,
+};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};
