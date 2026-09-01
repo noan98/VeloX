@@ -11,6 +11,7 @@
 pub mod benchmark;
 pub mod blocklist;
 pub mod bookmarks;
+pub mod downloads;
 pub mod history;
 pub mod metrics;
 pub mod navigation;
@@ -22,6 +23,7 @@ pub mod tabs;
 
 pub use blocklist::FilterList;
 pub use bookmarks::{BookmarkEntry, BookmarkStore};
+pub use downloads::{DownloadEntry, DownloadId, DownloadState, DownloadStore};
 pub use history::{
     date_bucket, group_by_date, search as search_history, HistoryDateBucket, HistoryEntry,
     HistoryGroup, HistoryStore,

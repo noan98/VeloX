@@ -34,6 +34,7 @@
 
 use std::cell::Cell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
@@ -42,7 +43,10 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
-use crate::browser::{group_by_date, BookmarkEntry, Candidate, FilterList, HistoryEntry, TabId};
+use crate::browser::downloads;
+use crate::browser::{
+    group_by_date, BookmarkEntry, Candidate, DownloadEntry, FilterList, HistoryEntry, TabId,
+};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -774,6 +778,13 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_bookmarks_script(entries))
     }
 
+    /// Replace the downloads panel's contents (Issue #16, see
+    /// docs/decisions.md D28).
+    pub fn set_downloads(&self, entries: &[&DownloadEntry]) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_downloads_script(entries))
+    }
+
     /// Asynchronously read `document.title` from tab `tab_id`'s content
     /// webview and report it back as [`UserEvent::PageTitleResolved`] for
     /// the history entry `history_id`.
@@ -886,6 +897,8 @@ fn content_webview_builder<'a>(
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
+    let download_started_proxy = proxy.clone();
+    let download_completed_proxy = proxy.clone();
     WebViewBuilder::new()
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
@@ -956,6 +969,75 @@ fn content_webview_builder<'a>(
             let _ = new_window_proxy.send_event(UserEvent::NewTabRequested(url));
             wry::NewWindowResponse::Deny
         })
+        // Downloads (Issue #16, see docs/decisions.md D28): both handlers
+        // fire on every backend VeloX ships on (confirmed from wry 0.56.1's
+        // source — see D28). `with_download_started_handler` must decide
+        // synchronously (return `bool`) and may rewrite the destination
+        // `PathBuf` in place, so the destination resolution itself
+        // (`browser::downloads::prepare_destination`, which sanitizes the
+        // suggested file name and avoids same-name collisions) has to run
+        // right here, not after a round trip through the event loop — the
+        // same synchronous-decision-then-async-notify shape
+        // `with_navigation_handler` above already uses for content
+        // blocking. VeloX always accepts every download (`true`, matching
+        // wry's own default), so this only ever *redirects* a download,
+        // never blocks one.
+        .with_download_started_handler(move |url, destination| {
+            let suggested_name = destination
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Prefer VeloX's own directory resolution (respects
+            // `VELOX_DOWNLOAD_DIR`, see docs/decisions.md D28) over
+            // whatever default wry already picked; fall back to wry's own
+            // suggested directory only if no environment variable could be
+            // resolved at all, rather than failing the download outright.
+            let dir = downloads::resolve_download_dir()
+                .or_else(|| destination.parent().map(Path::to_path_buf))
+                .unwrap_or_else(|| PathBuf::from("."));
+            let final_path = match downloads::prepare_destination(&dir, &suggested_name) {
+                Ok(path) => path,
+                Err(err) => {
+                    eprintln!(
+                        "velox: failed to prepare download destination in {dir:?}: {err}; \
+                         refusing this download"
+                    );
+                    return false;
+                }
+            };
+            let file_name = final_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(suggested_name);
+            *destination = final_path.clone();
+            let _ = download_started_proxy.send_event(UserEvent::DownloadStarted {
+                url,
+                file_name,
+                destination: final_path,
+                started_at: unix_now(),
+            });
+            true
+        })
+        .with_download_completed_handler(move |url, path, success| {
+            let _ = download_completed_proxy.send_event(UserEvent::DownloadCompleted {
+                url,
+                path,
+                success,
+            });
+        })
+}
+
+/// Current time as a unix timestamp (seconds); `0` on a clock set before
+/// 1970, which should never happen in practice. A separate copy of
+/// `app::now_unix` (private there) — `ui::window` needs a timestamp at the
+/// moment a download is accepted, inside a wry callback that has no access
+/// to `app.rs`'s state, so duplicating this trivial conversion is simpler
+/// than threading a clock dependency through.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[cfg(any(

@@ -321,6 +321,47 @@
     text-align: center;
   }
 
+  /* Downloads panel (Issue #16, see docs/decisions.md D28). Each row is
+     taller than a plain history/bookmark row so a status line fits under
+     the file name. */
+  .download-row {
+    height: 44px;
+  }
+  .download-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    overflow: hidden;
+  }
+  .download-name {
+    height: auto;
+    padding: 0;
+  }
+  .download-name:disabled {
+    cursor: default;
+    color: var(--fg);
+  }
+  .download-status {
+    font-size: 11px;
+  }
+  /* wry exposes no byte-level progress for a download (see
+     docs/decisions.md D28) — this is only a coarse "something is
+     happening" cue, not a percentage. */
+  .download-row.in-progress .download-status::before {
+    content: "\25CF\a0";
+    animation: velox-pulse 1.2s ease-in-out infinite;
+  }
+  @keyframes velox-pulse {
+    0%, 100% { opacity: 0.25; }
+    50% { opacity: 1; }
+  }
+  .download-actions {
+    flex: none;
+    display: flex;
+    align-items: center;
+  }
   /* Omnibox candidate dropdown (Issue #15). Shares #panel's toolbar-resize
      mechanism with the history/bookmarks panels (see docs/decisions.md
      D11/D26), so it needs no layout rules of its own beyond the row style
@@ -385,6 +426,7 @@
   <button id="bookmark-star" title="ブックマークに追加/削除">&#9733;</button>
   <button id="history-toggle" title="履歴">&#128337;</button>
   <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
+  <button id="downloads-toggle" title="ダウンロード">&#11015;</button>
 </div>
 <div id="panel" hidden>
   <div id="panel-history" class="panel-list">
@@ -404,6 +446,13 @@
     </div>
     <div id="bookmarks-rows" class="panel-rows"></div>
   </div>
+  <div id="panel-downloads" class="panel-list" hidden>
+    <div class="panel-header">
+      <span>ダウンロード</span>
+      <button id="downloads-open-folder">フォルダを開く</button>
+    </div>
+    <div id="downloads-rows" class="panel-rows"></div>
+  </div>
   <div id="panel-omnibox" class="panel-list" hidden>
     <div id="omnibox-rows" class="panel-rows"></div>
   </div>
@@ -419,6 +468,8 @@
   const historyRowsEl = document.getElementById("history-rows");
   const bookmarksRowsEl = document.getElementById("bookmarks-rows");
   const historySearchEl = document.getElementById("history-search");
+  const downloadsPanelEl = document.getElementById("panel-downloads");
+  const downloadsRowsEl = document.getElementById("downloads-rows");
   const omniboxPanelEl = document.getElementById("panel-omnibox");
   const omniboxRowsEl = document.getElementById("omnibox-rows");
 
@@ -492,6 +543,12 @@
       send({ cmd: "search_history", query: "" });
       historySearchEl.blur();
     }
+  });
+  document.getElementById("downloads-toggle").addEventListener("click", () => {
+    send({ cmd: "toggle_panel", panel: "downloads" });
+  });
+  document.getElementById("downloads-open-folder").addEventListener("click", () => {
+    send({ cmd: "open_downloads_folder" });
   });
 
   /* Tab-management keyboard shortcuts (see docs/decisions.md D22). This is
@@ -575,6 +632,7 @@
     panelEl.hidden = panel === null;
     historyPanelEl.hidden = panel !== "history";
     bookmarksPanelEl.hidden = panel !== "bookmarks";
+    downloadsPanelEl.hidden = panel !== "downloads";
     omniboxPanelEl.hidden = panel !== "omnibox";
   };
 
@@ -749,6 +807,81 @@
     });
   };
 
+  /* Downloads (Issue #16, see docs/decisions.md D28). A dedicated renderer
+     rather than reusing renderRows(): a download row shows a status line
+     (no byte-level progress is available — see D28) and its action button
+     depends on state (cancel while in progress, remove once finished), so
+     the row shape genuinely differs from a plain history/bookmark row. */
+  function formatDownloadStatus(entry) {
+    switch (entry.state) {
+      case "in_progress":
+        return "ダウンロード中";
+      case "completed":
+        return "完了 - " + formatTimestamp(entry.finished_at);
+      case "failed":
+        return "失敗" + (entry.error ? ": " + entry.error : "");
+      case "cancelled":
+        return "キャンセル済み";
+      default:
+        return entry.state;
+    }
+  }
+
+  window.veloxSetDownloads = (entries) => {
+    downloadsRowsEl.replaceChildren();
+    if (entries.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "panel-empty";
+      empty.textContent = "ダウンロードはありません";
+      downloadsRowsEl.appendChild(empty);
+      return;
+    }
+    for (const entry of entries) {
+      const row = document.createElement("div");
+      row.className = "panel-row download-row"
+        + (entry.state === "in_progress" ? " in-progress" : "");
+
+      const info = document.createElement("div");
+      info.className = "download-info";
+
+      const name = document.createElement("button");
+      name.className = "panel-row-link download-name";
+      name.textContent = entry.file_name;
+      name.title = entry.destination;
+      name.disabled = entry.state !== "completed";
+      name.addEventListener("click", () => send({ cmd: "open_download", id: entry.id }));
+
+      const status = document.createElement("span");
+      status.className = "panel-row-meta download-status";
+      status.textContent = formatDownloadStatus(entry);
+
+      info.append(name, status);
+
+      const actions = document.createElement("span");
+      actions.className = "download-actions";
+      const actionButton = document.createElement("button");
+      actionButton.className = "panel-row-delete";
+      if (entry.state === "in_progress") {
+        actionButton.textContent = "✕";
+        actionButton.title = "キャンセル";
+        actionButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          send({ cmd: "cancel_download", id: entry.id });
+        });
+      } else {
+        actionButton.textContent = "×";
+        actionButton.title = "一覧から削除";
+        actionButton.addEventListener("click", (event) => {
+          event.stopPropagation();
+          send({ cmd: "remove_download_entry", id: entry.id });
+        });
+      }
+      actions.appendChild(actionButton);
+
+      row.append(info, actions);
+      downloadsRowsEl.appendChild(row);
+    }
+  };
   /* Omnibox candidate dropdown (Issue #15). One icon per Candidate.kind
      (see browser::omnibox::CandidateKind); history/bookmark are rendered
      already since #20 only has to start sending those kinds, not add UI
