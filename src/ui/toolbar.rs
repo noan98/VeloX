@@ -79,7 +79,7 @@ pub enum ToolbarCommand {
     /// The toolbar's inline `<script>` block started executing — sent as
     /// its very first statement, before any DOM lookups or rendering (see
     /// `ui/toolbar.html`). Purely a startup-timing probe (Issue #59, see
-    /// docs/decisions.md D42): it splits the `window_created` →
+    /// docs/decisions.md D43): it splits the `window_created` →
     /// `toolbar_ready` gap into "engine got the document parsed" vs. "the
     /// toolbar's own JS ran" — `app.rs` only feeds it to
     /// `metrics::StartupTimestamps::mark_toolbar_script_started` and

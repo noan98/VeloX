@@ -237,7 +237,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
 
     // Everything above (history/bookmarks/input-history load, `AppState`
     // build) is synchronous Rust code that runs before the GTK/webview
-    // event loop even starts pumping — see D42. Marking it here isolates
+    // event loop even starts pumping — see D43. Marking it here isolates
     // that cost from whatever happens inside the toolbar webview itself.
     if let Some(startup) = startup.as_mut() {
         startup.mark_rust_setup_done(Instant::now());
@@ -744,7 +744,7 @@ fn handle_toolbar_command(
             // Otherwise: unknown id, the active tab (never suspended), or
             // already suspended — a no-op, mirroring `CloseTab`'s guards.
         }
-        // A pure startup-timing probe (Issue #59/D42) — `record_perf_event`
+        // A pure startup-timing probe (Issue #59/D43) — `record_perf_event`
         // already consumed it above; nothing to do here.
         ToolbarCommand::ScriptStarted => {}
         ToolbarCommand::Ready => {
