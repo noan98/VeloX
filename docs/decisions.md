@@ -2747,6 +2747,152 @@ WebKitGTK のプロセスモデル設定変更が必要になり、「新規依�
 このコストがサンドボックス固有かどうかを切り分けたうえで、必要なら新しい
 Issue として起票するのが妥当。
 
+## D44: Benchmark automation hook — a read-once opt-in script file, not a socket/RPC server
+
+**Scope**: Issue #112. `velox-bench run` could only drive the three startup
+scenarios (`cold_startup`/`warm_startup`/`first_page_load`) unattended —
+nothing could open/switch/close tabs or navigate away from the initial page
+from outside the process, so `navigation`/`tab_create`/`tab_switch`/
+`tabs_1..50` all needed a human at the keyboard (see D21's original scoping
+of `Scenario::is_unattended`). Issues #60-#65 and performance targets T2/T4
+were blocked on this: Epic #57's rule is "no optimization without a
+benchmark", and there was no way to get one for these scenarios at all,
+attended or not.
+
+**Why not a listening socket or RPC server**: this was the obvious design
+and the one rejected first. `docs/architecture.md`'s "Why a webview
+toolbar?" and D18/D23 establish VeloX's one real trust boundary: the
+content webview's IPC channel accepts only a fixed set of exact-string
+sentinels (never structured, page-supplied data), and only the *toolbar*
+webview — trusted first-party chrome — can send a structured command
+(`ToolbarCommand`) that actually drives tab management. A TCP/Unix-socket
+listener or an HTTP/RPC endpoint that accepted "open a tab"/"navigate to
+this URL" commands from an arbitrary external process would be a second,
+much wider hole in exactly that boundary: unlike a content webview's
+sentinel-only channel, such a server would have to deserialize structured,
+externally-supplied commands into real browser actions, on every single
+launch, for as long as the process runs — precisely the shape of interface
+D18/D23 went out of their way to avoid giving to anything less trusted than
+the toolbar. It would also need to actually listen: a bindable port or
+socket path that exists on every launch, benchmark or not, is attack
+surface a normal user's VeloX process would carry for a feature only ever
+used by a benchmark harness talking to itself on the same machine.
+
+**Chosen instead: `VELOX_AUTOMATION_SCRIPT=<path>`, read exactly once at
+startup, never listened for again.** If the environment variable is unset —
+every normal launch — `browser::automation::parse_script` never runs at
+all: zero added attack surface, zero added cost, matching `VELOX_DEBUG`'s
+existing opt-in-by-environment-variable precedent in `app.rs` and
+`VELOX_HOMEPAGE`'s in D40. When set, `app::run` reads the named file exactly
+once, right after `AppState` is built and before the event loop starts
+pumping, and parses it with `browser::automation::parse_script` — a pure
+function that never panics, rejecting malformed input with a 1-based line
+number (`AutomationError`) rather than running a partially-valid script. A
+parse failure (bad line, missing file, unreadable file) is logged to stderr
+and otherwise ignored, exactly like every other `log_failure`-style guard
+in this file — never fatal, matching the project's "UI 系の失敗はクラッシュ
+させず継続" rule. There is nothing to "connect to": no port, no socket path,
+no listener thread — the script is consumed once, like a config file, not
+served.
+
+**Why a file (and a thread walking it) instead of, say, extra CLI flags**:
+a flat command list needed conditional pacing (`wait <ms>` between steps,
+so a webview has time to actually start a load before the next command
+fires) and an explicit end (`quit`), neither of which map cleanly onto a
+handful of `--` flags the way `--homepage`/`--private` do. A small
+line-oriented format — closer to `docs/benchmarking.md`'s existing
+`aggregate --input <path> --input <path> ...` precedent than to a new
+flag-parsing surface — keeps `Config::from_env_and_args`'s no-new-CLI-crate
+policy (D6) intact and stays trivially diffable/inspectable as a benchmark
+artifact, which a wall of CLI flags would not.
+
+**Command set is deliberately closed and tiny**: `open <url>` / `switch
+<index>` / `close <index>` / `navigate <url>` / `wait <ms>` / `quit`, plus
+`#` comments and blank lines. No expressions, no branching, no loops — this
+is not a scripting language, it is a fixed, enumerable command set,
+structurally incapable of expressing anything beyond "drive these specific
+tab operations". `wait` is capped at `automation::MAX_WAIT_MS` (120s) so a
+typo cannot stall a launched browser indefinitely. URLs go through the
+exact same `browser::navigation::normalize_input` address-bar input does,
+so a script cannot smuggle a `javascript:` URL or anything else the address
+bar itself would reject — the automation file gets no more trust over what
+URL it can load than a user typing into the omnibox would.
+
+**Delivery mechanism — proxied `UserEvent`s, not a new state-mutation
+path**: per D20's layering rule, `browser::automation` (the parser, plus
+`velox-bench`'s `generate_bench_script`/`needs_automation_script`/
+`recommended_timeout_secs`) has zero `wry`/`tao`/`gtk` dependency and is
+fully covered by `cargo test` with no display. Everything that actually
+touches a webview lives in `src/app.rs`: a background thread
+(`spawn_automation`) walks the parsed `Vec<AutomationCommand>`, sleeping
+locally for `Wait` (never blocking the main thread — the UI keeps servicing
+normally the whole time) and proxying every other command into the event
+loop as `UserEvent::Automation`, using the same `EventLoopProxy::send_event`
+fire-and-forget channel every existing webview callback
+(`PageTitleResolved`, `NewTabRequested`, ...) already uses to reach the main
+thread. `handle_automation_command` then resolves each command by calling
+the *exact same* tab-management functions `handle_toolbar_command`/
+`handle_content_shortcut` already call — `open_new_tab`, `close_tab`,
+`Tabs::activate_at`, the shared `navigate_active_tab` (newly extracted from
+`ToolbarCommand::Navigate`'s body so `AutomationCommand::Navigate` can reuse
+it) — never a parallel implementation of "open a tab" or "switch tabs".
+`Switch`/`Close` address a tab by its live tab-strip *position* (0-based),
+resolved against `state.tabs` at the moment each command actually runs
+(`tab_id_at`) rather than up front, since tabs opened/closed earlier in the
+same script shift what position `N` means; an out-of-range position is a
+logged no-op, matching every other `Tabs`/`BrowserWindow` guard in the
+file. `AutomationCommand::Quit` is intercepted in `run`'s event loop before
+dispatch (it needs `ControlFlow`, which `handle_user_event` does not have
+access to) and sets `ControlFlow::Exit`, mirroring how
+`WindowEvent::CloseRequested` is already handled at that same match site.
+
+**`Scenario::is_unattended` now always returns `true`**: with the hook in
+place, every scenario — not just the three startup ones — can be driven
+without a human, so the method's body collapsed from a three-variant
+`matches!` to a `match` covering every variant with the same `true`. It is
+kept as a real `match` (not a bare `true`) specifically so a future
+scenario that genuinely cannot be scripted has one obvious place to say so,
+rather than requiring someone to remember to special-case it somewhere
+downstream.
+
+**`velox-bench run` generates a script per scenario, not per user**:
+`browser::automation::generate_bench_script(scenario, url)` is a pure
+function (tested without a display) that builds the right command sequence
+for each newly-unattended scenario — e.g. `tabs_N` opens `N - 1` extra tabs
+(one already exists at the homepage) then `wait`s long enough for the RSS
+sampler to take a couple of samples with all tabs present; `tab_switch`
+opens a handful of extra tabs then round-robins `switch` across them;
+`navigation` repeatedly `navigate`s to the same fixed page with a
+cache-busting query parameter (`?velox-bench-step=N`) so each hop is a
+genuinely distinct navigation event rather than a same-URL no-op — and
+always ends with `quit`. Because every generated script ends with `quit`,
+`velox-bench run`'s trial loop (`wait_for_exit_or_timeout`) polls the child
+with `try_wait` instead of always sleeping a fixed `--warmup-secs`: a
+scripted trial normally exits on its own well before the timeout, and only
+a scenario with no script (or one that never reaches `quit`) still waits
+out the full timeout — the pre-#112 fixed-`sleep`-then-kill behavior,
+preserved unchanged for `cold_startup`/`warm_startup`/`first_page_load`.
+The per-scenario default timeout itself
+(`automation::recommended_timeout_secs`) is a small pure estimate (rough
+per-step overhead plus each scenario's own explicit `wait`s) — a caller can
+still override it with `--warmup-secs` on a slower machine.
+`--url` becomes **required** (not just recommended-with-a-warning, as it
+already was for the startup scenarios) for every scenario that needs a
+script, since there is no reproducible "measure whatever the default
+homepage is" fallback for "open N tabs at some page" the way there
+arguably almost is for "load one page and wait".
+
+**Verified on real hardware-less Xvfb, not just unit tests**: unlike D21's
+original `run`, which shipped with `navigation`/`tab_create`/`tab_switch`/
+`tabs_N` scaffolded but never actually exercised end-to-end (see D21 and
+the old `docs/benchmarking.md` "この環境での検証状況"), this issue's
+`Xvfb`-based run actually drove `tabs_5`/`navigation`/`tab_create`/
+`tab_switch` through `velox-bench run` and got back real, scenario-shaped
+metrics (`tab_create_ms`/`tab_switch_ms`/`page_load_ms` with plausible `n`
+counts) — see `docs/benchmarking.md`'s "この環境での検証状況" for the actual
+numbers and their caveats (software rendering, low trial count, not a
+performance baseline).
+
 ## D45: プロファイリングは既存の外部ツール + `browser::metrics` の組み合わせとし、常設の計測コードは足さない
 
 **対象**: Issue #70 (CPU / Memory Profiling Workflow)。「性能問題を見つけた
