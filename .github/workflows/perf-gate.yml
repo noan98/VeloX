@@ -126,47 +126,62 @@ jobs:
       # before measuring anything, launch VeloX once directly and capture
       # what the runner actually does. Never fails the job — this exists to
       # turn "0 records" into an actionable error message.
+      # Issue #72: two environment hypotheses (the unusable /dev/dri +
+      # DMABuf renderer, then WebKitGTK's bubblewrap sandbox needing an
+      # unprivileged user namespace) were both disproven by this step —
+      # VeloX behaves identically with software rendering forced, with the
+      # AppArmor userns restriction lifted (unshare -U succeeds), and with
+      # WebKit's sandbox disabled outright. So stop guessing at the
+      # environment and instrument the process instead.
+      #
+      # The key ambiguity so far: "killed at the 20s timeout with no perf
+      # log" is equally consistent with (a) VeloX hanging inside
+      # BrowserWindow::new, and (b) VeloX running perfectly well as a normal
+      # browser with metrics simply never enabled — a GUI browser does not
+      # exit on its own either way. VELOX_DEBUG makes app.rs print every
+      # UserEvent it dispatches, which separates the two: events in stderr
+      # means the event loop is alive.
       - name: Diagnose VeloX under Xvfb (never fails)
         continue-on-error: true
         run: |
           set +e
-          echo "=== can this user create a user namespace? ==="
-          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1
-          cat /proc/sys/user/max_user_namespaces 2>&1
-          unshare -U --map-root-user true
-          echo "unshare -U exit status: $? (0 = WebKitGTK's sandbox can be built)"
-          id
-          echo
-          # Launch VeloX under each candidate configuration and report which
-          # one actually writes a perf record. VeloX opens its perf log
-          # *after* BrowserWindow::new, so "no perf records" means it never
-          # finished creating the window.
-          run_once() {
-            label="$1"; shift
-            out="/tmp/perf-gate/diag/$label.jsonl"
-            mkdir -p /tmp/perf-gate/diag
-            echo "=== launch: $label ==="
-            env "$@" \
-              VELOX_PERF_METRICS=1 \
-              VELOX_PERF_FORMAT=json \
-              VELOX_PERF_OUTPUT="$out" \
-              VELOX_DATA_DIR="/tmp/perf-gate/diag/data-$label" \
-              timeout 20 xvfb-run -a --server-args="-screen 0 1280x900x24" \
-                /tmp/perf-gate/candidate/velox \
-                  --homepage http://127.0.0.1:8731/minimal.html
-            if [ -s "$out" ]; then
-              echo "  ✅ perf records written: $(wc -l < "$out")"
-              head -3 "$out"
-            else
-              echo "  ❌ NO perf records written"
-            fi
-          }
-          # Current job configuration (userns lifted + software rendering).
-          run_once as-configured
-          # Last resort, for comparison only — never applied to the real
-          # measurement steps, since it turns WebKit's sandbox off rather
-          # than letting it be built.
-          run_once sandbox-off WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
+          mkdir -p /tmp/perf-gate/diag
+          out=/tmp/perf-gate/diag/perf.jsonl
+          err=/tmp/perf-gate/diag/stderr.log
+
+          echo "=== launch with VELOX_DEBUG: is the event loop alive? ==="
+          VELOX_DEBUG=1 \
+          VELOX_PERF_METRICS=1 \
+          VELOX_PERF_FORMAT=json \
+          VELOX_PERF_RSS_INTERVAL_MS=1000 \
+          VELOX_PERF_OUTPUT="$out" \
+          VELOX_DATA_DIR=/tmp/perf-gate/diag/data \
+            timeout 20 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              /tmp/perf-gate/candidate/velox \
+                --homepage http://127.0.0.1:8731/minimal.html > "$err" 2>&1 &
+          velox_job=$!
+
+          # While it runs, look at what the process tree actually contains:
+          # WebKitNetworkProcess/WebKitWebProcess present means webview
+          # creation got at least that far.
+          sleep 8
+          echo "--- process tree ---"
+          ps -eo pid,ppid,etimes,stat,comm | grep -Ei "velox|WebKit|Xvfb" | grep -v grep
+          echo "--- /proc/<velox>/wchan (what is it blocked on?) ---"
+          for pid in $(pgrep -x velox); do
+            echo "pid $pid wchan=$(cat /proc/$pid/wchan 2>/dev/null) state=$(awk '/^State:/{print $2,$3}' /proc/$pid/status 2>/dev/null)"
+            echo "  last stack frames:"; cat /proc/$pid/stack 2>/dev/null | head -5 || echo "  (not readable)"
+          done
+          wait $velox_job
+
+          echo "--- velox stderr (VELOX_DEBUG dispatch trace) ---"
+          if [ -s "$err" ]; then head -40 "$err"; else echo "(empty — no events dispatched at all)"; fi
+          echo "--- perf log ---"
+          if [ -s "$out" ]; then
+            echo "records: $(wc -l < "$out")"; head -5 "$out"
+          else
+            echo "NO perf records ($( [ -e "$out" ] && echo 'file exists but empty' || echo 'file never created' ))"
+          fi
 
       - name: Measure baseline (merge-base binary)
         run: |
