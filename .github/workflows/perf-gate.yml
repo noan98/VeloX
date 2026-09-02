@@ -1,0 +1,274 @@
+name: Performance Regression Gate
+
+# Issue #72 (developed from #36). This job answers a narrower question than
+# the main `ci.yml`: "does this PR's startup/load performance regress
+# relative to what it is being merged onto". It always measures its own
+# baseline in the same job/runner as its candidate (see the "Build
+# baseline" step) instead of comparing against an old, separately-captured
+# file — docs/performance-targets.md's own rule is "never compare numbers
+# from different sessions/machines", and docs/decisions.md D46 measured
+# exactly how bad that comparison gets on this project's shared/noisy
+# environment (up to +78.9% on an *unchanged* binary between two runs
+# several minutes apart). See D46 for the full design rationale and the
+# `evaluate_gate`/`GateThresholds` docs in src/browser/benchmark.rs for the
+# warn/fail thresholds this workflow's `gate` step applies.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  # Issue #72: this runner has a DRM node it cannot open (/dev/dri/card1,
+  # crw-rw---- root:video; the runner user is not in `video`), so make the
+  # software-rendering fallback explicit rather than letting Mesa discover
+  # it. NOTE: the diagnostic step below proved these variables are NOT what
+  # fixes the "0 perf records" hang — VeloX hangs identically with and
+  # without them. They are kept only because this runner genuinely has no
+  # usable GPU. See the "Allow unprivileged user namespaces" step for the
+  # actual blocker.
+  #
+  # These belong here, in the measurement environment, and NOT in VeloX
+  # itself: docs/decisions.md D43 measured the same variables during #59
+  # and deliberately kept them out of the product because their effect is
+  # an artifact of GPU-less environments. Baseline and candidate are both
+  # measured under the same environment in the same job, so the comparison
+  # this gate makes stays internally consistent.
+  LIBGL_ALWAYS_SOFTWARE: "1"
+  WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+  WEBKIT_DISABLE_DMABUF_RENDERER: "1"
+
+jobs:
+  perf-gate:
+    name: Startup regression gate (Xvfb)
+    runs-on: ubuntu-latest
+    # Only meaningful for a PR (needs a merge-base to compare against);
+    # workflow_dispatch is for manually re-running this job on demand
+    # (e.g. after a Fail verdict that looks like noise).
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install WebKitGTK + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb dbus-x11
+
+      # Issue #72: added while investigating the "0 perf records" hang, on
+      # the theory that WebKitGTK's bubblewrap sandbox was being denied an
+      # unprivileged user namespace by Ubuntu 24.04's
+      # kernel.apparmor_restrict_unprivileged_userns=1.
+      #
+      # That theory was WRONG: the hang persisted with this sysctl set to 0
+      # and `unshare -U` succeeding, and also with WebKit's sandbox disabled
+      # outright. The actual fix was giving the process a D-Bus session bus
+      # (see the dbus-run-session wrappers below). This step is kept because
+      # it has not been isolated whether lifting the restriction is *also*
+      # required — the successful run had both — and re-testing that costs a
+      # red gate. Harmless either way: it only relaxes a kernel restriction
+      # inside this throwaway runner.
+      - name: Allow unprivileged user namespaces (WebKitGTK sandbox)
+        run: |
+          set +e
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 || true
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Determine merge-base commit
+        id: merge_base
+        run: |
+          set -eu
+          base_ref="${{ github.event.pull_request.base.ref || 'main' }}"
+          git fetch origin "$base_ref"
+          base_sha=$(git merge-base "origin/$base_ref" HEAD)
+          echo "PR head: $(git rev-parse HEAD)"
+          echo "merge-base ($base_ref): $base_sha"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Serve fixed benchmark page over loopback
+        run: |
+          cd scripts/bench/pages
+          nohup python3 -m http.server 8731 > /tmp/perf-gate-http.log 2>&1 &
+          disown
+          sleep 1
+          curl -sf http://127.0.0.1:8731/minimal.html > /dev/null
+
+      - name: Build candidate (PR head)
+        run: |
+          set -eu
+          cargo build --release
+          mkdir -p /tmp/perf-gate/candidate
+          cp target/release/velox target/release/velox-bench /tmp/perf-gate/candidate/
+
+      - name: Build baseline (merge-base commit)
+        run: |
+          set -eu
+          git checkout --quiet "${{ steps.merge_base.outputs.sha }}"
+          cargo build --release
+          mkdir -p /tmp/perf-gate/baseline
+          cp target/release/velox /tmp/perf-gate/baseline/
+          # Return to the PR head: measurements below must all read the
+          # *same* fixed test page (already being served) and use the same
+          # velox-bench build; only --velox-bin varies between baseline and
+          # candidate runs.
+          git checkout --quiet -
+
+      # Issue #72: the first CI run of this job produced 0 perf records on
+      # all 8 trials while the same command works locally under Xvfb, so
+      # before measuring anything, launch VeloX once directly and capture
+      # what the runner actually does. Never fails the job — this exists to
+      # turn "0 records" into an actionable error message.
+      # Issue #72: kept as a permanent tripwire. Three environment
+      # hypotheses were disproven here before the real cause was found
+      # (unusable /dev/dri + DMABuf renderer; WebKitGTK's bubblewrap sandbox
+      # needing an unprivileged user namespace; the sandbox itself) — what
+      # actually fixed it was wrapping the launch in dbus-run-session, since
+      # WebKitGTK needs a session bus to start its web process.
+      #
+      # What made that diagnosable: "killed at the timeout with no perf log"
+      # is equally consistent with VeloX hanging inside BrowserWindow::new
+      # and with VeloX running fine as a normal browser — a GUI browser does
+      # not exit on its own either way. The three signals below separate
+      # them, so keep them if this ever regresses:
+      #   - perf log never *created* → never reached build_perf_log, i.e.
+      #     still inside BrowserWindow::new (app.rs opens the log after it)
+      #   - empty VELOX_DEBUG trace  → no UserEvent ever dispatched
+      #   - no WebKitWebProcess in ps → WebKit's child processes never spawned
+      - name: Diagnose VeloX under Xvfb (never fails)
+        continue-on-error: true
+        run: |
+          set +e
+          mkdir -p /tmp/perf-gate/diag
+          out=/tmp/perf-gate/diag/perf.jsonl
+          err=/tmp/perf-gate/diag/stderr.log
+
+          echo "=== launch with VELOX_DEBUG: is the event loop alive? ==="
+          VELOX_DEBUG=1 \
+          VELOX_PERF_METRICS=1 \
+          VELOX_PERF_FORMAT=json \
+          VELOX_PERF_RSS_INTERVAL_MS=1000 \
+          VELOX_PERF_OUTPUT="$out" \
+          VELOX_DATA_DIR=/tmp/perf-gate/diag/data \
+            timeout 20 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
+              /tmp/perf-gate/candidate/velox \
+                --homepage http://127.0.0.1:8731/minimal.html > "$err" 2>&1 &
+          velox_job=$!
+
+          # While it runs, look at what the process tree actually contains:
+          # WebKitNetworkProcess/WebKitWebProcess present means webview
+          # creation got at least that far.
+          sleep 8
+          echo "--- process tree ---"
+          ps -eo pid,ppid,etimes,stat,comm | grep -Ei "velox|WebKit|Xvfb" | grep -v grep
+          echo "--- /proc/<velox>/wchan (what is it blocked on?) ---"
+          for pid in $(pgrep -x velox); do
+            echo "pid $pid wchan=$(cat /proc/$pid/wchan 2>/dev/null) state=$(awk '/^State:/{print $2,$3}' /proc/$pid/status 2>/dev/null)"
+            echo "  last stack frames:"; cat /proc/$pid/stack 2>/dev/null | head -5 || echo "  (not readable)"
+          done
+          wait $velox_job
+
+          echo "--- velox stderr (VELOX_DEBUG dispatch trace) ---"
+          if [ -s "$err" ]; then head -40 "$err"; else echo "(empty — no events dispatched at all)"; fi
+          echo "--- perf log ---"
+          if [ -s "$out" ]; then
+            echo "records: $(wc -l < "$out")"; head -5 "$out"
+          else
+            echo "NO perf records ($( [ -e "$out" ] && echo 'file exists but empty' || echo 'file never created' ))"
+          fi
+
+      - name: Measure baseline (merge-base binary)
+        run: |
+          set -eu
+          xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
+            /tmp/perf-gate/candidate/velox-bench run \
+              --scenario cold_startup --trials 8 \
+              --velox-bin /tmp/perf-gate/baseline/velox \
+              --url http://127.0.0.1:8731/minimal.html \
+              --git-commit "${{ steps.merge_base.outputs.sha }}" \
+              --output /tmp/perf-gate/baseline.json
+
+      - name: Measure candidate, run 1 of 2 (PR head binary)
+        run: |
+          set -eu
+          xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
+            /tmp/perf-gate/candidate/velox-bench run \
+              --scenario cold_startup --trials 8 \
+              --velox-bin /tmp/perf-gate/candidate/velox \
+              --url http://127.0.0.1:8731/minimal.html \
+              --output /tmp/perf-gate/candidate-1.json
+
+      - name: Measure candidate, run 2 of 2 (PR head binary)
+        run: |
+          set -eu
+          xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
+            /tmp/perf-gate/candidate/velox-bench run \
+              --scenario cold_startup --trials 8 \
+              --velox-bin /tmp/perf-gate/candidate/velox \
+              --url http://127.0.0.1:8731/minimal.html \
+              --output /tmp/perf-gate/candidate-2.json
+
+      # Two independent candidate runs (not one bigger --trials) so `gate`
+      # can apply its majority-vote rule (docs/decisions.md D46): a metric
+      # only fails the build when *both* candidate runs independently
+      # exceed --fail-pct against the same baseline, not on one noisy run.
+      - name: Evaluate regression gate
+        id: gate
+        run: |
+          set +e
+          /tmp/perf-gate/candidate/velox-bench gate \
+            --baseline /tmp/perf-gate/baseline.json \
+            --candidate /tmp/perf-gate/candidate-1.json \
+            --candidate /tmp/perf-gate/candidate-2.json \
+            --output /tmp/perf-gate/gate-report.json \
+            --markdown-output /tmp/perf-gate/gate-summary.md
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "<!-- velox-perf-gate -->"
+            cat /tmp/perf-gate/gate-summary.md
+            echo ""
+            echo "(baseline: merge-base \`${{ steps.merge_base.outputs.sha }}\`"' / candidate: PR head, 2 independent runs, same job/runner)'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Never let a non-zero gate exit code fail *this* step — the next
+          # step decides whether the job fails, based on exit_code alone,
+          # so a WARN (3) or an argument/IO error (2) does not abort the
+          # workflow before the summary above is written.
+          exit 0
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate-results
+          path: |
+            /tmp/perf-gate/baseline.json
+            /tmp/perf-gate/candidate-1.json
+            /tmp/perf-gate/candidate-2.json
+            /tmp/perf-gate/gate-report.json
+            /tmp/perf-gate/gate-summary.md
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail the job on a FAIL verdict
+        if: steps.gate.outputs.exit_code == '1'
+        run: |
+          echo "性能回帰ゲート: FAIL — 上記の Job Summary を参照してください。" >&2
+          echo "ノイズが疑わしい場合は、このワークフローを再実行してください" \
+               "(docs/decisions.md D46 の「残存リスク」を参照)。" >&2
+          exit 1
+
+      - name: Report a WARN verdict (non-blocking)
+        if: steps.gate.outputs.exit_code == '3'
+        run: |
+          echo "性能回帰ゲート: WARN — ブロックしませんが、Job Summary を確認してください。"

@@ -18,8 +18,11 @@ Issue #14 の成果物。VeloX 自身の最適化効果や、将来的な Chrome
 points」節) が生成する JSON Lines を、このスイートが回収・集計・比較する。
 
 このドキュメントは #53 (Phase 2 Epic) の「高速化を感覚で判断しない」方針の
-"Measure / Compare" 部分の仕様であり、後続の #36 (CI へのパフォーマンス回帰
-検知の導入) が呼び出す前提のインターフェースでもある。
+"Measure / Compare" 部分の仕様であり、#36 (CI へのパフォーマンス回帰検知の
+導入) を Phase 3 の実運用レベルまで発展させた #72 (Performance Regression
+Gate) が呼び出す前提のインターフェースでもある。CI が実際にブロッキング
+判定へ使うのは「4. 過去の結果と比較する (`compare`)」ではなく「5. 回帰
+ゲートを評価する (`gate`)」— 理由は当該節と `docs/decisions.md` D46 参照。
 
 ## 構成
 
@@ -298,12 +301,65 @@ cargo run --release --bin velox-bench -- compare \
 - `--threshold-pct`: 中央値がこの割合 (%) を超えて悪化していたら回帰と判定
   する。既定 10。
 - 終了コード: 回帰なしなら `0`、いずれかの指標が閾値を超えて悪化していれば
-  `1`。**この終了コードが Issue #36 の CI 回帰検知が使うフックになる。**
+  `1`。
 - `--baseline` と `--candidate` は同じ `scenario` かつ同じ OS
   (`environment.os`) の結果同士を比較すること。OS が異なる環境の結果を
   比較しても `compare` はエラーにはしない (意図的な比較を妨げないため) が、
   WebView 実装・メモリ管理が OS ごとに異なる (`docs/architecture.md`) ため
   数値の意味が異なり、比較として無意味になる。
+
+**`compare` は単発の 2 ファイル diff であり、CI の合否判定には使わない。**
+`compare` の単純な固定閾値は、この環境のセッション間ノイズ (同一バイナリで
+中央値が最大 -19.0%〜+78.9% 動く。`docs/decisions.md` D46) の前では
+`--threshold-pct` をいくつに設定しても誤検知を避けられない。CI が実際に
+使うのは次の `gate` サブコマンドである。手元で 2 つの結果ファイルをさっと
+見比べたいとき (ノイズを気にせず数値だけ見たいとき) には引き続き
+`compare` が便利。
+
+### 5. 回帰ゲートを評価する (`gate`, Issue #72)
+
+**Issue #36/#72 の「性能回帰検知」を CI で実際にブロッキング判定できる
+形にしたサブコマンド。** ロジックは `benchmark::evaluate_gate`
+(`src/browser/benchmark.rs`、純粋 Rust、`cargo test` で境界値・同着・試行数
+不足・baseline 欠損を含めて検証済み)。**なぜ `compare` の単純な固定閾値では
+足りないか、どう解決したかは `docs/decisions.md` D46 と
+`docs/performance-targets.md` §10 を参照。**
+
+```sh
+cargo run --release --bin velox-bench -- gate \
+  --baseline results/baseline/cold_startup-linux-xvfb.json \
+  --candidate results/cold_startup-candidate-1.json \
+  --candidate results/cold_startup-candidate-2.json \
+  --warn-pct 20 --fail-pct 60 \
+  --output results/gate-report.json \
+  --markdown-output results/gate-summary.md
+```
+
+- `--baseline <path>`: 比較の基準になる結果ファイル (1 つ)。
+- `--candidate <path>`: 比較対象の結果ファイル。**繰り返し指定できる。**
+  2 つ以上渡すと多数決 (過半数が `fail_pct` を超えたときのみ Fail) が働く
+  — 1 回だけの悪化は Warn に留まる (D46)。CI では PR head を 2 回計測して
+  渡す運用にしている (`.github/workflows/perf-gate.yml`)。
+- `--warn-pct` / `--fail-pct`: 既定 20 / 60。**単なる固定閾値ではなく、**
+  各メトリクスにはこれとは別にメトリクス種別ごとの最小絶対差
+  (`MetricKey::min_significant_delta`) が併用される — 相対変化率だけでは
+  拾えない「絶対値がほぼゼロなのに % だけ跳ねる」ケースを吸収する。
+- `--output` / `--markdown-output`: それぞれ機械可読 JSON
+  (`benchmark::GateReport`) と、GitHub Actions の Job Summary /
+  PR コメントにそのまま貼れる Markdown テーブルを書き出す。
+- **終了コード**: `0` = OK、`3` = WARN (非ブロッキング — 人間が確認する
+  価値はあるが CI は失敗させない)、`1` = FAIL (CI をブロックすべき)、
+  それ以外の `2` は引数エラー等 (既存サブコマンドと同じ規約)。
+  **WARN に専用のコードを割ったのは `compare` の 0/1 の 2 値では
+  「ノイズかもしれないので確認してほしい」と「確実に回帰している」を
+  CI 上で区別できないため。**
+
+**baseline に何を渡すべきか**: リポジトリに `results/baseline/` として
+コミットされている結果ファイルを直接 CI のブロッキング判定に使っては
+ならない (§10 参照 — 機械/セッションが変わる比較はこの環境では成立しない
+ことが実測済み)。CI (`perf-gate.yml`) は baseline も **同じジョブ内で**
+PR の merge-base コミットをその場でビルド・計測して作る。コミット済みの
+`results/baseline/*.json` は経時トレンドを人が目視するための参考情報。
 
 ## 結果ファイルのフォーマット
 
@@ -378,6 +434,53 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   GPU が無い環境では WebKitGTK がソフトウェアレンダリングにフォールバック
   する (`libEGL warning: DRI3 error` が出る)。**この状態の RSS は実機より
   大きく出るため、メモリの絶対値を実機の基準値として扱わないこと。**
+- **⚠️ D-Bus セッションバスが無いと、起動したまま無応答になる (Issue #72 で実測)。**
+  GitHub Actions の `ubuntu-latest` で発生した。Xvfb があってもウィンドウ作成
+  (`BrowserWindow::new`) から先へ進まず、**クラッシュもせず perf ログを 1 行も
+  書かないまま**タイムアウトで kill される。`velox-bench` からは「0 件の
+  レコードを取得」としか見えない。
+
+  **対処: `dbus-run-session` でラップする。**
+
+  ```sh
+  sudo apt install -y dbus-x11
+  xvfb-run -a --server-args="-screen 0 1280x900x24" \
+    dbus-run-session -- \
+      ./target/release/velox-bench run --scenario cold_startup ...
+  ```
+
+  WebKitGTK は web process を別プロセスとして起動し、UI プロセスとの IPC に
+  D-Bus を使う。セッションバスが無いと子プロセスが起動できず、UI プロセスは
+  それを待ち続ける。**プロセスツリーを見ると `WebKitWebProcess` /
+  `WebKitNetworkProcess` が存在しない** (正常時は velox 系で 5 プロセスに
+  なる) のが決定的な見分け方である。
+
+  切り分けに使える観測点:
+
+  | 観測 | 意味 |
+  | --- | --- |
+  | perf ログファイルが**一度も作られない** | `build_perf_log` (`app.rs`) に到達していない = `BrowserWindow::new` でブロック |
+  | `VELOX_DEBUG=1` のトレースが空 | `UserEvent` が 1 件も発火していない = イベントループに入っていない |
+  | `ps` に `WebKitWebProcess` が無い | WebKitGTK の子プロセスが起動できていない |
+
+  以下は実測により原因では**ない**と確認済み。同じ症状が出たときに再度
+  疑わなくてよい。
+
+  - WebKitGTK のバージョン差 (ランナーも 2.52.6 でローカルと同一)
+  - ソフトウェアレンダリングの強制 (`LIBGL_ALWAYS_SOFTWARE` /
+    `WEBKIT_DISABLE_COMPOSITING_MODE` / `WEBKIT_DISABLE_DMABUF_RENDERER`) —
+    付けても付けなくても同じように失敗した
+  - WebKitGTK のサンドボックスと非特権ユーザ名前空間 —
+    `kernel.apparmor_restrict_unprivileged_userns=0` にして `unshare -U` が
+    成功する状態でも、`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` でも失敗した
+  - 試行タイムアウトの不足 (全試行が一律で失敗する)
+  - バイナリをリポジトリ外へコピーして実行すること
+
+  **ローカルで再現しない点に注意。** 本プロジェクトの開発用コンテナでは
+  `DBUS_SESSION_BUS_ADDRESS` が未設定でも動作するため、「ローカルで dbus 無しで
+  動くから dbus は無関係」という推論は成り立たない。両環境の dbus の状態は
+  同一ではない (ランナーではシステムバスが存在し AT-SPI の解決に失敗する)。
+
 - 仮想ディスプレイすら無い場合は、子プロセス (`velox`) がウィンドウ作成に
   失敗して即座に終了する (GTK 初期化失敗の panic として観測)。`velox-bench`
   自身はクラッシュせず、「0 件のレコードを取得」「結果ファイルは書き出したが

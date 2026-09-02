@@ -145,6 +145,45 @@ impl MetricKey {
         }
     }
 
+    /// Reverse of [`MetricKey::as_str`] — looks a key up by the name it is
+    /// stored under in [`BenchmarkResult::metrics`]. Used by
+    /// [`evaluate_gate`] to find each metric's [`MetricKey::min_significant_delta`]
+    /// from the string-keyed maps that [`compare`]/[`evaluate_gate`] both
+    /// work over. `None` for any name not in [`MetricKey::ALL`] (e.g. a
+    /// result file from a newer VeloX with metrics this build does not know
+    /// about) — callers fall back to a conservative default in that case.
+    pub fn from_metric_name(name: &str) -> Option<MetricKey> {
+        MetricKey::ALL.into_iter().find(|key| key.as_str() == name)
+    }
+
+    /// The smallest absolute `|candidate_median - baseline_median|` worth
+    /// treating as a real change at all, regardless of `pct_change`
+    /// (Issue #72 / D46). This is a *different* safeguard than the
+    /// warn/fail percentage thresholds in [`GateThresholds`]: it exists so
+    /// that a metric whose baseline is naturally tiny (e.g. `page_load_ms`
+    /// on a fast fixture, or a `pct_change` computed off a near-zero
+    /// baseline) cannot swing its percentage into the hundreds from a
+    /// change of a few milliseconds — measured directly: a same-binary
+    /// `page_load_ms` comparison swung +78.9% off nothing more than a
+    /// 16.2ms absolute change (D46). The percentage thresholds separately
+    /// absorb this environment's *session-to-session* noise on
+    /// larger-magnitude metrics; this floor absorbs noise at the
+    /// *opposite* end of the scale (small metrics, small absolute deltas).
+    pub fn min_significant_delta(self) -> f64 {
+        match self {
+            MetricKey::StartupWindowCreatedMs
+            | MetricKey::StartupRustSetupDoneMs
+            | MetricKey::StartupToolbarScriptStartedMs
+            | MetricKey::StartupToolbarReadyMs
+            | MetricKey::StartupFirstLoadMs
+            | MetricKey::PageLoadMs
+            | MetricKey::TabCreateMs
+            | MetricKey::TabSwitchMs => 20.0, // milliseconds
+            MetricKey::RssTotalBytes | MetricKey::PssTotalBytes => 5.0 * 1024.0 * 1024.0, // 5 MiB
+            MetricKey::RssProcessCount | MetricKey::PssProcessCount => 1.0, // whole processes
+        }
+    }
+
     /// The `PerfRecord` `"event"` value this metric is read from.
     fn event_name(self) -> &'static str {
         match self {
@@ -452,6 +491,799 @@ pub fn compare(
         only_in_baseline,
         only_in_candidate,
         any_regressed,
+    }
+}
+
+// ---------------------------------------------------------------------
+// Regression gate (Issue #72 / D46)
+// ---------------------------------------------------------------------
+//
+// `compare` above answers "did anything change between two saved results,
+// by how much". The gate built on top of it answers the different,
+// CI-shaped question Issue #72 asks: "should this PR be blocked". Those are
+// not the same question in this environment, because a *single*
+// baseline-vs-candidate `compare` is dominated by session-to-session noise,
+// not code changes — see the module-level numbers below.
+//
+// **Measured noise this design is calibrated against** — two experiments,
+// both on the identical `cold_startup` binary/commit with no code change
+// in between (full data and the exact commands in `docs/decisions.md` D46):
+//
+// 1. *Adjacent-set noise*: six consecutive 10-trial runs, each compared
+//    only to the one immediately before it (the gap a same-CI-job
+//    baseline/candidate pair would realistically see):
+//
+//    | metric                     | max adjacent-pair swing | peak-to-peak across all 6 |
+//    |-----------------------------|--------------------------|------------------------------|
+//    | `startup_first_load_ms`     | 19.0%                     | 45.0%                         |
+//    | `startup_toolbar_ready_ms`  | 16.0%                     | 42.5%                         |
+//    | `startup_window_created_ms` | 17.4%                     | 31.9%                         |
+//    | `pss_total_bytes`           | 28.8%                     | 43.4%                         |
+//    | `rss_total_bytes`           | 19.6%                     | 23.5%                         |
+//
+// 2. *Wide-gap noise*: comparing the first and last of those same six runs
+//    directly against each other (a ~9-minute gap, standing in for what a
+//    stale committed baseline file looks like against a run measured much
+//    later) surfaced far larger swings on the very same unchanged binary:
+//    `page_load_ms` +77.0%/+78.9%, `startup_toolbar_ready_ms`
+//    +52.2%/+53.4%, `startup_first_load_ms` +49.2%/+52.4%. This is *why*
+//    Issue #72's CI gate must never block on a comparison against an old,
+//    separately-captured baseline file (`docs/performance-targets.md`'s own
+//    rule: never compare numbers from different sessions/machines) — the
+//    blocking gate in this repo's CI workflow always measures its baseline
+//    (the PR's merge-base commit) and its candidate (the PR head commit)
+//    back-to-back in the same job, keeping the gap closer to case 1 above
+//    than case 2.
+//
+// A single fixed threshold cannot both (a) sit below this noise floor and
+// (b) catch a real regression, so `evaluate_gate` combines several
+// independent mitigations instead of one bigger number:
+//
+// 1. **Two severity tiers** ([`Severity`]) with different thresholds: a low
+//    `warn_pct` surfaces anything unusual for a human to glance at (this
+//    environment's noise routinely reaches it), while a much higher
+//    `fail_pct` — above every adjacent-pair swing measured above, with a
+//    smaller but still positive margin over the worst *wide-gap* swings
+//    seen on unrelated (non-floor-guarded) metrics — is reserved for
+//    changes large enough that noise alone is an implausible explanation
+//    for a same-job comparison.
+// 2. **A minimum absolute delta** ([`MetricKey::min_significant_delta`]),
+//    orthogonal to the percentage tiers: guards metrics with a naturally
+//    tiny baseline (`page_load_ms`'s wide-gap 78.9% swing above was a
+//    16.2ms absolute change) from a huge `pct_change` computed off noise.
+// 3. **Majority vote across repeated candidate runs**: `evaluate_gate`
+//    accepts more than one candidate [`BenchmarkResult`] (e.g. two runs of
+//    the same PR commit) and only escalates a metric to [`Severity::Fail`]
+//    when *more than half* of the candidates independently exceed
+//    `fail_pct` against the same baseline — approximating "N consecutive
+//    worse" within a single CI job rather than across PR history. A metric
+//    that low-confidence data touched (see below) is never escalated past
+//    [`Severity::Warn`], however many candidates agree.
+//
+// **Residual risk, stated plainly**: no fixed threshold fully absorbs the
+// wide-gap noise this environment can produce (`startup_toolbar_ready_ms`'s
+// measured 53.4% is only ~7 points under the default 60% `fail_pct`, and
+// nothing in this module can distinguish that from a genuine 53%
+// regression). The mitigation is architectural — always compare same-job,
+// back-to-back measurements — not purely statistical; a `Fail` verdict with
+// no plausible code cause should be treated as "re-run the gate" before
+// "revert the PR", the same way a flaky test is handled.
+//
+// **Insufficient trial count**: a [`Stats::count`] below
+// [`MIN_TRIALS_FOR_CONFIDENT_GATE`] on either side of a comparison marks
+// that pairing `low_confidence` and caps its severity at
+// [`Severity::Warn`] — a `Fail` verdict should never rest on a median of
+// (say) one or two samples.
+//
+// **Baseline gaps**: a metric present in the candidate(s) but absent from
+// the baseline (including a baseline with no metrics at all — e.g. a run
+// that collected zero records) cannot be evaluated and is reported in
+// [`GateReport::only_in_candidates`] rather than guessed at; the reverse
+// (baseline-only) goes in [`GateReport::only_in_baseline`]. Neither
+// contributes to [`GateReport::overall`].
+
+/// A regression gate's verdict for one metric, or for a whole
+/// [`GateReport`] (as the worst of its metrics' verdicts).
+///
+/// Ordered `Ok < Warn < Fail` so `Iterator::max` over a set of per-metric
+/// severities gives the correct overall verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// No metric change worth a human's attention.
+    Ok,
+    /// Non-blocking: worth surfacing in a PR summary, but within the range
+    /// this environment's session-to-session noise alone can produce.
+    Warn,
+    /// Blocking: large enough, and (when multiple candidates were given)
+    /// consistent enough, that noise is an implausible sole explanation.
+    Fail,
+}
+
+/// A trial count below this, on either side of a comparison, is not enough
+/// to trust a median at all — the comparison is still reported (never
+/// silently dropped) but capped at [`Severity::Warn`] and flagged
+/// `low_confidence`. `velox-bench run`/`aggregate` default to 10 trials
+/// (`docs/benchmarking.md`); this is deliberately well below that default
+/// so a slightly short run still gates normally, while a pathologically
+/// small one (e.g. every trial but one failed to spawn) does not.
+pub const MIN_TRIALS_FOR_CONFIDENT_GATE: usize = 5;
+
+/// Percentage thresholds for [`evaluate_gate`]. See the module-level "Regression
+/// gate" section above for how these were chosen relative to this
+/// environment's measured noise.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GateThresholds {
+    /// A `pct_change` strictly greater than this is [`Severity::Warn`] (and
+    /// candidate for [`Severity::Fail`] if it also clears `fail_pct` with
+    /// majority agreement). Default 20.0: at or below every measured
+    /// adjacent-pair swing for the three startup-timing metrics
+    /// (16.0–19.0%) and RSS (19.6%), so it also fires — correctly, as a
+    /// *non-blocking* notice — on ordinary noise in those metrics; PSS's
+    /// adjacent-pair swing (28.8%) clears it too, which is exactly the
+    /// point of a warn tier.
+    pub warn_pct: f64,
+    /// A `pct_change` strictly greater than this, in *more than half* of
+    /// the supplied candidates, is [`Severity::Fail`]. Default 60.0: a
+    /// ~31 percentage point margin above the largest adjacent-pair swing
+    /// measured in this environment (28.8%, PSS), and a real but
+    /// deliberately narrower ~7 point margin above the largest *wide-gap*
+    /// swing measured on a metric the absolute-delta floor does not shield
+    /// (`startup_toolbar_ready_ms` at 53.4% — see the module docs' "Residual
+    /// risk" note). Wider-gap comparisons are exactly what this repo's CI
+    /// gate is designed to avoid by measuring baseline and candidate in the
+    /// same job.
+    pub fail_pct: f64,
+}
+
+impl Default for GateThresholds {
+    fn default() -> Self {
+        GateThresholds {
+            warn_pct: 20.0,
+            fail_pct: 60.0,
+        }
+    }
+}
+
+/// One metric's regression-gate verdict: the baseline compared against
+/// every supplied candidate, majority-voted into a single [`Severity`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateMetricVerdict {
+    pub baseline_median: f64,
+    pub baseline_count: usize,
+    /// One entry per candidate that had this metric, in the order the
+    /// candidates were supplied.
+    pub candidate_medians: Vec<f64>,
+    pub pct_changes: Vec<f64>,
+    /// Per-candidate severity, before the majority vote and the
+    /// `low_confidence` cap that produce [`Self::severity`].
+    pub per_candidate_severity: Vec<Severity>,
+    /// `true` if the baseline or *any* contributing candidate had fewer
+    /// than [`MIN_TRIALS_FOR_CONFIDENT_GATE`] trials — see the module-level
+    /// docs. When `true`, [`Self::severity`] is never [`Severity::Fail`].
+    pub low_confidence: bool,
+    /// The final, majority-voted, low-confidence-capped verdict for this
+    /// metric.
+    pub severity: Severity,
+}
+
+/// The full result of [`evaluate_gate`] — one [`GateMetricVerdict`] per
+/// metric both the baseline and at least one candidate measured, plus the
+/// overall verdict CI should act on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GateReport {
+    pub scenario: String,
+    pub thresholds: GateThresholds,
+    /// Number of candidate results the gate was evaluated against.
+    pub candidate_count: usize,
+    pub metrics: BTreeMap<String, GateMetricVerdict>,
+    /// Metrics the baseline measured but no candidate did.
+    pub only_in_baseline: Vec<String>,
+    /// Metrics at least one candidate measured but the baseline did not.
+    pub only_in_candidates: Vec<String>,
+    /// The worst [`Severity`] across [`Self::metrics`] — [`Severity::Ok`]
+    /// when `metrics` is empty (nothing to compare, e.g. an empty
+    /// baseline). This is the single value `velox-bench gate`'s exit code
+    /// encodes.
+    pub overall: Severity,
+}
+
+/// Classify one baseline/candidate median pair against `thresholds` and
+/// `min_abs_delta`, ignoring trial counts (the caller applies the
+/// `low_confidence` cap separately, since that is a property of the whole
+/// metric across all candidates, not of one pair).
+fn classify_pair(
+    baseline_median: f64,
+    candidate_median: f64,
+    min_abs_delta: f64,
+    thresholds: &GateThresholds,
+) -> (f64, Severity) {
+    let delta = candidate_median - baseline_median;
+    let pct_change = if baseline_median == 0.0 {
+        if candidate_median == 0.0 {
+            0.0
+        } else {
+            f64::INFINITY
+        }
+    } else {
+        delta / baseline_median * 100.0
+    };
+    if delta.abs() < min_abs_delta {
+        return (pct_change, Severity::Ok);
+    }
+    let severity = if pct_change > thresholds.fail_pct {
+        Severity::Fail
+    } else if pct_change > thresholds.warn_pct {
+        Severity::Warn
+    } else {
+        Severity::Ok
+    };
+    (pct_change, severity)
+}
+
+/// Evaluate a regression gate: `baseline` against one or more `candidates`
+/// (measurements of the same scenario/OS to compare against it — see the
+/// module-level "Regression gate" docs for why more than one is useful).
+/// `candidates` must be non-empty; an empty slice returns a report with no
+/// metrics (`overall: Severity::Ok`) rather than panicking, since "no
+/// candidates" is a caller bug best surfaced by `velox-bench` requiring
+/// `--candidate` at least once, not by a panic deep in pure logic.
+pub fn evaluate_gate(
+    baseline: &BenchmarkResult,
+    candidates: &[&BenchmarkResult],
+    thresholds: &GateThresholds,
+) -> GateReport {
+    let mut metrics = BTreeMap::new();
+    let mut only_in_baseline = Vec::new();
+
+    for (name, baseline_stats) in &baseline.metrics {
+        let min_abs_delta = MetricKey::from_metric_name(name)
+            .map(MetricKey::min_significant_delta)
+            .unwrap_or(0.0);
+
+        let mut candidate_medians = Vec::new();
+        let mut pct_changes = Vec::new();
+        let mut per_candidate_severity = Vec::new();
+        let mut low_confidence = baseline_stats.count < MIN_TRIALS_FOR_CONFIDENT_GATE;
+
+        for candidate in candidates {
+            let Some(candidate_stats) = candidate.metrics.get(name) else {
+                continue;
+            };
+            if candidate_stats.count < MIN_TRIALS_FOR_CONFIDENT_GATE {
+                low_confidence = true;
+            }
+            let (pct_change, severity) = classify_pair(
+                baseline_stats.median,
+                candidate_stats.median,
+                min_abs_delta,
+                thresholds,
+            );
+            candidate_medians.push(candidate_stats.median);
+            pct_changes.push(pct_change);
+            per_candidate_severity.push(severity);
+        }
+
+        if candidate_medians.is_empty() {
+            only_in_baseline.push(name.clone());
+            continue;
+        }
+
+        let fail_votes = per_candidate_severity
+            .iter()
+            .filter(|s| **s == Severity::Fail)
+            .count();
+        // "More than half" — for 1 candidate that is 1/1, for 2 candidates
+        // it is 2/2 (both must fail), for 3 it is 2/3. See module docs.
+        let majority_fail = fail_votes * 2 > per_candidate_severity.len();
+        let any_at_least_warn = per_candidate_severity.iter().any(|s| *s >= Severity::Warn);
+
+        let severity = if low_confidence {
+            if any_at_least_warn {
+                Severity::Warn
+            } else {
+                Severity::Ok
+            }
+        } else if majority_fail {
+            Severity::Fail
+        } else if any_at_least_warn {
+            Severity::Warn
+        } else {
+            Severity::Ok
+        };
+
+        metrics.insert(
+            name.clone(),
+            GateMetricVerdict {
+                baseline_median: baseline_stats.median,
+                baseline_count: baseline_stats.count,
+                candidate_medians,
+                pct_changes,
+                per_candidate_severity,
+                low_confidence,
+                severity,
+            },
+        );
+    }
+
+    let mut only_in_candidates = Vec::new();
+    for candidate in candidates {
+        for name in candidate.metrics.keys() {
+            if !baseline.metrics.contains_key(name) && !only_in_candidates.contains(name) {
+                only_in_candidates.push(name.clone());
+            }
+        }
+    }
+    only_in_baseline.sort();
+    only_in_candidates.sort();
+
+    let overall = metrics
+        .values()
+        .map(|verdict| verdict.severity)
+        .max()
+        .unwrap_or(Severity::Ok);
+
+    GateReport {
+        scenario: baseline.scenario.clone(),
+        thresholds: *thresholds,
+        candidate_count: candidates.len(),
+        metrics,
+        only_in_baseline,
+        only_in_candidates,
+        overall,
+    }
+}
+
+/// Render `report` as a Markdown table, suitable for a GitHub Actions job
+/// summary (`$GITHUB_STEP_SUMMARY`) or a PR comment — the "PR
+/// summary/comment" acceptance item in Issue #72.
+pub fn render_gate_markdown(report: &GateReport) -> String {
+    let severity_label = |s: Severity| match s {
+        Severity::Ok => "OK",
+        Severity::Warn => "WARN",
+        Severity::Fail => "FAIL",
+    };
+    let mut out = String::new();
+    out.push_str(&format!(
+        "### 性能回帰ゲート: {} — 総合判定: **{}**\n\n",
+        report.scenario,
+        severity_label(report.overall)
+    ));
+    out.push_str(&format!(
+        "候補測定 {} 件 / warn 閾値 {:.1}% / fail 閾値 {:.1}%\n\n",
+        report.candidate_count, report.thresholds.warn_pct, report.thresholds.fail_pct
+    ));
+    if report.metrics.is_empty() {
+        out.push_str("_比較可能なメトリクスがありません。_\n");
+    } else {
+        out.push_str("| metric | baseline | candidate (中央値) | 変化率 | 判定 |\n");
+        out.push_str("|---|---:|---|---|---|\n");
+        for (name, verdict) in &report.metrics {
+            let candidates_display = verdict
+                .candidate_medians
+                .iter()
+                .zip(&verdict.pct_changes)
+                .map(|(median, pct)| {
+                    if pct.is_infinite() {
+                        format!("{median:.2} (inf)")
+                    } else {
+                        format!("{median:.2} ({pct:+.1}%)")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let confidence_note = if verdict.low_confidence {
+                " ⚠️試行数不足"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "| {} | {:.2} | {} | — | {}{} |\n",
+                name,
+                verdict.baseline_median,
+                candidates_display,
+                severity_label(verdict.severity),
+                confidence_note
+            ));
+        }
+    }
+    if !report.only_in_baseline.is_empty() {
+        out.push_str(&format!(
+            "\nbaseline のみに存在: {}\n",
+            report.only_in_baseline.join(", ")
+        ));
+    }
+    if !report.only_in_candidates.is_empty() {
+        out.push_str(&format!(
+            "\ncandidate のみに存在: {}\n",
+            report.only_in_candidates.join(", ")
+        ));
+    }
+    out
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    fn stats_with(count: usize, median: f64) -> Stats {
+        Stats {
+            count,
+            min: median,
+            max: median,
+            mean: median,
+            median,
+            p95: median,
+            stddev: 0.0,
+        }
+    }
+
+    fn result_with_stats(scenario: &str, metrics: &[(&str, Stats)]) -> BenchmarkResult {
+        BenchmarkResult {
+            scenario: scenario.to_owned(),
+            environment: RunEnvironment {
+                os: "linux".to_owned(),
+                cpu_count: 4,
+                git_commit: Some("abc123".to_owned()),
+                generated_at: "2026-09-02T00:00:00Z".to_owned(),
+                trials: 10,
+            },
+            metrics: metrics
+                .iter()
+                .map(|(name, stats)| ((*name).to_owned(), *stats))
+                .collect(),
+        }
+    }
+
+    const KEY: &str = "startup_first_load_ms";
+
+    // -- basic pass/warn/fail --------------------------------------------
+
+    #[test]
+    fn ok_when_change_is_negligible() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 502.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+        assert_eq!(report.overall, Severity::Ok);
+    }
+
+    #[test]
+    fn warn_when_change_exceeds_warn_pct_but_not_fail_pct() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        // +30%: above default warn_pct (20.0), below default fail_pct (60.0).
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 650.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Warn);
+        assert_eq!(report.overall, Severity::Warn);
+    }
+
+    #[test]
+    fn fail_when_single_candidate_exceeds_fail_pct() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        // +80%: above default fail_pct (60.0). One candidate is "more than
+        // half of 1", so this alone is enough to fail.
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Fail);
+        assert_eq!(report.overall, Severity::Fail);
+    }
+
+    #[test]
+    fn improvement_is_ok_not_warn_or_fail() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 200.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+    }
+
+    // -- boundary values ---------------------------------------------------
+
+    #[test]
+    fn exactly_at_warn_pct_is_still_ok() {
+        // +20.0% exactly == warn_pct: strictly-greater-than means this is
+        // still Ok, not Warn.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 600.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn just_above_warn_pct_is_warn() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 600.01))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn exactly_at_fail_pct_is_warn_not_fail() {
+        // +60.0% exactly == fail_pct: strictly-greater-than means this is
+        // Warn, not Fail.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 800.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn just_above_fail_pct_is_fail() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 800.01))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Fail);
+    }
+
+    // -- ties / no change ---------------------------------------------------
+
+    #[test]
+    fn identical_medians_are_ok() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let verdict = &report.metrics[KEY];
+        assert_eq!(verdict.severity, Severity::Ok);
+        assert_eq!(verdict.pct_changes, vec![0.0]);
+    }
+
+    #[test]
+    fn zero_baseline_and_zero_candidate_is_ok_not_nan() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 0.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 0.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+        assert_eq!(report.metrics[KEY].pct_changes, vec![0.0]);
+    }
+
+    // -- minimum absolute delta floor ---------------------------------------
+
+    #[test]
+    fn tiny_absolute_change_stays_ok_despite_huge_pct_change() {
+        // tab_switch_ms floor is 15.0ms; 0.1ms -> 5.0ms is a 4900% change
+        // but only a 4.9ms absolute delta, below the floor.
+        let baseline = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 0.1))]);
+        let candidate = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 5.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics["tab_switch_ms"].severity, Severity::Ok);
+    }
+
+    #[test]
+    fn zero_baseline_with_delta_above_floor_is_fail() {
+        // Infinite pct_change, but the 20ms absolute delta clears
+        // tab_switch_ms's 15ms floor, so it is evaluated normally.
+        let baseline = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 0.0))]);
+        let candidate = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 20.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let verdict = &report.metrics["tab_switch_ms"];
+        assert_eq!(verdict.pct_changes, vec![f64::INFINITY]);
+        assert_eq!(verdict.severity, Severity::Fail);
+    }
+
+    #[test]
+    fn metric_with_no_known_min_delta_falls_back_to_zero_floor() {
+        // A metric name the running build's MetricKey doesn't recognise
+        // (e.g. saved by a newer velox-bench) has no floor to apply, so it
+        // is evaluated on pct_change alone.
+        let baseline =
+            result_with_stats("cold_startup", &[("future_metric_ms", stats_with(10, 1.0))]);
+        let candidate =
+            result_with_stats("cold_startup", &[("future_metric_ms", stats_with(10, 2.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        // +100%, well above fail_pct, and the 1.0 absolute delta is not
+        // filtered by any floor.
+        assert_eq!(report.metrics["future_metric_ms"].severity, Severity::Fail);
+    }
+
+    // -- insufficient trial count --------------------------------------------
+
+    #[test]
+    fn low_baseline_trial_count_caps_severity_at_warn() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(2, 500.0))]);
+        // +100%, which would otherwise be Fail.
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 1000.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let verdict = &report.metrics[KEY];
+        assert!(verdict.low_confidence);
+        assert_eq!(verdict.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn low_candidate_trial_count_caps_severity_at_warn() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(1, 1000.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let verdict = &report.metrics[KEY];
+        assert!(verdict.low_confidence);
+        assert_eq!(verdict.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn low_confidence_with_no_real_change_stays_ok() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(1, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(1, 502.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let verdict = &report.metrics[KEY];
+        assert!(verdict.low_confidence);
+        assert_eq!(verdict.severity, Severity::Ok);
+    }
+
+    #[test]
+    fn exactly_at_min_trials_threshold_is_not_low_confidence() {
+        let baseline = result_with_stats(
+            "cold_startup",
+            &[(KEY, stats_with(MIN_TRIALS_FOR_CONFIDENT_GATE, 500.0))],
+        );
+        let candidate = result_with_stats(
+            "cold_startup",
+            &[(KEY, stats_with(MIN_TRIALS_FOR_CONFIDENT_GATE, 900.0))],
+        );
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let verdict = &report.metrics[KEY];
+        assert!(!verdict.low_confidence);
+        assert_eq!(verdict.severity, Severity::Fail);
+    }
+
+    // -- baseline / candidate gaps --------------------------------------------
+
+    #[test]
+    fn metric_missing_from_baseline_is_reported_not_guessed() {
+        let baseline = result_with_stats("cold_startup", &[]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert!(report.metrics.is_empty());
+        assert_eq!(report.only_in_candidates, vec![KEY.to_owned()]);
+        assert_eq!(report.overall, Severity::Ok);
+    }
+
+    #[test]
+    fn empty_baseline_result_never_fails() {
+        // A baseline from a run that collected zero records (e.g. a
+        // headless environment with no display — see
+        // `docs/benchmarking.md` "実行環境要件") must not silently gate
+        // everything as a pass *or* crash the gate; it should simply have
+        // nothing to compare.
+        let baseline = result_with_stats("cold_startup", &[]);
+        let candidate = result_with_stats(
+            "cold_startup",
+            &[
+                (KEY, stats_with(10, 500.0)),
+                ("rss_total_bytes", stats_with(10, 1.0)),
+            ],
+        );
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.overall, Severity::Ok);
+        assert_eq!(report.only_in_candidates.len(), 2);
+    }
+
+    #[test]
+    fn metric_missing_from_one_candidate_is_still_evaluated_from_the_other() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let with_metric = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
+        let without_metric = result_with_stats("cold_startup", &[]);
+        let report = evaluate_gate(
+            &baseline,
+            &[&with_metric, &without_metric],
+            &GateThresholds::default(),
+        );
+        let verdict = &report.metrics[KEY];
+        assert_eq!(verdict.candidate_medians, vec![900.0]);
+        // 1 candidate measured it, and that 1 exceeded fail_pct: "more than
+        // half of 1" is met.
+        assert_eq!(verdict.severity, Severity::Fail);
+    }
+
+    #[test]
+    fn no_candidates_at_all_yields_an_empty_ok_report() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let report = evaluate_gate(&baseline, &[], &GateThresholds::default());
+        // Nothing was actually compared (no candidate had any data at
+        // all), so nothing can be Warn/Fail — but the baseline's metric
+        // is still visible via `only_in_baseline`, same as when a
+        // candidate exists but happens not to have measured it.
+        assert!(report.metrics.is_empty());
+        assert_eq!(report.overall, Severity::Ok);
+        assert_eq!(report.only_in_baseline, vec![KEY.to_owned()]);
+        assert_eq!(report.candidate_count, 0);
+    }
+
+    // -- majority vote across multiple candidates ----------------------------
+
+    #[test]
+    fn two_candidates_both_failing_is_fail() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate_a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
+        let candidate_b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 1000.0))]);
+        let report = evaluate_gate(
+            &baseline,
+            &[&candidate_a, &candidate_b],
+            &GateThresholds::default(),
+        );
+        assert_eq!(report.metrics[KEY].severity, Severity::Fail);
+    }
+
+    #[test]
+    fn two_candidates_only_one_failing_is_warn_not_fail() {
+        // Requires *more than half* to fail; 1 of 2 is not a majority, so
+        // this is a noisy-looking single run, not a confirmed regression —
+        // downgraded to Warn rather than dropped entirely.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate_a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]); // fail
+        let candidate_b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]); // ok
+        let report = evaluate_gate(
+            &baseline,
+            &[&candidate_a, &candidate_b],
+            &GateThresholds::default(),
+        );
+        assert_eq!(report.metrics[KEY].severity, Severity::Warn);
+    }
+
+    #[test]
+    fn three_candidates_two_of_three_failing_is_fail() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]); // fail
+        let b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 1000.0))]); // fail
+        let c = result_with_stats("cold_startup", &[(KEY, stats_with(10, 502.0))]); // ok
+        let report = evaluate_gate(&baseline, &[&a, &b, &c], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Fail);
+    }
+
+    #[test]
+    fn three_candidates_one_of_three_failing_is_warn() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]); // fail
+        let b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 502.0))]); // ok
+        let c = result_with_stats("cold_startup", &[(KEY, stats_with(10, 503.0))]); // ok
+        let report = evaluate_gate(&baseline, &[&a, &b, &c], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Warn);
+    }
+
+    // -- overall / multi-metric ------------------------------------------
+
+    #[test]
+    fn overall_is_the_worst_of_all_metrics() {
+        // rss_total_bytes doubles (300MB -> 600MB): +100%, and the 300MB
+        // absolute delta clears its 5MiB min_significant_delta floor.
+        let baseline = result_with_stats(
+            "cold_startup",
+            &[
+                (KEY, stats_with(10, 500.0)),
+                ("rss_total_bytes", stats_with(10, 300_000_000.0)),
+            ],
+        );
+        let candidate = result_with_stats(
+            "cold_startup",
+            &[
+                (KEY, stats_with(10, 502.0)),                       // ok
+                ("rss_total_bytes", stats_with(10, 600_000_000.0)), // +100% -> fail
+            ],
+        );
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+        assert_eq!(report.metrics["rss_total_bytes"].severity, Severity::Fail);
+        assert_eq!(report.overall, Severity::Fail);
+    }
+
+    // -- markdown rendering --------------------------------------------------
+
+    #[test]
+    fn markdown_report_mentions_overall_severity_and_metric_rows() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let markdown = render_gate_markdown(&report);
+        assert!(markdown.contains("FAIL"));
+        assert!(markdown.contains(KEY));
+        assert!(markdown.contains("cold_startup"));
+    }
+
+    #[test]
+    fn markdown_report_of_empty_metrics_does_not_panic() {
+        let baseline = result_with_stats("cold_startup", &[]);
+        let candidate = result_with_stats("cold_startup", &[]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let markdown = render_gate_markdown(&report);
+        assert!(markdown.contains("OK"));
     }
 }
 
