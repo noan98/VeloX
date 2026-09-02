@@ -3169,3 +3169,35 @@ PR で #36 と #72 の両方を close する。**
 `first_page_load`) や、外部駆動フックが未実装の `navigation`/`tab_*`/
 `tabs_N` 系は対象外 — 将来 Issue でそれらの自動駆動フックが実装されたら
 `perf-gate.yml` に追加を検討する。
+
+### CI 環境での実行条件 (実測により確定)
+
+このゲートを GitHub Actions で動かすには **`dbus-run-session` が必須**である。
+無いと VeloX は `BrowserWindow::new` の中でブロックし、クラッシュもせず perf
+ログを 1 行も書かないままタイムアウトする。WebKitGTK は web process を別
+プロセスとして起動し UI プロセスとの IPC に D-Bus を使うため、セッションバスが
+無いと子プロセスが起動できず、UI プロセスが待ち続ける。
+
+**この結論に至るまでに 3 つの仮説を実測で棄却した。** 同じ症状で再度同じ道を
+辿らないよう記録しておく。
+
+1. 使えない `/dev/dri` と DMABuf レンダラ — ソフトウェアレンダリングを強制
+   しても、しなくても同じように失敗した
+2. bubblewrap サンドボックスと非特権ユーザ名前空間 —
+   `kernel.apparmor_restrict_unprivileged_userns=0` で `unshare -U` が成功する
+   状態でも失敗した
+3. WebKitGTK のサンドボックスそのもの — `WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1`
+   でも失敗した
+
+**推論上の教訓**: 当初 D-Bus 仮説を「開発用コンテナでも
+`DBUS_SESSION_BUS_ADDRESS` は未設定だが動作する」という理由で早々に棄却したが、
+これは誤りだった。ローカルには AT-SPI の dbus エラーがそもそも出ておらず、
+両環境の dbus の状態は同一ではない。**「ローカルで X 無しに動く」ことは
+「CI の失敗が X と無関係」を意味しない。**
+
+決め手になったのは環境の推測をやめてプロセスを直接観測したことである。有効な
+観測点は `docs/benchmarking.md`「実行環境要件」の表を参照。とくに
+**perf ログが「空」ではなく「一度も作られない」**という区別が、`app.rs` の
+`build_perf_log` が `event_loop.run` より後ろにある事実と合わさって、ブロック
+位置を `BrowserWindow::new` に特定する決め手になった。
+

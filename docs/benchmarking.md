@@ -434,31 +434,52 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   GPU が無い環境では WebKitGTK がソフトウェアレンダリングにフォールバック
   する (`libEGL warning: DRI3 error` が出る)。**この状態の RSS は実機より
   大きく出るため、メモリの絶対値を実機の基準値として扱わないこと。**
-- **⚠️ CI ランナー上で「起動したまま無応答」になることがある (Issue #72)。**
-  Xvfb があってもウィンドウ作成 (`BrowserWindow::new`) から先へ進まず、
-  **クラッシュもせず perf ログを 1 行も書かないまま**タイムアウトで kill
-  される、という失敗の仕方をする。`velox-bench` からは「0 件のレコードを
-  取得」としか見えない。
+- **⚠️ D-Bus セッションバスが無いと、起動したまま無応答になる (Issue #72 で実測)。**
+  GitHub Actions の `ubuntu-latest` で発生した。Xvfb があってもウィンドウ作成
+  (`BrowserWindow::new`) から先へ進まず、**クラッシュもせず perf ログを 1 行も
+  書かないまま**タイムアウトで kill される。`velox-bench` からは「0 件の
+  レコードを取得」としか見えない。
 
-  GitHub Actions の `ubuntu-latest` で実測した限り、以下は原因では**ない**
-  ことが確認できている。
+  **対処: `dbus-run-session` でラップする。**
 
-  - WebKitGTK のバージョン差 (ランナーも 2.52.6)
-  - D-Bus セッションバスの不在
+  ```sh
+  sudo apt install -y dbus-x11
+  xvfb-run -a --server-args="-screen 0 1280x900x24" \
+    dbus-run-session -- \
+      ./target/release/velox-bench run --scenario cold_startup ...
+  ```
+
+  WebKitGTK は web process を別プロセスとして起動し、UI プロセスとの IPC に
+  D-Bus を使う。セッションバスが無いと子プロセスが起動できず、UI プロセスは
+  それを待ち続ける。**プロセスツリーを見ると `WebKitWebProcess` /
+  `WebKitNetworkProcess` が存在しない** (正常時は velox 系で 5 プロセスに
+  なる) のが決定的な見分け方である。
+
+  切り分けに使える観測点:
+
+  | 観測 | 意味 |
+  | --- | --- |
+  | perf ログファイルが**一度も作られない** | `build_perf_log` (`app.rs`) に到達していない = `BrowserWindow::new` でブロック |
+  | `VELOX_DEBUG=1` のトレースが空 | `UserEvent` が 1 件も発火していない = イベントループに入っていない |
+  | `ps` に `WebKitWebProcess` が無い | WebKitGTK の子プロセスが起動できていない |
+
+  以下は実測により原因では**ない**と確認済み。同じ症状が出たときに再度
+  疑わなくてよい。
+
+  - WebKitGTK のバージョン差 (ランナーも 2.52.6 でローカルと同一)
   - ソフトウェアレンダリングの強制 (`LIBGL_ALWAYS_SOFTWARE` /
     `WEBKIT_DISABLE_COMPOSITING_MODE` / `WEBKIT_DISABLE_DMABUF_RENDERER`) —
-    **付けても付けなくても同じように失敗する**
+    付けても付けなくても同じように失敗した
+  - WebKitGTK のサンドボックスと非特権ユーザ名前空間 —
+    `kernel.apparmor_restrict_unprivileged_userns=0` にして `unshare -U` が
+    成功する状態でも、`WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1` でも失敗した
   - 試行タイムアウトの不足 (全試行が一律で失敗する)
+  - バイナリをリポジトリ外へコピーして実行すること
 
-  有力なのは **WebKitGTK のサンドボックスが非特権ユーザ名前空間を作れない**
-  という線である。WebKitGTK は web process を bubblewrap 経由で起動するが、
-  Ubuntu 24.04 は `kernel.apparmor_restrict_unprivileged_userns=1` を既定に
-  しており、これを禁じる。この sysctl キーが存在しない環境 (本プロジェクトの
-  開発用コンテナがそう) では問題が起きないため、**ローカルでは再現しない**。
-
-  `.github/workflows/perf-gate.yml` の診断ステップが、ランナー上で
-  `unshare -U` の可否と各対処の効果を毎回ログに残す。確定した対処は同
-  ワークフローを参照のこと。
+  **ローカルで再現しない点に注意。** 本プロジェクトの開発用コンテナでは
+  `DBUS_SESSION_BUS_ADDRESS` が未設定でも動作するため、「ローカルで dbus 無しで
+  動くから dbus は無関係」という推論は成り立たない。両環境の dbus の状態は
+  同一ではない (ランナーではシステムバスが存在し AT-SPI の解決に失敗する)。
 
 - 仮想ディスプレイすら無い場合は、子プロセス (`velox`) がウィンドウ作成に
   失敗して即座に終了する (GTK 初期化失敗の panic として観測)。`velox-bench`

@@ -57,20 +57,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb dbus-x11
 
-      # Issue #72: WebKitGTK launches its web process inside a bubblewrap
-      # sandbox, which needs an unprivileged user namespace. Ubuntu 24.04
-      # ships kernel.apparmor_restrict_unprivileged_userns=1, which denies
-      # exactly that — so the web process never starts and VeloX blocks
-      # inside BrowserWindow::new, before it has even opened its perf log.
-      # (A machine where this sysctl does not exist at all — the container
-      # this project is developed in — is unaffected, which is why the hang
-      # never reproduced locally.)
+      # Issue #72: added while investigating the "0 perf records" hang, on
+      # the theory that WebKitGTK's bubblewrap sandbox was being denied an
+      # unprivileged user namespace by Ubuntu 24.04's
+      # kernel.apparmor_restrict_unprivileged_userns=1.
       #
-      # Lifting the kernel restriction is preferred over setting
-      # WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1: it restores the
-      # capability WebKit needs to *build* its sandbox, rather than turning
-      # that sandbox off. Best-effort — the diagnostic step below reports
-      # whether it actually took effect.
+      # That theory was WRONG: the hang persisted with this sysctl set to 0
+      # and `unshare -U` succeeding, and also with WebKit's sandbox disabled
+      # outright. The actual fix was giving the process a D-Bus session bus
+      # (see the dbus-run-session wrappers below). This step is kept because
+      # it has not been isolated whether lifting the restriction is *also*
+      # required — the successful run had both — and re-testing that costs a
+      # red gate. Harmless either way: it only relaxes a kernel restriction
+      # inside this throwaway runner.
       - name: Allow unprivileged user namespaces (WebKitGTK sandbox)
         run: |
           set +e
@@ -126,21 +125,22 @@ jobs:
       # before measuring anything, launch VeloX once directly and capture
       # what the runner actually does. Never fails the job — this exists to
       # turn "0 records" into an actionable error message.
-      # Issue #72: two environment hypotheses (the unusable /dev/dri +
-      # DMABuf renderer, then WebKitGTK's bubblewrap sandbox needing an
-      # unprivileged user namespace) were both disproven by this step —
-      # VeloX behaves identically with software rendering forced, with the
-      # AppArmor userns restriction lifted (unshare -U succeeds), and with
-      # WebKit's sandbox disabled outright. So stop guessing at the
-      # environment and instrument the process instead.
+      # Issue #72: kept as a permanent tripwire. Three environment
+      # hypotheses were disproven here before the real cause was found
+      # (unusable /dev/dri + DMABuf renderer; WebKitGTK's bubblewrap sandbox
+      # needing an unprivileged user namespace; the sandbox itself) — what
+      # actually fixed it was wrapping the launch in dbus-run-session, since
+      # WebKitGTK needs a session bus to start its web process.
       #
-      # The key ambiguity so far: "killed at the 20s timeout with no perf
-      # log" is equally consistent with (a) VeloX hanging inside
-      # BrowserWindow::new, and (b) VeloX running perfectly well as a normal
-      # browser with metrics simply never enabled — a GUI browser does not
-      # exit on its own either way. VELOX_DEBUG makes app.rs print every
-      # UserEvent it dispatches, which separates the two: events in stderr
-      # means the event loop is alive.
+      # What made that diagnosable: "killed at the timeout with no perf log"
+      # is equally consistent with VeloX hanging inside BrowserWindow::new
+      # and with VeloX running fine as a normal browser — a GUI browser does
+      # not exit on its own either way. The three signals below separate
+      # them, so keep them if this ever regresses:
+      #   - perf log never *created* → never reached build_perf_log, i.e.
+      #     still inside BrowserWindow::new (app.rs opens the log after it)
+      #   - empty VELOX_DEBUG trace  → no UserEvent ever dispatched
+      #   - no WebKitWebProcess in ps → WebKit's child processes never spawned
       - name: Diagnose VeloX under Xvfb (never fails)
         continue-on-error: true
         run: |
