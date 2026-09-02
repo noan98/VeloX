@@ -76,6 +76,15 @@ pub enum ToolbarCommand {
     /// (the content page may have started loading before the toolbar was
     /// ready to display it).
     Ready,
+    /// The toolbar's inline `<script>` block started executing — sent as
+    /// its very first statement, before any DOM lookups or rendering (see
+    /// `ui/toolbar.html`). Purely a startup-timing probe (Issue #59, see
+    /// docs/decisions.md D42): it splits the `window_created` →
+    /// `toolbar_ready` gap into "engine got the document parsed" vs. "the
+    /// toolbar's own JS ran" — `app.rs` only feeds it to
+    /// `metrics::StartupTimestamps::mark_toolbar_script_started` and
+    /// otherwise ignores it.
+    ScriptStarted,
     /// Open the content webview's DevTools (Web Inspector).
     OpenDevtools,
     /// The star button was clicked: bookmark the current page, or remove
@@ -462,6 +471,10 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"ready"}"#).unwrap(),
             ToolbarCommand::Ready
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"script_started"}"#).unwrap(),
+            ToolbarCommand::ScriptStarted
         );
         assert_eq!(
             parse_command(r#"{"cmd":"open_devtools"}"#).unwrap(),

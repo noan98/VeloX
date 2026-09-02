@@ -76,6 +76,15 @@ pub fn parse_jsonl(text: &str) -> Vec<Value> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MetricKey {
     StartupWindowCreatedMs,
+    /// Right before `app::run` enters the event loop — see
+    /// `metrics::StartupTimestamps::mark_rust_setup_done` and
+    /// docs/decisions.md D42 (Issue #59). Splits `StartupWindowCreatedMs` →
+    /// `StartupToolbarReadyMs` into "VeloX's own synchronous setup" vs.
+    /// "inside the toolbar webview".
+    StartupRustSetupDoneMs,
+    /// The toolbar webview's inline script started executing — see
+    /// `metrics::StartupTimestamps::mark_toolbar_script_started` and D42.
+    StartupToolbarScriptStartedMs,
     StartupToolbarReadyMs,
     StartupFirstLoadMs,
     PageLoadMs,
@@ -89,8 +98,10 @@ impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 8] = [
+    pub const ALL: [MetricKey; 10] = [
         MetricKey::StartupWindowCreatedMs,
+        MetricKey::StartupRustSetupDoneMs,
+        MetricKey::StartupToolbarScriptStartedMs,
         MetricKey::StartupToolbarReadyMs,
         MetricKey::StartupFirstLoadMs,
         MetricKey::PageLoadMs,
@@ -105,6 +116,8 @@ impl MetricKey {
     pub fn as_str(self) -> &'static str {
         match self {
             MetricKey::StartupWindowCreatedMs => "startup_window_created_ms",
+            MetricKey::StartupRustSetupDoneMs => "startup_rust_setup_done_ms",
+            MetricKey::StartupToolbarScriptStartedMs => "startup_toolbar_script_started_ms",
             MetricKey::StartupToolbarReadyMs => "startup_toolbar_ready_ms",
             MetricKey::StartupFirstLoadMs => "startup_first_load_ms",
             MetricKey::PageLoadMs => "page_load_ms",
@@ -119,6 +132,8 @@ impl MetricKey {
     fn event_name(self) -> &'static str {
         match self {
             MetricKey::StartupWindowCreatedMs
+            | MetricKey::StartupRustSetupDoneMs
+            | MetricKey::StartupToolbarScriptStartedMs
             | MetricKey::StartupToolbarReadyMs
             | MetricKey::StartupFirstLoadMs => "startup",
             MetricKey::PageLoadMs => "page_load",
@@ -133,6 +148,8 @@ impl MetricKey {
     fn field_name(self) -> &'static str {
         match self {
             MetricKey::StartupWindowCreatedMs => "window_created_ms",
+            MetricKey::StartupRustSetupDoneMs => "rust_setup_done_ms",
+            MetricKey::StartupToolbarScriptStartedMs => "toolbar_script_started_ms",
             MetricKey::StartupToolbarReadyMs => "toolbar_ready_ms",
             MetricKey::StartupFirstLoadMs => "first_load_ms",
             MetricKey::PageLoadMs => "duration_ms",

@@ -235,6 +235,14 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         downloads: DownloadStore::new(),
     };
 
+    // Everything above (history/bookmarks/input-history load, `AppState`
+    // build) is synchronous Rust code that runs before the GTK/webview
+    // event loop even starts pumping — see D42. Marking it here isolates
+    // that cost from whatever happens inside the toolbar webview itself.
+    if let Some(startup) = startup.as_mut() {
+        startup.mark_rust_setup_done(Instant::now());
+    }
+
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -332,8 +340,16 @@ fn record_perf_event(
     event: &UserEvent,
 ) {
     match event {
-        UserEvent::ToolbarMessage(body) => {
-            if matches!(toolbar::parse_command(body), Ok(ToolbarCommand::Ready)) {
+        UserEvent::ToolbarMessage(body) => match toolbar::parse_command(body) {
+            Ok(ToolbarCommand::ScriptStarted) => {
+                mark_startup(
+                    startup,
+                    perf_log,
+                    process_start,
+                    metrics::StartupTimestamps::mark_toolbar_script_started,
+                );
+            }
+            Ok(ToolbarCommand::Ready) => {
                 mark_startup(
                     startup,
                     perf_log,
@@ -341,7 +357,8 @@ fn record_perf_event(
                     metrics::StartupTimestamps::mark_toolbar_ready,
                 );
             }
-        }
+            _ => {}
+        },
         UserEvent::NavigationStarted(id, _) => {
             page_load_timers
                 .entry(*id)
@@ -727,6 +744,9 @@ fn handle_toolbar_command(
             // Otherwise: unknown id, the active tab (never suspended), or
             // already suspended — a no-op, mirroring `CloseTab`'s guards.
         }
+        // A pure startup-timing probe (Issue #59/D42) — `record_perf_event`
+        // already consumed it above; nothing to do here.
+        ToolbarCommand::ScriptStarted => {}
         ToolbarCommand::Ready => {
             log_failure(
                 "initialize address bar",

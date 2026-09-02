@@ -637,8 +637,19 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
 - **Startup time**: `main.rs` captures `process_start` before building
   `Config`, and passes it into `app::run`. `metrics::StartupTimestamps`
   records window creation, the toolbar's first `Ready`, and the first
-  `LoadFinished` (≈ time-to-first-page) against it; `app::run` writes one
-  `startup` record once all three have fired.
+  `LoadFinished` (≈ time-to-first-page) against it, plus two sub-checkpoints
+  added for Issue #59/D42 that split the `window_created` → `toolbar_ready`
+  gap in half: `rust_setup_done` (right before `app::run` enters the event
+  loop — everything before this is synchronous Rust: persistence load,
+  `AppState` construction) and `toolbar_script_started` (the toolbar
+  webview's inline `<script>` block starting to execute, sent as its very
+  first statement — see `ui/toolbar.html` and
+  `ToolbarCommand::ScriptStarted`). `app::run` writes one `startup` record
+  once all five have fired. See docs/decisions.md D42 for what this
+  subdivision found: the gap is dominated by `tao`'s GTK/event-loop
+  initialization and WebKitGTK's own (content-size-independent) webview
+  spin-up cost, not by anything in `toolbar.html` or VeloX's Rust-side
+  setup.
 - **Page load time**: `UserEvent::NavigationStarted` → `LoadFinished` is
   bracketed by `metrics::PageLoadTimer` in `app::run`, writing one
   `page_load` record per load. Timers are kept per `TabId`, so a background
@@ -686,7 +697,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     formats, never changes this format for anyone already scraping it.
     Example lines:
     ```text
-    velox[perf] startup window_created=12.3ms toolbar_ready=45.6ms first_page=120.0ms
+    velox[perf] startup window_created=12.3ms rust_setup_done=12.4ms toolbar_script_started=44.9ms toolbar_ready=45.6ms first_page=120.0ms
     velox[perf] page_load url=https://example.com/ duration=250.0ms
     velox[perf] tab_create id=3 duration=15.2ms
     velox[perf] tab_switch id=3 duration=3.1ms
@@ -704,7 +715,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
 
     | `event`      | fields |
     |--------------|--------|
-    | `startup`    | `window_created_ms`, `toolbar_ready_ms`, `first_load_ms` (float ms) |
+    | `startup`    | `window_created_ms`, `rust_setup_done_ms`, `toolbar_script_started_ms`, `toolbar_ready_ms`, `first_load_ms` (float ms) |
     | `page_load`  | `url` (string), `duration_ms` (float ms) |
     | `tab_create` | `tab_id` (uint), `duration_ms` (float ms) |
     | `tab_switch` | `tab_id` (uint), `duration_ms` (float ms) |
