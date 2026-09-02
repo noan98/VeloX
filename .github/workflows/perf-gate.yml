@@ -19,25 +19,21 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  # Issue #72: this job's first two runs produced 0 perf records on every
-  # trial — VeloX started, hung, and was killed at the per-trial timeout
-  # without ever writing a perf record. The diagnostic step below found
-  # why: a GitHub runner exposes a DRM node (/dev/dri/card1, mode
-  # crw-rw---- root:video) that the unprivileged runner user cannot open,
-  # so WebKitGTK 2.52's DMABuf renderer blocks on a device it can neither
-  # use nor detect as absent. (A machine with *no* /dev/dri at all — like
-  # the container this was developed in — falls straight back to software
-  # rendering and works, which is why this never reproduced locally.)
-  # Forcing the software path makes the fallback explicit instead of
-  # letting Mesa/WebKit discover it.
+  # Issue #72: this runner has a DRM node it cannot open (/dev/dri/card1,
+  # crw-rw---- root:video; the runner user is not in `video`), so make the
+  # software-rendering fallback explicit rather than letting Mesa discover
+  # it. NOTE: the diagnostic step below proved these variables are NOT what
+  # fixes the "0 perf records" hang — VeloX hangs identically with and
+  # without them. They are kept only because this runner genuinely has no
+  # usable GPU. See the "Allow unprivileged user namespaces" step for the
+  # actual blocker.
   #
   # These belong here, in the measurement environment, and NOT in VeloX
   # itself: docs/decisions.md D43 measured the same variables during #59
   # and deliberately kept them out of the product because their effect is
   # an artifact of GPU-less environments. Baseline and candidate are both
-  # measured under these variables in the same job, so the comparison this
-  # gate makes stays internally consistent — but the absolute numbers are
-  # not comparable to a run made without them.
+  # measured under the same environment in the same job, so the comparison
+  # this gate makes stays internally consistent.
   LIBGL_ALWAYS_SOFTWARE: "1"
   WEBKIT_DISABLE_COMPOSITING_MODE: "1"
   WEBKIT_DISABLE_DMABUF_RENDERER: "1"
@@ -60,6 +56,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb
+
+      # Issue #72: WebKitGTK launches its web process inside a bubblewrap
+      # sandbox, which needs an unprivileged user namespace. Ubuntu 24.04
+      # ships kernel.apparmor_restrict_unprivileged_userns=1, which denies
+      # exactly that — so the web process never starts and VeloX blocks
+      # inside BrowserWindow::new, before it has even opened its perf log.
+      # (A machine where this sysctl does not exist at all — the container
+      # this project is developed in — is unaffected, which is why the hang
+      # never reproduced locally.)
+      #
+      # Lifting the kernel restriction is preferred over setting
+      # WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1: it restores the
+      # capability WebKit needs to *build* its sandbox, rather than turning
+      # that sandbox off. Best-effort — the diagnostic step below reports
+      # whether it actually took effect.
+      - name: Allow unprivileged user namespaces (WebKitGTK sandbox)
+        run: |
+          set +e
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1 || true
 
       - name: Install Rust (stable)
         uses: dtolnay/rust-toolchain@stable
@@ -114,16 +130,17 @@ jobs:
         continue-on-error: true
         run: |
           set +e
-          echo "=== WebKitGTK / GTK versions on this runner ==="
-          pkg-config --modversion webkit2gtk-4.1 || true
-          echo "=== /dev/dri present? can this user open it? ==="
-          ls -l /dev/dri 2>&1 || true
+          echo "=== can this user create a user namespace? ==="
+          sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1
+          cat /proc/sys/user/max_user_namespaces 2>&1
+          unshare -U --map-root-user true
+          echo "unshare -U exit status: $? (0 = WebKitGTK's sandbox can be built)"
           id
           echo
-          # Launch twice: once with the software-rendering variables removed
-          # (the configuration that hung), once with them applied (the job
-          # env above). Whichever writes a perf record is the answer — this
-          # keeps the diagnosis in the log instead of in a commit message.
+          # Launch VeloX under each candidate configuration and report which
+          # one actually writes a perf record. VeloX opens its perf log
+          # *after* BrowserWindow::new, so "no perf records" means it never
+          # finished creating the window.
           run_once() {
             label="$1"; shift
             out="/tmp/perf-gate/diag/$label.jsonl"
@@ -137,19 +154,19 @@ jobs:
               timeout 20 xvfb-run -a --server-args="-screen 0 1280x900x24" \
                 /tmp/perf-gate/candidate/velox \
                   --homepage http://127.0.0.1:8731/minimal.html
-            echo "  exit status: $? (124 = killed at timeout, expected)"
             if [ -s "$out" ]; then
-              echo "  perf records written: $(wc -l < "$out")"
+              echo "  ✅ perf records written: $(wc -l < "$out")"
               head -3 "$out"
             else
-              echo "  NO perf records written"
+              echo "  ❌ NO perf records written"
             fi
           }
-          run_once bare \
-            -u LIBGL_ALWAYS_SOFTWARE \
-            -u WEBKIT_DISABLE_COMPOSITING_MODE \
-            -u WEBKIT_DISABLE_DMABUF_RENDERER
-          run_once forced-software
+          # Current job configuration (userns lifted + software rendering).
+          run_once as-configured
+          # Last resort, for comparison only — never applied to the real
+          # measurement steps, since it turns WebKit's sandbox off rather
+          # than letting it be built.
+          run_once sandbox-off WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 
       - name: Measure baseline (merge-base binary)
         run: |
