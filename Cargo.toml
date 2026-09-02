@@ -40,3 +40,16 @@ gtk = "0.18"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Same codegen as [profile.release] (so hot-path behavior under the profiler
+# matches what ships) but with debug info kept instead of stripped, so `perf`/
+# `heaptrack`/`valgrind` can resolve Rust symbols and source lines. A separate
+# profile — not a `strip = false` edit to [profile.release] itself — because
+# it builds into its own `target/profiling/` directory and leaves `cargo build
+# --release`'s output (and its binary size / startup cost, `strip = true`'s
+# whole point) untouched. Use `cargo build --profile profiling`. See
+# docs/profiling.md and docs/decisions.md D45.
+[profile.profiling]
+inherits = "release"
+debug = true
+strip = false

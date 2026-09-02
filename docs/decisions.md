@@ -2746,3 +2746,105 @@ WebKitGTK のプロセスモデル設定変更が必要になり、「新規依�
 中では今回のスコープを超える。実機（GPU あり）での再測定 (#70) を先に行い、
 このコストがサンドボックス固有かどうかを切り分けたうえで、必要なら新しい
 Issue として起票するのが妥当。
+
+## D45: プロファイリングは既存の外部ツール + `browser::metrics` の組み合わせとし、常設の計測コードは足さない
+
+**対象**: Issue #70 (CPU / Memory Profiling Workflow)。「性能問題を見つけた
+あと、どこのコードが原因かまで掘る手順」がリポジトリに無かった問題への対応。
+成果物は `docs/profiling.md` と `scripts/profile/` (`pss_sampler.py` /
+`run_perf.py` / `run_heaptrack.py` / `flamegraph.py`)。詳細な検証記録は
+`docs/profiling.md` §9 を参照 — ここでは「何を選び、なぜか」の決定理由だけを
+記録する。
+
+**なぜ VeloX 自身にプロファイリング用のコードを足さなかったか**: `perf`
+(CPU) と `heaptrack`/`valgrind --tool=massif` (メモリ) はどちらもプロセスの
+外側から動的にアタッチできるツールで、対象バイナリに埋め込みの計装を要求
+しない (debug symbols さえあれば十分)。VeloX 自身にサンプリングプロファイラ
+やアロケータフックを組み込む選択肢もあったが、(1) 常設の計装は
+`docs/decisions.md` D19 が `browser::metrics` について既に立てている方針
+(「計測オフ時は追加コストゼロ、オンでも最小限」) をさらに複雑にする、
+(2) `perf`/`heaptrack` が持つコールスタックのシンボル解決・折り畳み・
+差分表示といった機能を車輪の再発明することになる、(3) 「新規 Rust 依存を
+避ける」(`CLAUDE.md`) 制約の中でアロケータフックを自前実装するのは高コスト
+で、既に確立されたツールが Linux に存在する以上その労力を正当化できない。
+`browser::metrics` (D16/D19/D42) は既に「VeloX が常時知っておくべき数値
+(起動時間の内訳、定期 RSS/PSS)」を`velox-bench`のベンチマーク結果に残す
+役割を担っており、これは今回も変更していない — 外部ツールは
+`browser::metrics` の**代わり**ではなく、`browser::metrics` が答えない
+「どの関数/どのアロケーションが原因か」を埋める**補完**として選んだ。
+`docs/profiling.md` §3 の使い分け表はこの役割分担をそのまま反映している。
+
+**CPU: `perf`、`cpu-clock` イベントを既定に**。当初は `perf stat -e
+cycles,instructions` のようなハードウェアイベントを想定していたが、実測で
+このコンテナ (Firecracker 相当の仮想化環境) はハードウェア PMU
+がゲストに渡されておらず `<not supported>` になることが分かった
+(`docs/profiling.md` §1.2)。ソフトウェアイベント `cpu-clock` (PMU 不要、
+一定間隔で「その時点で CPU 上にいるか」をサンプリングする) に切り替えたところ
+記録・シンボル解決とも動作した。**この選択はサンドボックス環境固有の
+制約への対応であり、実機ではハードウェアイベントの方が精度が高いので
+そちらを優先すべき** — `run_perf.py --event cycles` で切り替えられるように
+しており、決め打ちにしていない。また `/usr/bin/perf` がこのコンテナの
+カスタムカーネルバージョンに対応する `linux-tools` パッケージが存在せず
+即座に失敗する問題も実測で確認し (`docs/profiling.md` §1.1)、
+`linux-tools-generic` が入れる別バージョンの `perf` バイナリへの
+フォールバックを `run_perf.py` に組み込んだ。
+
+**メモリ: `heaptrack` を主、`valgrind --tool=massif` を副に**。両方このコンテナ
+に実際にインストール・実行して比較した。`heaptrack` は `LD_PRELOAD` ベースで
+オーバーヘッドが小さく、対象プロセスが正常に近い速度で動く。`massif` は
+エミュレーション (Valgrind) ベースで大幅に遅くなる代わりに、`heaptrack` が
+入らない環境 (この環境のように `apt` はあるがパッケージが引けない場合が
+あり得る) でも動く保険として残す。**どちらも意図的に選んだわけではなく
+「プロセス境界でアタッチする」という同じ性質を持つ**ため VeloX の Rust
+heap と WebKitGTK 側の分離に同じ理由で使える (次項)。
+
+**Rust heap と WebKitGTK 側の分離は新しい仕組みを作らず、プロセス境界に
+乗った**。Issue #61 の受け入れ条件「Rust 側と WebView/renderer 側を可能な
+範囲で分離して分析」に対し、`heaptrack <velox-binary>` を素朴に実行した
+ところ、生成される記録ファイルが 1 個だけ (VeloX 本体プロセスの分のみ) で
+あり、`WebKitWebProcess`/`WebKitNetworkProcess` 用のファイルは生成されない
+ことを実測で確認した (`docs/profiling.md` §2.1)。WebKitGTK が子プロセスを
+起動する際に環境をサニタイズし `LD_PRELOAD` を引き継がせていないためと
+考えられる。これは意図して設計した分離ではなく、**既存のプロセスモデル
+(D1: WebKitGTK はマルチプロセス) と `heaptrack` の実装 (`LD_PRELOAD` は
+プロセス単位) が組み合わさって自然に得られた副産物**であり、そのため
+VeloX 側のコード変更は一切不要だった。CPU 側も同じ理屈で、`perf report
+--comms=<binary名>` によるコマンド名フィルタで同じ分離ができることを確認
+済み。macOS (Instruments が対象プロセスを選ばせる)・Windows (WPA/VS
+プロファイラも対象プロセスを選ばせる) でも同じプロセス境界が成り立つはずだが
+未検証 — `docs/profiling.md` §7 の実機チェックリストに含めた。
+
+**フレームグラフは自前の SVG 生成スクリプトを新規に書いた**。定番の
+`stackcollapse-perf.pl`/`flamegraph.pl` (Brendan Gregg 版) はこの環境の
+外部ネットワーク遮断のもとでは `apt`/`pip`/`git clone` いずれでも入手でき
+ない (crates.io・github.com とも到達不可であることを実測で確認 — 403/400)。
+実行できない前提のツールを手順書に書いても再現できないため、
+`scripts/profile/flamegraph.py` として Python 標準ライブラリのみで
+「`perf script` の折り畳み → SVG 描画」を実装した。副次的な利点として、
+VeloX 自身のシンボル (`velox::` 接頭辞) を青系、WebKit/JSC 系を緑系、
+その他 (glib/gtk/libc) を橙系に色分けする、この文書の分離方針をそのまま
+可視化に反映させる配色を追加できた (本家 flamegraph.pl にはこの区別は
+無い)。折り畳み済みテキスト出力 (`--collapsed-only`) は
+`stackcollapse-perf.pl` と同じ行形式 (`"stack;stack;... count"`) にして
+あるので、将来インターネットが使える環境で本家 `flamegraph.pl` や他の
+可視化ツールに繋ぎたくなった場合の互換性は残している。
+
+**ビルド設定: `strip = true` の `[profile.release]` は変更せず、新しい
+`[profile.profiling]` を追加した**。`perf`/`heaptrack`/`massif` はいずれも
+debug symbols が無いと関数名どころかソース行まで一切読めない
+(生アドレスしか出ない) が、`[profile.release]` の `strip = true` は
+D6 以来意図的な選択であり、通常の配布物のサイズと起動性能を保つために
+変えるべきではない。`inherits = "release"` で最適化レベル・`lto` を release
+と揃えつつ `debug = true` / `strip = false` だけを乗せた別プロファイルに
+することで、`target/profiling/` という別ディレクトリに出力させ、
+`cargo build --release` の成果物 (`target/release/velox`) には一切影響しない
+ことを実測で確認した (strip 済み 1,984,704 バイトのまま、BuildID も
+変化なし)。新しい Rust 依存クレートは追加していない。
+
+**検証**: `docs/profiling.md` §9 に、このコンテナで実際に実行して確認した
+コマンドと出力を記録した (perf record/report、heaptrack、massif、
+`pss_sampler.py`、`run_perf.py`/`run_heaptrack.py` の一括実行、生成された
+SVG が妥当な XML であることの確認を含む)。macOS/Windows の手順と、実機
+(GPU あり) での数値は未検証であり、`docs/profiling.md` にもその旨を明記
+している — 実機再測定は本 Issue のスコープではなく、同文書 §7 の
+チェックリストとして次の作業に引き継ぐ。
