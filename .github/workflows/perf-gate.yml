@@ -83,6 +83,35 @@ jobs:
           # candidate runs.
           git checkout --quiet -
 
+      # Issue #72: the first CI run of this job produced 0 perf records on
+      # all 8 trials while the same command works locally under Xvfb, so
+      # before measuring anything, launch VeloX once directly and capture
+      # what the runner actually does. Never fails the job — this exists to
+      # turn "0 records" into an actionable error message.
+      - name: Diagnose VeloX under Xvfb (never fails)
+        continue-on-error: true
+        run: |
+          set +e
+          echo "=== WebKitGTK / GTK versions on this runner ==="
+          dpkg -l | grep -E "libwebkit2gtk|libgtk-3-0|libsoup" || true
+          pkg-config --modversion webkit2gtk-4.1 || true
+          echo "=== /dev/dri present? ==="
+          ls -l /dev/dri 2>&1 || true
+          echo "=== single direct launch, full stderr ==="
+          mkdir -p /tmp/perf-gate/diag
+          VELOX_PERF_METRICS=1 \
+          VELOX_PERF_FORMAT=json \
+          VELOX_PERF_OUTPUT=/tmp/perf-gate/diag/perf.jsonl \
+          VELOX_DATA_DIR=/tmp/perf-gate/diag/data \
+            timeout 25 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              /tmp/perf-gate/candidate/velox \
+                --homepage http://127.0.0.1:8731/minimal.html
+          echo "velox exit status: $?"
+          echo "=== perf log ==="
+          cat /tmp/perf-gate/diag/perf.jsonl 2>&1 || echo "(no perf log written)"
+          echo "=== dmesg tail (crashes?) ==="
+          sudo dmesg 2>/dev/null | tail -30 || true
+
       - name: Measure baseline (merge-base binary)
         run: |
           set -eu
