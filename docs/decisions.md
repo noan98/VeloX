@@ -508,6 +508,16 @@ Windows/macOS CI leg, that is the point to revisit a crate (or
 platform-specific APIs) with the actual OSes to test against, rather than
 guessing at `ps`/API behavior blind.
 
+**Update (D41/D42)**: summed RSS overstates VeloX's memory position relative
+to a browser (or a build) with more processes, since it counts shared memory
+once per process rather than once total — measured in D41 to actually flip
+which of two browsers looks lighter. D42 adds PSS to `sample_process_tree_rss`
+(same function, `RssSample` gains PSS fields) as the metric to actually
+compare on; RSS stays exactly as described above and remains what is always
+available, since PSS is best-effort on top of it (older kernels, permissions,
+non-Linux). Phase 3's memory work (#61/#62/#63) should read PSS, not RSS, as
+the improvement signal.
+
 ## D17: Content blocking — navigation-level only, wry 0.56 exposes no subresource hook
 
 **Decision**: VeloX blocks ad/tracker domains at main-frame navigation time,
@@ -2530,3 +2540,110 @@ to software rendering and the absolute memory numbers do not transfer to real
 hardware — treat them as same-environment relative figures only. Re-measure on
 real hardware under #70, and add Firefox (Gecko) as the next comparison target,
 since Safari does not exist on Linux and Edge shares Blink.
+
+## D42: `browser::metrics` gains PSS, alongside RSS rather than instead of it
+
+**Scope**: Issue #108, the follow-up D41 named directly — VeloX's own
+`browser::metrics::sample_process_tree_rss` (D16) summed only RSS, which D41
+showed *overstates* VeloX's memory position relative to a browser with more
+processes. Phase 3's memory work (#61/#62/#63) needs the corrected metric
+before it starts, or it optimizes against the wrong number.
+
+**One function, two totals — not a second `sample_process_tree_pss`**:
+`sample_process_tree_rss` already walks `/proc` once per call to place every
+process in the tree and read its RSS; reading PSS for the same process at
+the same time is one more file read per process, not a second tree walk. A
+separate function would either walk `/proc` twice per sample (wasteful, and
+liable to walk a slightly different process set the second time as
+processes come and go) or force every caller to thread two results back
+together themselves. So `RssSample` gained `total_pss_bytes: Option<u64>`
+and `pss_process_count: usize` alongside the existing `total_rss_bytes`, and
+`ProcInfo` (the internal per-process record `build_sample` sums over)
+gained `pss_bytes: Option<u64>`. The function's name stays
+`sample_process_tree_rss` rather than becoming `sample_process_tree_memory`
+or similar — RSS is still the one field guaranteed to be present (see
+below), so the name still describes what always comes back; PSS rides
+along as best-effort.
+
+**PSS source**: `/proc/<pid>/smaps_rollup`'s `Pss:` line (kB), matching
+`scripts/bench/compare_browsers.py`'s `_pss_bytes` (added in #58/D41) —
+the task explicitly asked to follow that reference implementation, and
+doing so means VeloX's own number and the competitive-comparison script's
+number are computed the same way, not two independently-written parsers
+that could silently drift apart. `smaps_rollup` is a kernel-computed sum
+across every mapping (Linux ≥ 4.14), cheaper than parsing
+`/proc/<pid>/smaps`'s per-mapping detail for a total this project has no
+use for at that granularity.
+
+**RSS must keep working when PSS cannot be read — this is the actual
+design constraint, not a footnote.** `smaps_rollup` did not exist before
+Linux 4.14, can be permission-gated in some sandboxes, and does not exist
+at all on the non-Linux `imp` backends (macOS/*BSD's `ps` fallback has no
+PSS equivalent; Windows has neither). RSS has no such gap: it comes from
+`/proc/<pid>/status`, which every `/proc` entry this code can already see
+at all has. So the two are independent per process — `ProcInfo::pss_bytes`
+is `Option<u64>`, defaulting to `None`, and a process missing it is still
+summed into `total_rss_bytes` normally. `build_sample` sums PSS only over
+processes that have it and separately counts how many did
+(`pss_process_count`); `total_pss_bytes` is `(pss_process_count >
+0).then_some(sum)` — `None` only when *no* process in the tree could be
+read, never a silent `0`, which would be indistinguishable from "measured
+zero PSS" and would make a dashboard built on this data quietly show a
+9x-too-good number instead of admitting it has nothing.
+
+**Partial reads are visible, not averaged away**: a tree can end up with
+some processes' PSS readable and others' not (e.g. one helper process
+exited in the gap between listing `/proc` and reading its
+`smaps_rollup`). `total_pss_bytes` in that case is `Some` of whatever
+*was* read — dropping the whole sample over one unreadable process would
+throw away real data — but `pss_process_count < process_count` marks it as
+an undercount rather than a complete total, so a consumer comparing two
+samples does not mistake a partial 3-of-5-processes sum for the real
+number. This is the same rule `compare_browsers.py`'s `process_tree_memory`
+follows (its docstring says as much) and the same rule as `total_pss_bytes:
+None` above, just one level down.
+
+**JSON schema change**: `rss` events gained `total_pss_bytes` (uint or
+`null` — `null`, not an absent key, precisely so a consumer parsing this
+field can never confuse "measured, came back zero" with "this build cannot
+measure it" with "this build predates the field") and `pss_process_count`
+(uint, always present — even `0` is informative: "PSS was attempted for 0
+of N processes"). This is additive only; the pre-existing `rss` fields
+(`pid`, `process_count`, `total_rss_bytes`) are untouched, so a consumer
+written against the pre-#108 schema keeps working unmodified — it just
+never sees the two new keys. The text format
+(`velox[perf] rss pid=… processes=… total_mib=… pss_processes=<n>/<total>
+pss_mib=<value|n/a>`) appends the same two facts at the end of the existing
+line rather than inserting them, for the same reason (D19's "never break
+existing text output" rule) — a scraper matching the original
+`rss pid=… processes=… total_mib=…` prefix is unaffected.
+
+**`velox-bench` side**: `MetricKey` gained `PssTotalBytes`
+(`pss_total_bytes`, reading `rss`'s `total_pss_bytes`) and
+`PssProcessCount` (`pss_process_count`, reading `rss`'s
+`pss_process_count`), taking `MetricKey::ALL` from 8 to 10 entries.
+`MetricKey::extract`'s existing `.and_then(Value::as_f64)` step already
+turns a JSON `null` into `None` and drops it, with no special-casing
+needed — a JSON `null` `total_pss_bytes` behaves exactly like a metric
+that never fired for that event, and `aggregate_trials` already omits any
+metric with zero samples from the result (`BenchmarkResult::metrics`) — so
+"PSS unreadable in this environment" surfaces as `pss_total_bytes` simply
+being absent from the saved result, not as a `0.0` a reviewer could
+mistake for a real measurement. `docs/benchmarking.md` and
+`docs/performance-targets.md` §3.1 are updated to say to compare
+`pss_total_bytes`, not `rss_total_bytes`, going forward.
+
+**No new dependency** (D6): the entire addition is one more per-process
+file read plus a few lines of the same line-based parsing D16 already used
+for `status`, matching D16's own reasoning for staying on direct `/proc`
+reads instead of a crate like `sysinfo`.
+
+**Verification**: unit-tested at the `build_sample` level (every-process-
+has-PSS, no-process-has-PSS, and the partial-coverage case), at the
+`RssSample`/`PerfRecord` text-and-JSON rendering level (`Some`/`None`
+displayed and serialized correctly), and at the `velox-bench` extraction/
+aggregation level (`MetricKey::PssTotalBytes` correctly disappears on a
+JSON `null` while `PssProcessCount` does not). Confirmed against the real
+VeloX binary under `Xvfb` per the Issue #108 tasking; see the task's PR
+description / commit for the actual PSS figure observed and how it compares
+to `compare_browsers.py`'s ~424 MiB (§4 of `docs/performance-targets.md`).

@@ -161,23 +161,53 @@ pub fn format_page_load(url: &str, duration: Duration) -> String {
 // Process-tree RSS sampling
 // ---------------------------------------------------------------------
 
-/// One RSS sample of a process and all of its descendants.
+/// One RSS/PSS sample of a process and all of its descendants.
+///
+/// The RSS side (`total_rss_bytes`) always succeeds when the tree itself
+/// could be walked at all (see [`RssError`]) — it comes from the same
+/// `/proc/<pid>/status` read that finds `PPid:`. The PSS side
+/// (`total_pss_bytes`/`pss_process_count`) is best-effort on top of that: a
+/// process's proportional share of shared memory
+/// (`/proc/<pid>/smaps_rollup`'s `Pss:` line) requires a newer kernel and
+/// enough privilege to read it, neither of which is guaranteed. See D42 in
+/// `docs/decisions.md` for why PSS — not summed RSS — is the right total
+/// when comparing browsers with different process counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RssSample {
     pub root_pid: u32,
+    /// Total number of processes in the tree (root plus every descendant),
+    /// all of which contributed to `total_rss_bytes`.
     pub process_count: usize,
     pub total_rss_bytes: u64,
+    /// Sum of PSS over every process in the tree whose `smaps_rollup` could
+    /// be read. `None` means *none* of the `process_count` processes could
+    /// be read (no Linux `smaps_rollup` support, a permissions failure, or a
+    /// non-Linux platform) — callers must not treat `None` as "zero PSS".
+    /// When `Some` but `pss_process_count < process_count`, the sum is a
+    /// genuine but incomplete total: some processes' shared-memory share is
+    /// simply missing from it rather than being counted as zero.
+    pub total_pss_bytes: Option<u64>,
+    /// How many of `process_count` processes contributed to
+    /// `total_pss_bytes`. Compare against `process_count` to tell a
+    /// complete PSS total from a partial one.
+    pub pss_process_count: usize,
 }
 
 impl fmt::Display for RssSample {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "rss pid={} processes={} total_mib={:.1}",
+            "rss pid={} processes={} total_mib={:.1} pss_processes={}/{}",
             self.root_pid,
             self.process_count,
-            self.total_rss_bytes as f64 / (1024.0 * 1024.0)
-        )
+            self.total_rss_bytes as f64 / (1024.0 * 1024.0),
+            self.pss_process_count,
+            self.process_count,
+        )?;
+        match self.total_pss_bytes {
+            Some(bytes) => write!(f, " pss_mib={:.1}", bytes as f64 / (1024.0 * 1024.0)),
+            None => write!(f, " pss_mib=n/a"),
+        }
     }
 }
 
@@ -213,9 +243,21 @@ impl std::error::Error for RssError {
     }
 }
 
-/// Sample the resident set size of `root_pid` and every process descended
-/// from it (WebKit splits into network/render/GPU helper processes, so a
-/// meaningful memory measurement needs the whole tree, not just one PID).
+/// Sample the resident set size *and* proportional set size of `root_pid`
+/// and every process descended from it (WebKit splits into network/render/
+/// GPU helper processes, so a meaningful memory measurement needs the whole
+/// tree, not just one PID).
+///
+/// RSS sums each process's resident pages, counting shared pages (e.g. a
+/// shared library mapped into every helper process) once *per process* — a
+/// browser with more helper processes looks heavier than one with fewer,
+/// even at equal real memory use. PSS divides each shared page by its
+/// sharer count before summing, so it does not inflate with process count;
+/// see D42 in `docs/decisions.md` for a measured case where this reverses
+/// which of two browsers looks lighter. RSS is kept alongside PSS in
+/// [`RssSample`] anyway: it is always available (see below), and dropping
+/// it would leave no memory number at all on a platform/kernel where PSS
+/// cannot be read.
 ///
 /// This is a plain function with no dependency on [`crate::config::Config`]
 /// or the running app: it can be called on demand from anywhere, e.g. a
@@ -223,20 +265,34 @@ impl std::error::Error for RssError {
 /// suspending a tab.
 ///
 /// Platform support:
-/// - Linux: reads `/proc` directly, no extra dependency.
-/// - Other Unix (macOS, *BSD): shells out to `ps`, best-effort/untested by
-///   this project's CI (Linux-only).
-/// - Windows: not implemented yet; returns [`RssError::Unsupported`].
+/// - Linux: reads `/proc` directly, no extra dependency. RSS comes from
+///   `/proc/<pid>/status` (`VmRSS:`) and is always available for any
+///   process this can see at all. PSS comes from
+///   `/proc/<pid>/smaps_rollup` (`Pss:`), which needs a kernel new enough
+///   to have it (Linux ≥ 4.14) and permission to read it; when a given
+///   process's `smaps_rollup` cannot be read, that process is simply
+///   excluded from [`RssSample::total_pss_bytes`] (see its field docs) —
+///   sampling never fails or falls back to treating it as zero.
+/// - Other Unix (macOS, *BSD): shells out to `ps` for RSS,
+///   best-effort/untested by this project's CI (Linux-only). PSS has no
+///   equivalent here, so `total_pss_bytes` is always `None`.
+/// - Windows: not implemented yet; returns [`RssError::Unsupported`] (no
+///   RSS *or* PSS).
 pub fn sample_process_tree_rss(root_pid: u32) -> Result<RssSample, RssError> {
     let processes = imp::process_map()?;
     build_sample(root_pid, &processes)
 }
 
-/// Minimal per-process info needed to walk the process tree and sum RSS.
+/// Minimal per-process info needed to walk the process tree and sum
+/// RSS/PSS. `pss_bytes` is `None` when this process's `smaps_rollup`
+/// couldn't be read (unsupported platform, old kernel, permissions) — RSS
+/// has no such gap since it comes from `status`, which every visible `/proc`
+/// entry has.
 #[derive(Debug, Clone, Copy)]
 struct ProcInfo {
     ppid: u32,
     rss_bytes: u64,
+    pss_bytes: Option<u64>,
 }
 
 /// Pure tree-walk + summation, independent of how `processes` was obtained
@@ -246,15 +302,22 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
         return Err(RssError::ProcessNotFound(root_pid));
     }
     let tree = collect_descendants(root_pid, processes);
-    let total_rss_bytes = tree
-        .iter()
-        .filter_map(|pid| processes.get(pid))
-        .map(|info| info.rss_bytes)
-        .sum();
+    let mut total_rss_bytes = 0u64;
+    let mut total_pss_bytes = 0u64;
+    let mut pss_process_count = 0usize;
+    for info in tree.iter().filter_map(|pid| processes.get(pid)) {
+        total_rss_bytes += info.rss_bytes;
+        if let Some(pss) = info.pss_bytes {
+            total_pss_bytes += pss;
+            pss_process_count += 1;
+        }
+    }
     Ok(RssSample {
         root_pid,
         process_count: tree.len(),
         total_rss_bytes,
+        total_pss_bytes: (pss_process_count > 0).then_some(total_pss_bytes),
+        pss_process_count,
     })
 }
 
@@ -457,6 +520,16 @@ impl PerfRecord {
                 fields.insert("pid".to_owned(), json!(sample.root_pid));
                 fields.insert("process_count".to_owned(), json!(sample.process_count));
                 fields.insert("total_rss_bytes".to_owned(), json!(sample.total_rss_bytes));
+                // `total_pss_bytes` serializes to JSON `null` (not an
+                // absent key) when `None`, so a consumer parsing this field
+                // always sees it and cannot mistake "unmeasured" for "0
+                // bytes". `pss_process_count` lets it tell a full PSS total
+                // from a partial one even when `total_pss_bytes` is `Some`.
+                fields.insert("total_pss_bytes".to_owned(), json!(sample.total_pss_bytes));
+                fields.insert(
+                    "pss_process_count".to_owned(),
+                    json!(sample.pss_process_count),
+                );
             }
         }
         serde_json::Value::Object(fields)
@@ -485,10 +558,10 @@ mod imp {
     use super::{HashMap, ProcInfo};
     use std::fs;
 
-    /// Build a `pid -> (ppid, rss_bytes)` map for every process currently
-    /// visible under `/proc`. Processes that exit mid-scan are silently
-    /// skipped rather than treated as an error — RSS sampling is inherently
-    /// a snapshot of a moving target.
+    /// Build a `pid -> ProcInfo` map for every process currently visible
+    /// under `/proc`. Processes that exit mid-scan are silently skipped
+    /// rather than treated as an error — RSS/PSS sampling is inherently a
+    /// snapshot of a moving target.
     pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         let mut map = HashMap::new();
         for entry in fs::read_dir("/proc").map_err(super::RssError::Io)? {
@@ -506,9 +579,16 @@ mod imp {
             let Ok(contents) = fs::read_to_string(entry.path().join("status")) else {
                 continue; // process exited between listing and reading
             };
-            if let Some(info) = parse_status(&contents) {
-                map.insert(pid, info);
-            }
+            let Some(mut info) = parse_status(&contents) else {
+                continue;
+            };
+            // Best-effort: a process whose `smaps_rollup` cannot be read
+            // (old kernel, permissions, or it exited in the gap since
+            // `status` was read) simply keeps `pss_bytes: None` — it stays
+            // in the map (RSS is still valid) and is excluded from the PSS
+            // total by `build_sample` rather than treated as 0 bytes.
+            info.pss_bytes = read_pss_bytes(&entry.path());
+            map.insert(pid, info);
         }
         Ok(map)
     }
@@ -516,7 +596,9 @@ mod imp {
     /// Parse the `PPid:` and `VmRSS:` fields out of `/proc/<pid>/status`
     /// text. Missing `PPid:` means we cannot place this process in the
     /// tree, so it is skipped entirely; missing `VmRSS:` (e.g. a zombie)
-    /// defaults to zero bytes rather than dropping the process.
+    /// defaults to zero bytes rather than dropping the process. `pss_bytes`
+    /// always starts `None` here — `process_map` fills it in separately
+    /// from `smaps_rollup`, a different file with its own failure mode.
     fn parse_status(contents: &str) -> Option<ProcInfo> {
         let mut ppid = None;
         let mut rss_kb = None;
@@ -534,7 +616,27 @@ mod imp {
         Some(ProcInfo {
             ppid: ppid?,
             rss_bytes: rss_kb.unwrap_or(0) * 1024,
+            pss_bytes: None,
         })
+    }
+
+    /// Read the `Pss:` line (kB) out of `<pid_path>/smaps_rollup`, VeloX's
+    /// PSS source (see D42 in `docs/decisions.md`) — a kernel-computed
+    /// rollup of the same per-mapping PSS `/proc/<pid>/smaps` exposes,
+    /// without the cost of parsing every mapping individually. `None` for
+    /// any failure (file absent on kernels older than 4.14, no permission,
+    /// the process having exited, or unexpected content) — this mirrors
+    /// `scripts/bench/compare_browsers.py`'s `_pss_bytes`, the reference
+    /// implementation this logic follows, so the two measurements agree.
+    fn read_pss_bytes(pid_path: &std::path::Path) -> Option<u64> {
+        let contents = fs::read_to_string(pid_path.join("smaps_rollup")).ok()?;
+        for line in contents.lines() {
+            if let Some(rest) = line.strip_prefix("Pss:") {
+                let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+                return Some(kb * 1024);
+            }
+        }
+        None
     }
 
     #[cfg(test)]
@@ -547,6 +649,7 @@ mod imp {
             let info = parse_status(text).unwrap();
             assert_eq!(info.ppid, 1234);
             assert_eq!(info.rss_bytes, 4567 * 1024);
+            assert_eq!(info.pss_bytes, None);
         }
 
         #[test]
@@ -560,6 +663,52 @@ mod imp {
             let text = "Name:\tbash\nPPid:\t1\n";
             let info = parse_status(text).unwrap();
             assert_eq!(info.rss_bytes, 0);
+        }
+
+        #[test]
+        fn read_pss_bytes_parses_the_pss_line() {
+            let dir = std::env::temp_dir().join(format!(
+                "velox-pss-test-{}-{:?}-ok",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            fs::write(
+                dir.join("smaps_rollup"),
+                "00400000-00452000 r-xp 00000000 00:00 0\nRss:            1234 kB\nPss:             567 kB\nShared_Clean:      0 kB\n",
+            )
+            .expect("write fake smaps_rollup");
+
+            assert_eq!(read_pss_bytes(&dir), Some(567 * 1024));
+
+            let _ = fs::remove_dir_all(&dir);
+        }
+
+        #[test]
+        fn read_pss_bytes_missing_file_is_none() {
+            let dir = std::env::temp_dir().join(format!(
+                "velox-pss-test-{}-{:?}-missing",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&dir); // ensure it does not exist
+            assert_eq!(read_pss_bytes(&dir), None);
+        }
+
+        #[test]
+        fn read_pss_bytes_without_pss_line_is_none() {
+            let dir = std::env::temp_dir().join(format!(
+                "velox-pss-test-{}-{:?}-nopss",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&dir).expect("create temp dir");
+            fs::write(dir.join("smaps_rollup"), "Rss:            1234 kB\n")
+                .expect("write fake smaps_rollup");
+
+            assert_eq!(read_pss_bytes(&dir), None);
+
+            let _ = fs::remove_dir_all(&dir);
         }
     }
 }
@@ -605,6 +754,10 @@ mod imp {
                 ProcInfo {
                     ppid,
                     rss_bytes: rss_kb * 1024,
+                    // `ps` has no PSS equivalent on these platforms, so
+                    // `total_pss_bytes` stays `None` for every sample taken
+                    // here (see `sample_process_tree_rss`'s platform docs).
+                    pss_bytes: None,
                 },
             );
         }
@@ -727,6 +880,7 @@ mod tests {
             ProcInfo {
                 ppid: 0,
                 rss_bytes: 1000,
+                pss_bytes: None,
             },
         );
         processes.insert(
@@ -734,6 +888,7 @@ mod tests {
             ProcInfo {
                 ppid: 1,
                 rss_bytes: 2000,
+                pss_bytes: None,
             },
         ); // child of 1
         processes.insert(
@@ -741,6 +896,7 @@ mod tests {
             ProcInfo {
                 ppid: 2,
                 rss_bytes: 3000,
+                pss_bytes: None,
             },
         ); // grandchild
         processes.insert(
@@ -748,6 +904,7 @@ mod tests {
             ProcInfo {
                 ppid: 0,
                 rss_bytes: 4000,
+                pss_bytes: None,
             },
         ); // unrelated
 
@@ -765,6 +922,7 @@ mod tests {
             ProcInfo {
                 ppid: 0,
                 rss_bytes: 999,
+                pss_bytes: None,
             },
         );
         let sample = build_sample(5, &processes).unwrap();
@@ -781,14 +939,131 @@ mod tests {
         ));
     }
 
+    // -- RSS: pure tree-walk / summation, PSS side ----------------------
+
+    #[test]
+    fn build_sample_sums_pss_when_every_process_has_it() {
+        let mut processes = HashMap::new();
+        processes.insert(
+            1,
+            ProcInfo {
+                ppid: 0,
+                rss_bytes: 1000,
+                pss_bytes: Some(400),
+            },
+        );
+        processes.insert(
+            2,
+            ProcInfo {
+                ppid: 1,
+                rss_bytes: 2000,
+                pss_bytes: Some(600),
+            },
+        );
+
+        let sample = build_sample(1, &processes).unwrap();
+        assert_eq!(sample.process_count, 2);
+        assert_eq!(sample.total_pss_bytes, Some(1000));
+        assert_eq!(sample.pss_process_count, 2);
+    }
+
+    #[test]
+    fn build_sample_pss_is_none_when_no_process_has_it() {
+        let mut processes = HashMap::new();
+        processes.insert(
+            1,
+            ProcInfo {
+                ppid: 0,
+                rss_bytes: 1000,
+                pss_bytes: None,
+            },
+        );
+        processes.insert(
+            2,
+            ProcInfo {
+                ppid: 1,
+                rss_bytes: 2000,
+                pss_bytes: None,
+            },
+        );
+
+        let sample = build_sample(1, &processes).unwrap();
+        // RSS is unaffected — it never depends on PSS being readable.
+        assert_eq!(sample.total_rss_bytes, 3000);
+        assert_eq!(sample.total_pss_bytes, None);
+        assert_eq!(sample.pss_process_count, 0);
+    }
+
+    #[test]
+    fn build_sample_pss_partial_when_only_some_processes_have_it() {
+        // e.g. a helper process's smaps_rollup could not be read, while the
+        // root's could — the sum must still reflect what *was* readable
+        // instead of silently dropping to `None`, and `pss_process_count`
+        // must say the total is incomplete (2 readable out of 3 processes).
+        let mut processes = HashMap::new();
+        processes.insert(
+            1,
+            ProcInfo {
+                ppid: 0,
+                rss_bytes: 1000,
+                pss_bytes: Some(300),
+            },
+        );
+        processes.insert(
+            2,
+            ProcInfo {
+                ppid: 1,
+                rss_bytes: 2000,
+                pss_bytes: None,
+            },
+        );
+        processes.insert(
+            3,
+            ProcInfo {
+                ppid: 1,
+                rss_bytes: 500,
+                pss_bytes: Some(150),
+            },
+        );
+
+        let sample = build_sample(1, &processes).unwrap();
+        assert_eq!(sample.process_count, 3);
+        assert_eq!(sample.total_pss_bytes, Some(450));
+        assert_eq!(sample.pss_process_count, 2);
+        assert!(
+            sample.pss_process_count < sample.process_count,
+            "a partial PSS total must be distinguishable from a complete one"
+        );
+    }
+
     #[test]
     fn rss_sample_display_reports_mib() {
         let sample = RssSample {
             root_pid: 42,
             process_count: 3,
             total_rss_bytes: 2 * 1024 * 1024,
+            total_pss_bytes: Some(1024 * 1024),
+            pss_process_count: 3,
         };
-        assert_eq!(sample.to_string(), "rss pid=42 processes=3 total_mib=2.0");
+        assert_eq!(
+            sample.to_string(),
+            "rss pid=42 processes=3 total_mib=2.0 pss_processes=3/3 pss_mib=1.0"
+        );
+    }
+
+    #[test]
+    fn rss_sample_display_reports_n_a_when_pss_unavailable() {
+        let sample = RssSample {
+            root_pid: 42,
+            process_count: 3,
+            total_rss_bytes: 2 * 1024 * 1024,
+            total_pss_bytes: None,
+            pss_process_count: 0,
+        };
+        assert_eq!(
+            sample.to_string(),
+            "rss pid=42 processes=3 total_mib=2.0 pss_processes=0/3 pss_mib=n/a"
+        );
     }
 
     // -- RSS: real /proc integration (Linux only, matches this project's CI) --
@@ -823,6 +1098,23 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn samples_own_process_reports_consistent_pss_invariants() {
+        // Whether `smaps_rollup` is actually readable depends on the
+        // sandbox this test runs in (kernel version, permissions), so this
+        // does not assert PSS is present — only that the two PSS fields
+        // never contradict each other, on the real `/proc` this project
+        // ships against.
+        let pid = std::process::id();
+        let sample = sample_process_tree_rss(pid).expect("sampling the current process");
+        assert!(sample.pss_process_count <= sample.process_count);
+        match sample.total_pss_bytes {
+            Some(_) => assert!(sample.pss_process_count > 0),
+            None => assert_eq!(sample.pss_process_count, 0),
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -879,6 +1171,8 @@ mod tests {
             root_pid: 42,
             process_count: 3,
             total_rss_bytes: 2 * 1024 * 1024,
+            total_pss_bytes: Some(1024 * 1024),
+            pss_process_count: 3,
         };
         let expected = sample.to_string();
         assert_eq!(PerfRecord::rss(sample).to_text(), expected);
@@ -939,11 +1233,32 @@ mod tests {
             root_pid: 42,
             process_count: 3,
             total_rss_bytes: 2 * 1024 * 1024,
+            total_pss_bytes: Some(1024 * 1024),
+            pss_process_count: 2,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         assert_eq!(value["pid"], 42);
         assert_eq!(value["process_count"], 3);
         assert_eq!(value["total_rss_bytes"], 2 * 1024 * 1024);
+        assert_eq!(value["total_pss_bytes"], 1024 * 1024);
+        assert_eq!(value["pss_process_count"], 2);
+    }
+
+    #[test]
+    fn perf_record_rss_json_total_pss_bytes_is_null_when_unavailable() {
+        let sample = RssSample {
+            root_pid: 42,
+            process_count: 3,
+            total_rss_bytes: 2 * 1024 * 1024,
+            total_pss_bytes: None,
+            pss_process_count: 0,
+        };
+        let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
+        // `null`, not an absent key — a consumer must be able to tell
+        // "unmeasured" from "field not implemented yet" by parsing this
+        // value, per the JSON schema in docs/architecture.md.
+        assert!(value["total_pss_bytes"].is_null());
+        assert_eq!(value["pss_process_count"], 0);
     }
 
     #[test]

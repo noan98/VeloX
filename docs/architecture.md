@@ -657,17 +657,22 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
   `open_at`/`activate_at` already takes for their own idle-tracking, which
   runs regardless of metrics.
 - **Memory**: `metrics::sample_process_tree_rss(pid)` walks the whole
-  process tree (WebKit's network/render helpers included) and sums RSS. It
-  is a standalone public function with no dependency on `Config` or the
-  running app — callable on demand from anywhere. Tab suspension is the
-  primary lever for reducing memory: dropping a background tab's webview
-  releases that process-tree's share of RSS, and measuring the before/after
-  delta with this function is its first real use case (see
-  docs/decisions.md D9). When `perf_rss_interval` is set, `app::run` also
-  spawns a background thread that samples it periodically and writes one
-  `rss` record per sample. Implementation reads `/proc` directly on Linux
-  (no extra dependency); other Unix falls back to parsing `ps` output;
-  Windows is not implemented yet (`RssError::Unsupported`).
+  process tree (WebKit's network/render helpers included) and sums both RSS
+  and PSS (D42). It is a standalone public function with no dependency on
+  `Config` or the running app — callable on demand from anywhere. Tab
+  suspension is the primary lever for reducing memory: dropping a
+  background tab's webview releases that process-tree's share of memory,
+  and measuring the before/after delta with this function is its first real
+  use case (see docs/decisions.md D9 — note PSS is the metric to use there
+  too, per D42). When `perf_rss_interval` is set, `app::run` also spawns a
+  background thread that samples it periodically and writes one `rss`
+  record per sample. Implementation reads `/proc` directly on Linux (no
+  extra dependency): RSS from `/proc/<pid>/status` (`VmRSS:`, always
+  available), PSS from `/proc/<pid>/smaps_rollup` (`Pss:`, best-effort —
+  `None` per process whose rollup could not be read, never treated as
+  zero). Other Unix falls back to parsing `ps` output for RSS only (no PSS
+  equivalent there); Windows is not implemented yet (`RssError::Unsupported`,
+  neither RSS nor PSS).
 - The `Config` struct is the home for all of these toggles;
   `Config::from_env_and_args` layers the environment-variable overrides onto
   `Config::default`.
@@ -690,8 +695,12 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     velox[perf] page_load url=https://example.com/ duration=250.0ms
     velox[perf] tab_create id=3 duration=15.2ms
     velox[perf] tab_switch id=3 duration=3.1ms
-    velox[perf] rss pid=4821 processes=5 total_mib=312.4
+    velox[perf] rss pid=4821 processes=5 total_mib=312.4 pss_processes=5/5 pss_mib=180.2
     ```
+    (Issue #108 / D42: `pss_processes=<readable>/<processes>` and `pss_mib`
+    were appended to the `rss` line, not inserted — an existing scraper
+    matching the original prefix still works. `pss_mib=n/a` when PSS could
+    not be read for any process in the tree.)
   - `json` emits one JSON object per line (JSON Lines) — **this is the
     format Issue #14's benchmark runner and Issue #36's CI regression check
     should parse.** No `velox[perf] ` prefix, so every line parses as JSON
@@ -708,14 +717,28 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     | `page_load`  | `url` (string), `duration_ms` (float ms) |
     | `tab_create` | `tab_id` (uint), `duration_ms` (float ms) |
     | `tab_switch` | `tab_id` (uint), `duration_ms` (float ms) |
-    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint) |
+    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint) |
+
+    `total_pss_bytes`/`pss_process_count` were added by Issue #108 (D42).
+    `total_pss_bytes` is the PSS counterpart to `total_rss_bytes` — see
+    `docs/performance-targets.md` §3.1 for why PSS, not RSS, is the number to
+    compare across builds/browsers with different process counts. It is
+    `null` (present, not omitted — a consumer must not have to distinguish
+    "old VeloX that never had this field" from "this VeloX build could not
+    read it") when PSS could not be read for *any* process in the tree
+    (unsupported platform, a kernel without `/proc/<pid>/smaps_rollup`, or a
+    permissions failure); `pss_process_count` says how many of
+    `process_count` processes it *was* read for, so a partial sum (some
+    processes' PSS missing, not zeroed) is distinguishable from a complete
+    one even when `total_pss_bytes` is non-null.
 
     Example lines:
     ```json
     {"event":"startup","first_load_ms":120.0,"toolbar_ready_ms":45.6,"ts_ms":120.0,"window_created_ms":12.3}
     {"event":"page_load","duration_ms":250.0,"ts_ms":5310.2,"url":"https://example.com/"}
     {"event":"tab_create","duration_ms":15.2,"tab_id":3,"ts_ms":8420.9}
-    {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"ts_ms":10000.0}
+    {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"total_pss_bytes":188978790,"pss_process_count":5,"ts_ms":10000.0}
+    {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"total_pss_bytes":null,"pss_process_count":0,"ts_ms":12000.0}
     ```
     (Field order is whatever `serde_json` produces — alphabetical, since
     this project does not enable the `preserve_order` feature — a

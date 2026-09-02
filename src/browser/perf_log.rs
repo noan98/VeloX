@@ -114,6 +114,8 @@ mod tests {
                 root_pid: 1,
                 process_count: 1,
                 total_rss_bytes: 1024,
+                total_pss_bytes: None,
+                pss_process_count: 0,
             }),
             Duration::from_millis(10),
         );

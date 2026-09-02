@@ -66,9 +66,17 @@ Linux に存在せず、Edge は実質 Chromium と同一エンジンなので�
 > プロセスなので、RSS 合計で比較すると VeloX が不当に有利になる。実際、同じ
 > 測定で結論が逆転する (§4)。
 >
-> **これは VeloX 自身の計測にも影響する。** `browser::metrics::sample_process_tree_rss`
-> (D16) は RSS 合計を採るため、**VeloX のメモリ優位を過大評価する。** #61 / #63 が
-> この値を改善の指標に使う前に PSS を足すべき — フォローアップは #108。
+> **これは VeloX 自身の計測にも影響していた。** `browser::metrics::sample_process_tree_rss`
+> (D16) はもともと RSS 合計のみを採っており、**VeloX のメモリ優位を過大評価
+> していた。** #108 (D42) でこの関数自体に PSS 合計 (`total_pss_bytes`) と
+> `pss_process_count` (読めたプロセス数) を追加済み。`velox-bench` の
+> `MetricKey` にも `pss_total_bytes` / `pss_process_count` が追加されている
+> ので、**#61 / #62 / #63 のメモリ最適化は `rss_total_bytes` ではなく
+> `pss_total_bytes` を改善の指標に使うこと。** `smaps_rollup` が読めない環境
+> (古いカーネル・権限不足・非 Linux) では `total_pss_bytes` は `null`
+> (欠損として扱われ `velox-bench` の集計からは丸ごと省かれる) になり、RSS 側
+> は従来どおり必ず取得できる。詳細は `docs/decisions.md` D42、フィールドの
+> 意味は `docs/benchmarking.md` の対応表を参照。
 
 ### 3.2 VeloX 内部の計測 (`velox-bench`)
 
