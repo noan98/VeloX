@@ -434,6 +434,31 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   GPU が無い環境では WebKitGTK がソフトウェアレンダリングにフォールバック
   する (`libEGL warning: DRI3 error` が出る)。**この状態の RSS は実機より
   大きく出るため、メモリの絶対値を実機の基準値として扱わないこと。**
+- **⚠️ 使えない `/dev/dri` があるとハングする (Issue #72 で実測)。** GPU が
+  「無い」環境より、**DRM デバイスノードはあるのに開く権限が無い**環境の方が
+  質が悪い。GitHub Actions の `ubuntu-latest` ランナーがこれで、
+  `/dev/dri/card1` が `crw-rw---- root:video` で存在する一方、ランナーの
+  実行ユーザは `video` グループに属さない。この状態だと WebKitGTK 2.52 の
+  DMABuf レンダラが「使えないが存在はする」デバイスを掴もうとしてブロック
+  し、**VeloX は起動したまま無応答になる** — クラッシュもせず、perf ログを
+  1 行も書かないまま毎試行がタイムアウトで kill され、「0 件のレコードを
+  取得」だけが残る。`/dev/dri` が丸ごと無い環境ならソフトウェア
+  レンダリングへ即座にフォールバックするので、**ローカルでは再現しない**。
+
+  対処はソフトウェアレンダリングを明示的に強制すること:
+
+  ```sh
+  LIBGL_ALWAYS_SOFTWARE=1 \
+  WEBKIT_DISABLE_COMPOSITING_MODE=1 \
+  WEBKIT_DISABLE_DMABUF_RENDERER=1 \
+    xvfb-run -a --server-args="-screen 0 1280x900x24" ...
+  ```
+
+  `.github/workflows/perf-gate.yml` はジョブの `env` でこれを設定している。
+  **これらは計測環境側の設定であって、VeloX 本体には入れていない** — 効果が
+  GPU 無し環境固有の artifact であることは #59 で確認済み (D43)。ただし
+  これらを付けた数値は付けない数値と比較できないので、baseline と candidate
+  は必ず同じ設定で測ること。
 - 仮想ディスプレイすら無い場合は、子プロセス (`velox`) がウィンドウ作成に
   失敗して即座に終了する (GTK 初期化失敗の panic として観測)。`velox-bench`
   自身はクラッシュせず、「0 件のレコードを取得」「結果ファイルは書き出したが

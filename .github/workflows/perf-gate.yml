@@ -19,6 +19,28 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Issue #72: this job's first two runs produced 0 perf records on every
+  # trial — VeloX started, hung, and was killed at the per-trial timeout
+  # without ever writing a perf record. The diagnostic step below found
+  # why: a GitHub runner exposes a DRM node (/dev/dri/card1, mode
+  # crw-rw---- root:video) that the unprivileged runner user cannot open,
+  # so WebKitGTK 2.52's DMABuf renderer blocks on a device it can neither
+  # use nor detect as absent. (A machine with *no* /dev/dri at all — like
+  # the container this was developed in — falls straight back to software
+  # rendering and works, which is why this never reproduced locally.)
+  # Forcing the software path makes the fallback explicit instead of
+  # letting Mesa/WebKit discover it.
+  #
+  # These belong here, in the measurement environment, and NOT in VeloX
+  # itself: docs/decisions.md D43 measured the same variables during #59
+  # and deliberately kept them out of the product because their effect is
+  # an artifact of GPU-less environments. Baseline and candidate are both
+  # measured under these variables in the same job, so the comparison this
+  # gate makes stays internally consistent — but the absolute numbers are
+  # not comparable to a run made without them.
+  LIBGL_ALWAYS_SOFTWARE: "1"
+  WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+  WEBKIT_DISABLE_DMABUF_RENDERER: "1"
 
 jobs:
   perf-gate:
@@ -93,24 +115,41 @@ jobs:
         run: |
           set +e
           echo "=== WebKitGTK / GTK versions on this runner ==="
-          dpkg -l | grep -E "libwebkit2gtk|libgtk-3-0|libsoup" || true
           pkg-config --modversion webkit2gtk-4.1 || true
-          echo "=== /dev/dri present? ==="
+          echo "=== /dev/dri present? can this user open it? ==="
           ls -l /dev/dri 2>&1 || true
-          echo "=== single direct launch, full stderr ==="
-          mkdir -p /tmp/perf-gate/diag
-          VELOX_PERF_METRICS=1 \
-          VELOX_PERF_FORMAT=json \
-          VELOX_PERF_OUTPUT=/tmp/perf-gate/diag/perf.jsonl \
-          VELOX_DATA_DIR=/tmp/perf-gate/diag/data \
-            timeout 25 xvfb-run -a --server-args="-screen 0 1280x900x24" \
-              /tmp/perf-gate/candidate/velox \
-                --homepage http://127.0.0.1:8731/minimal.html
-          echo "velox exit status: $?"
-          echo "=== perf log ==="
-          cat /tmp/perf-gate/diag/perf.jsonl 2>&1 || echo "(no perf log written)"
-          echo "=== dmesg tail (crashes?) ==="
-          sudo dmesg 2>/dev/null | tail -30 || true
+          id
+          echo
+          # Launch twice: once with the software-rendering variables removed
+          # (the configuration that hung), once with them applied (the job
+          # env above). Whichever writes a perf record is the answer — this
+          # keeps the diagnosis in the log instead of in a commit message.
+          run_once() {
+            label="$1"; shift
+            out="/tmp/perf-gate/diag/$label.jsonl"
+            mkdir -p /tmp/perf-gate/diag
+            echo "=== launch: $label ==="
+            env "$@" \
+              VELOX_PERF_METRICS=1 \
+              VELOX_PERF_FORMAT=json \
+              VELOX_PERF_OUTPUT="$out" \
+              VELOX_DATA_DIR="/tmp/perf-gate/diag/data-$label" \
+              timeout 20 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+                /tmp/perf-gate/candidate/velox \
+                  --homepage http://127.0.0.1:8731/minimal.html
+            echo "  exit status: $? (124 = killed at timeout, expected)"
+            if [ -s "$out" ]; then
+              echo "  perf records written: $(wc -l < "$out")"
+              head -3 "$out"
+            else
+              echo "  NO perf records written"
+            fi
+          }
+          run_once bare \
+            -u LIBGL_ALWAYS_SOFTWARE \
+            -u WEBKIT_DISABLE_COMPOSITING_MODE \
+            -u WEBKIT_DISABLE_DMABUF_RENDERER
+          run_once forced-software
 
       - name: Measure baseline (merge-base binary)
         run: |
