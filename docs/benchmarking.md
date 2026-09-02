@@ -1,5 +1,10 @@
 # VeloX ベンチマークスイート
 
+> **競合ブラウザとの比較・性能目標は [docs/performance-targets.md](performance-targets.md)
+> を参照。** この文書は VeloX 自身の内部計測 (`velox-bench`) を扱う。**メモリを
+> ブラウザ間で比較するときは RSS 合計ではなく PSS を使うこと** — 理由と実測での
+> 逆転例は D41 と performance-targets.md §3.1 にある。
+
 Issue #14 の成果物。VeloX 自身の最適化効果や、将来的な Chrome/Firefox 等との
 比較を定量評価するための、ベンチマーク条件・実行方法・結果フォーマットを
 記録する。Issue #13 が実装した計測基盤 (`src/browser/metrics.rs` /
