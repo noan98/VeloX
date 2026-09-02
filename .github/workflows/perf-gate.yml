@@ -1,0 +1,170 @@
+name: Performance Regression Gate
+
+# Issue #72 (developed from #36). This job answers a narrower question than
+# the main `ci.yml`: "does this PR's startup/load performance regress
+# relative to what it is being merged onto". It always measures its own
+# baseline in the same job/runner as its candidate (see the "Build
+# baseline" step) instead of comparing against an old, separately-captured
+# file — docs/performance-targets.md's own rule is "never compare numbers
+# from different sessions/machines", and docs/decisions.md D46 measured
+# exactly how bad that comparison gets on this project's shared/noisy
+# environment (up to +78.9% on an *unchanged* binary between two runs
+# several minutes apart). See D46 for the full design rationale and the
+# `evaluate_gate`/`GateThresholds` docs in src/browser/benchmark.rs for the
+# warn/fail thresholds this workflow's `gate` step applies.
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  perf-gate:
+    name: Startup regression gate (Xvfb)
+    runs-on: ubuntu-latest
+    # Only meaningful for a PR (needs a merge-base to compare against);
+    # workflow_dispatch is for manually re-running this job on demand
+    # (e.g. after a Fail verdict that looks like noise).
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Checkout PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install WebKitGTK + Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Determine merge-base commit
+        id: merge_base
+        run: |
+          set -eu
+          base_ref="${{ github.event.pull_request.base.ref || 'main' }}"
+          git fetch origin "$base_ref"
+          base_sha=$(git merge-base "origin/$base_ref" HEAD)
+          echo "PR head: $(git rev-parse HEAD)"
+          echo "merge-base ($base_ref): $base_sha"
+          echo "sha=$base_sha" >> "$GITHUB_OUTPUT"
+
+      - name: Serve fixed benchmark page over loopback
+        run: |
+          cd scripts/bench/pages
+          nohup python3 -m http.server 8731 > /tmp/perf-gate-http.log 2>&1 &
+          disown
+          sleep 1
+          curl -sf http://127.0.0.1:8731/minimal.html > /dev/null
+
+      - name: Build candidate (PR head)
+        run: |
+          set -eu
+          cargo build --release
+          mkdir -p /tmp/perf-gate/candidate
+          cp target/release/velox target/release/velox-bench /tmp/perf-gate/candidate/
+
+      - name: Build baseline (merge-base commit)
+        run: |
+          set -eu
+          git checkout --quiet "${{ steps.merge_base.outputs.sha }}"
+          cargo build --release
+          mkdir -p /tmp/perf-gate/baseline
+          cp target/release/velox /tmp/perf-gate/baseline/
+          # Return to the PR head: measurements below must all read the
+          # *same* fixed test page (already being served) and use the same
+          # velox-bench build; only --velox-bin varies between baseline and
+          # candidate runs.
+          git checkout --quiet -
+
+      - name: Measure baseline (merge-base binary)
+        run: |
+          set -eu
+          xvfb-run -a --server-args="-screen 0 1280x900x24" \
+            /tmp/perf-gate/candidate/velox-bench run \
+              --scenario cold_startup --trials 8 \
+              --velox-bin /tmp/perf-gate/baseline/velox \
+              --url http://127.0.0.1:8731/minimal.html \
+              --git-commit "${{ steps.merge_base.outputs.sha }}" \
+              --output /tmp/perf-gate/baseline.json
+
+      - name: Measure candidate, run 1 of 2 (PR head binary)
+        run: |
+          set -eu
+          xvfb-run -a --server-args="-screen 0 1280x900x24" \
+            /tmp/perf-gate/candidate/velox-bench run \
+              --scenario cold_startup --trials 8 \
+              --velox-bin /tmp/perf-gate/candidate/velox \
+              --url http://127.0.0.1:8731/minimal.html \
+              --output /tmp/perf-gate/candidate-1.json
+
+      - name: Measure candidate, run 2 of 2 (PR head binary)
+        run: |
+          set -eu
+          xvfb-run -a --server-args="-screen 0 1280x900x24" \
+            /tmp/perf-gate/candidate/velox-bench run \
+              --scenario cold_startup --trials 8 \
+              --velox-bin /tmp/perf-gate/candidate/velox \
+              --url http://127.0.0.1:8731/minimal.html \
+              --output /tmp/perf-gate/candidate-2.json
+
+      # Two independent candidate runs (not one bigger --trials) so `gate`
+      # can apply its majority-vote rule (docs/decisions.md D46): a metric
+      # only fails the build when *both* candidate runs independently
+      # exceed --fail-pct against the same baseline, not on one noisy run.
+      - name: Evaluate regression gate
+        id: gate
+        run: |
+          set +e
+          /tmp/perf-gate/candidate/velox-bench gate \
+            --baseline /tmp/perf-gate/baseline.json \
+            --candidate /tmp/perf-gate/candidate-1.json \
+            --candidate /tmp/perf-gate/candidate-2.json \
+            --output /tmp/perf-gate/gate-report.json \
+            --markdown-output /tmp/perf-gate/gate-summary.md
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          {
+            echo "<!-- velox-perf-gate -->"
+            cat /tmp/perf-gate/gate-summary.md
+            echo ""
+            echo "(baseline: merge-base \`${{ steps.merge_base.outputs.sha }}\`"' / candidate: PR head, 2 independent runs, same job/runner)'
+          } >> "$GITHUB_STEP_SUMMARY"
+          # Never let a non-zero gate exit code fail *this* step — the next
+          # step decides whether the job fails, based on exit_code alone,
+          # so a WARN (3) or an argument/IO error (2) does not abort the
+          # workflow before the summary above is written.
+          exit 0
+
+      - name: Upload gate artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-gate-results
+          path: |
+            /tmp/perf-gate/baseline.json
+            /tmp/perf-gate/candidate-1.json
+            /tmp/perf-gate/candidate-2.json
+            /tmp/perf-gate/gate-report.json
+            /tmp/perf-gate/gate-summary.md
+          retention-days: 30
+          if-no-files-found: warn
+
+      - name: Fail the job on a FAIL verdict
+        if: steps.gate.outputs.exit_code == '1'
+        run: |
+          echo "性能回帰ゲート: FAIL — 上記の Job Summary を参照してください。" >&2
+          echo "ノイズが疑わしい場合は、このワークフローを再実行してください" \
+               "(docs/decisions.md D46 の「残存リスク」を参照)。" >&2
+          exit 1
+
+      - name: Report a WARN verdict (non-blocking)
+        if: steps.gate.outputs.exit_code == '3'
+        run: |
+          echo "性能回帰ゲート: WARN — ブロックしませんが、Job Summary を確認してください。"

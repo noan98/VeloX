@@ -1,0 +1,102 @@
+{
+  "scenario": "cold_startup",
+  "environment": {
+    "os": "linux",
+    "cpu_count": 4,
+    "git_commit": "b81b1fc08cd73256a15a4ffb4bdafb93745e799e",
+    "generated_at": "2026-09-02T17:09:03Z",
+    "trials": 15
+  },
+  "metrics": {
+    "page_load_ms": {
+      "count": 15,
+      "min": 13.6,
+      "max": 28.5,
+      "mean": 23.82,
+      "median": 25.2,
+      "p95": 27.799999999999997,
+      "stddev": 3.969742704868559
+    },
+    "pss_process_count": {
+      "count": 15,
+      "min": 5.0,
+      "max": 5.0,
+      "mean": 5.0,
+      "median": 5.0,
+      "p95": 5.0,
+      "stddev": 0.0
+    },
+    "pss_total_bytes": {
+      "count": 15,
+      "min": 134984704.0,
+      "max": 153676800.0,
+      "mean": 147876795.73333332,
+      "median": 148878336.0,
+      "p95": 153380044.8,
+      "stddev": 4968217.131337724
+    },
+    "rss_process_count": {
+      "count": 15,
+      "min": 5.0,
+      "max": 5.0,
+      "mean": 5.0,
+      "median": 5.0,
+      "p95": 5.0,
+      "stddev": 0.0
+    },
+    "rss_total_bytes": {
+      "count": 15,
+      "min": 209887232.0,
+      "max": 319475712.0,
+      "mean": 287335492.26666665,
+      "median": 297656320.0,
+      "p95": 318274355.2,
+      "stddev": 29880997.55753353
+    },
+    "startup_first_load_ms": {
+      "count": 15,
+      "min": 404.6,
+      "max": 511.2,
+      "mean": 454.65999999999997,
+      "median": 451.0,
+      "p95": 497.76,
+      "stddev": 31.565935527309904
+    },
+    "startup_rust_setup_done_ms": {
+      "count": 15,
+      "min": 178.2,
+      "max": 241.1,
+      "mean": 215.41333333333336,
+      "median": 212.8,
+      "p95": 240.32999999999998,
+      "stddev": 18.191240696973864
+    },
+    "startup_toolbar_ready_ms": {
+      "count": 15,
+      "min": 391.1,
+      "max": 466.5,
+      "mean": 431.03333333333336,
+      "median": 435.0,
+      "p95": 464.12,
+      "stddev": 26.596097099995347
+    },
+    "startup_toolbar_script_started_ms": {
+      "count": 15,
+      "min": 391.1,
+      "max": 466.4,
+      "mean": 430.96,
+      "median": 434.8,
+      "p95": 464.09000000000003,
+      "stddev": 26.654476975869226
+    },
+    "startup_window_created_ms": {
+      "count": 15,
+      "min": 178.1,
+      "max": 240.9,
+      "mean": 215.22,
+      "median": 212.6,
+      "p95": 240.13,
+      "stddev": 18.161033639557605
+    }
+  }
+}

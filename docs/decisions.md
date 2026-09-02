@@ -2746,3 +2746,178 @@ WebKitGTK のプロセスモデル設定変更が必要になり、「新規依�
 中では今回のスコープを超える。実機（GPU あり）での再測定 (#70) を先に行い、
 このコストがサンドボックス固有かどうかを切り分けたうえで、必要なら新しい
 Issue として起票するのが妥当。
+
+## D46: Performance Regression Gate (#72) — 2 段階閾値 + 絶対差フロア + 多数決、baseline は同一ジョブ内でその場作成
+
+**Scope**: Issue #72（#36 の性能回帰検知を Phase 3 の実運用レベルへ発展させた
+もの）。#59（D43）が実測で明らかにした「単一中央値を固定閾値と突き合わせる
+判定ルールはこの環境では成立しない」という課題に対する具体的な設計と実装。
+
+### 実測したノイズ (この Decision の設計根拠)
+
+`docs/performance-targets.md` §9 の -19.0%/-22.4% という 1 件の観測だけでは
+判定方式を設計するのに足りないと考え、本 Issue の作業として追加のノイズ計測を
+行った。**同一リリースビルド・同一コミット (`b81b1fc08cd73256a15a4ffb4bdafb93745e799e`)・
+コード変更なし**で、`cold_startup` シナリオを 10 試行 × 6 セット、連続実行した。
+
+```sh
+cargo build --release
+(cd scripts/bench/pages && python3 -m http.server 8751 &)
+for i in 1 2 3 4 5 6; do
+  xvfb-run -a --server-args="-screen 0 1280x900x24" \
+    ./target/release/velox-bench run --scenario cold_startup --trials 10 \
+    --url http://127.0.0.1:8751/minimal.html --output /tmp/noise/set$i.json
+done
+```
+
+各セットの中央値 (ms / bytes):
+
+| set | `startup_window_created_ms` | `startup_toolbar_ready_ms` | `startup_first_load_ms` | `pss_total_bytes` | `rss_total_bytes` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 258.60 | 596.55 | 638.15 | 161,976,320 | 315,203,584 |
+| 2 | 249.90 | 591.65 | 624.65 | 180,518,912 | 359,311,360 |
+| 3 | 222.50 | 496.85 | 505.90 | 130,053,632 | 377,419,776 |
+| 4 | 230.30 | 457.30 | 487.80 | 116,281,856 | 370,688,000 |
+| 5 | 190.20 | 402.00 | 407.20 | 149,772,288 | 297,897,984 |
+| 6 | 187.40 | 388.80 | 418.80 | 149,641,216 | 309,852,160 |
+
+**このマシンは他セッションと共有されており、実行のたびに ± の負荷が乗る**
+（6 セットは合計で約 9 分かけて連続実行しており、外部要因を意図的に変えては
+いない）。これを 2 通りに集計した:
+
+1. **隣接セット同士の比較**（`set1↔set2`、`set2↔set3`、… の 5 ペア。CI が
+   同一ジョブ内で baseline/candidate を数分の間隔を空けて計測する状況に近い）:
+
+   | metric | 隣接ペアの最大変化率 |
+   | --- | ---: |
+   | `startup_window_created_ms` | 17.4% |
+   | `startup_toolbar_ready_ms` | 16.0% |
+   | `startup_first_load_ms` | 19.0% |
+   | `pss_total_bytes` | 28.8% |
+   | `rss_total_bytes` | 19.6% |
+
+2. **set1 と set6 の比較**（約 9 分離れた 2 点。コミット済みの古い baseline
+   ファイルと「今」の測定を比較する状況に近い）:
+
+   | metric | set6(基準)→set1 | set6(基準)→set2 |
+   | --- | ---: | ---: |
+   | `page_load_ms` (21.05→) | +77.0% | +78.9% |
+   | `startup_window_created_ms` (187.40→) | +38.0% | +33.4% |
+   | `startup_toolbar_ready_ms` (388.80→) | +53.4% | +52.2% |
+   | `startup_first_load_ms` (418.80→) | +52.4% | +49.2% |
+   | `pss_total_bytes` (149,641,216→) | +8.2% | +20.6% |
+   | `rss_total_bytes` (309,852,160→) | +1.7% | +16.0% |
+
+**結論**: コードを一切変更していないのに、隣接セット間だけでも最大 28.8%、
+測定の間隔が数分開くだけで `page_load_ms` は最大 78.9%、
+`startup_toolbar_ready_ms` は最大 53.4% 動く。`page_load_ms` の 78.9% は
+絶対値では 21.05ms→37.65ms、わずか 16.2ms の変化にすぎない — 相対閾値だけ
+では小さい絶対値の指標を正しく扱えないことも同時に分かった。
+
+（コマンド・生の JSON は `/tmp/noise/set{1..6}.json` として作業時に確認した
+ものであり、この PR には含めていない — 再現手順は上記コマンドのとおり。
+`results/baseline/cold_startup-linux-xvfb.json` として commit したのは、
+このうち別途 15 試行で採り直した 1 本。）
+
+### 採用した判定方式
+
+`src/browser/benchmark.rs::evaluate_gate`（純粋 Rust、`browser::benchmark`
+の既存方針（D21）を踏襲し `cargo test` で完全に検証）に実装した。
+
+1. **2 段階の重大度 (`Severity::{Ok,Warn,Fail}`)**: `warn_pct`(既定 20.0) と
+   `fail_pct`(既定 60.0) の 2 つの相対閾値。`fail_pct` は隣接セットの最大
+   ノイズ (28.8%, PSS) に約 31pt、set1/set6 間の最悪ノイズのうち絶対差
+   フロアで吸収できないもの (53.4%, `startup_toolbar_ready_ms`) にも
+   約 7pt のマージンを残す水準に設定した。`warn_pct`(20.0) は隣接セットの
+   起動系メトリクスのノイズ (16.0〜19.0%) とほぼ同水準に置いており、
+   「これくらいはこの環境では日常的に動く、人間が一瞥する値」という位置
+   づけにしている。
+2. **メトリクスごとの最小絶対差 (`MetricKey::min_significant_delta`)**:
+   相対閾値とは独立な安全弁。`page_load_ms` のように絶対値が小さい指標は
+   20ms 未満の変化を無視する（`page_load_ms` の実測 +78.9% は 16.2ms の
+   変化だったので、このフロアで吸収される）。メモリ系は 5MiB、プロセス数
+   系は 1 プロセスをフロアとした。
+3. **複数候補測定の多数決**: `evaluate_gate` は baseline 1 つに対し
+   candidate を複数 (`&[&BenchmarkResult]`) 受け取れる。**過半数の
+   candidate が独立に `fail_pct` を超えたときのみ** その指標を Fail とする
+   （1 候補なら 1/1 必要、2 候補なら 2/2 必要、3 候補なら 2/3 で成立）。
+   これは「連続 N 回悪化して初めて fail」という Issue 側の候補案を、PR
+   履歴を跨がず 1 回の CI ジョブ内で近似する実装である。
+4. **試行数不足の検出**: baseline/candidate のいずれかの `Stats::count` が
+   `MIN_TRIALS_FOR_CONFIDENT_GATE`(5) 未満なら `low_confidence` を立て、
+   その指標は多数決の結果に関わらず Fail に昇格させない（Warn 止まり）。
+
+固定閾値 1 本 + 単発比較という素朴な方式（当初 #59 が指摘した「成立しない」
+方式そのもの）を採らなかった理由は、上の実測データが直接示すとおり — この
+環境ではその方式は必ずどちらか一方で壊れる (閾値を低くすれば通常運転でも
+false fail、高くすれば実際の劣化を見逃す)。2 段階 + 絶対差フロア + 多数決の
+組み合わせは、単一の数字ではこの環境のノイズ分布 (小さい絶対値の指標は
+%が暴れる／隣接ペアと広い間隔とでノイズの桁が違う／短時間に相関したノイズが
+乗ることがある) を吸収しきれないという実測結果から導いた。
+
+**正直に書く残存リスク**: `fail_pct`(60%) と set1/set6 間で実際に観測した
+`startup_toolbar_ready_ms` の最悪値 (53.4%) との差はわずか 7pt しかなく、
+統計的な閾値だけでこの環境の最悪ノイズを完全に吸収できているとは言えない。
+この残差を吸収しているのは閾値の値そのものではなく、**baseline と
+candidate を同一 CI ジョブ内で数分以内に連続測定するという設計**（下記）
+である — 詳しくは `docs/performance-targets.md` §10 も参照。実測で
+Fail が出て、直前の変更に妥当な原因が見当たらない場合は、まず
+`perf-gate.yml` を再実行する運用を推奨する (flaky test の再実行と同じ扱い)。
+
+### CI で GUI ベンチを回す/回さない判断
+
+**回す。** `.github/workflows/perf-gate.yml` を新設し、`libwebkit2gtk-4.1-dev`
+と `xvfb` を導入したうえで、実際に `velox-bench run`（Xvfb 経由）を実行する。
+Issue #106 と本 Issue の実測で、この方式の Xvfb 環境で `cold_startup` が
+確実に計測できることは確認済みであり、GUI を回さない代替 (純粋ロジックの
+マイクロベンチ、コンパイル時定数、バイナリサイズ等) では T1 が対象とする
+`startup_*`/`page_load_ms` そのものを測ることができない — それらの指標を
+支配しているのは D43 が明らかにしたとおり `tao`/GTK の初期化と WebKitGTK の
+webview 生成であり、Rust 側の純粋ロジックには現れない。コストは同一ジョブ内
+で 2 回ビルド + 3 回計測 (baseline 1 回 + candidate 2 回、Xvfb 込みで見積もり
+数分) だが、`ci.yml` 本体とは別ワークフローに分離し、通常の fmt/clippy/test
+のフィードバック速度には影響させない。
+
+### baseline: 固定ファイルではなく同一ジョブ内でその場作成
+
+**`results/baseline/cold_startup-linux-xvfb.json`（この dev/agent コンテナで
+採取。commit `b81b1fc` 紐付け、§7 の形式）は、CI のブロッキング判定には
+使わない。** 上記の実測（set1/set6 間で無変更バイナリが最大 78.9% 動く）が
+示すとおり、機械やセッションが変わる比較はこの環境では意味をなさない ——
+`docs/performance-targets.md` §1 が最初から明記している「異なる日・異なる
+マシンで取った数値を並べて比較しない」という制約が、GitHub Actions の
+ランナー (ローカルよりさらにノイズが大きいと予想される共有環境) と
+コミット済みファイルの間には確実に当てはまる。
+
+そこで `perf-gate.yml` は baseline も **同一ジョブ・同一ランナー内で** その場
+作成する: PR の merge-base コミットをチェックアウトしてビルドし、その
+バイナリを baseline として計測してから PR head に戻る。baseline と
+candidate の間の時間差は「ビルド 1 回分」程度に収まり、上記の「隣接セット」
+ノイズ (最大 28.8%) に近い条件になる。コミット済みの `results/baseline/`
+ファイルは、経時トレンドを人が目視で追うための参考情報としてのみ残す
+(`docs/benchmarking.md` §5 参照)。
+
+### 終了コードの設計
+
+`velox-bench gate` の終了コードは `0`=OK, `3`=WARN(非ブロッキング),
+`1`=FAIL(ブロッキング), `2`=引数エラー等（既存サブコマンドと同じ規約）。
+`compare` の 0/1 の 2 値ではブロッキングと非ブロッキングを CI 側で区別
+できないため、`gate` では意図的に別の値を割り当てた。`perf-gate.yml` は
+`FAIL` のときのみジョブを失敗させ、`WARN` は Job Summary に出すだけで
+ビルドを止めない。
+
+### #36 との関係
+
+#72 は #36 の受け入れ条件（PR でベンチマーク実行・baseline との差分確認・
+閾値設定・環境差による誤検知の考慮）を全て満たし、かつ #36 が要求していな
+かった「複数回測定」「多数決」「試行数不足検出」まで実装したため、**この
+PR で #36 と #72 の両方を close する。**
+
+**Cost / revisit condition**: `warn_pct`/`fail_pct` は実測に基づく初期値
+であり、GitHub Actions 実ランナーでの運用実績（ローカルより大きいノイズが
+出る可能性が高い、`docs/benchmarking.md` の既存の記述どおり）が蓄積したら
+見直すこと。現状は `cold_startup` シナリオのみを CI でゲートしており、
+`Scenario::is_unattended()` が `true` の残り 2 シナリオ (`warm_startup`,
+`first_page_load`) や、外部駆動フックが未実装の `navigation`/`tab_*`/
+`tabs_N` 系は対象外 — 将来 Issue でそれらの自動駆動フックが実装されたら
+`perf-gate.yml` に追加を検討する。

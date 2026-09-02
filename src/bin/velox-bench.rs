@@ -29,8 +29,15 @@
 //!   the path for scenarios that need manual or externally-scripted
 //!   interaction (navigation, tab create/switch, N-tab memory/CPU).
 //! - `compare` — diff two saved result files and exit non-zero on a
-//!   regression beyond `--threshold-pct`, the hook Issue #36's CI check is
-//!   expected to call.
+//!   regression beyond `--threshold-pct`, the original two-file diff Issue
+//!   #36 asked for.
+//! - `gate` (Issue #72) — the CI-shaped regression gate: one baseline
+//!   result against one or more candidate results, majority-voted into a
+//!   warn/fail verdict via `benchmark::evaluate_gate`. See that function's
+//!   module docs (`src/browser/benchmark.rs`) and `docs/decisions.md` D46
+//!   for why this is not just `compare` with a stricter threshold — a
+//!   single median comparison in this environment cannot distinguish a
+//!   real regression from session-to-session noise.
 
 use std::env;
 use std::fs;
@@ -40,7 +47,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use velox::browser::benchmark::scenario::Scenario;
 use velox::browser::benchmark::{
-    self, BenchmarkResult, ComparisonReport, MetricDiff, RunEnvironment,
+    self, BenchmarkResult, ComparisonReport, GateThresholds, MetricDiff, RunEnvironment, Severity,
 };
 
 fn main() {
@@ -53,6 +60,7 @@ fn main() {
         Some("run") => cmd_run(&rest),
         Some("aggregate") => cmd_aggregate(&rest),
         Some("compare") => cmd_compare(&rest),
+        Some("gate") => cmd_gate(&rest),
         Some(other) => Err(format!("未知のサブコマンドです: {other}\n\n{USAGE}")),
         None => Err(USAGE.to_owned()),
     };
@@ -70,8 +78,11 @@ const USAGE: &str = "使い方:\n\
   velox-bench list-scenarios\n\
   velox-bench run --scenario <id> --trials <N> --output <path> [--url <URL>] [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>]\n\
   velox-bench aggregate --scenario <id> --output <path> --input <path> [--input <path> ...] [--git-commit <sha>]\n\
-  velox-bench compare --baseline <path> --candidate <path> [--threshold-pct <pct>] [--output <path>]\n\n\
-詳細は docs/benchmarking.md を参照してください。";
+  velox-bench compare --baseline <path> --candidate <path> [--threshold-pct <pct>] [--output <path>]\n\
+  velox-bench gate --baseline <path> --candidate <path> [--candidate <path> ...] \\\n\
+      [--warn-pct <pct>] [--fail-pct <pct>] [--output <path>] [--markdown-output <path>]\n\n\
+gate の終了コード: 0=OK, 1=FAIL (CIをブロックすべき), 3=WARN (非ブロッキング、要確認)。\n\
+それ以外の引数エラー等は 2。詳細は docs/benchmarking.md を参照してください。";
 
 // ---------------------------------------------------------------------
 // list-scenarios
@@ -438,6 +449,139 @@ fn print_diff_row(name: &str, diff: &MetricDiff) {
         pct_display,
         if diff.regressed { "NG" } else { "OK" }
     );
+}
+
+// ---------------------------------------------------------------------
+// gate (Issue #72 / D46)
+// ---------------------------------------------------------------------
+
+/// `gate`'s exit codes are its CI contract, so they get names rather than
+/// bare literals scattered through `cmd_gate`. `Ok`/`Warn` are both
+/// non-blocking (`0`/`3`); only `Fail` (`1`) should stop a CI job — see
+/// `docs/benchmarking.md` "回帰ゲート (gate)".
+const EXIT_GATE_OK: i32 = 0;
+const EXIT_GATE_FAIL: i32 = 1;
+const EXIT_GATE_WARN: i32 = 3;
+
+fn cmd_gate(args: &[String]) -> Result<i32, String> {
+    let flags = Flags::parse(args)?;
+    let baseline_path = flags.required("baseline")?;
+    let candidate_paths = flags.many("candidate");
+    if candidate_paths.is_empty() {
+        return Err("--candidate を少なくとも 1 つ指定してください".to_owned());
+    }
+    let warn_pct: f64 = flags
+        .one("warn-pct")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| "--warn-pct は数値で指定してください".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(GateThresholds::default().warn_pct);
+    let fail_pct: f64 = flags
+        .one("fail-pct")
+        .map(|v| {
+            v.parse()
+                .map_err(|_| "--fail-pct は数値で指定してください".to_owned())
+        })
+        .transpose()?
+        .unwrap_or(GateThresholds::default().fail_pct);
+    if fail_pct <= warn_pct {
+        return Err(format!(
+            "--fail-pct ({fail_pct}) は --warn-pct ({warn_pct}) より大きい必要があります"
+        ));
+    }
+    let thresholds = GateThresholds { warn_pct, fail_pct };
+
+    let baseline = read_result(baseline_path)?;
+    let candidates = candidate_paths
+        .iter()
+        .map(|path| read_result(path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let candidate_refs: Vec<&BenchmarkResult> = candidates.iter().collect();
+
+    let report = benchmark::evaluate_gate(&baseline, &candidate_refs, &thresholds);
+    print_gate_report(&report);
+
+    if let Some(output_path) = flags.one("output") {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|err| format!("ゲート結果のシリアライズに失敗しました: {err}"))?;
+        fs::write(output_path, json)
+            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+    }
+    if let Some(markdown_path) = flags.one("markdown-output") {
+        let markdown = benchmark::render_gate_markdown(&report);
+        fs::write(markdown_path, markdown)
+            .map_err(|err| format!("{markdown_path} へ書き込めませんでした: {err}"))?;
+    }
+
+    Ok(match report.overall {
+        Severity::Ok => EXIT_GATE_OK,
+        Severity::Warn => EXIT_GATE_WARN,
+        Severity::Fail => EXIT_GATE_FAIL,
+    })
+}
+
+fn severity_label(severity: Severity) -> &'static str {
+    match severity {
+        Severity::Ok => "OK",
+        Severity::Warn => "WARN",
+        Severity::Fail => "FAIL",
+    }
+}
+
+fn print_gate_report(report: &benchmark::GateReport) {
+    println!(
+        "regression gate: scenario={} candidates={} (warn>{:.1}% fail>{:.1}%)",
+        report.scenario,
+        report.candidate_count,
+        report.thresholds.warn_pct,
+        report.thresholds.fail_pct
+    );
+    println!(
+        "{:<28} {:>14} {:>26} {:>8} {:>8}",
+        "metric", "baseline", "candidates (中央値/変化率)", "判定", "備考"
+    );
+    for (name, verdict) in &report.metrics {
+        let candidates_display = verdict
+            .candidate_medians
+            .iter()
+            .zip(&verdict.pct_changes)
+            .map(|(median, pct)| {
+                if pct.is_infinite() {
+                    format!("{median:.1}(inf)")
+                } else {
+                    format!("{median:.1}({pct:+.1}%)")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "{:<28} {:>14.2} {:>26} {:>8} {:>8}",
+            name,
+            verdict.baseline_median,
+            candidates_display,
+            severity_label(verdict.severity),
+            if verdict.low_confidence {
+                "試行数不足"
+            } else {
+                ""
+            }
+        );
+    }
+    if !report.only_in_baseline.is_empty() {
+        println!(
+            "baseline のみに存在: {}",
+            report.only_in_baseline.join(", ")
+        );
+    }
+    if !report.only_in_candidates.is_empty() {
+        println!(
+            "candidate のみに存在: {}",
+            report.only_in_candidates.join(", ")
+        );
+    }
+    println!("\n総合判定: {}", severity_label(report.overall));
 }
 
 // ---------------------------------------------------------------------
