@@ -2484,3 +2484,49 @@ navigation after startup, or opening N tabs at launch, still has no hook, so
 `tabs_1..50` manual. Those need a separate automation hook in `app.rs`;
 revisit when #58 fixes the benchmark conditions and says which of them must
 run unattended in CI.
+
+## D41: Competitive benchmarking measures an external load beacon, and compares memory by PSS
+
+**Scope**: Issue #58 — fixing Phase 3's measurement conditions and targets.
+
+**Why a second harness**: `velox-bench` (D21) aggregates the JSON Lines VeloX
+writes about *its own* internal events (window created, toolbar ready,
+`LoadFinished`). Those have no counterpart in another browser, so they cannot
+express "VeloX vs Chromium". `scripts/bench/compare_browsers.py` therefore
+measures only things that mean the same thing in any browser.
+
+**The comparable clock**: process spawn → the page's own `load` event. The
+harness serves the fixed fixture from loopback with a small beacon appended,
+and timestamps the resulting `GET /loaded`. No browser-internal API, no
+DevTools protocol, no network. The same beacon is injected for both browsers,
+so it cannot favour either. The fixture files themselves are left untouched.
+
+**Memory is compared by PSS, not summed RSS.** Summing RSS across a process
+tree counts every shared page once per process, so a browser with more
+processes looks heavier than it is. This is not a theoretical concern: on the
+same page at the same instant, VeloX (5 processes) totalled 775 MiB RSS
+against Chromium's (9 processes) 855 MiB — but by PSS it was VeloX 424 MiB
+against Chromium 329 MiB. **The two metrics give opposite answers to "which
+browser uses less memory".** PSS divides each shared page by its sharer count,
+which is the right question for browsers that differ in process count.
+
+**Consequence for D16**: `browser::metrics::sample_process_tree_rss` sums RSS
+and therefore *overstates* VeloX's memory position. Phase 3's memory work
+(#61/#62/#63) must not adopt it as the improvement metric unchanged; adding
+PSS is tracked as #108. Tab suspension (D9) has the same exposure — dropping a
+webview process removes its whole RSS from the sum, while the shared pages it
+was counting survive in the remaining processes, so the RSS delta overstates
+the real saving.
+
+**What this does not measure**: rendering quality, JS execution, multi-tab
+behaviour, battery. And because VeloX embeds the system WebView, the
+comparison is as much "WebKitGTK vs Blink" as "VeloX vs Chromium" — it does
+not separate VeloX's own overhead from the engine's, which is exactly the
+distinction Epic #57 insists on. Reading a VeloX-vs-Chromium number as a
+verdict on VeloX's code would be a mistake.
+
+**Cost / revisit condition**: measured with no GPU, so both browsers fall back
+to software rendering and the absolute memory numbers do not transfer to real
+hardware — treat them as same-environment relative figures only. Re-measure on
+real hardware under #70, and add Firefox (Gecko) as the next comparison target,
+since Safari does not exist on Linux and Edge shares Blink.
