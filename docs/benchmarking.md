@@ -67,6 +67,22 @@ points」節) が生成する JSON Lines を、このスイートが回収・集
 | `tab_switch_ms` | `tab_switch` | `duration_ms` |
 | `rss_total_bytes` | `rss` | `total_rss_bytes` |
 | `rss_process_count` | `rss` | `process_count` |
+| `pss_total_bytes` | `rss` | `total_pss_bytes` |
+| `pss_process_count` | `rss` | `pss_process_count` |
+
+**`pss_total_bytes` (Issue #108 / D42), not `rss_total_bytes`, is the metric
+to use when comparing memory footprint across builds or against another
+browser.** RSS sums each process's resident pages, so it double-counts
+shared memory once per process — a build/browser with more helper processes
+looks heavier by RSS even at equal real memory use (`docs/performance-
+targets.md` §3.1 has a measured case where this flips which of two browsers
+looks lighter). `pss_total_bytes` is absent from a trial's aggregated
+metrics when PSS could not be read for any process (old kernel, permissions,
+non-Linux) — `rss_total_bytes` still is present in that case, since RSS has
+no such platform gap. `pss_process_count` says how many processes
+contributed to the PSS sum, out of `rss_process_count` total; less than
+`rss_process_count` (but present) means the sum is real but incomplete, not
+wrong.
 
 `cold_startup` / `warm_startup` / `first_page_load` はいずれも同じ `startup`
 イベントの 3 フィールドを見ている。「cold」と「warm」の違いはランナー側の

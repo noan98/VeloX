@@ -83,13 +83,26 @@ pub enum MetricKey {
     TabSwitchMs,
     RssTotalBytes,
     RssProcessCount,
+    /// PSS total (Issue #108 / D42): `None`/absent in the source `rss`
+    /// event's `total_pss_bytes` field (unsupported platform, old kernel,
+    /// permissions) yields no sample for this key, same as any other metric
+    /// that never fired — see [`MetricKey::extract`]. Prefer this over
+    /// [`MetricKey::RssTotalBytes`] whenever comparing memory footprint
+    /// across builds/browsers with different process counts: RSS double
+    /// counts shared pages once per process, so it is not comparable across
+    /// process counts (`docs/performance-targets.md` §3.1).
+    PssTotalBytes,
+    /// How many processes contributed to [`MetricKey::PssTotalBytes`] in
+    /// the same sample, out of [`MetricKey::RssProcessCount`] total —
+    /// compare the two to tell a complete PSS total from a partial one.
+    PssProcessCount,
 }
 
 impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 8] = [
+    pub const ALL: [MetricKey; 10] = [
         MetricKey::StartupWindowCreatedMs,
         MetricKey::StartupToolbarReadyMs,
         MetricKey::StartupFirstLoadMs,
@@ -98,6 +111,8 @@ impl MetricKey {
         MetricKey::TabSwitchMs,
         MetricKey::RssTotalBytes,
         MetricKey::RssProcessCount,
+        MetricKey::PssTotalBytes,
+        MetricKey::PssProcessCount,
     ];
 
     /// The key's name as stored in [`BenchmarkResult::metrics`] and printed
@@ -112,6 +127,8 @@ impl MetricKey {
             MetricKey::TabSwitchMs => "tab_switch_ms",
             MetricKey::RssTotalBytes => "rss_total_bytes",
             MetricKey::RssProcessCount => "rss_process_count",
+            MetricKey::PssTotalBytes => "pss_total_bytes",
+            MetricKey::PssProcessCount => "pss_process_count",
         }
     }
 
@@ -124,7 +141,10 @@ impl MetricKey {
             MetricKey::PageLoadMs => "page_load",
             MetricKey::TabCreateMs => "tab_create",
             MetricKey::TabSwitchMs => "tab_switch",
-            MetricKey::RssTotalBytes | MetricKey::RssProcessCount => "rss",
+            MetricKey::RssTotalBytes
+            | MetricKey::RssProcessCount
+            | MetricKey::PssTotalBytes
+            | MetricKey::PssProcessCount => "rss",
         }
     }
 
@@ -140,6 +160,8 @@ impl MetricKey {
             MetricKey::TabSwitchMs => "duration_ms",
             MetricKey::RssTotalBytes => "total_rss_bytes",
             MetricKey::RssProcessCount => "process_count",
+            MetricKey::PssTotalBytes => "total_pss_bytes",
+            MetricKey::PssProcessCount => "pss_process_count",
         }
     }
 
@@ -148,6 +170,14 @@ impl MetricKey {
     /// the `"tab_create"`/`"tab_switch"` event names respectively (not both
     /// named `"tab_latency"`), so no extra disambiguation is needed beyond
     /// matching on `event_name()`.
+    ///
+    /// [`MetricKey::PssTotalBytes`] rides the same `.and_then(Value::as_f64)`
+    /// as every other key: a JSON `null` `total_pss_bytes` (an `rss` sample
+    /// where PSS could not be read at all) parses to `None` and is dropped
+    /// here, same as a field that is simply absent — so a trial where PSS
+    /// was never available ends up with zero samples for this key, and
+    /// [`aggregate_trials`] omits it from the result entirely rather than
+    /// reporting a misleading `0.0`.
     pub fn extract(self, events: &[Value]) -> Vec<f64> {
         events
             .iter()
@@ -673,6 +703,40 @@ mod tests {
     }
 
     #[test]
+    fn extract_pss_reads_bytes_and_process_count_separately() {
+        let events = vec![event(
+            r#"{"event":"rss","ts_ms":1.0,"pid":42,"process_count":5,"total_rss_bytes":1048576,"total_pss_bytes":524288,"pss_process_count":4}"#,
+        )];
+        assert_eq!(MetricKey::PssTotalBytes.extract(&events), vec![524288.0]);
+        assert_eq!(MetricKey::PssProcessCount.extract(&events), vec![4.0]);
+    }
+
+    #[test]
+    fn extract_pss_total_bytes_is_empty_when_json_null() {
+        // matches an `rss` event where PSS could not be read for any
+        // process in the tree (see `metrics::RssSample::total_pss_bytes`).
+        let events = vec![event(
+            r#"{"event":"rss","ts_ms":1.0,"pid":42,"process_count":5,"total_rss_bytes":1048576,"total_pss_bytes":null,"pss_process_count":0}"#,
+        )];
+        assert!(MetricKey::PssTotalBytes.extract(&events).is_empty());
+        // pss_process_count is still a real number (0), unlike the null
+        // total — it is extracted normally.
+        assert_eq!(MetricKey::PssProcessCount.extract(&events), vec![0.0]);
+    }
+
+    #[test]
+    fn extract_pss_total_bytes_is_empty_when_field_absent() {
+        // An `rss` event from before Issue #108 (or any producer that never
+        // added the field) has no `total_pss_bytes` key at all — same
+        // "absent metric" outcome as a JSON `null`.
+        let events = vec![event(
+            r#"{"event":"rss","ts_ms":1.0,"pid":42,"process_count":5,"total_rss_bytes":1048576}"#,
+        )];
+        assert!(MetricKey::PssTotalBytes.extract(&events).is_empty());
+        assert!(MetricKey::PssProcessCount.extract(&events).is_empty());
+    }
+
+    #[test]
     fn extract_returns_empty_for_absent_metric() {
         let events = vec![event(
             r#"{"event":"page_load","url":"x","duration_ms":1.0}"#,
@@ -782,6 +846,30 @@ mod tests {
         assert!(!aggregated.contains_key("tab_create_ms"));
         assert!(!aggregated.contains_key("rss_total_bytes"));
         assert_eq!(aggregated.len(), 3);
+    }
+
+    #[test]
+    fn aggregate_trials_includes_pss_when_present() {
+        let trial = vec![event(
+            r#"{"event":"rss","process_count":5,"total_rss_bytes":1000,"total_pss_bytes":600,"pss_process_count":5}"#,
+        )];
+        let aggregated = aggregate_trials(&[trial]);
+        assert_eq!(aggregated["pss_total_bytes"].median, 600.0);
+        assert_eq!(aggregated["pss_process_count"].median, 5.0);
+    }
+
+    #[test]
+    fn aggregate_trials_omits_pss_total_bytes_when_unreadable_but_keeps_rss() {
+        let trial = vec![event(
+            r#"{"event":"rss","process_count":5,"total_rss_bytes":1000,"total_pss_bytes":null,"pss_process_count":0}"#,
+        )];
+        let aggregated = aggregate_trials(&[trial]);
+        assert!(!aggregated.contains_key("pss_total_bytes"));
+        assert_eq!(aggregated["rss_total_bytes"].median, 1000.0);
+        // pss_process_count(0) is a real, present sample — it says "zero of
+        // process_count were readable", which is different information from
+        // the metric being entirely absent.
+        assert_eq!(aggregated["pss_process_count"].median, 0.0);
     }
 
     #[test]
