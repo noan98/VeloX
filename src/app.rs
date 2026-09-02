@@ -12,8 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
 
+use crate::browser::automation::{self, AutomationCommand};
 use crate::browser::downloads;
 use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
@@ -114,6 +115,19 @@ pub enum UserEvent {
         path: Option<PathBuf>,
         success: bool,
     },
+    /// One step of a `VELOX_AUTOMATION_SCRIPT` (Issue #112, see
+    /// docs/decisions.md D44 and `browser::automation`). Sent by a
+    /// dedicated background thread spawned once at startup
+    /// (`spawn_automation`) that walks the parsed script and proxies each
+    /// non-`Wait` command through here in order, sleeping locally between
+    /// steps for `Wait` — `Wait` itself never becomes an event. This is a
+    /// delivery mechanism only: every variant is resolved on the main
+    /// thread in `handle_automation_command` by calling the exact same
+    /// tab-management functions `ToolbarCommand`/`ContentShortcut` already
+    /// use (`open_new_tab`, `close_tab`, `apply_activation`, ...), not a
+    /// new state-mutation path. `AutomationCommand::Quit` is special-cased
+    /// in `run`'s event loop, before dispatch, to set `ControlFlow::Exit`.
+    Automation(AutomationCommand),
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -170,6 +184,9 @@ struct PerfContext {
 pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>> {
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
+    // Cloned before `proxy` is moved into `BrowserWindow::new` below — see
+    // `spawn_automation`'s call site further down, once `AppState` exists.
+    let automation_proxy = proxy.clone();
 
     // `.then(...)` short-circuits: when metrics are off, no `Instant` is
     // captured here and `startup` stays `None`, so every checkpoint below
@@ -243,6 +260,28 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         startup.mark_rust_setup_done(Instant::now());
     }
 
+    // Issue #112: only when `VELOX_AUTOMATION_SCRIPT` names a file, read
+    // and parse it once, right here at startup, and hand it to a
+    // background thread that drives it. See docs/decisions.md D44 and
+    // `browser::automation`'s module doc comment for why this is a
+    // read-once opt-in file instead of any kind of listening
+    // socket/RPC server. A missing/unreadable file or a parse error is
+    // logged and otherwise ignored — never fatal, matching every other
+    // `log_failure`-style guard in this file.
+    if let Some(script_path) = std::env::var_os("VELOX_AUTOMATION_SCRIPT") {
+        match std::fs::read_to_string(&script_path) {
+            Ok(text) => match automation::parse_script(&text) {
+                Ok(commands) => spawn_automation(automation_proxy, commands),
+                Err(err) => eprintln!(
+                    "velox: VELOX_AUTOMATION_SCRIPT {script_path:?} は解析できません: {err}"
+                ),
+            },
+            Err(err) => {
+                eprintln!("velox: VELOX_AUTOMATION_SCRIPT {script_path:?} を読み込めません: {err}")
+            }
+        }
+    }
+
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
@@ -268,7 +307,15 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
                         &user_event,
                     );
                 }
-                handle_user_event(&mut window, &mut state, &config, &homepage, user_event);
+                // `quit` (Issue #112) is handled here, before dispatch,
+                // exactly like `WindowEvent::CloseRequested` above — it
+                // needs `control_flow`, which `handle_user_event` does not
+                // have access to.
+                if matches!(user_event, UserEvent::Automation(AutomationCommand::Quit)) {
+                    *control_flow = ControlFlow::Exit;
+                } else {
+                    handle_user_event(&mut window, &mut state, &config, &homepage, user_event);
+                }
             }
             _ => {}
         }
@@ -395,7 +442,11 @@ fn record_perf_event(
         | UserEvent::ContentShortcut(_)
         | UserEvent::NewTabRequested(_)
         | UserEvent::DownloadStarted { .. }
-        | UserEvent::DownloadCompleted { .. } => {}
+        | UserEvent::DownloadCompleted { .. }
+        // `handle_automation_command` calls the same tab-management
+        // functions the toolbar path does, which already call
+        // `record_tab_latency` themselves — nothing extra to log here.
+        | UserEvent::Automation(_) => {}
     }
 }
 
@@ -644,6 +695,9 @@ fn handle_user_event(
             }
             refresh_downloads_panel(window, state);
         }
+        UserEvent::Automation(command) => {
+            handle_automation_command(window, state, command);
+        }
     }
 }
 
@@ -678,8 +732,7 @@ fn handle_toolbar_command(
             }
             match resolve_intent(config, intent) {
                 Some(url) => {
-                    state.tabs.active_mut().on_navigation_started(&url);
-                    log_failure("navigate", window.navigate(&url));
+                    navigate_active_tab(window, state, &url);
                     // A panel entry click drives this same command; close
                     // whichever panel was open now that the user has acted
                     // on it.
@@ -1008,11 +1061,25 @@ fn focus_address_bar(window: &mut BrowserWindow, state: &AppState) {
     );
 }
 
+/// Navigate the active tab to `url` (already normalized/resolved by the
+/// caller). Shared by `ToolbarCommand::Navigate` (address bar submit, a
+/// history/bookmark/candidate row click) and `AutomationCommand::Navigate`
+/// (Issue #112, `handle_automation_command`) — both already have a
+/// ready-to-load URL by the time they get here, just via different
+/// resolution paths (`resolve_intent`'s search/URL classification vs.
+/// `browser::automation::parse_script`'s `navigation::normalize_input`
+/// call).
+fn navigate_active_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
+    state.tabs.active_mut().on_navigation_started(url);
+    log_failure("navigate", window.navigate(url));
+}
+
 /// Open a new tab at `url` and make it active. The one path every "open a
 /// new tab" trigger funnels through — `ToolbarCommand::NewTab` (homepage),
-/// `ContentShortcut::NewTab` (homepage), and `UserEvent::NewTabRequested`
-/// (a `target="_blank"`/`window.open()` URL, see docs/decisions.md D25) —
-/// so the webview-build-then-activate sequence is written once.
+/// `ContentShortcut::NewTab` (homepage), `UserEvent::NewTabRequested`
+/// (a `target="_blank"`/`window.open()` URL, see docs/decisions.md D25),
+/// and `AutomationCommand::Open` (Issue #112) — so the
+/// webview-build-then-activate sequence is written once.
 fn open_new_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
     // Reuses the `Instant` `Tabs::open_at` needs anyway, so tab-create
     // latency costs no extra clock read when metrics are off (D19).
@@ -1124,6 +1191,94 @@ fn handle_content_shortcut(
         ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, state),
         ContentShortcut::ToggleBookmarkBar => toggle_bookmark_bar(window),
     }
+}
+
+/// Dispatch one step of a `VELOX_AUTOMATION_SCRIPT` (Issue #112, see
+/// docs/decisions.md D44 and `browser::automation`) to the same tab
+/// operations `handle_toolbar_command`/`handle_content_shortcut` already
+/// use — every branch here mirrors an existing `ToolbarCommand`/
+/// `ContentShortcut` arm, exactly like `handle_content_shortcut` itself
+/// mirrors `handle_toolbar_command`. `Open`/`Close`/`Switch` address a tab
+/// by its position in the tab strip (0-based, matching what a benchmark
+/// script author sees on screen), resolved against `state.tabs` right
+/// here — since by the time this runs, tabs may have been opened/closed
+/// since the script was parsed, resolving late (rather than up front) is
+/// the only way position `2` reliably means "the third tab, right now".
+/// An out-of-range position is a silent no-op (eprintln'd), never a panic
+/// or a crash — matching every other `Tabs`/`BrowserWindow` guard in this
+/// file.
+///
+/// `AutomationCommand::Wait` never reaches here (the automation thread
+/// sleeps locally instead of sending an event — see `spawn_automation`)
+/// and `AutomationCommand::Quit` is intercepted in `run`'s event loop
+/// before dispatch (it needs `ControlFlow`, which this function does not
+/// have); both arms are still written out explicitly, rather than folded
+/// into a wildcard, so a future new `AutomationCommand` variant fails to
+/// compile here instead of silently doing nothing.
+fn handle_automation_command(
+    window: &mut BrowserWindow,
+    state: &mut AppState,
+    command: AutomationCommand,
+) {
+    match command {
+        AutomationCommand::Open { url } => open_new_tab(window, state, &url),
+        AutomationCommand::Navigate { url } => navigate_active_tab(window, state, &url),
+        AutomationCommand::Switch { index } => match tab_id_at(state, index) {
+            Some(id) => {
+                let started = Instant::now();
+                if let Some(effect) = state.tabs.activate_at(id, started) {
+                    activate_and_refresh(window, state, id, effect);
+                    record_tab_latency(state, metrics::TabLatencyKind::Switch, id, started);
+                }
+            }
+            None => eprintln!("velox: automation: switch {index} は範囲外です"),
+        },
+        AutomationCommand::Close { index } => match tab_id_at(state, index) {
+            Some(id) => close_tab(window, state, id),
+            None => eprintln!("velox: automation: close {index} は範囲外です"),
+        },
+        AutomationCommand::Wait { .. } | AutomationCommand::Quit => {}
+    }
+}
+
+/// The [`TabId`] currently at tab-strip position `index` (0-based), or
+/// `None` if `index` is out of range — the shared lookup
+/// `handle_automation_command`'s `Switch`/`Close` arms use to turn a
+/// script's positional index into the `TabId` every other tab operation
+/// in this file addresses tabs by.
+fn tab_id_at(state: &AppState, index: usize) -> Option<TabId> {
+    state.tabs.iter().nth(index).map(|tab| tab.id())
+}
+
+/// Spawn the background thread that drives one parsed
+/// `VELOX_AUTOMATION_SCRIPT` (Issue #112). Walks `commands` in order:
+/// `AutomationCommand::Wait` sleeps this thread (never blocking the main
+/// thread, which keeps servicing the webview/UI the whole time); every
+/// other command is proxied into the event loop as
+/// `UserEvent::Automation`, processed on the main thread exactly like any
+/// other `UserEvent` (see docs/decisions.md D44). `EventLoopProxy::send_event`
+/// is the same fire-and-forget channel every webview callback already uses
+/// to reach the main thread (`ui/window.rs`) — nothing new is introduced
+/// here beyond one more sender.
+///
+/// If the event loop has already gone away (the window was closed before
+/// the script finished), `send_event` starts failing and this thread exits
+/// early rather than spinning forever.
+fn spawn_automation(proxy: EventLoopProxy<UserEvent>, commands: Vec<AutomationCommand>) {
+    std::thread::spawn(move || {
+        for command in commands {
+            match command {
+                AutomationCommand::Wait { ms } => {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
+                other => {
+                    if proxy.send_event(UserEvent::Automation(other)).is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Show `id` in the window, then bring the toolbar (address bar, loading
