@@ -55,7 +55,7 @@ jobs:
       - name: Install WebKitGTK + Xvfb
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb
+          sudo apt-get install -y libwebkit2gtk-4.1-dev xvfb dbus-x11
 
       # Issue #72: WebKitGTK launches its web process inside a bubblewrap
       # sandbox, which needs an unprivileged user namespace. Ubuntu 24.04
@@ -157,6 +157,7 @@ jobs:
           VELOX_PERF_OUTPUT="$out" \
           VELOX_DATA_DIR=/tmp/perf-gate/diag/data \
             timeout 20 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
               /tmp/perf-gate/candidate/velox \
                 --homepage http://127.0.0.1:8731/minimal.html > "$err" 2>&1 &
           velox_job=$!
@@ -187,6 +188,7 @@ jobs:
         run: |
           set -eu
           xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
             /tmp/perf-gate/candidate/velox-bench run \
               --scenario cold_startup --trials 8 \
               --velox-bin /tmp/perf-gate/baseline/velox \
@@ -198,6 +200,7 @@ jobs:
         run: |
           set -eu
           xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
             /tmp/perf-gate/candidate/velox-bench run \
               --scenario cold_startup --trials 8 \
               --velox-bin /tmp/perf-gate/candidate/velox \
@@ -208,6 +211,7 @@ jobs:
         run: |
           set -eu
           xvfb-run -a --server-args="-screen 0 1280x900x24" \
+              dbus-run-session -- \
             /tmp/perf-gate/candidate/velox-bench run \
               --scenario cold_startup --trials 8 \
               --velox-bin /tmp/perf-gate/candidate/velox \
