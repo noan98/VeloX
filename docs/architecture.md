@@ -605,6 +605,26 @@ D20 for how suspension fits into the `TabState` model above.
   tab's timestamp is never read, since the active tab is always excluded
   from suspension candidates regardless of its value.
 
+## Startup URL
+
+`Config::homepage` is resolved at launch from three layers, highest priority
+first: a `--homepage <URL>`/`--homepage=<URL>` flag, the `VELOX_HOMEPAGE`
+environment variable, then the compiled-in default
+(`https://www.google.com/`). `config::resolve_homepage` is a pure function
+over those three ingredients, so the precedence and the rejection rules are
+unit-tested without touching the real process environment — the same shape as
+`resolve_private`/`resolve_perf_env`/`resolve_search_engine`.
+
+Every candidate is validated with `navigation::normalize_input`, the exact
+function address-bar input goes through, rather than a second copy of the
+scheme rules. A candidate it rejects is skipped in favour of the next one, so
+neither a typo nor a hostile `VELOX_HOMEPAGE` can stop VeloX from starting or
+turn into a navigable `javascript:` URL. See docs/decisions.md D40.
+
+This exists mainly so `velox-bench run --url <URL>` can point a benchmark
+trial at a fixed local fixture instead of a network-dependent page; see
+docs/benchmarking.md.
+
 ## Performance extension points
 
 Implemented in `browser::metrics` (see D16/D19 in `docs/decisions.md`),

@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use crate::browser::metrics::PerfFormat;
+use crate::browser::navigation;
 
 /// Default interval between process-tree RSS samples when performance
 /// metrics are enabled but no explicit interval was requested.
@@ -166,7 +167,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            homepage: "https://example.com".to_owned(),
+            homepage: "https://www.google.com/".to_owned(),
             window_title: "VeloX".to_owned(),
             window_width: 1024,
             window_height: 768,
@@ -197,6 +198,13 @@ impl Config {
     /// Build a config from compiled defaults, overridden by the
     /// environment and command line:
     ///
+    /// - `VELOX_HOMEPAGE`, or a `--homepage <URL>` / `--homepage=<URL>` flag
+    ///   in `args`, overrides the page loaded at startup. The flag wins over
+    ///   the environment variable. The value goes through
+    ///   [`navigation::normalize_input`], exactly like address-bar input, so
+    ///   a rejected scheme (`javascript:` and friends) or unparseable URL
+    ///   falls back to the compiled-in default rather than starting a
+    ///   browser that cannot navigate. See docs/decisions.md D40.
     /// - `VELOX_PRIVATE` — presence (like `VELOX_DEBUG`; see `app.rs`), or a
     ///   `--private` flag in `args`, turns on whole-app private browsing.
     /// - `VELOX_PERF_METRICS` — any value (including empty) turns on
@@ -226,7 +234,19 @@ impl Config {
     /// D6); `args` is expected to be the process arguments with argv\[0\]
     /// already stripped (e.g. `std::env::args().skip(1)`).
     pub fn from_env_and_args<I: IntoIterator<Item = String>>(args: I) -> Self {
-        let private = resolve_private(std::env::var_os("VELOX_PRIVATE").is_some(), args);
+        // Collected once: both `resolve_private` and `resolve_homepage` need
+        // to walk the arguments.
+        let args: Vec<String> = args.into_iter().collect();
+        let private = resolve_private(
+            std::env::var_os("VELOX_PRIVATE").is_some(),
+            args.iter().cloned(),
+        );
+        let defaults = Self::default();
+        let homepage = resolve_homepage(
+            std::env::var("VELOX_HOMEPAGE").ok().as_deref(),
+            &args,
+            &defaults.homepage,
+        );
         let metrics_requested = std::env::var_os("VELOX_PERF_METRICS").is_some();
         let interval_raw = std::env::var("VELOX_PERF_RSS_INTERVAL_MS").ok();
         let (perf_metrics, perf_rss_interval) =
@@ -244,15 +264,57 @@ impl Config {
             std::env::var("VELOX_SEARCH_ENGINE_URL").ok().as_deref(),
         );
         Self {
+            homepage,
             private,
             search_engine,
             perf_metrics,
             perf_rss_interval,
             perf_format,
             perf_output_path,
-            ..Self::default()
+            ..defaults
         }
     }
+}
+
+/// The startup URL, given the raw ingredients (`VELOX_HOMEPAGE`, the CLI
+/// arguments, and the compiled-in default). Pure so the precedence and the
+/// rejection rules are unit-testable without touching the real process
+/// environment, matching [`resolve_private`]/[`resolve_perf_env`].
+///
+/// `--homepage` wins over `VELOX_HOMEPAGE`, which wins over `default`. A
+/// candidate that [`navigation::normalize_input`] rejects — an unsupported
+/// or dangerous scheme, or something that is not a URL at all — is dropped
+/// in favour of the next candidate rather than failing the launch: a typo in
+/// a benchmark script should not leave VeloX with no page to show. The
+/// returned string is always already normalized.
+fn resolve_homepage(env_raw: Option<&str>, args: &[String], default: &str) -> String {
+    let from_args = homepage_arg(args);
+    from_args
+        .as_deref()
+        .and_then(navigation::normalize_input)
+        .or_else(|| env_raw.and_then(navigation::normalize_input))
+        .unwrap_or_else(|| {
+            navigation::normalize_input(default).unwrap_or_else(|| default.to_owned())
+        })
+}
+
+/// The value of a `--homepage <URL>` or `--homepage=<URL>` flag, if present.
+/// The last occurrence wins, mirroring how a shell wrapper appending flags
+/// would expect to override an earlier one. A bare trailing `--homepage`
+/// with nothing after it yields `None`.
+fn homepage_arg(args: &[String]) -> Option<String> {
+    let mut found = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--homepage=") {
+            found = Some(value.to_owned());
+        } else if arg == "--homepage" {
+            if let Some(value) = iter.next() {
+                found = Some(value.clone());
+            }
+        }
+    }
+    found
 }
 
 /// Pure decision logic behind [`Config::from_env_and_args`]'s
@@ -417,6 +479,123 @@ mod tests {
         assert_eq!(
             resolve_perf_output(true, Some("json"), Some("   ")),
             (PerfFormat::Json, None)
+        );
+    }
+
+    // -- resolve_homepage / homepage_arg (Issue #106, D40) ---------------
+
+    const DEFAULT_HOME: &str = "https://www.google.com/";
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn homepage_falls_back_to_the_default_with_no_flag_or_env() {
+        assert_eq!(
+            resolve_homepage(None, &args(&[]), DEFAULT_HOME),
+            DEFAULT_HOME
+        );
+    }
+
+    #[test]
+    fn homepage_comes_from_the_env_var_when_no_flag_is_given() {
+        assert_eq!(
+            resolve_homepage(Some("https://a.example/"), &args(&[]), DEFAULT_HOME),
+            "https://a.example/"
+        );
+    }
+
+    #[test]
+    fn homepage_flag_wins_over_the_env_var() {
+        assert_eq!(
+            resolve_homepage(
+                Some("https://env.example/"),
+                &args(&["--homepage", "https://flag.example/"]),
+                DEFAULT_HOME,
+            ),
+            "https://flag.example/"
+        );
+    }
+
+    #[test]
+    fn homepage_accepts_the_equals_form() {
+        assert_eq!(
+            resolve_homepage(
+                None,
+                &args(&["--homepage=https://a.example/"]),
+                DEFAULT_HOME
+            ),
+            "https://a.example/"
+        );
+    }
+
+    #[test]
+    fn homepage_is_normalized_like_address_bar_input() {
+        // Bare host gains a scheme; loopback defaults to http (navigation's
+        // existing rules, not a second copy of them).
+        assert_eq!(
+            resolve_homepage(None, &args(&["--homepage", "a.example"]), DEFAULT_HOME),
+            "https://a.example/"
+        );
+        assert_eq!(
+            resolve_homepage(None, &args(&["--homepage", "127.0.0.1:8731"]), DEFAULT_HOME),
+            "http://127.0.0.1:8731/"
+        );
+    }
+
+    #[test]
+    fn homepage_rejects_dangerous_schemes_and_falls_back() {
+        for hostile in ["javascript:alert(1)", "ftp://a.example/", "   "] {
+            assert_eq!(
+                resolve_homepage(None, &args(&["--homepage", hostile]), DEFAULT_HOME),
+                DEFAULT_HOME,
+                "{hostile} should not become the homepage"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_flag_does_not_shadow_a_valid_env_var() {
+        assert_eq!(
+            resolve_homepage(
+                Some("https://env.example/"),
+                &args(&["--homepage", "javascript:alert(1)"]),
+                DEFAULT_HOME,
+            ),
+            "https://env.example/"
+        );
+    }
+
+    #[test]
+    fn a_trailing_homepage_flag_with_no_value_is_ignored() {
+        assert_eq!(homepage_arg(&args(&["--homepage"])), None);
+        assert_eq!(
+            resolve_homepage(None, &args(&["--homepage"]), DEFAULT_HOME),
+            DEFAULT_HOME
+        );
+    }
+
+    #[test]
+    fn the_last_homepage_flag_wins() {
+        assert_eq!(
+            homepage_arg(&args(&[
+                "--homepage",
+                "https://first.example/",
+                "--homepage=https://second.example/",
+            ])),
+            Some("https://second.example/".to_owned())
+        );
+    }
+
+    #[test]
+    fn homepage_parsing_does_not_swallow_the_private_flag() {
+        // `--private` must still be seen when it follows a `--homepage` pair.
+        let list = args(&["--homepage", "https://a.example/", "--private"]);
+        assert!(resolve_private(false, list.iter().cloned()));
+        assert_eq!(
+            resolve_homepage(None, &list, DEFAULT_HOME),
+            "https://a.example/"
         );
     }
 

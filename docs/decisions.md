@@ -2443,3 +2443,44 @@ private browsing — at that point "does an omnibox opened in a private
 window suggest from the *other*, non-private window's very-recent history"
 becomes a real question this decision does not answer, since today there
 is only ever one `AppState`/one set of stores for the whole process.
+
+## D40: Startup URL is overridable (`--homepage` / `VELOX_HOMEPAGE`), default is Google
+
+**Scope**: Issue #106. Until now `Config::homepage` was a compile-time
+constant and `Config::from_env_and_args`'s `args` were consulted only for
+`--private`, so nothing outside the binary could choose the page VeloX opens.
+
+**Why this blocked Phase 3**: `velox-bench run` (D21) spawns `velox` with
+only the `VELOX_PERF_*` variables, so every trial measured whatever the
+default homepage was. That made the fixed fixtures in `scripts/bench/pages/`
+unreachable, and pinned first-page-load numbers to a network-dependent
+external site. Epic #57's first absolute rule is "no optimization without a
+benchmark", so this one gap held up the whole performance program.
+
+**Decision**: three layers, highest priority first — a `--homepage <URL>` /
+`--homepage=<URL>` flag, the `VELOX_HOMEPAGE` environment variable, then the
+compiled-in default. `velox-bench run` grew a `--url` option that it forwards
+as `VELOX_HOMEPAGE`, and warns when it is omitted precisely because the
+default is network-dependent.
+
+**Validation, not a second parser**: every candidate goes through
+`navigation::normalize_input` — the same function the address bar uses (D26).
+`javascript:` and other rejected schemes, and anything unparseable, are
+*skipped in favour of the next candidate* rather than failing the launch: a
+typo in a benchmark script should not leave VeloX with no page to show, and
+a hostile value in the environment must not become a navigable URL. The
+resolution is a pure function (`resolve_homepage`) so the precedence and the
+rejection rules are unit-tested without touching the real environment,
+matching `resolve_private`/`resolve_perf_env`/`resolve_search_engine`.
+
+**Default changed** from `https://example.com` to `https://www.google.com/`.
+`example.com` is a specification placeholder, not a page anyone wants on
+startup; it was only ever a stand-in. Note that this makes the *default*
+launch network-dependent, which is exactly why benchmarks must pass `--url`.
+
+**Cost / revisit condition**: the flag only sets the *initial* page. Driving
+navigation after startup, or opening N tabs at launch, still has no hook, so
+`Scenario::is_unattended()` keeps `navigation`/`tab_create`/`tab_switch`/
+`tabs_1..50` manual. Those need a separate automation hook in `app.rs`;
+revisit when #58 fixes the benchmark conditions and says which of them must
+run unattended in CI.
