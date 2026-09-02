@@ -4,6 +4,12 @@
 > を参照。** この文書は VeloX 自身の内部計測 (`velox-bench`) を扱う。**メモリを
 > ブラウザ間で比較するときは RSS 合計ではなく PSS を使うこと** — 理由と実測での
 > 逆転例は D41 と performance-targets.md §3.1 にある。
+>
+> **このスイートやベンチマークで「遅い/重い」を検出した後、原因のコード箇所まで
+> 掘り下げる手順は [docs/profiling.md](profiling.md) を参照。** ここでの
+> 役割分担は: 本文書と `compare_browsers.py` が「どのくらい悪いか」を数値で
+> 検出し、`docs/profiling.md` (`perf`/`heaptrack`/`scripts/profile/`) が
+> 「どこのコードが原因か」を特定する。
 
 Issue #14 の成果物。VeloX 自身の最適化効果や、将来的な Chrome/Firefox 等との
 比較を定量評価するための、ベンチマーク条件・実行方法・結果フォーマットを
@@ -25,7 +31,8 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | 場所 | 役割 | 検証方法 |
 |------|------|----------|
 | `src/browser/benchmark.rs` | JSON Lines の解析、統計量算出 (中央値/p95 等)、複数試行の集約、2 つの保存結果の比較。UI/WebView/OS に非依存の純粋な Rust ロジック | `cargo test` で完全にカバー (ヘッドレス環境でも実行できる) |
-| `src/bin/velox-bench.rs` | 実際に `velox` バイナリを起動してログを収集し、`benchmark.rs` に渡す薄い IO 層。`run` / `aggregate` / `compare` / `list-scenarios` サブコマンドを持つ CLI | **GUI (WebView) を起動できる環境でのみ動作を確認できる。この開発環境・CI はヘッドレスのため `run` サブコマンドは検証できていない** (下記「実行環境要件」参照) |
+| `src/bin/velox-bench.rs` | 実際に `velox` バイナリを起動してログを収集し、`benchmark.rs` に渡す薄い IO 層。`run` / `aggregate` / `compare` / `list-scenarios` サブコマンドを持つ CLI | **GUI (WebView) を起動できる環境が必要。この開発環境・CI はヘッドレスのため `Xvfb` (下記「実行環境要件」) を経由してのみ検証している** — Issue #106/#112 で `Xvfb` 上の全シナリオの `run` 実行に成功済み |
+| `src/browser/automation.rs` | `VELOX_AUTOMATION_SCRIPT` の行区切りスクリプトのパース、`velox-bench run` 用スクリプト生成 (`generate_bench_script`)。UI/WebView/OS に非依存の純粋な Rust ロジック (Issue #112、docs/decisions.md D44) | `cargo test` で完全にカバー |
 | `scripts/bench/pages/*.html` | 固定テストページ (ネットワーク非依存のローカル HTML) | — |
 
 新規依存クレートは追加していない。既存の `serde` / `serde_json` のみを使用する
@@ -42,17 +49,93 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | `cold_startup` | cold startup | 可 |
 | `warm_startup` | warm startup | 可 |
 | `first_page_load` | first page load | 可 |
-| `navigation` | navigation latency | 不可 (手動 / 将来の自動化) |
-| `tab_create` | tab creation | 不可 (手動 / 将来の自動化) |
-| `tab_switch` | tab switching | 不可 (手動 / 将来の自動化) |
-| `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 不可 (手動 / 将来の自動化) |
+| `navigation` | navigation latency | 可 (`--url` 必須、下記「自動操作フック」参照) |
+| `tab_create` | tab creation | 可 (`--url` 必須) |
+| `tab_switch` | tab switching | 可 (`--url` 必須) |
+| `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 可 (`--url` 必須) |
 
 「自動実行」列の意味は `src/browser/benchmark.rs` の
-`scenario::Scenario::is_unattended` を参照。VeloX には外部からタブ作成や
-アドレスバー入力を駆動する CLI/IPC が (この Issue の時点では) 存在しないため、
-`run` サブコマンドが完全に無人で実行できるのは「起動して待つだけ」で済む
-起動系シナリオだけである。それ以外は手動 (または将来 Issue で追加される
-自動操作) でログを収集し、`velox-bench aggregate` に渡す。
+`scenario::Scenario::is_unattended` を参照。**Issue #112 より前は、VeloX に
+外部からタブ作成やナビゲーションを駆動する仕組みが存在しなかったため、`run`
+サブコマンドが完全に無人で実行できるのは「起動して待つだけ」で済む起動系
+シナリオだけだった。** #112 で追加された `VELOX_AUTOMATION_SCRIPT` フック
+(下記「自動操作フック (`VELOX_AUTOMATION_SCRIPT`)」参照) により、`run` は
+残り全シナリオについても自動操作スクリプトを生成して VeloX に渡すようになり、
+現在は `is_unattended` が全シナリオで `true` を返す。起動系 3 シナリオ以外は
+自動操作スクリプトを組み立てるために実際のページ URL が要る (「measure
+whatever the default homepage is」のような無条件フォールバックは、比較可能な
+数値を得るという目的に反する) ため、`--url` を省略すると `run` はエラーで
+即座に失敗する (exit code 2)。手動でログを収集して `velox-bench aggregate`
+に渡す経路は引き続き利用できる (シナリオを問わず)。
+
+### 自動操作フック (`VELOX_AUTOMATION_SCRIPT`)
+
+Issue #112 の成果物。VeloX は起動時に環境変数 `VELOX_AUTOMATION_SCRIPT=<path>`
+が設定されていると、そのファイルを**一度だけ**読み込み、パースして、タブの
+開閉・切替・ナビゲーション・待機・終了を自動的に行う。**これは常設の待ち受け
+ソケットや RPC サーバではない** — 環境変数が無ければパーサ自体が一切動かず、
+通常起動に追加のコストや攻撃面を持ち込まない。設計判断の詳細は
+docs/decisions.md D44 (D18/D23 の IPC 信頼境界との関係) を参照。
+
+パーサ本体は `src/browser/automation.rs`
+(`browser::automation::parse_script`) — UI/WebView/OS に非依存の純粋な Rust
+ロジックで、`cargo test` から完全にカバーされる。実際にタブを開いたり
+切り替えたりする側 (`UserEvent::Automation` として既存のメインスレッド
+ディスパッチに流し、`ToolbarCommand`/`ContentShortcut` と同じタブ操作関数を
+呼ぶだけで、新しい状態変更経路は作っていない) は `src/app.rs` にある。
+
+**スクリプト形式**: 1 行 1 コマンド、上から順に実行される。`#` で始まる行と
+空行は無視される。
+
+```
+open <url>        # 新規タブを開いてアクティブにする
+switch <index>    # tab strip 上の position <index> (0始まり) のタブをアクティブにする
+close <index>     # position <index> のタブを閉じる
+navigate <url>    # アクティブタブを <url> へ遷移させる
+wait <ms>         # 次のコマンドまで <ms> ミリ秒待つ (上限 120000ms = automation::MAX_WAIT_MS)
+quit              # アプリケーションを終了する
+```
+
+`open`/`navigate` の URL はアドレスバー入力と同じ
+`browser::navigation::normalize_input` で正規化されるため、`javascript:`
+などの危険なスキームはパース時点で拒否される。`switch`/`close` の
+`<index>` は実行時点の tab strip 上の位置 (0 始まり) — スクリプトの各行が
+実行される順にタブが増減していくので、`close 1` は「その時点で 2 番目に
+あるタブ」を指す。範囲外の `index` は panic ではなく無視 (stderr に警告)
+される。不正な行 (未知のコマンド・引数欠落・数値パース失敗・`wait` の上限
+超過) はパース時点で全体を拒否し、行番号付きのエラーを stderr に出す —
+一部だけ実行される、ということはない。
+
+手で使う例:
+
+```sh
+cat > /tmp/script.txt <<'EOF'
+open http://127.0.0.1:8731/minimal.html
+wait 500
+switch 0
+wait 500
+close 1
+wait 300
+quit
+EOF
+
+VELOX_AUTOMATION_SCRIPT=/tmp/script.txt \
+VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
+  cargo run --release
+```
+
+`velox-bench run` は `navigation`/`tab_create`/`tab_switch`/`tabs_N` それぞれ
+に対して、上記コマンドを組み合わせたスクリプトを自動生成し (`--url` で
+渡されたページを使う)、一時ファイルに書き出して子プロセスに
+`VELOX_AUTOMATION_SCRIPT` として渡す。生成ロジックは
+`browser::automation::generate_bench_script` (純粋関数、`cargo test` で
+カバー) — 例えば `tabs_5` なら追加で 4 タブを `open` してから安定するまで
+`wait` し、`tab_switch` ならタブを数個開いてから `switch` を繰り返す。生成
+されるスクリプトは必ず `quit` で終わるため、`run` は各試行が warmup タイムア
+ウトを待たずに自発的に終了するのを検出でき (`wait_for_exit_or_timeout`)、
+シナリオごとの目安のタイムアウトは
+`browser::automation::recommended_timeout_secs` が決める (`--warmup-secs`
+で明示的に上書きできる)。
 
 ### 計測される生データとの対応
 
@@ -157,28 +240,36 @@ cargo run --release --bin velox-bench -- run \
   ホームページ (`https://www.google.com/`) を計測することになり、外部
   ネットワークに依存して再現性が失われる**ため、`velox-bench` は未指定時に
   警告を出す。比較可能な数値を取るには `scripts/bench/pages/` の固定ページを
-  loopback 経由で指定すること。
+  loopback 経由で指定すること。`navigation`/`tab_create`/`tab_switch`/
+  `tabs_*` は自動操作スクリプトの生成にこの URL を使うため必須 (省略すると
+  exit code 2 で即座に失敗する) — 上記「自動操作フック」参照。
 - `--velox-bin <path>`: 起動する `velox` バイナリのパス。省略時は
   `velox-bench` 自身の実行ファイルと同じディレクトリの `velox` (Windows は
   `velox.exe`) を使う。
-- `--warmup-secs <秒>`: 1 試行あたりプロセスを起動してから終了させるまでの
-  待ち時間。既定 5 秒 (`startup` イベントが記録されるのに十分な時間)。
+- `--warmup-secs <秒>`: 1 試行あたりプロセスを起動してから (強制) 終了させる
+  までの上限。既定値はシナリオごとに異なる
+  (`browser::automation::recommended_timeout_secs`) — 起動系 3 シナリオは
+  従来どおり 5 秒、自動操作スクリプトを使うシナリオはそのスクリプトが
+  余裕を持って完走できる秒数 (`tabs_N` はタブ数に応じて増える)。**自動操作
+  スクリプトは必ず `quit` で終わるため、実際にはこの上限より先に子プロセス
+  が自発的に終了することが多い** — `run` は `try_wait` でこれを検出し、
+  待ち切らずに次の試行へ進む。それでも `--warmup-secs` を明示すれば既定値を
+  上書きできる (遅い環境で余裕を持たせたい場合など)。
 - `--rss-interval-ms <ms>`: `VELOX_PERF_RSS_INTERVAL_MS` を子プロセスに渡す。
 - `--git-commit <sha>`: 保存する `environment.git_commit` を明示的に指定
   (省略時はカレントディレクトリで `git rev-parse HEAD` を試みる)。
 
-**`navigation` / `tab_create` / `tab_switch` / `tabs_*` を `run` に渡すと、
-「手動で収集して `aggregate` に渡してください」というエラーで即座に失敗する
-(exit code 2)。** これらのシナリオを外部から無人で駆動する仕組みはこの
-Issue の範囲では実装していない。
-
 ### 3. 手動収集したログを集計する (`aggregate`)
 
-`navigation` や `tabs_N` のように手動操作が要るシナリオでは、実際に VeloX を
+`run` はすべてのシナリオを自動実行できるが (上記)、`aggregate` は今も
+使える経路として残っている — `VELOX_AUTOMATION_SCRIPT` を使わずに手で VeloX
+を操作したログや、`run` 以外の方法 (CI の別ジョブなど) で集めたログを集計
+したい場合はこちらを使う。実際に VeloX を
 `VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=<path>` 付きで
 起動し、想定の操作 (例: `tabs_5` ならタブを 5 個開いた状態を数秒維持する、
-`navigation` なら `scripts/bench/pages/` のページ間を数回移動する) をした後に
-終了し、そのログファイルを 1 試行分として渡す。試行回数分だけログファイルを
+`navigation` なら `scripts/bench/pages/` のページ間を数回移動する) を手動で
+行うか、上記の `VELOX_AUTOMATION_SCRIPT` を自分で書いて再現し、終了後に
+そのログファイルを 1 試行分として渡す。試行回数分だけログファイルを
 用意し、`--input` を繰り返し指定する:
 
 ```sh
@@ -376,21 +467,42 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   起動が間に合わず 1 レコードしか取れなかった (startup 系の `n` が 2 に
   なっている)、(c) 競合ブラウザとの比較条件が未確定 (#58)。正式な目標値と
   比較条件は #58 で定める。
-- `navigation` / `tab_create` / `tab_switch` / `tabs_1..50`: シナリオ定義・
-  データモデル・集計コードパスは実装・テスト済みだが、実測 (ログの収集)
-  そのものは行っていない — タブ操作やナビゲーションを外部から無人で駆動
-  する仕組みが存在しないため、この Issue の範囲では未実施。手動運用手順は
-  上記「3. 手動収集したログを集計する」に記載した。
+- `navigation` / `tab_create` / `tab_switch` / `tabs_1..50`: **Issue #112 で
+  `VELOX_AUTOMATION_SCRIPT` フックを実装し、`Xvfb` 上で実際に `run` から
+  自動実行して実測に成功した** (4 コア・GPU 無しのコンテナ、ソフトウェア
+  レンダリング、`scripts/bench/pages/minimal.html` を loopback 配信、各
+  2 試行)。
+
+  | シナリオ | metric | median | p95 | n |
+  | --- | --- | ---: | ---: | ---: |
+  | `tabs_5` | `page_load_ms` | 31.80 | 42.21 | 10 |
+  | `tabs_5` | `tab_create_ms` | 25.75 | 36.86 | 8 |
+  | `tabs_5` | `pss_total_bytes` | 140172288 | 142782259 | 2 |
+  | `navigation` | `page_load_ms` | 7.45 | 23.68 | 10 |
+  | `tab_create` | `tab_create_ms` | 20.65 | 50.22 | 10 |
+  | `tab_switch` | `tab_switch_ms` | 0.60 | 0.85 | 16 |
+
+  **これも `cold_startup` の既存の実測結果同様、正式なベースラインでは
+  ない** (a) ソフトウェアレンダリングのため RSS/PSS が実機より大きい、
+  (b) 試行数が 2 と少ない、(c) 競合ブラウザとの比較条件・目標値は #58 で
+  別途定める。ここでの目的は「自動実行の配線が実際に動き、意味のある値を
+  返す」ことの確認であり、性能の当落判定ではない。`tab_switch_ms` が
+  1ms 未満なのは、このコンテナではソフトウェアレンダリングの初回描画待ちが
+  ボトルネックにならない (既にレンダリング済みの背景タブへの切り替えは
+  ほぼ即時) ためで、実機の GPU レンダリングでも同程度かは未確認。
 
 ## 既知の制約・将来の拡張
 
-- タブ作成・タブ切り替え・ナビゲーションを外部から自動的に駆動する仕組みが
-  まだ無い。Issue #106 で**起動時の URL 指定 (`--homepage` / `VELOX_HOMEPAGE`)
-  までは入った**ので `first_page_load` は自動化できるが、「起動時に N 個の
-  タブを開く」「起動後に別ページへ遷移する」に相当するフックは未実装。
-  `tabs_1..50` / `navigation` / `tab_create` / `tab_switch` の自動実行には
-  引き続き追加のフックが必要で、`Scenario::is_unattended()` はこれらを
-  `false` のままにしている。
-- ~~`Xvfb` 等の仮想ディスプレイを使えば `run` の起動系シナリオを実行できる
-  可能性がある~~ → **Issue #106 で実証済み。** 上記「実行環境の前提」の
-  `xvfb-run` の項を参照。
+- `browser::automation::generate_bench_script` が各シナリオに生成する
+  ステップ数・待ち時間 (`NAVIGATION_STEPS` などの定数) は現時点では控えめな
+  固定値であり、統計的に十分なサンプル数を保証する設計ではない。
+  `tab_switch_ms`/`tab_create_ms` の `n` を増やしたい場合、今は `--trials`
+  を増やすしかない (1 試行あたりのステップ数を増やす調整は将来の課題)。
+- `browser::automation::recommended_timeout_secs` の見積もり定数
+  (`PER_STEP_OVERHEAD_MS` など) は経験則であり、実機のログを継続的に見て
+  調整する前提。極端に遅い/速い環境では `--warmup-secs` で明示的に上書き
+  すること。
+- `switch`/`close <index>` は tab strip 上の**位置** (0 始まり) でタブを
+  指定する。並行して他の要因でタブの並び順が変わる状況 (今の VeloX には
+  無いが、将来ドラッグ&ドロップでの並べ替え等が入った場合) には対応して
+  いない — スクリプトの各行は「その時点の並び」を前提に書く。

@@ -1423,14 +1423,29 @@ pub mod scenario {
 
         /// Whether `velox-bench run` can drive this scenario unattended
         /// (launch the binary, wait, collect) versus needing a real display
-        /// plus manual or externally-scripted interaction (opening tabs,
-        /// navigating) before its log can be fed to `velox-bench
-        /// aggregate`. See `docs/benchmarking.md`, "自動化できる範囲".
+        /// plus manual interaction before its log can be fed to
+        /// `velox-bench aggregate`. See `docs/benchmarking.md`, "自動実行".
+        ///
+        /// Before Issue #112 this was only true for the three startup
+        /// scenarios, since nothing could drive tab creation/switching or
+        /// navigation without a human at the keyboard. #112's
+        /// `VELOX_AUTOMATION_SCRIPT` hook (`browser::automation`) plus
+        /// `browser::automation::generate_bench_script` cover the rest:
+        /// `velox-bench run` now generates and feeds a script for every
+        /// scenario, so every variant is unattended. The method (and its
+        /// `match`, rather than a bare `true`) is kept so a future scenario
+        /// that genuinely needs a human has a single, obvious place to say
+        /// so.
         pub fn is_unattended(self) -> bool {
-            matches!(
-                self,
-                Scenario::ColdStartup | Scenario::WarmStartup | Scenario::FirstPageLoad
-            )
+            match self {
+                Scenario::ColdStartup
+                | Scenario::WarmStartup
+                | Scenario::FirstPageLoad
+                | Scenario::Navigation
+                | Scenario::TabCreate
+                | Scenario::TabSwitch
+                | Scenario::TabCountMemory(_) => true,
+            }
         }
     }
 
@@ -1459,16 +1474,12 @@ pub mod scenario {
         }
 
         #[test]
-        fn only_startup_and_first_page_load_are_unattended() {
-            let unattended: Vec<_> = Scenario::all()
-                .into_iter()
-                .filter(|s| s.is_unattended())
-                .map(Scenario::id)
-                .collect();
-            assert_eq!(
-                unattended,
-                vec!["cold_startup", "warm_startup", "first_page_load"]
-            );
+        fn every_scenario_is_unattended_since_112() {
+            // #112 gave `velox-bench run` a `VELOX_AUTOMATION_SCRIPT` hook
+            // (`browser::automation`) covering tab create/switch/close and
+            // navigation, so nothing is left that needs a human anymore —
+            // see `is_unattended`'s doc comment.
+            assert!(Scenario::all().into_iter().all(Scenario::is_unattended));
         }
     }
 }

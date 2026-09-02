@@ -21,13 +21,16 @@
 //! - `list-scenarios` — print the fixed scenario catalog
 //!   (`benchmark::scenario::Scenario::all`).
 //! - `run` — spawn the `velox` binary N times and aggregate the results.
-//!   Only works for the "unattended" scenarios (cold/warm startup, first
-//!   page load) that need no interaction after launch; see
-//!   `Scenario::is_unattended`.
+//!   Every scenario is unattended (`Scenario::is_unattended`): the three
+//!   startup scenarios need no interaction after launch, and — since
+//!   Issue #112 — `navigation`/`tab_create`/`tab_switch`/`tabs_N` are
+//!   driven by a generated `VELOX_AUTOMATION_SCRIPT`
+//!   (`velox::browser::automation::generate_bench_script`) instead of a
+//!   human at the keyboard. See `docs/decisions.md` D44.
 //! - `aggregate` — build the same machine-readable result file from
-//!   already-collected `VELOX_PERF_OUTPUT` log files (one per trial) —
-//!   the path for scenarios that need manual or externally-scripted
-//!   interaction (navigation, tab create/switch, N-tab memory/CPU).
+//!   already-collected `VELOX_PERF_OUTPUT` log files (one per trial) — the
+//!   path for a manually-driven trial, or one collected some other way
+//!   outside `run` entirely.
 //! - `compare` — diff two saved result files and exit non-zero on a
 //!   regression beyond `--threshold-pct`, the original two-file diff Issue
 //!   #36 asked for.
@@ -45,6 +48,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use velox::browser::automation;
 use velox::browser::benchmark::scenario::Scenario;
 use velox::browser::benchmark::{
     self, BenchmarkResult, ComparisonReport, GateThresholds, MetricDiff, RunEnvironment, Severity,
@@ -91,15 +95,16 @@ gate の終了コード: 0=OK, 1=FAIL (CIをブロックすべき), 3=WARN (非�
 fn cmd_list_scenarios() -> Result<i32, String> {
     println!("{:<16} 自動実行 (run)", "scenario");
     for scenario in Scenario::all() {
-        println!(
-            "{:<16} {}",
-            scenario.id(),
-            if scenario.is_unattended() {
-                "可 (run で自動実行可能)"
-            } else {
-                "不可 (手動収集して aggregate に渡す)"
-            }
-        );
+        // Every scenario is unattended as of Issue #112 (see
+        // `Scenario::is_unattended`'s doc comment); what differs is
+        // whether `run` needs `--url` to build a
+        // `VELOX_AUTOMATION_SCRIPT` for it.
+        let note = if automation::needs_automation_script(scenario) {
+            "可 (run で自動実行可能、--url 必須)"
+        } else {
+            "可 (run で自動実行可能)"
+        };
+        println!("{:<16} {}", scenario.id(), note);
     }
     Ok(0)
 }
@@ -161,11 +166,15 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     let scenario_id = flags.required("scenario")?;
     let scenario = Scenario::parse(scenario_id)
         .ok_or_else(|| format!("未知のシナリオです: {scenario_id} (list-scenarios を参照)"))?;
+    // As of Issue #112 every scenario is unattended (`is_unattended` always
+    // returns `true` now — see its doc comment); this guard is kept so a
+    // future scenario that genuinely needs a human still fails loudly here
+    // instead of silently trying to run.
     if !scenario.is_unattended() {
         return Err(format!(
             "シナリオ {scenario_id} は run では自動実行できません。実際に VeloX を \
-             手動 (または将来のIPC自動化) で操作し、VELOX_PERF_OUTPUT に書き出した \
-             ログファイルを `velox-bench aggregate --scenario {scenario_id} --input <path> ...` \
+             手動で操作し、VELOX_PERF_OUTPUT に書き出したログファイルを \
+             `velox-bench aggregate --scenario {scenario_id} --input <path> ...` \
              に渡してください。docs/benchmarking.md 参照。"
         ));
     }
@@ -182,10 +191,6 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         Some(path) => PathBuf::from(path),
         None => default_velox_bin_path()?,
     };
-    let warmup_secs: u64 = flags
-        .one("warmup-secs")
-        .map(|v| v.parse().unwrap_or(5))
-        .unwrap_or(5);
     let rss_interval_ms = flags.one("rss-interval-ms");
     // The page every trial loads. Handed to VeloX as `VELOX_HOMEPAGE`
     // (Issue #106): without it every trial would measure whatever the
@@ -194,10 +199,39 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     // fixture served over loopback for comparable numbers.
     let url = flags.one("url");
 
+    // Issue #112: `navigation`/`tab_create`/`tab_switch`/`tabs_N` need an
+    // automation script (`browser::automation::generate_bench_script`) to
+    // open/switch/navigate tabs, and that script needs a concrete page to
+    // point at — unlike the three startup scenarios, there is no sensible
+    // "measure whatever the default homepage is" fallback here, since the
+    // whole point is comparable, network-independent pages.
+    if automation::needs_automation_script(scenario) && url.is_none() {
+        return Err(format!(
+            "シナリオ {scenario_id} の自動実行には --url が必要です \
+             (scripts/bench/pages/ の固定ページを指定してください。docs/benchmarking.md 参照)。"
+        ));
+    }
+    let automation_script = url.and_then(|url| automation::generate_bench_script(scenario, url));
+
+    // A script ends with `quit`, so a trial normally exits on its own well
+    // before this — see `wait_for_exit_or_timeout`. `--warmup-secs`
+    // overrides the default either way (e.g. to force a longer wait on a
+    // slower machine).
+    let default_warmup_secs = automation::recommended_timeout_secs(scenario);
+    let warmup_secs: u64 = flags
+        .one("warmup-secs")
+        .map(|v| v.parse().unwrap_or(default_warmup_secs))
+        .unwrap_or(default_warmup_secs);
+
     match url {
         Some(url) => println!(
-            "velox-bench: {scenario_id} を {trials} 回実行します (velox バイナリ: {}, URL: {url})",
-            velox_bin.display()
+            "velox-bench: {scenario_id} を {trials} 回実行します (velox バイナリ: {}, URL: {url}{})",
+            velox_bin.display(),
+            if automation_script.is_some() {
+                "、自動操作スクリプトあり"
+            } else {
+                ""
+            }
         ),
         None => println!(
             "velox-bench: {scenario_id} を {trials} 回実行します (velox バイナリ: {})\n\
@@ -207,6 +241,21 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
             velox_bin.display()
         ),
     }
+
+    // Written once (its content only depends on `scenario`/`url`, not on
+    // the trial number) and removed again once every trial has run.
+    let script_path = match &automation_script {
+        Some(text) => {
+            let path = env::temp_dir().join(format!(
+                "velox-bench-{}-{scenario_id}-script.txt",
+                std::process::id()
+            ));
+            fs::write(&path, text)
+                .map_err(|err| format!("自動操作スクリプトを書き出せません: {err}"))?;
+            Some(path)
+        }
+        None => None,
+    };
 
     let mut trial_events = Vec::with_capacity(trials as usize);
     let mut spawn_failures = 0u32;
@@ -232,10 +281,13 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         if let Some(url) = url {
             command.env("VELOX_HOMEPAGE", url);
         }
+        if let Some(script_path) = &script_path {
+            command.env("VELOX_AUTOMATION_SCRIPT", script_path);
+        }
 
         match command.spawn() {
-            Ok(child) => {
-                std::thread::sleep(Duration::from_secs(warmup_secs));
+            Ok(mut child) => {
+                wait_for_exit_or_timeout(&mut child, Duration::from_secs(warmup_secs));
                 terminate(child);
             }
             Err(err) => {
@@ -256,6 +308,10 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         );
         trial_events.push(events);
         let _ = fs::remove_file(&log_path);
+    }
+
+    if let Some(script_path) = &script_path {
+        let _ = fs::remove_file(script_path);
     }
 
     let metrics = benchmark::aggregate_trials(&trial_events);
@@ -280,6 +336,35 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         return Ok(1);
     }
     Ok(0)
+}
+
+/// Poll `child` until it exits on its own or `timeout` elapses, whichever
+/// comes first, then return either way — `terminate` (called right after)
+/// is always the one that actually reaps it. A `VELOX_AUTOMATION_SCRIPT`
+/// (Issue #112) ends with `quit`, so a scripted trial's process usually
+/// exits well before `timeout`; this lets that trial move on immediately
+/// instead of always waiting out the full timeout, while a scenario with
+/// no script (or a script that never reaches `quit`) simply waits out
+/// `timeout` exactly like the pre-#112 fixed `sleep`.
+fn wait_for_exit_or_timeout(child: &mut Child, timeout: Duration) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            // Exited on its own (normally or otherwise) — nothing left to
+            // wait for.
+            Ok(Some(_status)) => return,
+            // Still running.
+            Ok(None) => {}
+            // Can no longer observe this child's state; give up polling
+            // rather than looping forever.
+            Err(_) => return,
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(POLL_INTERVAL);
+    }
 }
 
 /// Send a graceful terminate-then-kill to `child` and reap it. Perf log
