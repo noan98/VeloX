@@ -68,7 +68,7 @@ fn main() {
 
 const USAGE: &str = "使い方:\n\
   velox-bench list-scenarios\n\
-  velox-bench run --scenario <id> --trials <N> --output <path> [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>]\n\
+  velox-bench run --scenario <id> --trials <N> --output <path> [--url <URL>] [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>]\n\
   velox-bench aggregate --scenario <id> --output <path> --input <path> [--input <path> ...] [--git-commit <sha>]\n\
   velox-bench compare --baseline <path> --candidate <path> [--threshold-pct <pct>] [--output <path>]\n\n\
 詳細は docs/benchmarking.md を参照してください。";
@@ -176,11 +176,26 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         .map(|v| v.parse().unwrap_or(5))
         .unwrap_or(5);
     let rss_interval_ms = flags.one("rss-interval-ms");
+    // The page every trial loads. Handed to VeloX as `VELOX_HOMEPAGE`
+    // (Issue #106): without it every trial would measure whatever the
+    // compiled-in default homepage is, which is network-dependent and
+    // therefore not reproducible. Point this at a `scripts/bench/pages/`
+    // fixture served over loopback for comparable numbers.
+    let url = flags.one("url");
 
-    println!(
-        "velox-bench: {scenario_id} を {trials} 回実行します (velox バイナリ: {})",
-        velox_bin.display()
-    );
+    match url {
+        Some(url) => println!(
+            "velox-bench: {scenario_id} を {trials} 回実行します (velox バイナリ: {}, URL: {url})",
+            velox_bin.display()
+        ),
+        None => println!(
+            "velox-bench: {scenario_id} を {trials} 回実行します (velox バイナリ: {})\n\
+             velox-bench: 警告: --url が未指定のため VeloX の既定ホームページを計測します。\n\
+             velox-bench: 再現性のある結果には scripts/bench/pages/ の固定ページを \
+             --url で指定してください (docs/benchmarking.md 参照)。",
+            velox_bin.display()
+        ),
+    }
 
     let mut trial_events = Vec::with_capacity(trials as usize);
     let mut spawn_failures = 0u32;
@@ -202,6 +217,9 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
             .env("VELOX_PERF_OUTPUT", &log_path);
         if let Some(interval) = rss_interval_ms {
             command.env("VELOX_PERF_RSS_INTERVAL_MS", interval);
+        }
+        if let Some(url) = url {
+            command.env("VELOX_HOMEPAGE", url);
         }
 
         match command.spawn() {

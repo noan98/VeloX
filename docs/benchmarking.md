@@ -118,12 +118,22 @@ cargo build --release
 ### 2. 起動系シナリオを自動実行する (`run`)
 
 ```sh
+# ローカル固定ページを配信しておく (再現性のため)
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+
 cargo run --release --bin velox-bench -- run \
   --scenario cold_startup \
   --trials 10 \
+  --url http://127.0.0.1:8731/minimal.html \
   --output results/cold_startup-$(date +%Y%m%d).json
 ```
 
+- **`--url <URL>`**: 各試行で VeloX に読み込ませるページ。`VELOX_HOMEPAGE`
+  として子プロセスへ渡す (Issue #106、D40)。**省略すると VeloX の既定
+  ホームページ (`https://www.google.com/`) を計測することになり、外部
+  ネットワークに依存して再現性が失われる**ため、`velox-bench` は未指定時に
+  警告を出す。比較可能な数値を取るには `scripts/bench/pages/` の固定ページを
+  loopback 経由で指定すること。
 - `--velox-bin <path>`: 起動する `velox` バイナリのパス。省略時は
   `velox-bench` 自身の実行ファイルと同じディレクトリの `velox` (Windows は
   `velox.exe`) を使う。
@@ -244,18 +254,24 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   `first_page_load`) は、実際に VeloX のウィンドウを作成できる環境が必要
   (Linux は `DISPLAY` が使える X11/Wayland セッション、WebKitGTK が動作する
   環境。macOS/Windows はそれぞれ通常のデスクトップセッション)。
-- **この開発環境・CI コンテナはヘッドレスで、GUI をまったく起動できない。**
-  `Xvfb` 等の仮想ディスプレイがあれば動く可能性はあるが、この環境にはなく、
-  導入もしていない。前提条件としては書かない (Issue #14 のタスキング指示
-  通り)。
-- ヘッドレスで `velox-bench run` を実行すると、子プロセス (`velox`) が
-  ウィンドウ作成に失敗して即座に終了する (この環境では GTK 初期化失敗の
-  panic として観測した)。`velox-bench` 自身はクラッシュせず、
-  「0 件のレコードを取得」「結果ファイルは書き出したが metrics は空」という
-  明確な警告を出し、終了コード `1` で終わることを確認済み — つまり
-  **ヘッドレス環境で `cargo run --bin velox-bench -- run ...` を実行しても
-  安全に失敗する** (壊れた結果ファイルを本物の計測結果として誤って保存する
-  ことはない)。
+- **`Xvfb` があれば、ディスプレイのない環境でも実測できる** (Issue #106 で
+  実際に確認済み)。
+
+  ```sh
+  sudo apt install -y xvfb            # Debian/Ubuntu
+  xvfb-run -a --server-args="-screen 0 1280x900x24" \
+    cargo run --release --bin velox-bench -- run --scenario cold_startup ...
+  ```
+
+  GPU が無い環境では WebKitGTK がソフトウェアレンダリングにフォールバック
+  する (`libEGL warning: DRI3 error` が出る)。**この状態の RSS は実機より
+  大きく出るため、メモリの絶対値を実機の基準値として扱わないこと。**
+- 仮想ディスプレイすら無い場合は、子プロセス (`velox`) がウィンドウ作成に
+  失敗して即座に終了する (GTK 初期化失敗の panic として観測)。`velox-bench`
+  自身はクラッシュせず、「0 件のレコードを取得」「結果ファイルは書き出したが
+  metrics は空」という警告を出し、終了コード `1` で終わる — つまり
+  **ディスプレイのない環境で実行しても安全に失敗する** (壊れた結果ファイルを
+  本物の計測結果として誤って保存することはない)。
 - `aggregate` / `compare` / `list-scenarios` はディスプレイ不要で、この開発
   環境でも実際に動作確認済み (下記「この環境での検証状況」参照)。
 
@@ -266,11 +282,23 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
 - `velox-bench aggregate` / `compare` / `list-scenarios`: 実際にビルドして
   合成した JSON Lines ログを与え、想定通りの集計結果・比較結果・終了コード
   (回帰時 1、非回帰時 0) になることを手動で確認した。
-- `velox-bench run`: ヘッドレス環境のため、実際に VeloX を起動しての
-  cold/warm startup 計測そのものは検証できていない。上記の通り「起動失敗を
-  クラッシュせず処理できること」は確認したが、**実マシンでの起動時間の
-  実測値は未取得**。GUI が使える環境 (開発者のローカルマシン、または将来
-  Xvfb 等を導入した CI) で改めて実測する必要がある。
+- `velox-bench run`: **Issue #106 で `Xvfb` を用いた実測に成功した。**
+  `--url` で loopback 上の `minimal.html` を指定し、`cold_startup` を 3 試行
+  実行した初回の結果 (4 コア・GPU 無しのコンテナ、ソフトウェアレンダリング):
+
+  | metric | median | p95 |
+  | --- | ---: | ---: |
+  | `startup_window_created_ms` | 224.40 | 226.38 |
+  | `startup_toolbar_ready_ms` | 528.40 | 643.51 |
+  | `startup_first_load_ms` | 665.25 | 867.62 |
+  | `page_load_ms` | 77.50 | 127.18 |
+  | `rss_total_bytes` | 201273344 | 813502464 |
+
+  **これは正式なベースラインではない**。(a) ソフトウェアレンダリングのため
+  RSS が実機より大きい、(b) 3 試行のうち 1 試行は `--warmup-secs 6` では
+  起動が間に合わず 1 レコードしか取れなかった (startup 系の `n` が 2 に
+  なっている)、(c) 競合ブラウザとの比較条件が未確定 (#58)。正式な目標値と
+  比較条件は #58 で定める。
 - `navigation` / `tab_create` / `tab_switch` / `tabs_1..50`: シナリオ定義・
   データモデル・集計コードパスは実装・テスト済みだが、実測 (ログの収集)
   そのものは行っていない — タブ操作やナビゲーションを外部から無人で駆動
@@ -280,10 +308,12 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
 ## 既知の制約・将来の拡張
 
 - タブ作成・タブ切り替え・ナビゲーションを外部から自動的に駆動する仕組みが
-  ない。実現するには `app.rs`/toolbar IPC に何らかの自動操作用フック
-  (例: 起動時に開くタブ数や URL 一覧を指定する CLI フラグ) を追加する必要が
-  あり、今回のタスキングでは `src/app.rs` 等への変更が禁止されている
-  (Issue #12 の並行作業との衝突回避) ため見送った。将来の Issue で検討する。
-- `Xvfb` 等の仮想ディスプレイを使えば、この開発環境でも `run` の起動系
-  シナリオを実行できる可能性がある。ただし本 Issue の指示に従い、前提条件
-  としては明記していない。
+  まだ無い。Issue #106 で**起動時の URL 指定 (`--homepage` / `VELOX_HOMEPAGE`)
+  までは入った**ので `first_page_load` は自動化できるが、「起動時に N 個の
+  タブを開く」「起動後に別ページへ遷移する」に相当するフックは未実装。
+  `tabs_1..50` / `navigation` / `tab_create` / `tab_switch` の自動実行には
+  引き続き追加のフックが必要で、`Scenario::is_unattended()` はこれらを
+  `false` のままにしている。
+- ~~`Xvfb` 等の仮想ディスプレイを使えば `run` の起動系シナリオを実行できる
+  可能性がある~~ → **Issue #106 で実証済み。** 上記「実行環境の前提」の
+  `xvfb-run` の項を参照。
