@@ -43,13 +43,34 @@ use serde_json::json;
 // Startup timestamps
 // ---------------------------------------------------------------------
 
-/// The four startup checkpoints from Issue #3: process start, window
-/// creation, toolbar `ready`, and the first `LoadFinished` (≈
-/// time-to-first-page).
+/// The startup checkpoints: process start, window creation, two
+/// sub-checkpoints splitting the `window_created` → `toolbar_ready` gap
+/// (Issue #59 — see docs/decisions.md D43), the toolbar's `ready`
+/// handshake, and the first `LoadFinished` (≈ time-to-first-page).
+///
+/// The two additions (`rust_setup_done`, `toolbar_script_started`) exist to
+/// answer one question: is the `window_created` → `toolbar_ready` gap spent
+/// in VeloX's own Rust-side setup (persistence I/O, building `AppState`)
+/// before the event loop even starts pumping the webview, or inside the
+/// toolbar webview itself (HTML/CSS parse, JS execution)? See D43 for the
+/// measurement this was built to answer.
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTimestamps {
     process_start: Instant,
     window_created: Option<Instant>,
+    /// Right before `app::run` calls `event_loop.run(...)` — after
+    /// history/bookmarks/input-history have been loaded from disk and
+    /// `AppState` is built. Everything between this and `window_created` is
+    /// synchronous Rust code that runs before the GTK/webview event loop
+    /// even starts pumping.
+    rust_setup_done: Option<Instant>,
+    /// The toolbar webview's inline `<script>` has started executing (sent
+    /// as the very first statement, see `ui/toolbar.html`) — i.e. the
+    /// document's HTML markup and `<style>` block have already been parsed
+    /// by the engine. Everything between this and `toolbar_ready` is the
+    /// toolbar's own JS running (DOM lookups, initial render calls) plus
+    /// the IPC round-trip back to Rust.
+    toolbar_script_started: Option<Instant>,
     toolbar_ready: Option<Instant>,
     first_load_finished: Option<Instant>,
 }
@@ -61,6 +82,8 @@ impl StartupTimestamps {
         Self {
             process_start,
             window_created: None,
+            rust_setup_done: None,
+            toolbar_script_started: None,
             toolbar_ready: None,
             first_load_finished: None,
         }
@@ -69,6 +92,18 @@ impl StartupTimestamps {
     /// Record the window-creation checkpoint. Only the first call counts.
     pub fn mark_window_created(&mut self, now: Instant) {
         self.window_created.get_or_insert(now);
+    }
+
+    /// Record the "Rust-side setup finished, about to enter the event loop"
+    /// checkpoint. Only the first call counts.
+    pub fn mark_rust_setup_done(&mut self, now: Instant) {
+        self.rust_setup_done.get_or_insert(now);
+    }
+
+    /// Record the toolbar's inline script starting to execute. Only the
+    /// first call counts.
+    pub fn mark_toolbar_script_started(&mut self, now: Instant) {
+        self.toolbar_script_started.get_or_insert(now);
     }
 
     /// Record the toolbar's first `ready` handshake. Only the first call
@@ -83,11 +118,15 @@ impl StartupTimestamps {
     }
 
     /// Build a report of elapsed time from process start to each
-    /// checkpoint. Returns `None` until all three post-start checkpoints
-    /// have been recorded (order does not matter).
+    /// checkpoint. Returns `None` until every post-start checkpoint has
+    /// been recorded (order does not matter).
     pub fn report(&self) -> Option<StartupReport> {
         Some(StartupReport {
             to_window_created: self.window_created?.duration_since(self.process_start),
+            to_rust_setup_done: self.rust_setup_done?.duration_since(self.process_start),
+            to_toolbar_script_started: self
+                .toolbar_script_started?
+                .duration_since(self.process_start),
             to_toolbar_ready: self.toolbar_ready?.duration_since(self.process_start),
             to_first_load_finished: self.first_load_finished?.duration_since(self.process_start),
         })
@@ -98,6 +137,8 @@ impl StartupTimestamps {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupReport {
     pub to_window_created: Duration,
+    pub to_rust_setup_done: Duration,
+    pub to_toolbar_script_started: Duration,
     pub to_toolbar_ready: Duration,
     pub to_first_load_finished: Duration,
 }
@@ -106,8 +147,11 @@ impl fmt::Display for StartupReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "startup window_created={} toolbar_ready={} first_page={}",
+            "startup window_created={} rust_setup_done={} toolbar_script_started={} \
+             toolbar_ready={} first_page={}",
             format_duration(self.to_window_created),
+            format_duration(self.to_rust_setup_done),
+            format_duration(self.to_toolbar_script_started),
             format_duration(self.to_toolbar_ready),
             format_duration(self.to_first_load_finished),
         )
@@ -498,6 +542,14 @@ impl PerfRecord {
                     json!(ms(report.to_window_created)),
                 );
                 fields.insert(
+                    "rust_setup_done_ms".to_owned(),
+                    json!(ms(report.to_rust_setup_done)),
+                );
+                fields.insert(
+                    "toolbar_script_started_ms".to_owned(),
+                    json!(ms(report.to_toolbar_script_started)),
+                );
+                fields.insert(
                     "toolbar_ready_ms".to_owned(),
                     json!(ms(report.to_toolbar_ready)),
                 );
@@ -791,6 +843,12 @@ mod tests {
         timestamps.mark_window_created(Instant::now());
         assert!(timestamps.report().is_none());
 
+        timestamps.mark_rust_setup_done(Instant::now());
+        assert!(timestamps.report().is_none());
+
+        timestamps.mark_toolbar_script_started(Instant::now());
+        assert!(timestamps.report().is_none());
+
         timestamps.mark_toolbar_ready(Instant::now());
         assert!(timestamps.report().is_none());
 
@@ -804,6 +862,8 @@ mod tests {
         let mut timestamps = StartupTimestamps::new(start);
         timestamps.mark_first_load_finished(Instant::now());
         timestamps.mark_toolbar_ready(Instant::now());
+        timestamps.mark_toolbar_script_started(Instant::now());
+        timestamps.mark_rust_setup_done(Instant::now());
         timestamps.mark_window_created(Instant::now());
         assert!(timestamps.report().is_some());
     }
@@ -815,6 +875,8 @@ mod tests {
         timestamps.mark_window_created(start);
         let later = start + Duration::from_secs(10);
         timestamps.mark_window_created(later); // ignored, already set
+        timestamps.mark_rust_setup_done(start);
+        timestamps.mark_toolbar_script_started(start);
         timestamps.mark_toolbar_ready(start);
         timestamps.mark_first_load_finished(start);
         let report = timestamps.report().unwrap();
@@ -1147,6 +1209,8 @@ mod tests {
     fn perf_record_startup_text_matches_legacy_display() {
         let report = StartupReport {
             to_window_created: Duration::from_millis(10),
+            to_rust_setup_done: Duration::from_millis(12),
+            to_toolbar_script_started: Duration::from_millis(15),
             to_toolbar_ready: Duration::from_millis(20),
             to_first_load_finished: Duration::from_millis(30),
         };
@@ -1215,14 +1279,18 @@ mod tests {
     }
 
     #[test]
-    fn perf_record_startup_json_has_all_three_checkpoints() {
+    fn perf_record_startup_json_has_all_five_checkpoints() {
         let report = StartupReport {
             to_window_created: Duration::from_millis(10),
+            to_rust_setup_done: Duration::from_millis(12),
+            to_toolbar_script_started: Duration::from_millis(15),
             to_toolbar_ready: Duration::from_millis(20),
             to_first_load_finished: Duration::from_millis(30),
         };
         let value = PerfRecord::startup(report).to_json(Duration::from_millis(30));
         assert_eq!(value["window_created_ms"], 10.0);
+        assert_eq!(value["rust_setup_done_ms"], 12.0);
+        assert_eq!(value["toolbar_script_started_ms"], 15.0);
         assert_eq!(value["toolbar_ready_ms"], 20.0);
         assert_eq!(value["first_load_ms"], 30.0);
     }

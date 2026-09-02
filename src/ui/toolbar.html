@@ -664,6 +664,12 @@
 <script>
   "use strict";
   const send = (msg) => window.ipc.postMessage(JSON.stringify(msg));
+  /* Startup-timing probe (Issue #59, docs/decisions.md D42): fired as the
+     very first statement below, before any DOM lookup or rendering, so
+     Rust can tell "the document (HTML + <style>) is parsed and this script
+     started running" apart from "this script finished its own setup" —
+     the two halves of the window_created -> toolbar_ready gap. */
+  send({ cmd: "script_started" });
   const urlInput = document.getElementById("url");
   const tabsContainer = document.getElementById("tabs");
   const panelEl = document.getElementById("panel");

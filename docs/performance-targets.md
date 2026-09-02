@@ -147,13 +147,25 @@ Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」�
 
 | # | 目標 | 現在値 | 目標値 | 根拠 |
 | --- | --- | ---: | ---: | --- |
-| T1 | 起動〜load の優位を**維持**する | Chromium 比 -22〜-32% | **Chromium 比 -20% 以内を維持** | 既に勝っている領域を最適化で失わないことが最優先。回帰ゲート (#72) の対象 |
+| T1 | 起動〜load の優位を**維持**する | Chromium 比 -22〜-32% | **Chromium より速い状態を維持** (目安 -20%) | 既に勝っている領域を最適化で失わないことが最優先。回帰ゲート (#72) の対象。**閾値の運用は §9 の注記を参照** — このマシンはセッション間で ±10〜20% 変動するため、単発の測定値で -20% を割ったことを回帰と判定してはならない |
 | T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +28〜29% | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。まず #61/#62 で VeloX 側の寄与を特定する |
-| T3 | `startup_toolbar_ready_ms` を短縮する | 528.4ms | **300ms 以下** | 内部内訳で window_created (224ms) からツールバー ready まで 300ms かかっている。ここは VeloX 自身のコードであり、エンジン差ではない = **確実に手が出せる** |
+| T3 | `startup_toolbar_ready_ms` を短縮する | 528.4ms | **300ms 以下** | ⚠️ **保留**。当初「この区間は VeloX 自身のコードでエンジン差ではないから確実に手が出せる」と設定したが、**#59 の実測でこの前提は誤りと判明した** (支配的なのは tao/GTK の初期化と WebKitGTK の webview 生成)。目標値は据え置くが、達成手段は現時点で不明。§9 参照 |
 | T4 | 20 タブ時に操作不能な遅延を出さない | 未測定 | タブ切替 median **100ms 以下** | #60 の受け入れ条件。まず計測手段が必要 |
 
-**T3 が Phase 3 で最初に着手すべき項目**である。エンジン差の影響を受けず、VeloX の
-コードだけで改善でき、かつ内訳上いちばん大きい (起動時間の約半分)。
+> **⚠️ この節の当初の記述は #59 の実測で覆っている。**
+>
+> #58 の時点では「T3 が Phase 3 で最初に着手すべき項目である。エンジン差の影響を
+> 受けず、VeloX のコードだけで改善でき、かつ内訳上いちばん大きい」と書いていた。
+> **これは内訳を細分化する前の推測であり、誤りだった。** #59 が
+> `window_created → toolbar_ready` を 3 区間に分解して実測した結果、この区間は
+> `tao`/GTK のイベントループ初期化と WebKitGTK の最初の webview 生成が支配的で、
+> **VeloX の Rust 側起動処理 (history/bookmarks の読み込み、`AppState` 構築) は
+> 約 0.1ms、ツールバー自身の JS 実行はほぼ 0ms** だった。`toolbar.html` を 49KB
+> から `<script>` 2 行に差し替えても変化しない。詳細は §9 と D43。
+>
+> **したがって Phase 3 で次に着手すべきは T2 (メモリ) である。** T3 は目標として
+> 残すが、エンジン側のコストである以上、Epic #57 の「WebView をブラックボックス
+> として扱う」原則の下では VeloX 側から短縮する手段が現時点で無い。
 
 ## 7. baseline の保存形式
 
@@ -187,3 +199,89 @@ xvfb-run -a --server-args="-screen 0 1280x900x24" \
     --url http://127.0.0.1:8731/minimal.html \
     --output results/cold_startup.json
 ```
+
+## 9. T3 の調査結果 (Issue #59, 2026-09-02)
+
+**結論を先に**: `window_created → toolbar_ready` を細分化して実測した結果、
+このギャップは `tao`/GTK のイベントループ初期化と、WebKitGTK が最初の
+webview を生成する際のエンジン側コストが支配的で、**`toolbar.html` の内容量
+にも VeloX の Rust 側起動処理にもほとんど依存しないことが実測で確認できた**。
+49KB のフル `toolbar.html` を `<script>` 2 行だけの最小版に一時的に差し替えて
+再計測しても、このギャップはほとんど変化しなかった（詳細・生データは
+`docs/decisions.md` D43 を参照）。そのため **本 Issue では有効な最適化を
+適用していない** — 効果がゼロと分かっている変更を数値のために入れることは
+Epic #57 の「ベンチマークなしの最適化をしない」に反するため。
+
+### 追加した計測
+
+`browser::metrics::StartupTimestamps` に 2 つの中間チェックポイントを追加し
+（`rust_setup_done`／`toolbar_script_started`）、`startup` イベントの JSON に
+`rust_setup_done_ms`／`toolbar_script_started_ms` フィールドが増えた。
+`velox-bench` の `MetricKey` にも対応する
+`startup_rust_setup_done_ms`／`startup_toolbar_script_started_ms` を追加した。
+計測オフ時のオーバーヘッドは増えていない（既存の `Option` パターンを維持、
+D19）。
+
+### VeloX 内部の同一セッション before/after (`velox-bench`, cold_startup, minimal.html, 各 10 試行)
+
+計測を追加する前 (`e8f1250`, before) と、計測を追加した後 (after, 機能的な
+実行パスの変更なし) を同一セッション内で比較。
+
+| メトリクス | before median (ms) | after median (ms) | 変化率 |
+| --- | ---: | ---: | ---: |
+| `startup_window_created_ms` | 209.70 | 191.50 | -8.7% |
+| `startup_rust_setup_done_ms` | (未計測) | 191.65 | — |
+| `startup_toolbar_script_started_ms` | (未計測) | 378.60 | — |
+| `startup_toolbar_ready_ms` | 397.50 | 380.20 | -4.4% |
+| `startup_first_load_ms` | 426.35 | 404.70 | -5.1% |
+
+`velox-bench compare --baseline before.json --candidate after.json` は
+**回帰なし**（すべての既存メトリクスが閾値 10% 以内、`rss_*` も含む）。
+`toolbar_ready` の -4.4% はセッション内変動の範囲内であり、計測追加による
+実質的な改善ではない（実行パスを一切変えていないので当然の結果）。
+
+新しく分かったのは内訳: `rust_setup_done`(191.65ms) は `window_created`
+(191.50ms) とほぼ同時刻 — history/bookmarks/input_history の読み込みと
+`AppState` 構築は無視できるコスト（約 0.1ms）。一方
+`toolbar_script_started`(378.60ms) は `toolbar_ready`(380.20ms) とほぼ同時刻
+— ツールバー自身の JS 実行はほぼ 0ms。つまり `window_created` →
+`toolbar_ready` の約 190ms は、ほぼ全て `rust_setup_done →
+toolbar_script_started` の区間（エンジンがツールバーのドキュメントをパース
+し終えるまで）に集中している。この区間が `toolbar.html` のサイズに依存しな
+いことは `docs/decisions.md` D43 に記載した実験（フル版 vs 最小版の比較）で
+確認済み。
+
+### 競合比較 (`compare_browsers.py`) の after — T1 が保たれているか
+
+| ブラウザ | load 到達 median (ms, 7 試行) | PSS median (MiB) |
+| --- | ---: | ---: |
+| **VeloX** | **453.9** | 423.9 |
+| Chromium | 560.6 | 330.3 |
+
+VeloX は Chromium より **-19.0%** 速い（§4 の初回 baseline は -22.4%
+〔minimal〕）。
+
+**この測定値は当初 T1 に書いていた -20% の線をわずかに下回っている。** 本 Issue は
+実行パスを一切変更していない（計測点を増やしただけ）ので、コード変更による回帰では
+なく、セッション間のノイズと考えるのが自然である — このマシンは他セッションと共有
+されており、並行するビルドの有無で ±10〜20% 程度変動する。
+
+ただし「回帰ではない」と「目標を達成した」は別である。**-19.0% は -20% の線を
+満たしていない**ので、ここでは達成とは書かない。むしろこの結果は、**単発の中央値と
+固定閾値で T1 を判定する運用自体が、この環境では成立しないことを示している。**
+#72 (Performance Regression Gate) は、複数回測定・統計処理・許容分散を前提に
+設計する必要がある（#72 の本文にも同じ注意書きがある）。T1 の閾値はその設計が
+決まった時点で見直すこと。優位そのもの（VeloX の方が明確に速い）は保たれている。
+
+### T3 (`startup_toolbar_ready_ms` ≤ 300ms) は未達
+
+**達成できなかった。** 実測により、このメトリクスを支配しているのは
+VeloX 自身のコードではなく `tao`/GTK の初期化と WebKitGTK の webview 生成
+コストであることが分かったため、本 Issue のスコープ（新規依存を避ける、
+`unsafe` 原則禁止、correctness を壊さない）の中では安全に短縮する手段が
+見つからなかった。参考実験として `LIBGL_ALWAYS_SOFTWARE=1
+WEBKIT_DISABLE_COMPOSITING_MODE=1` を設定すると `rust_setup_done →
+toolbar_script_started` がおよそ半分になったが、これは本評価環境が GPU を
+持たないために発生する `DRI3`/`EGL` ネゴシエーション失敗のリトライコストを
+スキップしているだけであり、実 GPU を持つ利用者の環境には当てはまらない
+（`docs/decisions.md` D43 参照）。したがって本 Issue のコードには含めていない。

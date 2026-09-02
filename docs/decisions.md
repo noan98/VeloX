@@ -2647,3 +2647,102 @@ JSON `null` while `PssProcessCount` does not). Confirmed against the real
 VeloX binary under `Xvfb` per the Issue #108 tasking; see the task's PR
 description / commit for the actual PSS figure observed and how it compares
 to `compare_browsers.py`'s ~424 MiB (§4 of `docs/performance-targets.md`).
+## D43: `window_created` → `toolbar_ready` を細分化して実測した結果、有効な最適化は見つからなかった
+
+**対象**: Issue #59 (T3: `startup_toolbar_ready_ms` を 300ms 以下にする)。
+
+**背景の仮説（Issue #59 の記述、実測前）**: `src/ui/toolbar.html` が 49KB の
+単一ファイルであり、その HTML/CSS/JS のパースと初期化スクリプト実行が
+`window_created`(224ms) → `toolbar_ready`(528ms) の約 300ms のギャップの
+主因ではないか、というのが Issue 起票時点の推測だった。
+
+**計測の細分化**: `browser::metrics::StartupTimestamps` に 2 つの中間チェック
+ポイントを追加した（`docs/architecture.md` の「Performance extension
+points」も参照）。
+
+1. `mark_rust_setup_done` — `app::run` が history/bookmarks/input_history を
+   ディスクから読み込み、`AppState` を組み立て終え、`event_loop.run(...)` を
+   呼ぶ直前。ここまでは GTK/webview のイベントループが一切回っていない、純粋
+   な Rust 側の同期処理。
+2. `mark_toolbar_script_started` — ツールバー webview の `<script>` ブロック
+   が実行を開始した瞬間。`toolbar.html` の `<script>` はドキュメント末尾
+   （`</body>` 直前）にあり、`send({cmd:"script_started"})` をその最初の文
+   として送る。この時点でエンジンはすでに HTML/CSS 全体をパース済みであり、
+   ここから既存の `toolbar_ready`（スクリプトの最後の行で送る `ready`）まで
+   が「ツールバー自身の JS 実行 + IPC 往復」に相当する。
+
+この 2 点により、`window_created → toolbar_ready` の約 200〜300ms を
+「①Rust 側セットアップ」「②エンジンがドキュメントをパースし終えるまで」
+「③ツールバー自身の JS 実行」の 3 区間に分解できる。計測オフ時は D19 と同じ
+パターン（`Option` の有無だけで分岐、追加の `Instant::now()` なし）で
+オーバーヘッドを増やさない。
+
+**実測結果（このリポジトリの計測用サンドボックス、GPU なし Xvfb、
+`docs/performance-targets.md` §1 の環境、`minimal.html`、複数試行の中央値）**:
+
+| 区間 | 所要時間 | 内容 |
+| --- | ---: | --- |
+| `window_created` → `rust_setup_done` | **約 0.1ms** | history/bookmarks/input_history の読み込み + `AppState` 構築 |
+| `rust_setup_done` → `toolbar_script_started` | **約 170〜220ms** | ここが実質的にギャップの全て |
+| `toolbar_script_started` → `toolbar_ready` | **ほぼ 0ms**（同一 `ts_ms` に丸められる） | ツールバー自身の JS 実行 |
+
+**① は無視できる**: history.json 等が小さい（数百バイト程度）現状では、
+永続化の読み込みは測定誤差の範囲。件数が数千件規模まで増えた場合は別だが、
+現状のギャップの説明にはならない。
+
+**② が支配的で、しかも `toolbar.html` の内容量に依存しないことを実証した**:
+`toolbar.html` を 49KB のフル版から `<script>` 2 行だけの最小版（CSS なし、
+DOM 操作なし）に一時的に差し替えて同条件で再計測したところ、
+`rust_setup_done → toolbar_script_started` は **約 174〜199ms** とフル版
+（約 170〜220ms）とほぼ同じだった。つまりこの区間は toolbar.html の
+サイズや複雑さで説明できない。
+
+`src/ui/window.rs::BrowserWindow::new` に一時的な診断タイムスタンプを入れて
+さらに分解すると、この区間の内訳は概ね次のとおりだった:
+
+- `EventLoopBuilder::with_user_event().build()`（tao 経由の `gtk_init` 相当）
+  だけで **約 95〜130ms**。
+- `attach(toolbar_builder)`（`WebViewBuilderExtUnix::build_gtk`、ツールバー
+  webview の生成）に **約 60〜100ms**（`window_created` にはこの同期呼び出し
+  の分だけが含まれ、その後さらに非同期のエンジン初期化が続く）。
+- content webview の `attach` は追加で **約 10〜30ms** のみ（ツールバーが
+  先に「初回 webview 作成」のコストを払ったあとなので安い）。
+
+**③ はほぼ 0ms**: スクリプトの先頭（`script_started` 送信）から末尾
+（`ready` 送信）までの JS 自体の実行コストは、フル版・最小版どちらでも
+測定精度（0.1ms）内に収まった。DOM 要素の取得やイベントリスナー登録は軽い。
+
+**結論 — 有効な最適化は見つからなかった**: `window_created → toolbar_ready`
+の実体は、`tao`/GTK のイベントループ初期化と、WebKitGTK が最初の webview
+（ツールバー）を生成する際のエンジン側コスト（プロセス起動・IPC 確立を含む
+と推測される非同期処理）であり、**VeloX 自身の toolbar.html の内容や
+Rust 側の起動処理を変更しても実測上ほとんど動かない**。これは Issue #59
+起票時点の仮説（「ここは VeloX 自身のコードでエンジン差ではない」）を実測で
+覆す結果である。Epic #57 の原則（「WebView をブラックボックスとして扱う —
+VeloX が改善できるのは WebView の周囲だけ」）が、この区間についてはそのまま
+当てはまってしまうということでもある。
+
+参考として、`libEGL warning: DRI3 error` と `LIBGL_ALWAYS_SOFTWARE=1
+WEBKIT_DISABLE_COMPOSITING_MODE=1` を組み合わせた実験では、この区間がおよそ
+半分に短縮された（失敗する DRI3/EGL ネゴシエーションを最初からスキップする
+ため）。ただしこれは `docs/performance-targets.md` が明記する「GPU なしの
+Xvfb 環境」固有のアーティファクトであり、実 GPU を持つ利用者のマシンでは
+再現しない（むしろハードウェアアクセラレーションを恒久的に無効化することに
+なり、実機では悪化させる可能性がある）。したがって **本 Issue の変更には
+含めていない**。実機再測定は #70 の課題であり、そちらで意味のある差になる
+かどうかを判断すべきものと考える。
+
+**このため、本 Issue でのコード変更は計測の細分化のみである**（`toolbar.html`
+の圧縮や遅延読み込みといった対症療法は行わない — 効果が実測でゼロと分かって
+いる変更を「やった感」のために入れることは、Epic #57 の「ベンチマークなしの
+最適化をしない」に反する）。`velox-bench` の before/after 比較でも
+`startup_toolbar_ready_ms` は誤差の範囲内で変化なし（計測を追加しただけで
+実行パスは変わっていないため、当然の結果）。
+
+**フォローアップ**: エンジン側コスト（tao の `gtk_init`、WebKitGTK の初回
+webview 生成）を削減する手段があるとすれば、wry/tao 自体へのパッチや
+WebKitGTK のプロセスモデル設定変更が必要になり、「新規依存を避ける」
+「`unsafe` 原則禁止」「correctness を壊さない」という本リポジトリの制約の
+中では今回のスコープを超える。実機（GPU あり）での再測定 (#70) を先に行い、
+このコストがサンドボックス固有かどうかを切り分けたうえで、必要なら新しい
+Issue として起票するのが妥当。
