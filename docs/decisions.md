@@ -3381,3 +3381,130 @@ GUI を起動できない環境でのスキップは `cargo test` からは**た
 したところ、4 件すべてがタイムアウト経由で失敗した (110 秒)。確認後にソースは
 元に戻してある。
 
+## D48: メモリ超過の主因は WebKitGTK/Blink のエンジン差ではなく、VeloX 自身の webview/`WebContext` の使い方だった
+
+**対象**: Issue #61 (「なぜ WebKitGTK ベースの VeloX が Blink より PSS で
+重いのか」の切り分け。実装は含まない — 詳細な測定データ・再現手順は
+`docs/memory-analysis.md`、`docs/performance-targets.md` §5/§11 参照)。
+
+**背景の仮説 (#58 時点、実測前)**: `docs/performance-targets.md` §5 (#58)
+は「VeloX 側のオーバーヘッドなのか、WebKitGTK と Blink の差なのか」を未解決
+のまま残し、「後者ならエンジン側であり Epic #57 の原則上手が出せない」と
+書いていた。#59/D43 が T3 で「VeloX 側で手が出せるはずだった区間が実は
+エンジン側だった」という結果になっていたため、#61 でも同様に「エンジン側で
+手が出せない」という結論になる可能性を排除せずに調査を始めた。
+
+**実測結果はその逆だった**: 3 つの独立した測定が同じ結論を指した。
+
+1. **プロセス別 PSS 内訳** (`scripts/profile/process_breakdown.py`、本
+   Issue で新規追加): VeloX (1 タブ) は `velox` 本体 + `WebKitWebProcess`
+   ×2 + `WebKitNetworkProcess`×2 の 5 プロセス構成で、合計約 416 MiB。
+   webview は 1 タブぶんしか無いのに `WebKitWebProcess`/
+   `WebKitNetworkProcess` が 2 個ずつあるのは、`docs/architecture.md` の
+   D3 (「Browser chrome as an HTML toolbar in a second webview」) の設計
+   どおり、VeloX が toolbar 用と content 用の 2 つの webview を常に同時に
+   持つためである。
+2. **VeloX 自身の Rust heap** (`heaptrack`、既存の D42/D45 の手法を使用):
+   ピーク malloc heap は 32.08 MiB で、`minimal.html`/`dom_heavy.html`
+   (DOM 要素 5000 個) の違いにも、1〜5 タブの違いにも一切依存せず完全に
+   一致した (6 回の計測すべてで同じ値)。ツリー全体 PSS の 1〜8% に過ぎず、
+   タブが増えるほど比率はさらに薄まる — Rust heap を削っても全体には
+   ほぼ効かないことを確認した。
+3. **エンジンだけの比較**: VeloX の Rust コードを一切含まない、GTK
+   ウィンドウ 1 つ + `WebKitWebView` 1 つだけの最小 C プログラム
+   (`webkit2gtk-4.1`/`gtk+-3.0` に直接リンク、使い捨て、リポジトリには
+   含めていない。全文は `docs/memory-analysis.md` §5.3) を書いて計測した
+   ところ、合計 PSS は約 296〜299 MiB (2 回計測) — **これは Chromium (1
+   タブ、318〜328 MiB) より軽かった。** WebKitGTK というエンジン自体が
+   Blink より PSS で重いという証拠は、この環境では見つからなかった。
+
+**VeloX (415〜420 MiB) と単一 webview の WebKitGTK ベースライン (296〜299
+MiB) との差 (約 116〜125 MiB) は、toolbar 用の 2 個目の webview 1 個分の
+コストでほぼ説明がつく** — これは「webview を 1 個追加するごとに PSS が
+どれだけ増えるか」を別途タブ数のスケーリング実験で測った値 (次項) とほぼ
+一致する。
+
+**タブ数を増やすとさらに悪化する** (`scripts/bench/tab_scaling.py`、本
+Issue で新規追加。既存の `velox-bench run --scenario tabs_N` を使わなかった
+理由は下記): `minimal.html` で 1/5/10/20 タブを計測すると、VeloX の 1 タブ
+あたりの PSS 増分は約 92〜122 MiB (平均約 106 MiB/タブ) で、Chromium の
+約 9.7〜10.1 MiB/タブ (平均約 9.9 MiB/タブ) の約 10.7 倍だった。20 タブでは
+VeloX (2421.9 MiB) は Chromium (464.8 MiB) の約 5.2 倍になる。プロセス数は
+VeloX が追加タブ 1 個ごとに正確に +2 (`WebKitWebProcess`+
+`WebKitNetworkProcess` のペア)、Chromium は概ね +1 (共有ネットワーク/GPU/
+zygote プロセスの上にレンダラ 1 個だけ追加) で、PSS の増分の差とちょうど
+対応している。
+
+**根本原因をソースコードで特定した**: VeloX は webview を作るたび
+(toolbar 用に 1 回、content webview はタブごとに 1 回) に
+`wry::WebViewBuilder::new()` を呼んでおり、`.web_context(...)` で既存の
+`WebContext` を明示的に共有させている箇所はソース中どこにも無い
+(`src/ui/window.rs`、`grep -rn "\.web_context(" src/` はゼロ件)。`wry`
+0.56.1 の WebKitGTK バックエンド (`~/.cargo/registry/.../wry-0.56.1/src/
+webkitgtk/mod.rs` 257〜268 行目) は `attributes.context` が渡されなければ
+毎回新しい `WebContext` を作る。WebKitGTK は `WebContext` ごとに独立した
+`WebProcess`/`NetworkProcess` のプールを持つため、**webview を作るたびに
+新しい `WebContext` が生まれ、それがそのまま新しい `WebProcess`+
+`NetworkProcess` のペアになる。** 実測でも、自動操作で webview を 6 個
+(toolbar + content 5 個) にした状態で `WebKitWebProcess` がちょうど 6 個
+生成されることを確認した。
+
+**なぜ既存の `velox-bench run --scenario tabs_N` を使わなかったか**: 素直に
+実行すると `pss_total_bytes` の中央値がタブ数に依らずほぼ一定 (134〜147
+MiB) という明らかに誤った値になった。原因は `spawn_rss_sampler`
+(`src/app.rs`) が `VELOX_PERF_RSS_INTERVAL_MS` の既定値
+(`config::DEFAULT_PERF_RSS_INTERVAL` = 5000ms) で起動直後から即座にサンプ
+リングを始めるループであるのに対し、`tabs_N` の自動操作スクリプト
+(`browser::automation::generate_bench_script` の `TabCountMemory` 分岐) が
+生成するシナリオ全体の所要時間が (`tabs_1`/`tabs_5` では) 5000ms 未満で
+終わることが多く、「起動直後の 1 回目」のサンプルしか記録に残らないため
+だった。これは #61 のコード変更ではなく既存の測定手法の限界の発見であり、
+本 Issue では修正せず (メモリ削減以外のコード変更も本 Issue のスコープ外)、
+代わりに `scripts/bench/tab_scaling.py` を新規に書いて計測した (VeloX には
+`open` の間に明示的な `wait` を挟む自動操作スクリプトを渡し、Chromium には
+コマンドライン引数に URL を複数渡してタブを開かせ、どちらも全タブ安定後に
+1 回だけプロセスツリー PSS を採る)。`tabs_N` シナリオの PSS/RSS メトリクス
+自体の改善は将来の Issue に委ねる。
+
+**#59/D43 との対比が今回の核心**: #59 は「VeloX 側で手が出せるはず」と
+思われていた区間が実測するとエンジン側 (tao/GTK 初期化、WebKitGTK の
+webview 生成) だった。#61 は逆に、「エンジン差だろう」と予想されていた
+PSS 超過分の大半が、実測すると VeloX 自身の実装 (wry への webview の作り
+方) に起因していた。**どちらも「実測するまで分からない」という Epic #57
+の原則そのものの実例であり、憶測で先回りして結論を出していたら両方とも
+逆の判断をしていたことになる。**
+
+**T2 (Chromium 比 +10% 以内) の扱い**: 「達成不能」と判定する根拠は今回の
+実測には無い。toolbar/content 間 (非プライベートモード限定、後述) の
+`WebContext` 共有は、Epic #57 の「エンジンをブラックボックスとして扱う」
+原則に反しない (WebKit の内部を触るのではなく、wry への webview の作らせ方
+を変えるだけ) 有望な方向として見つかった。ただし**これは実装・計測して
+いない仮説**であり、#59/T3 のように「効果ゼロと判明したので見送る」のとは
+違う — 逆に「効果があると確定した」わけでもない。次にやるべきことは:
+
+1. **最優先**: `src/ui/window.rs` で toolbar と (非プライベートモードの)
+   content webview に同じ `WebContext` を渡すよう変更し、
+   `compare_browsers.py`/`tab_scaling.py` で before/after を計測する。
+2. タブ間の `WebContext` 共有 (プールするかどうか、何個まで共有するか) は
+   別の変更として検討する。WebKitGTK の related-view process pool が 1 つ
+   の `WebContext` に対して実際に何個の `WebProcess` を使うかは未検証。
+3. **プライベートモードでは同じ手が使えない可能性が高い**: `wry` は
+   `.with_incognito(true)` のとき `attributes.context` を無視して毎回
+   `WebContext::new_ephemeral()` を作る (wry 自身のドキュメントコメントが
+   明言。既存の D15 が同じ事実を記録している)。VeloX は toolbar/content
+   両方に `.with_incognito(config.private)` を渡しているため、
+   `config.private == true` の間は webview ごとの `WebContext` 独立が
+   wry 自身の設計であり、VeloX 側の呼び出し方を変えても (今のバージョンの
+   wry では) 解消できない可能性が高い。これは Epic #57 が言う「エンジンを
+   ラップするライブラリがブラックボックスで手が出せない」領域に該当し
+   うる。実際に手が出せるかどうかは #62 で確認する。
+
+**検証**: `docs/memory-analysis.md` に、このコンテナで実際に実行して確認
+したコマンドと生データ (プロセス別内訳 3〜6 試行、heaptrack 6 条件、タブ
+スケーリング 3 試行×4 タブ数、最小 WebKitGTK アプリ 2 試行) を記録した。
+すべて中央値または範囲で報告し、単発の測定だけで結論を出した箇所は無い
+(§7 にばらつきの一覧がある)。macOS (WKWebView) / Windows (WebView2) での
+検証、50 タブでの計測、`heaptrack -p <PID>` による `WebKitWebProcess` への
+直接アタッチ、`WebContext` 共有の実装・計測はいずれも未実施 —
+`docs/memory-analysis.md` §7/§8 に明記した。
+
