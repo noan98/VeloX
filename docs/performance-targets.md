@@ -128,17 +128,58 @@ dom_heavy 467.4 vs 364.6 MiB)。
 **これは VeloX の掲げる「低メモリ」という位置付けと矛盾する。** RSS 合計で見ると
 逆に見えるが、それは §3.1 のとおり測り方の問題であり、実態ではない。
 
+> **⚠️ 2026-09-03 (#61) の実測で切り分けが完了した。詳細は
+> [docs/memory-analysis.md](memory-analysis.md) を参照。**
+>
+> 「VeloX 側のオーバーヘッドなのか、WebKitGTK と Blink の差なのか」という
+> 上記の問いへの答え: **主因は WebKitGTK と Blink のエンジン差ではなく、
+> VeloX 自身の実装 (toolbar を独立 webview にしている設計 + webview を
+> 作るたびに独立した `WebContext` を作っている wry の呼び出し方) だった。**
+> 単一 webview だけの最小 WebKitGTK アプリを作って計測すると PSS は約
+> 296〜299 MiB で、これは Chromium (318〜328 MiB) より**軽い** — WebKitGTK
+> というエンジン自体が重いという証拠はこの環境では見つからなかった。VeloX
+> が実際に重いのは、1 タブでも toolbar 用 + content 用の 2 つの webview
+> (=2 組の `WebKitWebProcess`+`WebKitNetworkProcess`) を同時に持っている
+> ためで、この超過分だけで 1 タブ時の Chromium 超過分のほぼ全部を説明できる。
+> さらにタブが増えるたびに VeloX は正確に +2 プロセスするのに対し
+> Chromium は概ね +1 プロセスで済んでおり (タブごとに独立した `WebContext`
+> を作っているため)、20 タブでは VeloX は Chromium の約 5.2 倍の PSS になる。
+> VeloX 自身の Rust heap (heaptrack 実測 32.08 MiB、タブ数やページの重さに
+> 依らず一定) はツリー全体 PSS の 1〜8% 程度に過ぎず、削っても全体にはほぼ
+> 効かないことも確認済み。**Epic #57 の「エンジンをブラックボックスとして
+> 扱う」原則には反しない** (WebKit 内部ではなく wry への webview の作り方の
+> 話) が、**未実装・未検証の仮説**であることに変わりはない — 実装・計測は
+> #62 に引き継ぐ (`docs/decisions.md` D48)。
+
 Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」を出発点にできない。
-**まず「なぜ WebKitGTK ベースの VeloX が Blink より PSS で重いのか」を切り分ける
-必要がある** — VeloX 側のオーバーヘッドなのか、WebKitGTK と Blink の差なのか。
-後者なら Epic #57 の原則上 VeloX には手が出せない領域になる。
+上記のとおり、原因の切り分け自体は #61 で完了した。
+
+### タブ数に対する増え方 (2026-09-03、#61 で測定)
+
+1/5/10/20 タブで `minimal.html` を計測 (`scripts/bench/tab_scaling.py`、
+各 3 試行の中央値、詳細は `docs/memory-analysis.md` §4)。
+
+| タブ数 | VeloX PSS (MiB) | Chromium PSS (MiB) |
+| ---: | ---: | ---: |
+| 1 | 409.6 | 276.7 |
+| 5 | 777.7 | 315.6 |
+| 10 | 1387.0 | 366.0 |
+| 20 | 2421.9 | 464.8 |
+
+1 タブあたりの増分は VeloX 約 106 MiB/タブ、Chromium 約 9.9 MiB/タブ (約
+10.7 倍)。原因はプロセス数の増え方 (VeloX +2/タブ、Chromium +1/タブ 程度)
+と一致する。
 
 ### 未測定
 
-タブ生成/切替、複数タブ時のメモリ、バックグラウンド CPU、ページロードの内訳
-(DNS/TLS/レンダリング)、バッテリー/アイドル消費。これらは自動駆動の仕組みが
-まだ無い (`Scenario::is_unattended()` が `false`)。#106 で起動 URL の指定までは
-入ったが、「N タブ開く」「起動後に遷移する」フックは未実装。
+バックグラウンド CPU、ページロードの内訳 (DNS/TLS/レンダリング)、バッテリー/
+アイドル消費。タブ生成/切替のレイテンシと複数タブ時のメモリは #61/#112 で
+測定可能になった (`velox-bench run --scenario tab_create|tab_switch|tabs_N`、
+`scripts/bench/tab_scaling.py`) — メモリ側は上表のとおり測定済み。ただし
+`velox-bench run --scenario tabs_N` 自体の `pss_total_bytes`/`rss_total_bytes`
+は既定の RSS サンプリング間隔 (5000ms) がシナリオの所要時間より長いことが
+多く、タブ数に対する増え方の指標としては現状使えない
+(`docs/memory-analysis.md` §4.1、`docs/decisions.md` D48)。
 
 ## 6. VeloX の性能目標
 
@@ -148,7 +189,7 @@ Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」�
 | # | 目標 | 現在値 | 目標値 | 根拠 |
 | --- | --- | ---: | ---: | --- |
 | T1 | 起動〜load の優位を**維持**する | Chromium 比 -22〜-32% | **Chromium より速い状態を維持** (目安 -20%) | 既に勝っている領域を最適化で失わないことが最優先。回帰ゲート (#72) の対象 — **判定方式は §10 で確定**。単発の測定値で -20% を割ったことを回帰と判定してはならない (§10 参照) |
-| T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +28〜29% | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。まず #61/#62 で VeloX 側の寄与を特定する |
+| T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +28〜29% (1 タブ)、タブ数が増えるほど拡大 (20 タブで約 5.2 倍、§11) | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。**#61 で切り分け完了 — 主因は VeloX 自身の webview/`WebContext` の使い方であってエンジン差ではないと判明した (§11、`docs/memory-analysis.md`)。達成可能性は「有望」だが未実装・未検証。次は #62 で toolbar/content 間の `WebContext` 共有を実装し計測する** |
 | T3 | `startup_toolbar_ready_ms` を短縮する | 528.4ms | **300ms 以下** | ⚠️ **保留**。当初「この区間は VeloX 自身のコードでエンジン差ではないから確実に手が出せる」と設定したが、**#59 の実測でこの前提は誤りと判明した** (支配的なのは tao/GTK の初期化と WebKitGTK の webview 生成)。目標値は据え置くが、達成手段は現時点で不明。§9 参照 |
 | T4 | 20 タブ時に操作不能な遅延を出さない | 未測定 | タブ切替 median **100ms 以下** | #60 の受け入れ条件。まず計測手段が必要 |
 
@@ -362,3 +403,62 @@ baseline と candidate を `velox-bench gate` に渡す。** これにより機�
 candidate 2 回) が掛かるが、`ci.yml` の本体 CI とは別ワークフローに分離
 してあるため、通常の fmt/clippy/test/build のフィードバック速度には影響
 しない。
+
+## 11. T2 (メモリ) の切り分け結果 (Issue #61, 2026-09-03)
+
+**詳細な測定データ・再現手順は [docs/memory-analysis.md](memory-analysis.md)
+を参照。ここでは§5〜6 の「なぜ負けているか / T2 は達成可能か」に対応する
+結論だけを記録する。**
+
+**結論を先に**: §5 の「VeloX 側のオーバーヘッドなのか、WebKitGTK と Blink
+の差なのか」という問いに対する答えは、**主因は VeloX 自身の実装**だった。
+実測の柱は 3 つ:
+
+1. **プロセス別 PSS 内訳**: VeloX (1 タブ) は `velox` 本体 (約 70.5 MiB) +
+   `WebKitWebProcess`×2 (約 310 MiB) + `WebKitNetworkProcess`×2 (約 35.5
+   MiB) の 5 プロセス、合計約 416 MiB。webview が 1 タブしかないのに
+   `WebKitWebProcess`/`WebKitNetworkProcess` が 2 個ずつあるのは、VeloX が
+   toolbar 用と content 用の 2 つの webview を常に同時に持つ設計
+   (`docs/architecture.md` D3) の帰結。
+2. **VeloX 自身の Rust heap (`heaptrack` 実測)**: 32.08 MiB で、ページの
+   重さ (`minimal.html`/`dom_heavy.html`) にもタブ数 (1〜5 タブ) にも
+   依存せず一定。ツリー全体 PSS の 1〜8% に過ぎず、削っても全体にはほぼ
+   効かないことを確認した。
+3. **エンジンだけの比較**: VeloX の Rust コードを一切含まない、webview 1
+   個だけの最小 WebKitGTK C アプリを書いて計測すると、合計 PSS は約
+   296〜299 MiB — これは **Chromium (318〜328 MiB) より軽い**。WebKitGTK
+   というエンジン自体が Blink より PSS で重いという証拠はこの環境では
+   見つからなかった。VeloX (415〜420 MiB) との差 (約 116〜125 MiB) は、
+   §4.3 で計測した「webview 1 個あたりの増分 (約 92〜122 MiB)」とほぼ
+   同じ大きさで、toolbar 用の 2 個目の webview 1 個分にほぼ対応する。
+
+**タブ数を増やすとさらに悪化する**: 1/5/10/20 タブで計測すると、VeloX の
+1 タブあたりの PSS 増分 (約 106 MiB/タブ) は Chromium (約 9.9 MiB/タブ) の
+約 10.7 倍で、20 タブでは VeloX は Chromium の約 5.2 倍の PSS になる。原因
+はプロセス数の増え方の違い (VeloX は追加タブ 1 個ごとに正確に +2 プロセス、
+Chromium は概ね +1 プロセス) と一致しており、ソースコード上も VeloX が
+webview を作るたび (`wry::WebViewBuilder::new()`) に `.web_context(...)`
+で既存の `WebContext` を共有させておらず、毎回新しい `WebContext` を
+作っていることと符合する (wry 0.56.1 の WebKitGTK バックエンドは
+`attributes.context` が渡されなければ新しい `WebContext` を作り、
+WebKitGTK は `WebContext` ごとに独立した `WebProcess`/`NetworkProcess` の
+プールを持つ)。
+
+**T2 (+10% 以内) は「達成不能」ではない。** #59/T3 (D43) とは逆の結果に
+なった — あちらは「VeloX 側で手が出せるはず」の区間が実測するとエンジン
+側だったが、こちらは「エンジン差だろう」と予想されていた超過分の大半が、
+実測すると VeloX 自身の webview/`WebContext` の使い方に起因していた。
+toolbar/content 間で `WebContext` を共有する変更は Epic #57 の「エンジンを
+ブラックボックスとして扱う」原則に反しない (WebKit の内部ではなく、
+wry への webview の作り方の話)。ただし**これは実装・計測していない仮説で
+あり**、実際に効果があるかは #62 で実装して計測するまで分からない
+(`docs/decisions.md` D48 に条件を記録した)。
+
+**そのまま使えなかった既存の仕組み**: `velox-bench run --scenario
+tabs_1/5/10/20` の `pss_total_bytes` はタブ数によらずほぼ一定 (134〜147
+MiB) という、明らかに誤った値を返すことが分かった。原因は RSS/PSS サンプラ
+(既定間隔 5000ms、起動直後から即座にサンプリングを開始) がシナリオ全体の
+所要時間 (3〜4 秒程度で終わることが多い) より長い間隔で動いているため、
+「起動直後の 1 回目」の値しか記録に残らないこと。本 Issue では代わりに
+`scripts/bench/tab_scaling.py` を新規に書いて計測した
+(`docs/memory-analysis.md` §4.1)。
