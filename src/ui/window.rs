@@ -40,7 +40,7 @@ use std::sync::Arc;
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Window, WindowBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::{PageLoadEvent, Rect, WebView, WebViewBuilder};
+use wry::{PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
 use crate::browser::downloads;
@@ -317,6 +317,22 @@ fn to_bounds((x, y, width, height): LogicalRect) -> Rect {
     }
 }
 
+/// Start a [`WebViewBuilder`], sharing `context` when one is given.
+///
+/// See docs/decisions.md D49: in non-private mode `BrowserWindow` holds one
+/// `WebContext` shared by the toolbar and every tab's content webview, so
+/// `wry` stops creating a fresh `WebKitWebProcess`/`WebKitNetworkProcess`
+/// pair per webview. `context` is `None` in private mode (see
+/// `BrowserWindow::context`'s doc comment for why sharing is skipped there
+/// rather than attempted and ignored) — `WebViewBuilder::new()` reproduces
+/// today's behavior in that case.
+fn new_webview_builder(context: Option<&mut WebContext>) -> WebViewBuilder<'_> {
+    match context {
+        Some(context) => WebViewBuilder::new_with_web_context(context),
+        None => WebViewBuilder::new(),
+    }
+}
+
 /// One tab's content webview.
 struct ContentTab {
     /// The tab's webview.
@@ -364,6 +380,18 @@ pub struct BrowserWindow {
     proxy: EventLoopProxy<UserEvent>,
     contents: HashMap<TabId, ContentTab>,
     active: Option<TabId>,
+    /// The `WebContext` shared by the toolbar and every tab's content
+    /// webview (see docs/decisions.md D49). `Some` only in non-private mode:
+    /// `wry`'s WebKitGTK backend ignores any custom context passed via
+    /// `attributes.context` once `.with_incognito(true)` is set — it always
+    /// builds a fresh `WebContext::new_ephemeral()` per webview instead (see
+    /// docs/decisions.md D15) — so there is nothing to share in private mode
+    /// and this stays `None` there, leaving every private webview exactly as
+    /// isolated as before this change. Every webview built after startup
+    /// (`open_tab`, and `resume_tab` through it) borrows this mutably via
+    /// [`new_webview_builder`], which is why it lives on `self` rather than
+    /// only inside `new`.
+    context: Option<WebContext>,
     /// Whole-app private browsing (see docs/decisions.md D14). Kept so tabs
     /// opened after startup are built with the same ephemeral data store.
     private: bool,
@@ -461,8 +489,18 @@ impl BrowserWindow {
         let (toolbar_rect, content_rect) =
             split_layout(size.width, size.height, config.toolbar_height);
 
+        // Shared across the toolbar and every content webview in non-private
+        // mode only — see docs/decisions.md D49 and `BrowserWindow::context`'s
+        // doc comment for why private mode gets `None` instead of a context
+        // that `.with_incognito(true)` would just ignore anyway.
+        let mut context = if config.private {
+            None
+        } else {
+            Some(WebContext::new(None))
+        };
+
         let ipc_proxy = proxy.clone();
-        let toolbar_builder = WebViewBuilder::new()
+        let toolbar_builder = new_webview_builder(context.as_mut())
             .with_bounds(to_bounds(toolbar_rect))
             .with_html(toolbar::TOOLBAR_HTML)
             // The toolbar now loads more than our own embedded HTML: a
@@ -484,7 +522,10 @@ impl BrowserWindow {
             &config.homepage,
             content_rect,
             &proxy,
-            config.private,
+            WebviewIsolation {
+                private: config.private,
+                context: context.as_mut(),
+            },
             Arc::clone(&blocklist),
             content_blocking_enabled,
         );
@@ -517,6 +558,7 @@ impl BrowserWindow {
             proxy,
             contents,
             active: Some(initial_tab),
+            context,
             private: config.private,
             blocklist,
             content_blocking_enabled,
@@ -568,12 +610,35 @@ impl BrowserWindow {
             url,
             content_rect,
             &self.proxy,
-            self.private,
+            WebviewIsolation {
+                private: self.private,
+                context: self.context.as_mut(),
+            },
             Arc::clone(&self.blocklist),
             self.content_blocking_enabled,
         )
         .with_visible(false);
-        let webview = self.attach_webview(builder)?;
+        // Not `self.attach_webview(builder)`: `builder` may already hold a
+        // `&mut` borrow of `self.context` (docs/decisions.md D49), and a
+        // `&self` method call would borrow all of `self`, conflicting with
+        // it. Passing the target field directly keeps the two borrows
+        // disjoint — see `Self::attach_webview`'s doc comment.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+        ))]
+        let webview = Self::attach_webview(&self.host, builder)?;
+        #[cfg(not(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+        )))]
+        let webview = Self::attach_webview(&self.window, builder)?;
         self.contents.insert(
             id,
             ContentTab {
@@ -958,6 +1023,25 @@ fn extract_js_string_result(raw: &str) -> Option<String> {
     serde_json::from_str::<String>(raw).ok()
 }
 
+/// A webview's private-browsing/`WebContext` isolation settings, bundled so
+/// [`content_webview_builder`] stays under clippy's argument-count lint
+/// (docs/decisions.md D49 added the `context` field; `private` moved in
+/// alongside it since the two are directly related — see this struct's
+/// field docs).
+struct WebviewIsolation<'a> {
+    /// Whole-app private browsing (see docs/decisions.md D14).
+    private: bool,
+    /// The `WebContext` to build this webview against when `private` is
+    /// `false` (docs/decisions.md D49). Ignored — not even read — when
+    /// `private` is `true`: `.with_incognito(true)` makes `wry`'s WebKitGTK
+    /// backend build a fresh ephemeral context per webview regardless of
+    /// what is passed here (docs/decisions.md D15), so a private webview's
+    /// builder is constructed with `context: None` in the first place (see
+    /// `BrowserWindow::context`'s doc comment) rather than relying on that
+    /// downstream behavior to discard a real one.
+    context: Option<&'a mut WebContext>,
+}
+
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
 /// URL, and navigation/page-load handlers that tag their `UserEvent`s with
 /// `id` so `app.rs` knows which tab they belong to.
@@ -977,10 +1061,11 @@ fn content_webview_builder<'a>(
     url: &str,
     content_rect: LogicalRect,
     proxy: &EventLoopProxy<UserEvent>,
-    private: bool,
+    isolation: WebviewIsolation<'a>,
     blocklist: Arc<FilterList>,
     content_blocking_enabled: bool,
 ) -> WebViewBuilder<'a> {
+    let WebviewIsolation { private, context } = isolation;
     let nav_proxy = proxy.clone();
     let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
@@ -988,7 +1073,7 @@ fn content_webview_builder<'a>(
     let new_window_proxy = proxy.clone();
     let download_started_proxy = proxy.clone();
     let download_completed_proxy = proxy.clone();
-    WebViewBuilder::new()
+    new_webview_builder(context)
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
         // Ephemeral (non-persistent) cookies/storage/cache for the page
@@ -1140,9 +1225,15 @@ impl BrowserWindow {
     /// Attach a webview built for a tab opened after startup. Startup's own
     /// toolbar + first tab attach via the local `attach` closure in `new`
     /// (no `self` exists yet at that point).
-    fn attach_webview(&self, builder: WebViewBuilder<'_>) -> wry::Result<WebView> {
+    ///
+    /// Takes `host` explicitly rather than `&self` — see the call site in
+    /// [`Self::open_tab`] — because `builder` may already hold a `&mut`
+    /// borrow of `self.context` (docs/decisions.md D49); a `&self` method
+    /// here would borrow the whole struct and conflict with that, whereas a
+    /// disjoint `&self.host` argument does not.
+    fn attach_webview(host: &gtk::Fixed, builder: WebViewBuilder<'_>) -> wry::Result<WebView> {
         use wry::WebViewBuilderExtUnix;
-        builder.build_gtk(&self.host)
+        builder.build_gtk(host)
     }
 }
 
@@ -1154,8 +1245,10 @@ impl BrowserWindow {
     target_os = "netbsd",
 )))]
 impl BrowserWindow {
-    fn attach_webview(&self, builder: WebViewBuilder<'_>) -> wry::Result<WebView> {
-        builder.build_as_child(&self.window)
+    /// See the Linux/BSD `attach_webview` above for why this takes `window`
+    /// explicitly instead of `&self`.
+    fn attach_webview(window: &Window, builder: WebViewBuilder<'_>) -> wry::Result<WebView> {
+        builder.build_as_child(window)
     }
 }
 
