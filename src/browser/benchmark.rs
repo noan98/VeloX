@@ -341,6 +341,98 @@ pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
 }
 
 // ---------------------------------------------------------------------
+// Memory-scenario sample-count confidence (Issue #119, D50)
+// ---------------------------------------------------------------------
+
+/// The minimum number of pooled `pss_total_bytes`/`rss_total_bytes` samples
+/// [`memory_sample_confidence`] expects *per trial* for a
+/// [`scenario::Scenario::TabCountMemory`] scenario's aggregated metric to be
+/// trustworthy. [`crate::browser::automation::recommended_rss_interval_ms`]
+/// paces the sampler to land about four samples inside the fixed settle
+/// window alone, so two per trial is a conservative floor with real margin
+/// for scheduling jitter — not a tight bound tuned to just barely pass. A trial that
+/// contributed fewer than this (in the limit, the pre-fix bug: exactly one
+/// sample, taken before any tab had opened) means the sampler most likely
+/// missed the "all tabs open" state this scenario exists to measure.
+pub const MIN_RSS_SAMPLES_PER_TRIAL: usize = 2;
+
+/// Whether a scenario's aggregated PSS/RSS metrics were sampled densely
+/// enough, across `trials` trials, to trust as "tabs finished opening"
+/// figures — see [`MIN_RSS_SAMPLES_PER_TRIAL`] and docs/decisions.md D50.
+///
+/// Only [`scenario::Scenario::TabCountMemory`] is checked
+/// ([`Self::NotApplicable`] for everything else, including the three
+/// startup scenarios and `navigation`/`tab_create`/`tab_switch`, none of
+/// which claim to measure a "settled" memory state): those scenarios pass
+/// `VELOX_PERF_METRICS=1` too, so they always produce *some* `rss` samples,
+/// but a low count there says nothing about their own (non-memory) metrics
+/// being unreliable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemorySampleConfidence {
+    /// `scenario` is not a memory scenario; this check does not apply.
+    NotApplicable,
+    /// At least `required` pooled PSS/RSS samples were observed.
+    Sufficient { observed: usize, required: usize },
+    /// Fewer than `required` pooled PSS/RSS samples were observed — the
+    /// scenario's `pss_total_bytes`/`rss_total_bytes` figures may reflect a
+    /// process that had not finished opening its tabs yet, not the
+    /// "N tabs open" state the scenario name promises. Per D42's existing
+    /// rule against ever turning "could not measure" into a silent zero,
+    /// the caller must not present these numbers as reliable without
+    /// surfacing this — see `docs/decisions.md` D50 and
+    /// `docs/benchmarking.md` for how `velox-bench run`/`aggregate` do so
+    /// (a stderr warning and a non-zero exit code, not a dropped metric —
+    /// the samples that *were* taken are still real data, just too few to
+    /// trust as this scenario's answer).
+    Insufficient { observed: usize, required: usize },
+}
+
+impl MemorySampleConfidence {
+    /// `true` for [`Self::Insufficient`] — the one variant a caller needs to
+    /// act on.
+    pub fn is_insufficient(self) -> bool {
+        matches!(self, MemorySampleConfidence::Insufficient { .. })
+    }
+}
+
+/// Evaluate [`MemorySampleConfidence`] for one aggregated result. `metrics`
+/// is normally [`BenchmarkResult::metrics`] (or the map [`aggregate_trials`]
+/// just built, before it is wrapped in one) — keyed exactly the way that map
+/// is, so this can run against either a freshly aggregated result or one
+/// just read back from disk.
+///
+/// Prefers [`MetricKey::PssTotalBytes`]'s sample count when present (the
+/// metric this project recommends comparing across builds, D42) and falls
+/// back to [`MetricKey::RssTotalBytes`]'s when PSS could not be read at all
+/// in this environment (old kernel, permissions, non-Linux) — RSS is always
+/// present alongside PSS in the same `rss` event
+/// ([`crate::browser::metrics::RssSample`]'s field docs), so the two
+/// metrics' sample counts are identical whenever both exist; this only
+/// matters when PSS is entirely absent. A scenario with *neither* metric at
+/// all (e.g. every trial failed to spawn) is `observed: 0`, which is always
+/// [`MemorySampleConfidence::Insufficient`] for a non-zero `required`.
+pub fn memory_sample_confidence(
+    scenario: scenario::Scenario,
+    trials: u32,
+    metrics: &BTreeMap<String, Stats>,
+) -> MemorySampleConfidence {
+    if !matches!(scenario, scenario::Scenario::TabCountMemory(_)) {
+        return MemorySampleConfidence::NotApplicable;
+    }
+    let required = trials as usize * MIN_RSS_SAMPLES_PER_TRIAL;
+    let observed = metrics
+        .get(MetricKey::PssTotalBytes.as_str())
+        .or_else(|| metrics.get(MetricKey::RssTotalBytes.as_str()))
+        .map(|stats| stats.count)
+        .unwrap_or(0);
+    if observed >= required {
+        MemorySampleConfidence::Sufficient { observed, required }
+    } else {
+        MemorySampleConfidence::Insufficient { observed, required }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Saved result shape
 // ---------------------------------------------------------------------
 
@@ -1738,6 +1830,164 @@ mod tests {
         let broken = parse_jsonl("not json\n\n");
         let aggregated = aggregate_trials(&[good, broken]);
         assert_eq!(aggregated["tab_switch_ms"].count, 1);
+    }
+
+    // -- memory_sample_confidence (Issue #119, D50) -----------------------
+
+    fn rss_stats(count: usize) -> Stats {
+        // The specific values don't matter to `memory_sample_confidence` —
+        // only `Stats::count` — but `compute_stats` is used anyway so this
+        // stays a realistic `Stats`, not a hand-built one that could drift
+        // from what `compute_stats` actually produces.
+        compute_stats(&vec![100.0; count]).expect("non-empty sample vec")
+    }
+
+    #[test]
+    fn memory_confidence_is_not_applicable_to_non_memory_scenarios() {
+        let metrics = BTreeMap::new();
+        for scenario in [
+            scenario::Scenario::ColdStartup,
+            scenario::Scenario::WarmStartup,
+            scenario::Scenario::FirstPageLoad,
+            scenario::Scenario::Navigation,
+            scenario::Scenario::TabCreate,
+            scenario::Scenario::TabSwitch,
+        ] {
+            assert_eq!(
+                memory_sample_confidence(scenario, 3, &metrics),
+                MemorySampleConfidence::NotApplicable,
+                "{scenario:?} should not be checked at all"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_confidence_insufficient_with_zero_samples_reproduces_the_bug() {
+        // The pre-fix failure mode this issue is about: the sampler took
+        // exactly its startup sample and nothing else, so the metric never
+        // even makes it into the aggregated map.
+        let metrics = BTreeMap::new();
+        let confidence =
+            memory_sample_confidence(scenario::Scenario::TabCountMemory(20), 3, &metrics);
+        assert_eq!(
+            confidence,
+            MemorySampleConfidence::Insufficient {
+                observed: 0,
+                required: 3 * MIN_RSS_SAMPLES_PER_TRIAL,
+            }
+        );
+        assert!(confidence.is_insufficient());
+    }
+
+    #[test]
+    fn memory_confidence_insufficient_one_sample_below_the_floor() {
+        let mut metrics = BTreeMap::new();
+        let required = 4 * MIN_RSS_SAMPLES_PER_TRIAL;
+        metrics.insert(
+            MetricKey::PssTotalBytes.as_str().to_owned(),
+            rss_stats(required - 1),
+        );
+        let confidence =
+            memory_sample_confidence(scenario::Scenario::TabCountMemory(5), 4, &metrics);
+        assert!(confidence.is_insufficient());
+        assert_eq!(
+            confidence,
+            MemorySampleConfidence::Insufficient {
+                observed: required - 1,
+                required,
+            }
+        );
+    }
+
+    #[test]
+    fn memory_confidence_sufficient_exactly_at_the_boundary() {
+        let mut metrics = BTreeMap::new();
+        let required = 4 * MIN_RSS_SAMPLES_PER_TRIAL;
+        metrics.insert(
+            MetricKey::PssTotalBytes.as_str().to_owned(),
+            rss_stats(required),
+        );
+        let confidence =
+            memory_sample_confidence(scenario::Scenario::TabCountMemory(5), 4, &metrics);
+        assert!(!confidence.is_insufficient());
+        assert_eq!(
+            confidence,
+            MemorySampleConfidence::Sufficient {
+                observed: required,
+                required
+            }
+        );
+    }
+
+    #[test]
+    fn memory_confidence_sufficient_comfortably_above_the_boundary() {
+        let mut metrics = BTreeMap::new();
+        metrics.insert(MetricKey::PssTotalBytes.as_str().to_owned(), rss_stats(50));
+        let confidence =
+            memory_sample_confidence(scenario::Scenario::TabCountMemory(1), 3, &metrics);
+        assert!(!confidence.is_insufficient());
+    }
+
+    #[test]
+    fn memory_confidence_falls_back_to_rss_when_pss_is_absent() {
+        // A build/environment where PSS could never be read at all (old
+        // kernel, permissions, non-Linux) still has RSS samples — the check
+        // must not treat that as automatically insufficient just because
+        // the preferred metric is missing.
+        let mut metrics = BTreeMap::new();
+        let required = 2 * MIN_RSS_SAMPLES_PER_TRIAL;
+        metrics.insert(
+            MetricKey::RssTotalBytes.as_str().to_owned(),
+            rss_stats(required),
+        );
+        let confidence =
+            memory_sample_confidence(scenario::Scenario::TabCountMemory(10), 2, &metrics);
+        assert_eq!(
+            confidence,
+            MemorySampleConfidence::Sufficient {
+                observed: required,
+                required
+            }
+        );
+    }
+
+    #[test]
+    fn memory_confidence_prefers_pss_count_over_rss_when_both_present() {
+        // PSS and RSS come from the same `rss` event, so their sample
+        // counts are normally identical — but the function must read PSS's
+        // `count`, not RSS's, to honor D42's "PSS is the metric to compare"
+        // guidance even in a contrived case where they'd disagree.
+        let mut metrics = BTreeMap::new();
+        metrics.insert(MetricKey::PssTotalBytes.as_str().to_owned(), rss_stats(2));
+        metrics.insert(MetricKey::RssTotalBytes.as_str().to_owned(), rss_stats(99));
+        // 2 trials => required = 4: PSS's count (2) alone is insufficient,
+        // while RSS's count (99) alone would easily pass — this only proves
+        // PSS's count is the one actually consulted when the two disagree.
+        let confidence =
+            memory_sample_confidence(scenario::Scenario::TabCountMemory(1), 2, &metrics);
+        assert_eq!(
+            confidence,
+            MemorySampleConfidence::Insufficient {
+                observed: 2,
+                required: 2 * MIN_RSS_SAMPLES_PER_TRIAL,
+            }
+        );
+    }
+
+    #[test]
+    fn memory_confidence_required_scales_with_trial_count() {
+        let metrics = BTreeMap::new();
+        for trials in [1u32, 5, 10] {
+            let confidence =
+                memory_sample_confidence(scenario::Scenario::TabCountMemory(1), trials, &metrics);
+            assert_eq!(
+                confidence,
+                MemorySampleConfidence::Insufficient {
+                    observed: 0,
+                    required: trials as usize * MIN_RSS_SAMPLES_PER_TRIAL,
+                }
+            );
+        }
     }
 
     // -- format_unix_time_utc -------------------------------------------

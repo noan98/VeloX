@@ -51,7 +51,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use velox::browser::automation;
 use velox::browser::benchmark::scenario::Scenario;
 use velox::browser::benchmark::{
-    self, BenchmarkResult, ComparisonReport, GateThresholds, MetricDiff, RunEnvironment, Severity,
+    self, BenchmarkResult, ComparisonReport, GateThresholds, MemorySampleConfidence, MetricDiff,
+    RunEnvironment, Severity,
 };
 
 fn main() {
@@ -191,7 +192,20 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         Some(path) => PathBuf::from(path),
         None => default_velox_bin_path()?,
     };
-    let rss_interval_ms = flags.one("rss-interval-ms");
+    // `--rss-interval-ms` always wins when given explicitly. Otherwise, for
+    // `tabs_N` scenarios only, fall back to
+    // `automation::recommended_rss_interval_ms` rather than leaving this
+    // `None` (which would leave `Config`'s 5000ms default in effect) — see
+    // that function's doc comment and docs/decisions.md D50 for why the
+    // 5000ms default undersamples a `tabs_N` run badly enough that its
+    // `pss_total_bytes`/`rss_total_bytes` stop tracking tab count at all.
+    // Every other scenario keeps getting `None` here exactly as before, so
+    // this cannot change `cold_startup`/`warm_startup`/`first_page_load`'s
+    // (or `navigation`/`tab_create`/`tab_switch`'s) behavior.
+    let rss_interval_ms: Option<String> = flags
+        .one("rss-interval-ms")
+        .map(str::to_owned)
+        .or_else(|| automation::recommended_rss_interval_ms(scenario).map(|ms| ms.to_string()));
     // The page every trial loads. Handed to VeloX as `VELOX_HOMEPAGE`
     // (Issue #106): without it every trial would measure whatever the
     // compiled-in default homepage is, which is network-dependent and
@@ -241,6 +255,16 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
             velox_bin.display()
         ),
     }
+    if flags.one("rss-interval-ms").is_none() {
+        if let Some(interval) = &rss_interval_ms {
+            println!(
+                "velox-bench: {scenario_id} は RSS/PSS サンプリング間隔を \
+                 {interval}ms に自動調整します (タブを開き終えた後の状態を確実に \
+                 サンプリングするため、既定の間隔のままだと使えません。\
+                 docs/decisions.md D50 参照。--rss-interval-ms で上書き可能)。",
+            );
+        }
+    }
 
     // Written once (its content only depends on `scenario`/`url`, not on
     // the trial number) and removed again once every trial has run.
@@ -275,7 +299,7 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
             .env("VELOX_PERF_METRICS", "1")
             .env("VELOX_PERF_FORMAT", "json")
             .env("VELOX_PERF_OUTPUT", &log_path);
-        if let Some(interval) = rss_interval_ms {
+        if let Some(interval) = &rss_interval_ms {
             command.env("VELOX_PERF_RSS_INTERVAL_MS", interval);
         }
         if let Some(url) = url {
@@ -335,7 +359,46 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         );
         return Ok(1);
     }
+
+    // Issue #119 / D50: a `tabs_N` scenario can produce *some* records
+    // (total_events > 0 above) while still not having sampled memory densely
+    // enough to trust — the original bug. Never let that pass silently: the
+    // saved result already carries whatever `pss_total_bytes`/
+    // `rss_total_bytes` samples were taken (nothing is dropped, matching
+    // D42's "partial data is still real data" rule), but a caller must be
+    // told loudly that this scenario's memory figures may not reflect "all
+    // tabs open" before trusting them.
+    if warn_on_insufficient_memory_samples(scenario_id, scenario, trials, &result.metrics) {
+        return Ok(1);
+    }
     Ok(0)
+}
+
+/// Check `metrics` via [`benchmark::memory_sample_confidence`] and, if
+/// insufficient, print a warning explaining why. Returns `true` when a
+/// warning was printed, so callers can fold it into their exit code exactly
+/// like the existing "zero records" check above. A no-op (returns `false`)
+/// for every scenario `memory_sample_confidence` does not apply to.
+fn warn_on_insufficient_memory_samples(
+    scenario_id: &str,
+    scenario: Scenario,
+    trials: u32,
+    metrics: &std::collections::BTreeMap<String, benchmark::Stats>,
+) -> bool {
+    let MemorySampleConfidence::Insufficient { observed, required } =
+        benchmark::memory_sample_confidence(scenario, trials, metrics)
+    else {
+        return false;
+    };
+    eprintln!(
+        "velox-bench: 警告: {scenario_id} の PSS/RSS サンプル数が不足しています \
+         ({observed} 件 / 最低 {required} 件必要、trials={trials})。タブを開き \
+         終える前 (またはごく初期) の状態しかサンプリングできていない可能性が \
+         あり、pss_total_bytes/rss_total_bytes をタブ数比較の根拠にしないで \
+         ください。結果ファイルには採取できたサンプルをそのまま書き出しました \
+         — docs/benchmarking.md と docs/decisions.md の D50 を参照してください。"
+    );
+    true
 }
 
 /// Poll `child` until it exits on its own or `timeout` elapses, whichever
@@ -394,11 +457,8 @@ fn default_velox_bin_path() -> Result<PathBuf, String> {
 fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
     let flags = Flags::parse(args)?;
     let scenario_id = flags.required("scenario")?;
-    if Scenario::parse(scenario_id).is_none() {
-        return Err(format!(
-            "未知のシナリオです: {scenario_id} (list-scenarios を参照)"
-        ));
-    }
+    let scenario = Scenario::parse(scenario_id)
+        .ok_or_else(|| format!("未知のシナリオです: {scenario_id} (list-scenarios を参照)"))?;
     let output_path = flags.required("output")?;
     let inputs = flags.many("input");
     if inputs.is_empty() {
@@ -426,10 +486,8 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
 
     let metrics = benchmark::aggregate_trials(&trial_events);
     let total_events: usize = trial_events.iter().map(Vec::len).sum();
-    let environment = collect_environment(
-        trial_events.len() as u32,
-        flags.one("git-commit").map(str::to_owned),
-    );
+    let trials = trial_events.len() as u32;
+    let environment = collect_environment(trials, flags.one("git-commit").map(str::to_owned));
     let result = BenchmarkResult {
         scenario: scenario_id.to_owned(),
         environment,
@@ -443,6 +501,15 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
     }
     if total_events == 0 {
         eprintln!("velox-bench: 警告: どの入力からもレコードを取得できませんでした");
+        return Ok(1);
+    }
+
+    // Same D50 safety net as `cmd_run` — `aggregate` builds a
+    // `BenchmarkResult` from externally-supplied logs, which can just as
+    // easily under-sample a `tabs_N` run (e.g. logs collected by hand, or
+    // from an older `velox-bench run` that predates this scenario's
+    // auto-tuned interval).
+    if warn_on_insufficient_memory_samples(scenario_id, scenario, trials, &result.metrics) {
         return Ok(1);
     }
     Ok(0)
