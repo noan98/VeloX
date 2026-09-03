@@ -3508,3 +3508,151 @@ PSS 超過分の大半が、実測すると VeloX 自身の実装 (wry への we
 直接アタッチ、`WebContext` 共有の実装・計測はいずれも未実施 —
 `docs/memory-analysis.md` §7/§8 に明記した。
 
+
+## D50: `tabs_N` の PSS/RSS サンプル不足 (#119) — サンプリング間隔の自動短縮 + サンプル数不足の明示的な警告
+
+**対象**: Issue #119。D48 (#61) が「別スクリプト (`scripts/bench/tab_scaling.py`)
+で回避した」とだけ記録し、修正を先送りしていた欠陥そのものを本 Issue で
+修正する: `velox-bench run --scenario tabs_1|tabs_5|tabs_10|tabs_20|tabs_50`
+が記録する `pss_total_bytes`/`rss_total_bytes` が、タブ数を変えてもほとんど
+変化しない。
+
+**原因 (D48 が発見済みだった内容の再確認)**: `spawn_rss_sampler`
+(`src/app.rs`) は起動直後に 1 回サンプルを取ってから
+`VELOX_PERF_RSS_INTERVAL_MS` (既定 5000ms, `config::DEFAULT_PERF_RSS_
+INTERVAL`) 間隔でループするだけの単純なスレッドである。一方
+`browser::automation::generate_bench_script` の `TabCountMemory` 分岐は
+`open` を待ち時間なしで連続実行し、全タブを開き終えてから
+`MEMORY_STABILIZE_MS` (3000ms) だけ待って `quit` する。`tabs_1`/`tabs_5` の
+ようにシナリオ全体が 5000ms 未満で終わることが多く、この場合サンプラの
+「起動直後の 1 回目」のサンプル (まだタブが 1 つも開いていない状態) しか
+記録に残らない。**一見それらしい数字が出るため、気づかずに誤った結論を
+出す危険がある**のが最も悪い点で、#34/#72 と同じ「緑なのに何も検証して
+いない」構造の問題である。
+
+**実測で再現した (このコンテナ、`minimal.html`、3 試行、修正前バイナリ)**:
+
+| シナリオ | `pss_process_count` (median) | `pss_total_bytes` (median, MiB) |
+| --- | ---: | ---: |
+| `tabs_1` | 5 | 147.1 |
+| `tabs_5` | 5 | 98.4 |
+| `tabs_10` | 5 | 142.8 |
+| `tabs_20` | 5 | 138.2 |
+
+`pss_process_count` が常に 5 (= toolbar + content 1 タブぶんの webview 構成、
+D48 §2.1 参照) のまま動かないことから、全試行で「起動直後、まだタブを
+1 つも開いていない」状態しかサンプリングできていないことが直接確認できる。
+
+**選んだ対策: `tabs_N` に限定してサンプリング間隔を自動的に短縮する
+(候補 1)。`MEMORY_STABILIZE_MS` を単純に延ばす (候補 3) や、自動操作
+コマンドに新しい「今すぐ 1 サンプル採る」命令を追加する (候補 2) は
+採らなかった。**
+
+- **候補 3 (単純に `MEMORY_STABILIZE_MS` を延ばす) を採らなかった理由**:
+  タスクの制約「計測時間を不必要に延ばさないこと」に反する。既定間隔
+  5000ms に対して安全マージンを持たせるには `MEMORY_STABILIZE_MS` を
+  10 秒以上にする必要があり、`tabs_50` まで含めると `--trials` を重ねる
+  ほど CI のゲートジョブが顕著に遅くなる。間隔そのものを短くする方が、
+  同じ確実性をずっと小さい時間コストで得られる。
+- **候補 2 (自動操作コマンドに `sample` のような新命令を追加する) を
+  採らなかった理由**: D44 が明記しているとおり、`VELOX_AUTOMATION_SCRIPT`
+  の命令セットは「`open`/`switch`/`close`/`navigate`/`wait`/`quit` に
+  限定した、意図的に閉じた集合」であり、それ自体が信頼境界の設計判断
+  (D18/D23) の一部になっている。命令を追加するたびにこの閉じた集合の
+  前提が崩れ、`app.rs` 側の `handle_automation_command`/`parse_script`
+  にも手を入れる必要が生じる — 得られる効果 (サンプリング間隔の問題は
+  純粋にタイミングの問題であり、命令セットの表現力不足が原因ではない)
+  に見合わない変更コストだと判断した。
+- **候補 1 を選んだ理由**: 問題の本質は「サンプラのループ間隔が、
+  `tabs_N` シナリオの所要時間に対して長すぎる」ことだけであり、
+  `VELOX_PERF_RSS_INTERVAL_MS` という既存の調整点 (Issue #108/D42 以前
+  から存在する) を `velox-bench run` 側から自動的に渡すだけで直る。
+  新しい環境変数もコマンドも増えず、`Config`/`app.rs`/`automation` の
+  信頼境界には一切触れない。
+
+**実装**: `browser::automation::recommended_rss_interval_ms(scenario)`
+(`src/browser/automation.rs`) が `Scenario::TabCountMemory(_)` にだけ
+`Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES)` (定数は
+3000ms / 4 = 750ms) を返し、起動系 3 シナリオと `navigation`/
+`tab_create`/`tab_switch` には `None` を返す (`config::DEFAULT_PERF_RSS_
+INTERVAL` のまま、挙動不変)。`velox-bench run` (`src/bin/velox-bench.rs`)
+は `--rss-interval-ms` が明示されていないときだけ、この値を
+`VELOX_PERF_RSS_INTERVAL_MS` として子プロセスに渡す — 明示指定は常に
+優先される。
+
+**なぜ `MEMORY_STABILIZE_MS` (固定 3000ms) から逆算し、シナリオ全体の
+推定所要時間 (`recommended_timeout_secs` が使う `PER_STEP_OVERHEAD_MS`
+のような経験則) からは逆算しなかったか**: `MEMORY_STABILIZE_MS` は
+タブ数に関係なく常に同じ長さの `wait` であり、実際の `open` 1 回あたりの
+実時間 (環境や tab_count に依存し、見積もりが外れうる) に一切依存しない。
+サンプラスレッドは main スレッドの `open` 処理とは独立して動き続けるので、
+「750ms 間隔なら 3000ms の固定窓に約 4 サンプル入る」という保証は
+tab_count や実際の open 所要時間が見積もりとズレても崩れない。実測でも
+`tabs_20` まで含めて全試行で `pss_process_count` の中央値と p95 が完全に
+一致しており (後述の表)、この窓の中で確実にサンプルが取れていることを
+確認した。
+
+**安全網: サンプル数が不足しているときに黙って値を返さない
+(`browser::benchmark::memory_sample_confidence`)**。タスクの要件そのもの
+であり、間隔の自動調整だけでは「それでも環境が遅くて足りない」ケース
+(遅いマシン、`--rss-interval-ms` を利用者が意図的に大きく上書きした場合
+など) を救えない。`scenario::Scenario::TabCountMemory` のときだけ、
+集計済み `Stats` の `pss_total_bytes` (無ければ `rss_total_bytes` に
+フォールバック — D42 が既に確立した「PSS は best-effort、RSS は必ず
+ある」という前提と同じ理由) の `count` を `trials × MIN_RSS_SAMPLES_
+PER_TRIAL` (既定 2、`recommended_rss_interval_ms` が窓あたり約 4 サンプル
+を狙うのに対して十分な余裕を持たせた保守的な下限) と比較する。純粋な
+判定ロジックとして `src/browser/benchmark.rs` に置き (D20 の層分離)、
+`MemorySampleConfidence::{NotApplicable, Sufficient, Insufficient}` を
+返す — `wry`/`tao`/`gtk` に一切依存せず、ちょうど・1 件不足・0 件・
+複数 trials・PSS 不在時の RSS フォールバックなど境界値を含めて
+`cargo test` で検証した (`src/browser/benchmark.rs` の
+`memory_confidence_*` テスト群)。
+
+**D42 との整合**: D42 は PSS の部分読み取りについて「`None` ではなく
+部分和を返す」設計を選んだ。`memory_sample_confidence` はこの前提を
+崩さない — サンプル数が不足していても `BenchmarkResult.metrics` から
+`pss_total_bytes`/`rss_total_bytes` を削除したり `null` にしたりはせず、
+採取できたサンプルをそのまま結果ファイルに書き出す。その代わり
+`velox-bench run`/`aggregate` が `Insufficient` を検出したら stderr に
+警告を出し、終了コード `1` を返す (`total_events == 0` の既存の警告と
+同じパターン) — 「データを隠す」のではなく「信頼できないと明示した上で
+そのまま渡す」設計であり、D42 の哲学をそのまま一段上 (1 サンプル内の
+プロセス網羅性ではなく、1 run 内のサンプル数の網羅性) に適用したもの。
+
+**検証 (実測、`xvfb-run` + `dbus-run-session`、`minimal.html`、3 試行)**:
+
+修正前 (既定 5000ms 間隔のまま) と修正後 (自動短縮 750ms) の
+`pss_total_bytes` 中央値:
+
+| シナリオ | 修正前 (MiB) | 修正後 (MiB) | `pss_process_count` (修正後) |
+| --- | ---: | ---: | ---: |
+| `tabs_1` | 147.1 | 427.0 | 5 |
+| `tabs_5` | 98.4 | 682.2 | 13 |
+| `tabs_10` | 142.8 | 939.4 | 23 |
+| `tabs_20` | 138.2 | 1399.8 | 43 |
+
+`pss_process_count` が `5 → 13 → 23 → 43` と、D48 §4.3 が実測した
+「追加タブ 1 個ごとに正確に +2 プロセス」の関係にきれいに一致している。
+`#61` の `tab_scaling.py` の参照値 (中央値: 1 タブ 409.6 MiB、5 タブ
+777.7 MiB、10 タブ 1387.0 MiB、20 タブ 2421.9 MiB) と比べると、桁は同じで
+単調に増える傾向も一致するが、絶対値は `tabs_10`/`tabs_20` で
+2〜4 割ほど低め — `tab_scaling.py` は各 `open` の間に明示的な待機
+(`--settle-per-open-ms`、既定 300ms) を挟んだ上でさらに安定待ちするため、
+本 Issue の `generate_bench_script` (`open` を待機なしで連続実行) より
+WebKit 側がメモリを「温める」時間が長い。タブ数に応じて明確に増えており
+桁が合っていることは確認できた (完全一致は測定条件が異なるため求めていない
+— Issue 本文どおり)。`--rss-interval-ms` を意図的に大きく (8000ms) 指定
+して同じ `tabs_5` を再実行すると、`pss_process_count` が 5 のまま
+(サンプル不足の再現) になり、`memory_sample_confidence` の警告と
+終了コード `1` が実際に発火することも確認した。
+
+**変えていないもの**: `recommended_rss_interval_ms` は `TabCountMemory`
+以外に `None` を返すため、`cold_startup`/`warm_startup`/`first_page_load`
+(#72 の性能回帰ゲートが依存する 3 シナリオ) と `navigation`/`tab_create`/
+`tab_switch` は `VELOX_PERF_RSS_INTERVAL_MS` を一切渡されず、既定挙動の
+まま変わらない — 実測でも `cold_startup` の出力に間隔の自動調整メッセージ
+が出ないこと、終了コードが `0` のままであることを確認した。
+
+**検証コマンド・詳細な数値・`memory_sample_confidence` の境界値テストの
+一覧は `docs/benchmarking.md`「実行環境要件」の該当箇所を参照。**
