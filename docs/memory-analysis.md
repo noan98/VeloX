@@ -491,3 +491,225 @@ MiB/タブ) の 9 倍近い。
   実際に何個の `WebProcess` を使うか**の一般的な調査: 今回の最小 WebKitGTK
   アプリは webview 1 個だけなので、複数 webview を 1 つの `WebContext` に
   ぶら下げた場合の挙動は確認できていない。
+
+---
+
+## 9. `WebContext` 共有の実装・計測結果 (Issue #118)
+
+Issue #61 (上記 §4/§5、`docs/decisions.md` D48) が「有望だが未検証」とした
+仮説 — toolbar/タブ間で `WebContext` を共有すれば `WebKitWebProcess`/
+`WebKitNetworkProcess` の重複が減るのではないか — を実際に実装し、**同一
+セッション内で** before/after を計測した。結論は `docs/decisions.md` D49
+に記録した。branch `claude/issue-118-webcontext-sharing`。
+
+### 9.1 実装
+
+`src/ui/window.rs` の `BrowserWindow` に `context: Option<wry::WebContext>`
+フィールドを追加した。`config.private == false` のときだけ起動時に
+`WebContext::new(None)` を 1 つ生成して `Some` で保持し、toolbar と全タブの
+content webview の両方が `WebViewBuilder::new_with_web_context(&mut context)`
+(wry 0.56.1 が唯一提供する共有経路 — チェーン可能な `.web_context(...)`
+メソッドは存在しない。ソース確認済み: `grep -n "fn web_context" wry-0.56.1/src/lib.rs`
+はゼロ件) 経由でこの 1 つの `WebContext` を共有して構築されるようにした。
+`config.private == true` のときは `context` を最初から `None` にする
+(`WebViewBuilder::new()` を使う、従来どおり) — D15 が確認済みのとおり wry
+は `.with_incognito(true)` のとき `attributes.context` を無視して毎回
+`WebContext::new_ephemeral()` を作るため、共有 context を渡しても無視される
+だけであり、そもそも渡さない設計にした。
+
+### 9.2 変更前後の PSS (`scripts/bench/tab_scaling.py`, 各 3 試行の中央値)
+
+同一セッション内で、変更前 (baseline: このブランチの差分を `git stash` で
+外してビルドした状態) → 変更後 (差分を適用してビルドした状態) の順に計測
+した (`docs/performance-targets.md` §1 の「異なるセッション間の数値を比較
+しない」制約を守るため)。
+
+| タブ数 | before PSS (MiB) | after PSS (MiB) | 変化率 | before プロセス数 | after プロセス数 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1  | 419.0  | 408.5  | -2.5%  | 5  | 4  |
+| 5  | 834.8  | 790.9  | -5.3%  | 13 | 8  |
+| 10 | 1386.4 | 1234.5 | -11.0% | 23 | 13 |
+| 20 | 2456.6 | 2322.5 | -5.5%  | 43 | 23 |
+
+各セルは 3 試行の中央値。trial 間のばらつき (min-max スプレッド) は before
+0.2〜2.2%、after 0.3〜4.5% — §7 で報告した #61 のばらつき (最大 8.6%) の
+範囲内。**同時に測定した対照群の Chromium (このセッションでは一切変更して
+いない) は同じ 4 条件で -0.6%〜+1.5% の変動しかなく**、上表の VeloX 側の
+変化がこの環境のノイズではなく実装変更由来であることを裏付ける。
+
+再現コマンド:
+
+```sh
+xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+  python3 scripts/bench/tab_scaling.py \
+    --velox <before または after のバイナリ> --chromium /opt/pw-browsers/chromium \
+    --page minimal.html --tab-counts 1,5,10,20 --trials 3 \
+    --output results/tab-scaling-{before,after}.json
+```
+
+### 9.3 プロセス数の変化: 何が実際に減ったか
+
+プロセス数はどのタブ数でも 3 trial 全てで完全に一致した (分散ゼロ)。増分の
+パターンが根本的に変わった:
+
+- before: タブ 1 個増えるごとに正確に **+2 プロセス** (5→13→23→43。
+  toolbar+各タブごとに独立した `WebKitWebProcess`+`WebKitNetworkProcess`
+  のペア、#61/D48 の指摘どおり)
+- after: タブ 1 個増えるごとに正確に **+1 プロセス** (4→8→13→23。これは
+  Chromium の増分パターン (+1/タブ、§4.3) と一致する)
+
+`scripts/profile/process_breakdown.py` で実際のプロセス種別を直接確認した
+(`VELOX_AUTOMATION_SCRIPT` で toolbar+5 タブ=webview 6 個を開かせ、
+`--pid` で実行中プロセスにスナップショット。`VELOX_DEBUG=1` の
+`PageTitleResolved` ログで全 5 タブが実際に読み込み完了したことも確認済み):
+
+| comm | after (webview 6 個) | before 相当 (#61 §5.2 実測) |
+| --- | ---: | ---: |
+| `WebKitWebProces` | **6** (webview 1 個につき 1 個、変化なし) | 6 |
+| `WebKitNetworkPr` | **1** (全 webview で共有) | 6 |
+| `velox` (本体) | 1 | 1 |
+| 合計 | **8** | 13 |
+
+**`WebContext` 共有は `WebKitNetworkProcess` を完全に 1 個へ統合した
+(webview がいくつあっても常に 1 個) が、`WebKitWebProcess` は webview 1 個
+につき 1 個のまま、まったく統合されなかった。** これは D48/#61 が明記して
+いた未検証の留保 「`NetworkProcess` の重複 (1 タブあたり約 17 MiB) は消えて
+も、`WebProcess` (同 155 MiB) は残る可能性がある」がそのとおりに的中した
+ことを意味する — WebKitGTK の `WebContext` は `NetworkProcess` の生成単位
+ではあるが、`WebProcess` の生成単位ではない (related-view process pool を
+明示的に使わない限り、webview ごとに独立)。
+
+再現コマンド (実行中プロセスの直接確認):
+
+```sh
+python3 scripts/profile/process_breakdown.py --pid <実行中の velox の PID>
+```
+
+### 9.4 プライベートモードでの挙動
+
+`VELOX_PRIVATE=1` で toolbar+3 タブ (webview 4 個) を起動し、同じ
+`process_breakdown.py` で確認したところ、**`WebKitWebProcess` 4 個 +
+`WebKitNetworkProcess` 4 個** — 完全に 1:1 のまま、共有は一切起きて
+いなかった。実装のとおり `context: None` を渡しており (§9.1)、D15 が
+指摘した wry 自身の制約 (`.with_incognito(true)` は `attributes.context`
+を無視して毎回 `WebContext::new_ephemeral()` を作る) を実装レベルで
+そのまま追認する形になった。**プライベートモードはこの変更の影響を一切
+受けず、変更前とプロセス構成・PSS 特性ともに同一である。**
+
+### 9.5 データ分離の確認
+
+自作の cookie テストページ (`document.cookie` を読み書きし、結果を
+`document.title` に反映するだけの最小 HTML — 使い捨て、リポジトリには
+含めていない) を使い、`VELOX_DEBUG=1` の `PageTitleResolved` ログで
+確認した。
+
+- **通常タブ同士の Cookie 共有 (意図通りか)**: 通常モードの 2 タブ間で
+  Cookie が共有されることを確認した — 1 つ目のタブが
+  `veloxmark=set-by-B` という Cookie を設定すると、2 つ目のタブは同じ
+  セッション内でその Cookie を読み取れた。**これは `WebContext` を
+  共有した意図通りの結果であり、通常タブが同一プロファイルの
+  Cookie/storage を共有するのは (実際のブラウザと同じ) 正しい挙動で
+  あって分離の破壊ではない。**
+- **プライベートモードは通常モードのデータを一切見ない**: 上記のテスト
+  で通常モードのタブが Cookie を書き込んだあとに、同じ `XDG_DATA_HOME`/
+  `XDG_CACHE_HOME` を指した状態でプライベートモードを起動し同じページを
+  開いたところ、2 タブとも Cookie が見えていなかった。プライベート
+  モードのデータストアは常にエフェメラル (§9.4) であり、通常モードの
+  永続データへ通じる経路自体が存在しない。
+- **プライベートモードの各タブは互いにも共有しない**: 上記と同じ
+  プライベートセッション内で 2 タブとも Cookie が見えていなかった —
+  1 つ目のタブが設定した Cookie を 2 つ目のタブも見ていない。これは
+  wry の `.with_incognito(true)` パスが webview ごとに独立した
+  `WebContext::new_ephemeral()` を作るという **この変更以前からの**
+  既存の挙動であり (§9.1 のとおり、この変更はプライベートパスに一切
+  手を入れていない)、今回の変更による新しい制約や規模拡大ではない
+  (むしろプライベート性としては保守的な方向であり、緩んでもいない)。
+- **通常/プライベートの混在は起きない**: `BrowserWindow::context` は
+  `config.private` に基づいて起動時に一度だけ決まり (D14: プライベート
+  モードはプロセス全体で固定、タブ単位で切り替わらない)、共有
+  `WebContext` はそもそも `config.private == true` の実行では生成すら
+  されない。共有 `WebContext` がプライベート webview に渡る経路はコード
+  上存在しない。
+
+### 9.6 startup / page load への影響 (`velox-bench gate`)
+
+`cold_startup` シナリオ (`minimal.html`、baseline 10 試行 + candidate
+2×10 試行、同一セッション内) を `velox-bench gate` (既定閾値 warn 20% /
+fail 60%、D46) で評価した。**総合判定: OK (全指標 OK、Warn/Fail なし)。**
+
+| metric | baseline (中央値) | candidate 1 | candidate 2 | 判定 |
+| --- | ---: | --- | --- | --- |
+| page_load_ms | 19.50 | 20.35 (+4.4%) | 21.50 (+10.3%) | OK |
+| pss_process_count | 5.00 | 4.00 (-20.0%) | 4.00 (-20.0%) | OK |
+| pss_total_bytes | 143,933,952 | 140,063,232 (-2.7%) | 133,710,848 (-7.1%) | OK |
+| rss_process_count | 5.00 | 4.00 (-20.0%) | 4.00 (-20.0%) | OK |
+| rss_total_bytes | 266,754,048 | 234,227,712 (-12.2%) | 212,791,296 (-20.2%) | OK |
+| startup_first_load_ms | 312.00 | 285.80 (-8.4%) | 299.75 (-3.9%) | OK |
+| startup_rust_setup_done_ms | 135.45 | 135.35 (-0.1%) | 134.30 (-0.8%) | OK |
+| startup_toolbar_ready_ms | 288.75 | 289.90 (+0.4%) | 286.25 (-0.9%) | OK |
+| startup_window_created_ms | 135.35 | 135.15 (-0.1%) | 134.10 (-0.9%) | OK |
+
+**起動系メトリクスは悪化しておらず (いずれもゲート内)、`pss_process_count`/
+`pss_total_bytes` はむしろ改善している。**
+
+### 9.7 T2 (Chromium 比 +10% 以内) は達成したか
+
+**達成していない。** 変更後も Chromium との差は依然として大きい:
+
+| タブ数 | before: VeloX vs Chromium | after: VeloX vs Chromium |
+| ---: | ---: | ---: |
+| 1  | +48.6%  | +45.5%  |
+| 5  | +160.4% | +146.6% |
+| 10 | +281.6% | +234.7% |
+| 20 | +428.1% | +402.2% |
+
+1 タブあたりの増分 (1→20 タブの平均) は before 約 107.2 MiB/タブ → after
+約 100.7 MiB/タブへと、約 6% だけ縮んだ (§9.3 のとおり `NetworkProcess`
+の重複だけが消え、支配的な `WebProcess` (§2.1 で全体の 74.4% を占めて
+いた) はタブごとに増え続けるため)。
+
+### 9.8 結論: 変更を残すか、revert するか
+
+**残す。** 理由:
+
+1. **効果はゼロではなく、実測で確認できる程度に有意である。** 1/5/10/20
+   タブすべてで PSS が -2.5%〜-11.0% 減少し、プロセス数は 20%〜38%
+   減少した。対照群の Chromium は同一測定で -0.6%〜+1.5% にとどまって
+   おり、VeloX 側の変化がこの環境のノイズ (§7 で報告した 0.1〜8.6% の
+   trial 間ばらつき) の範囲を超えていることを裏付ける。
+2. **プロセス数の減少パターン (+2/タブ→+1/タブ) は決定的 (trial 間で
+   分散ゼロ) であり、根本原因 (`NetworkProcess` の統合) がソースレベルで
+   説明できる。** 偶然の測定ノイズでは説明できない。
+3. **startup/page load を悪化させていない** (§9.6、`velox-bench gate`
+   総合判定 OK)。
+4. **データ分離を壊していない** (§9.5) — 通常タブ間の共有は意図通り、
+   プライベートモードは変更の影響を受けていない。
+5. **統合テスト・単体テストが全て通る** (`cargo test`、
+   `xvfb-run ... dbus-run-session -- cargo test` とも 0 failed)。
+
+一方で正直に記録すべき限界:
+
+- **T2 (Chromium 比 +10% 以内) は達成できていない** (§9.7)。支配的な
+  `WebProcess` の重複が残っているため、Chromium 比の超過分の大半は
+  未解決のまま。
+- **タブが増えるほど Chromium との差は絶対値でも相対値でも拡大し続ける**
+  (§9.7 の表)。今回の変更はこの傾向そのものは変えていない — 増分の
+  傾きをわずかに緩めた (107.2→100.7 MiB/タブ) だけである。
+- したがって **この変更は「メモリ超過分の主要因を解決した」わけではなく、
+  「効果が実測で確認できる部分的な改善」という位置付けが正確である。**
+  #59/D43 (効果ゼロと判明し見送った) とも、当初期待された「T2 達成」とも
+  異なる、第三の結果になった。
+
+### 9.9 次に残された課題
+
+`WebProcess` を webview 間で共有するには、wry 0.56.1 が
+`WebViewBuilderExtUnix::with_related_view(webview: webkit2gtk::WebView)`
+という別の (`WebContext` 共有とは独立した) API を公開していることを
+ソース調査で確認した (「Creates a new webview sharing the same web
+process with the provided webview.」— `wry-0.56.1/src/lib.rs`)。ただし
+この API は `webkit2gtk::WebView` という wry の外側の型を要求しており、
+VeloX が現状 `wry::WebView` しか保持していない設計 (D20 の「`browser::`
+は `wry`/`gtk` 型を一切知らない」という層分離とも関わる) を崩さずに
+使えるかは未検証。WebKitGTK の related-view process pool の一般的な挙動
+(#61 §5.4 が未検証としていた点) も含め、次の Issue で検証することを
+推奨する。

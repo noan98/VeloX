@@ -154,21 +154,45 @@ dom_heavy 467.4 vs 364.6 MiB)。
 Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」を出発点にできない。
 上記のとおり、原因の切り分け自体は #61 で完了した。
 
-### タブ数に対する増え方 (2026-09-03、#61 で測定)
+> **⚠️ 2026-09-03 (#118) で toolbar/タブ間の `WebContext` 共有を実装・計測
+> した。詳細は [docs/memory-analysis.md](memory-analysis.md) §9、
+> `docs/decisions.md` D49 を参照。**
+>
+> 結論: **効果は実測できる程度に有意だが、部分的。** `WebKitNetworkProcess`
+> はタブ数に関わらず 1 個に統合できた (タブ 1 個あたりの増分プロセス数が
+> +2→+1 に、Chromium と同じ増分パターンになった) が、PSS の大半を占める
+> `WebKitWebProcess` は webview ごとに独立したまま統合されなかった
+> (WebKitGTK の `WebContext` は `NetworkProcess` の生成単位ではあるが
+> `WebProcess` の生成単位ではないと判明)。結果として PSS は 1/5/10/20 タブ
+> で -2.5%〜-11.0% 減少したが、**T2 (Chromium 比 +10% 以内) には遠く届いて
+> いない** (1 タブで +45.5%、20 タブで +402.2%、変更前はそれぞれ +48.6%/
+> +428.1%)。プライベートモードは D15/D48 の予測どおり wry の制約で共有が
+> 効かず、変更前と同一の挙動 (webview ごとに独立した `WebProcess`+
+> `NetworkProcess`) のまま。**効果がゼロではなく measurable なため実装は
+> 残したが、T2 達成には別の手段 (`WebProcess` 自体の共有) が必要。**
+
+### タブ数に対する増え方 (2026-09-03、#61 で測定 / #118 で before/after 追記)
 
 1/5/10/20 タブで `minimal.html` を計測 (`scripts/bench/tab_scaling.py`、
-各 3 試行の中央値、詳細は `docs/memory-analysis.md` §4)。
+各 3 試行の中央値、詳細は `docs/memory-analysis.md` §4/§9)。
 
-| タブ数 | VeloX PSS (MiB) | Chromium PSS (MiB) |
-| ---: | ---: | ---: |
-| 1 | 409.6 | 276.7 |
-| 5 | 777.7 | 315.6 |
-| 10 | 1387.0 | 366.0 |
-| 20 | 2421.9 | 464.8 |
+| タブ数 | before (#61時点) VeloX PSS (MiB) | after (#118: WebContext共有後) VeloX PSS (MiB) | Chromium PSS (MiB) |
+| ---: | ---: | ---: | ---: |
+| 1  | 409.6  | 408.5  | 276.7 |
+| 5  | 777.7  | 790.9  | 315.6 |
+| 10 | 1387.0 | 1234.5 | 366.0 |
+| 20 | 2421.9 | 2322.5 | 464.8 |
 
-1 タブあたりの増分は VeloX 約 106 MiB/タブ、Chromium 約 9.9 MiB/タブ (約
-10.7 倍)。原因はプロセス数の増え方 (VeloX +2/タブ、Chromium +1/タブ 程度)
-と一致する。
+（#61 と #118 は別セッションの計測のため、上表の Chromium 列は #61 時点の
+参考値。#118 は同一セッション内の before/after 比較を別途行っており、その
+数値は `docs/memory-analysis.md` §9.2 を参照— before 419.0/834.8/1386.4/
+2456.6 MiB → after 408.5/790.9/1234.5/2322.5 MiB、-2.5%〜-11.0%。）
+
+1 タブあたりの増分は before 約 107 MiB/タブ → after 約 101 MiB/タブ
+(#118、同一セッション比較)。Chromium は約 9.9 MiB/タブ。原因はプロセス数の
+増え方 (before: VeloX +2/タブ → after: VeloX +1/タブ。Chromium は +1/タブ
+程度) と一致する — `WebKitNetworkProcess` の統合分だけ増分が縮んだ
+(`docs/memory-analysis.md` §9.3)。
 
 ### 未測定
 
@@ -189,7 +213,7 @@ Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」�
 | # | 目標 | 現在値 | 目標値 | 根拠 |
 | --- | --- | ---: | ---: | --- |
 | T1 | 起動〜load の優位を**維持**する | Chromium 比 -22〜-32% | **Chromium より速い状態を維持** (目安 -20%) | 既に勝っている領域を最適化で失わないことが最優先。回帰ゲート (#72) の対象 — **判定方式は §10 で確定**。単発の測定値で -20% を割ったことを回帰と判定してはならない (§10 参照) |
-| T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +28〜29% (1 タブ)、タブ数が増えるほど拡大 (20 タブで約 5.2 倍、§11) | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。**#61 で切り分け完了 — 主因は VeloX 自身の webview/`WebContext` の使い方であってエンジン差ではないと判明した (§11、`docs/memory-analysis.md`)。達成可能性は「有望」だが未実装・未検証。次は #62 で toolbar/content 間の `WebContext` 共有を実装し計測する** |
+| T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +45.5% (1 タブ)、タブ数が増えるほど拡大 (20 タブで +402.2%、§11・`docs/memory-analysis.md` §9.7) | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。**#61 で主因を特定 (webview/`WebContext` の使い方、エンジン差ではない) → #118 で toolbar/タブ間の `WebContext` 共有を実装・計測した。`WebKitNetworkProcess` の重複は解消できたが、PSS の大半を占める `WebKitWebProcess` は webview ごとに独立したままで統合されず、T2 には届いていない (未達)。次の一手は `WebProcess` 自体の共有 (`docs/memory-analysis.md` §9.9 の `with_related_view` 調査などが候補) — 別 Issue に引き継ぐ** |
 | T3 | `startup_toolbar_ready_ms` を短縮する | 528.4ms | **300ms 以下** | ⚠️ **保留**。当初「この区間は VeloX 自身のコードでエンジン差ではないから確実に手が出せる」と設定したが、**#59 の実測でこの前提は誤りと判明した** (支配的なのは tao/GTK の初期化と WebKitGTK の webview 生成)。目標値は据え置くが、達成手段は現時点で不明。§9 参照 |
 | T4 | 20 タブ時に操作不能な遅延を出さない | 未測定 | タブ切替 median **100ms 以下** | #60 の受け入れ条件。まず計測手段が必要 |
 

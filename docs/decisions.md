@@ -3508,6 +3508,113 @@ PSS 超過分の大半が、実測すると VeloX 自身の実装 (wry への we
 直接アタッチ、`WebContext` 共有の実装・計測はいずれも未実施 —
 `docs/memory-analysis.md` §7/§8 に明記した。
 
+## D49: toolbar/タブ間で `WebContext` を共有 — 効果は部分的 (`NetworkProcess` は統合できたが `WebProcess` は残った)、実装は残す
+
+**対象**: Issue #118 (D48/#61 が「有望だが未検証」とした仮説の実装フェーズ。
+Epic #57)。詳細な測定データ・再現手順は `docs/memory-analysis.md` §9。
+
+**背景**: D48 は「`WebContext` を共有すれば `WebKitWebProcess`/
+`WebKitNetworkProcess` の重複が減るはず」という仮説と同時に、2 つの未検証
+の留保を明記していた — (1) 共有しても `NetworkProcess` (1 タブあたり約
+17 MiB) しか消えず、支配的な `WebProcess` (同 155 MiB) は残る可能性がある、
+(2) プライベートモードでは wry の制約で同じ手が使えない可能性が高い。
+**「効果ゼロ」という結論もあり得る、その場合は変更を入れずに記録して終える**
+というルールで着手した。
+
+### 実装
+
+`src/ui/window.rs` の `BrowserWindow` に `context: Option<wry::WebContext>`
+を追加。`config.private == false` のときだけ `WebContext::new(None)` を
+起動時に 1 つ生成し、toolbar と全タブの content webview がこの 1 つを
+`WebViewBuilder::new_with_web_context(&mut context)` (wry 0.56.1 が唯一
+提供する共有経路 — チェーン可能な `.web_context(...)` は存在しない、ソース
+確認済み) 経由で共有して構築されるようにした。`config.private == true` の
+ときは `context` を最初から `None` にする (`WebViewBuilder::new()` を使う、
+従来どおり) — D15 のとおり wry は `.with_incognito(true)` で
+`attributes.context` を無視して毎回 `WebContext::new_ephemeral()` を作る
+ため、共有 context を渡しても無視されるだけであり、そもそも渡さない設計に
+した。
+
+### 実測結果: 2 つの留保はどちらも的中した
+
+同一セッション内で before (`git stash` でこの変更を外してビルド) /
+after (この変更を適用してビルド) を `scripts/bench/tab_scaling.py`
+(1/5/10/20 タブ、各 3 試行) と `scripts/profile/process_breakdown.py`
+(実プロセスの直接観測) で比較した。
+
+**留保 (1) は的中した — `NetworkProcess` は統合できたが `WebProcess` は
+残った。** toolbar+5 タブ (webview 6 個) を自動操作で開かせて実プロセスを
+数えたところ、`WebKitNetworkProcess` は webview がいくつあっても常に
+**1 個**に統合された一方、`WebKitWebProcess` は webview 1 個につき 1 個の
+まま、まったく統合されなかった (6 個)。WebKitGTK の `WebContext` は
+`NetworkProcess` の生成単位ではあるが `WebProcess` の生成単位ではない
+(related-view process pool を明示的に使わない限り webview ごとに独立)、
+ということが実測で確定した。
+
+**留保 (2) も的中した — プライベートモードは変更の影響を一切受けなかった。**
+`VELOX_PRIVATE=1` で toolbar+3 タブ (webview 4 個) を起動すると
+`WebKitWebProcess`/`WebKitNetworkProcess` とも 4 個ずつ、完全に 1:1 の
+まま。実装のとおり private では `context: None` を渡しているため wry の
+`.with_incognito` パスがそのまま従来どおり動き、プロセス構成・PSS 特性
+ともに変更前と同一だった。
+
+**それでも「効果ゼロ」ではなかった — `NetworkProcess` の統合だけで
+measurable な PSS 減少が出た。** 1/5/10/20 タブで PSS が -2.5%〜-11.0%
+減少し、タブ 1 個あたりの増分プロセス数は +2→+1 (Chromium と同じ増分
+パターン) に変わった。プロセス数の変化は trial 間で完全に決定的 (分散
+ゼロ) であり、対照群として同時に測定した Chromium (このセッションでは
+無変更) は ±1.5% 以内の変動しかなかった — VeloX 側の PSS 減少がこの環境の
+測定ノイズ (`docs/memory-analysis.md` §7 が報告する最大 8.6%) の範囲内の
+偶然ではなく、実装変更由来であると判断できる根拠である。
+
+### T2 (Chromium 比 +10% 以内) は未達のまま
+
+PSS の大半 (1 タブ時で全体の 74.4%、#61 §2.1) を占める `WebKitWebProcess`
+が統合されなかったため、Chromium との差はほとんど縮まっていない: 1 タブで
++48.6%→+45.5%、20 タブで +428.1%→+402.2%。1 タブあたりの増分も約 107→約
+101 MiB/タブとわずかに縮んだだけで、タブが増えるほど Chromium との差が
+拡大し続ける傾向そのものは変わっていない。**この変更は「メモリ超過の主要因
+を解決した」わけではなく「効果が実測で確認できる部分的な改善」である。**
+
+### データ分離とプライベート/通常の混在
+
+自作の cookie テストページで確認した (`docs/memory-analysis.md` §9.5):
+通常モードの 2 タブは Cookie を共有する (`WebContext` 共有の意図通り、
+実ブラウザと同じ正しい挙動)。プライベートモードは通常モードの永続データを
+一切見ず、かつプライベート内の各タブも互いに共有しない (これは wry の
+`.with_incognito` パスの既存の挙動であり、本変更が新たに導入したものでは
+ない)。`BrowserWindow::context` は `config.private` に基づき起動時に一度
+だけ決まる (D14: プロセス全体で固定) ため、共有 `WebContext` がプライベート
+webview に渡る経路はコード上そもそも存在しない。
+
+### startup/page load への影響なし
+
+`cold_startup` シナリオを `velox-bench gate` (baseline 10 試行 + candidate
+2×10 試行、同一セッション内、既定閾値 warn 20%/fail 60%、D46) で評価し、
+総合判定 **OK** (全指標 OK)。`pss_process_count`/`pss_total_bytes` はむしろ
+改善方向、`startup_*`/`page_load_ms` 系は悪化なし。
+
+### 判断: 実装は残す
+
+**#59/D43 (「効果ゼロと判明したので見送る」) とは異なる、第三の結果に
+なった。** 効果は部分的だが measurable かつ決定的 (プロセス数の変化に
+分散ゼロ) であり、対照群の Chromium が同時測定でノイズ範囲内に収まって
+いたことから、偶然ではなく実装変更由来と判断できる。データ分離を壊さず、
+プライベートモードに影響を与えず、startup/page load を悪化させず、
+統合テスト・単体テストが全て通ることも確認した。Epic #57 の「ベンチマーク
+なしの最適化をしない」は「効果が無ければ入れない」であって「効果が部分的
+なら入れない」ではないため、実装を revert する理由はないと判断した。
+
+**Revisit condition**: T2 達成には `WebKitWebProcess` 自体の共有が必要。
+wry 0.56.1 は `WebViewBuilderExtUnix::with_related_view(webview:
+webkit2gtk::WebView)` という別の API (`WebContext` 共有とは独立) を公開
+しているが、`webkit2gtk::WebView` という wry の外側の型を要求するため、
+VeloX が現状 `wry::WebView` しか保持しない設計 (D20 の層分離) を崩さずに
+使えるかは未検証。WebKitGTK の related-view process pool の一般的な挙動
+(#61 §5.4 が未検証としていた点) も含め、次の Issue で検証することを
+推奨する (`docs/memory-analysis.md` §9.9)。
+
+
 
 ## D50: `tabs_N` の PSS/RSS サンプル不足 (#119) — サンプリング間隔の自動短縮 + サンプル数不足の明示的な警告
 
