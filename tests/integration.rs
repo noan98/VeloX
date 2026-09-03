@@ -66,9 +66,27 @@ static GUI_TEST_LOCK: Mutex<()> = Mutex::new(());
 /// Skip the calling test (printing why, to stdout, and returning — a
 /// pass) when this environment cannot attempt to launch a GUI window. See
 /// this file's module doc comment and docs/decisions.md D47.
+///
+/// **Unless `VELOX_INTEGRATION_REQUIRE_GUI` is set**, in which case a skip
+/// becomes a hard failure instead. A skip is reported by `cargo test` as an
+/// ordinary pass, which is exactly right on a developer machine with no X
+/// session — and exactly wrong in CI, where it would mean this whole file
+/// quietly stops testing anything while the job stays green. That is the
+/// same shape of silent, green-but-untested failure as #72 itself (all unit
+/// tests passing while `velox` never started), so the CI job that provides
+/// `xvfb-run`/`dbus-run-session` also sets this variable: if that setup is
+/// ever removed or breaks, CI fails loudly rather than skipping.
 macro_rules! skip_without_gui {
     ($test_name:literal) => {
         if let Some(reason) = gui_skip_reason() {
+            assert!(
+                !env_is_set("VELOX_INTEGRATION_REQUIRE_GUI"),
+                "VELOX_INTEGRATION_REQUIRE_GUI が設定されているのに GUI を起動できません \
+                 ({}): {reason}。この環境は統合テストを実行する前提で構成されている \
+                 はずです — xvfb-run / dbus-run-session の設定を確認してください \
+                 (docs/decisions.md D47)。",
+                $test_name,
+            );
             println!("skip: {} — {reason}", $test_name);
             return;
         }

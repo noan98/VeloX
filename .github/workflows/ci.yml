@@ -43,7 +43,14 @@ jobs:
       # session bus, WebKitGTK's web process cannot start and `velox` hangs
       # silently instead of making progress — see docs/benchmarking.md's
       # 「実行環境要件」and docs/decisions.md D46/D47.
+      # VELOX_INTEGRATION_REQUIRE_GUI turns the integration tests' "no
+      # display/D-Bus, skip me" path into a hard failure. A skip is an
+      # ordinary green pass, so without this a broken xvfb-run/dbus-run-session
+      # setup here would silently drop every integration test and leave the
+      # job green — the same green-but-untested shape #34 exists to prevent.
       - name: Test (unit + integration, under Xvfb/D-Bus)
+        env:
+          VELOX_INTEGRATION_REQUIRE_GUI: "1"
         run: |
           xvfb-run -a --server-args="-screen 0 1280x900x24" \
             dbus-run-session -- cargo test
