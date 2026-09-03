@@ -221,6 +221,12 @@ const SWITCH_SETTLE_MS: u64 = 200;
 /// the RSS sampler (`VELOX_PERF_RSS_INTERVAL_MS`) time to take at least a
 /// couple of samples with all tabs present.
 const MEMORY_STABILIZE_MS: u64 = 3_000;
+/// How many RSS/PSS samples [`recommended_rss_interval_ms`] aims to land
+/// inside the fixed [`MEMORY_STABILIZE_MS`] settle window at the end of a
+/// generated `tabs_N` script — see that function's doc comment and
+/// docs/decisions.md D50 for why this window, not the scenario's total
+/// duration, is what the interval is derived from.
+const TARGET_STABILIZED_RSS_SAMPLES: u64 = 4;
 
 /// Build the automation script text for `scenario`, given the fixed page
 /// `url` every trial should use (the same `--url` `velox-bench run` already
@@ -330,6 +336,57 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
         }
     };
     script_ms / 1000 + STARTUP_DEFAULT_SECS + TEARDOWN_BUFFER_SECS
+}
+
+/// A `VELOX_PERF_RSS_INTERVAL_MS` override for `velox-bench run`, when
+/// `scenario`'s default (`config::DEFAULT_PERF_RSS_INTERVAL`, 5000ms) would
+/// undersample it. `None` for every scenario but [`Scenario::TabCountMemory`]
+/// — the default interval is left alone everywhere else, including the three
+/// startup scenarios, so this function cannot change their behavior (see
+/// docs/decisions.md D50).
+///
+/// **Why `tabs_N` needs an override at all**: `generate_bench_script`'s
+/// `TabCountMemory` branch opens every extra tab back to back with no
+/// `wait` between them, then waits [`MEMORY_STABILIZE_MS`] once at the end
+/// before `quit`. A scenario's whole run can finish in a few seconds
+/// (`docs/memory-analysis.md` §4.1 measured `tabs_1`/`tabs_5` at 3-4s), well
+/// under the periodic RSS sampler's default 5000ms period
+/// (`spawn_rss_sampler`, `src/app.rs`) — so the sampler's loop, which takes
+/// its first sample immediately at startup and then sleeps `interval`
+/// before the next one, can easily take *only* that first sample (all tabs
+/// still closed, or only partway open) before the process exits. Every
+/// `tabs_N` PSS/RSS figure this project has recorded ends up reporting
+/// close to the same "just launched" number regardless of `N`, which is
+/// this issue's bug.
+///
+/// **Why the interval is derived from [`MEMORY_STABILIZE_MS`] and not from
+/// the scenario's total estimated duration** (unlike
+/// [`recommended_timeout_secs`], which does use a per-step time estimate):
+/// [`MEMORY_STABILIZE_MS`] is the one part of a `tabs_N` script whose
+/// duration does not depend on how long the real `open` calls actually take
+/// — it is a fixed `wait` the automation thread sleeps regardless. Pacing
+/// the sampler off it means the interval keeps working whether the real
+/// per-tab open cost this session happens to see is faster or slower than
+/// any estimate: `MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES`
+/// (750ms today) fits comfortably more than [`TARGET_STABILIZED_RSS_SAMPLES`]
+/// sampler ticks inside that fixed window no matter when the window starts,
+/// and the sampler thread runs independently of the main thread's tab-open
+/// work, so tab count does not slow it down either. `benchmark::
+/// memory_sample_confidence` is the safety net for the case where the
+/// real environment is slow enough that even this still undersamples.
+pub fn recommended_rss_interval_ms(
+    scenario: crate::browser::benchmark::scenario::Scenario,
+) -> Option<u64> {
+    use crate::browser::benchmark::scenario::Scenario;
+    match scenario {
+        Scenario::TabCountMemory(_) => Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES),
+        Scenario::ColdStartup
+        | Scenario::WarmStartup
+        | Scenario::FirstPageLoad
+        | Scenario::Navigation
+        | Scenario::TabCreate
+        | Scenario::TabSwitch => None,
+    }
 }
 
 #[cfg(test)]
@@ -645,5 +702,70 @@ mod tests {
             let secs = recommended_timeout_secs(scenario);
             assert!(secs > 0, "scenario {:?} had a zero timeout", scenario.id());
         }
+    }
+
+    // -- recommended_rss_interval_ms (Issue #119, D50) --------------------
+
+    #[test]
+    fn startup_scenarios_keep_the_default_rss_interval() {
+        // `None` here means "`velox-bench run` does not pass
+        // `VELOX_PERF_RSS_INTERVAL_MS` at all", i.e. `Config`'s existing
+        // 5000ms default applies unchanged — this is the behavior the task
+        // explicitly must not disturb.
+        assert_eq!(recommended_rss_interval_ms(Scenario::ColdStartup), None);
+        assert_eq!(recommended_rss_interval_ms(Scenario::WarmStartup), None);
+        assert_eq!(recommended_rss_interval_ms(Scenario::FirstPageLoad), None);
+    }
+
+    #[test]
+    fn non_memory_tab_scenarios_keep_the_default_rss_interval() {
+        assert_eq!(recommended_rss_interval_ms(Scenario::Navigation), None);
+        assert_eq!(recommended_rss_interval_ms(Scenario::TabCreate), None);
+        assert_eq!(recommended_rss_interval_ms(Scenario::TabSwitch), None);
+    }
+
+    #[test]
+    fn tab_count_memory_scenarios_get_an_explicit_short_interval() {
+        for &n in &Scenario::TAB_COUNTS {
+            let interval = recommended_rss_interval_ms(Scenario::TabCountMemory(n))
+                .unwrap_or_else(|| panic!("tabs_{n} should override the RSS interval"));
+            assert!(
+                interval > 0,
+                "tabs_{n} interval must be positive, got {interval}"
+            );
+            // The interval must be short enough that more than one sample
+            // can land inside the fixed MEMORY_STABILIZE_MS settle window,
+            // regardless of tab count (see the function's doc comment for
+            // why this is independent of N).
+            assert!(
+                interval * 2 <= MEMORY_STABILIZE_MS,
+                "tabs_{n} interval {interval}ms leaves room for fewer than 2 \
+                 samples in a {MEMORY_STABILIZE_MS}ms settle window"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_count_memory_interval_is_independent_of_tab_count() {
+        // Deliberately identical across every tab count: the settle window
+        // (MEMORY_STABILIZE_MS) that it is derived from does not grow with
+        // N, and the sampler thread runs independently of how many `open`
+        // commands the main thread is still working through.
+        let intervals: Vec<u64> = Scenario::TAB_COUNTS
+            .iter()
+            .map(|&n| recommended_rss_interval_ms(Scenario::TabCountMemory(n)).unwrap())
+            .collect();
+        assert!(
+            intervals.windows(2).all(|pair| pair[0] == pair[1]),
+            "expected the same interval for every tab count, got {intervals:?}"
+        );
+    }
+
+    #[test]
+    fn tab_count_memory_interval_matches_the_documented_formula() {
+        assert_eq!(
+            recommended_rss_interval_ms(Scenario::TabCountMemory(1)),
+            Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES)
+        );
     }
 }

@@ -481,6 +481,48 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   動くから dbus は無関係」という推論は成り立たない。両環境の dbus の状態は
   同一ではない (ランナーではシステムバスが存在し AT-SPI の解決に失敗する)。
 
+- **⚠️ `tabs_N` シナリオの既定の RSS/PSS サンプリング間隔 (5000ms) では、
+  タブを開き終える前の状態しか記録できないことがある (Issue #119 で実測、
+  D50 に記録)。**
+  `spawn_rss_sampler` (`src/app.rs`) は起動直後に 1 回サンプルを取ってから
+  `VELOX_PERF_RSS_INTERVAL_MS` (既定 5000ms, `config::DEFAULT_PERF_RSS_
+  INTERVAL`) 間隔でループする一方、`tabs_N` の自動操作スクリプト
+  (`browser::automation::generate_bench_script` の `TabCountMemory` 分岐)
+  は `open` を待ち時間なしで連続実行し、全タブを開き終えてから
+  `MEMORY_STABILIZE_MS` (3000ms) だけ待って `quit` する。**シナリオ全体の
+  所要時間が 5000ms 未満で終わることが多く、この場合サンプラの「起動直後の
+  1 回目」のサンプルしか記録に残らない** — `pss_total_bytes`/
+  `rss_total_bytes` の中央値がタブ数に関係なくほぼ一定になり、見た目には
+  それらしい数字が出るため気づきにくい。#61 (`docs/memory-analysis.md` §4.1)
+  で最初に発見され、本 Issue で修正した。
+
+  **対処: `velox-bench run` が `tabs_N` を検出したら自動でサンプリング
+  間隔を短縮する。** `--rss-interval-ms` を明示しない限り、
+  `browser::automation::recommended_rss_interval_ms` が
+  `MEMORY_STABILIZE_MS` (タブ数に関わらず一定の待ち時間) から逆算した
+  間隔 (既定の定数では 750ms) を `VELOX_PERF_RSS_INTERVAL_MS` として渡す
+  — 起動系シナリオ (`cold_startup`/`warm_startup`/`first_page_load`) と
+  `navigation`/`tab_create`/`tab_switch` は対象外で、挙動は変わらない。
+
+  ```sh
+  # --rss-interval-ms を省略すれば自動調整が効く
+  xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+    ./target/release/velox-bench run --scenario tabs_20 --trials 3 \
+      --url http://127.0.0.1:8771/minimal.html --output tabs20.json
+  ```
+
+  **それでもサンプル数が足りない場合は、値を静かに返さず警告する。**
+  `browser::benchmark::memory_sample_confidence` が `tabs_N` の
+  `pss_total_bytes`/`rss_total_bytes` の実際のサンプル数 (`Stats::count`)
+  を `trials × MIN_RSS_SAMPLES_PER_TRIAL` (既定 2) と比較し、不足していれば
+  `velox-bench run`/`aggregate` が `velox-bench: 警告: ... サンプル数が
+  不足しています` を stderr に出し、終了コード `1` を返す。結果ファイル
+  自体は採取できたサンプルをそのまま書き出す (D42 の「部分和は `None` では
+  なく返す」方針に合わせ、値そのものは隠さない) — CI や手元での確認は
+  終了コードと警告メッセージで気付く設計。`--rss-interval-ms` で意図的に
+  大きな値を指定するなど、自動調整を上書きした場合には今でも再現しうる
+  ので、この警告は自動調整の有無に関わらず常時効く安全網である。
+
 - 仮想ディスプレイすら無い場合は、子プロセス (`velox`) がウィンドウ作成に
   失敗して即座に終了する (GTK 初期化失敗の panic として観測)。`velox-bench`
   自身はクラッシュせず、「0 件のレコードを取得」「結果ファイルは書き出したが
@@ -528,6 +570,13 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   | `navigation` | `page_load_ms` | 7.45 | 23.68 | 10 |
   | `tab_create` | `tab_create_ms` | 20.65 | 50.22 | 10 |
   | `tab_switch` | `tab_switch_ms` | 0.60 | 0.85 | 16 |
+
+  **⚠️ 上の `tabs_5` の `pss_total_bytes` (n=2) は、上記「実行環境要件」の
+  D50 が記録したサンプル不足バグの実例そのものである** — この値が採取された
+  時点 (#112) では `velox-bench run` は既定の 5000ms 間隔しか使えず、
+  誰もこの数字がタブ数を反映していないことに気付けなかった。歴史的記録
+  として残しているが、`tabs_N` の `pss_total_bytes`/`rss_total_bytes` の
+  参考値としては使わないこと。
 
   **これも `cold_startup` の既存の実測結果同様、正式なベースラインでは
   ない** (a) ソフトウェアレンダリングのため RSS/PSS が実機より大きい、
