@@ -3201,6 +3201,186 @@ PR で #36 と #72 の両方を close する。**
 `build_perf_log` が `event_loop.run` より後ろにある事実と合わさって、ブロック
 位置を `BrowserWindow::new` に特定する決め手になった。
 
+## D47: Integration Test 基盤 (#34) — `VELOX_AUTOMATION_SCRIPT` を駆動機構に再利用し、GUI 不可環境は実行時判定でスキップ
+
+**対象**: Issue #34。`cargo test` の 474 件 (本 Issue の作業開始時点) はすべて
+`src/browser/` の純粋ロジックに対する単体テストで、実際に `velox` バイナリを
+起動する経路が 1 つも検証されていなかった。これは仮説上の欠落ではなく実害と
+して観測済みだった — 直前の Issue #72 (D46) では、**474 テストが全緑のまま、
+CI 上の VeloX は `BrowserWindow::new` から先へ進まず起動すらしていなかった**
+(D-Bus セッションバスの欠如)。クラッシュせず、perf ログを 1 行も書かず、ただ
+無応答になるという壊れ方であり、既存の単体テストの守備範囲 (`src/browser/`
+の純粋ロジック) には原理的に入らない。成果物は `tests/integration.rs`
+(Cargo の統合テスト、`cargo test` で自動実行される) と、それが `browser::
+gui_probe::gui_probe_reason` として使う 1 つの純粋関数
+(`src/browser/gui_probe.rs`)。
+
+### 駆動機構: 新しい制御チャネルを作らず `VELOX_AUTOMATION_SCRIPT` を再利用する
+
+Issue #112 (D44) で導入済みの `VELOX_AUTOMATION_SCRIPT` — 起動時に一度だけ
+読み込まれる読み取り専用のスクリプトファイルで、`open`/`switch`/`close`/
+`navigate`/`wait`/`quit` を既存の `UserEvent` ディスパッチへ流し込む —
+をそのまま統合テストの駆動機構として使う。D44 が listening socket/RPC
+サーバを明確に却下した理由 (D18/D23 の IPC 信頼境界 — 構造化コマンドを外部
+プロセスから受け付けられるのはトップレベルの信頼されたツールバー webview
+だけ、という原則) は本 Issue でも変わらない。**統合テスト専用の別チャネルを
+新設することは、D44 がわざわざ避けた「常設の待ち受け口」を、テストという
+名目でもう一つ増やすことに等しく、採らなかった。** `tests/integration.rs`
+は `velox-bench run` が `browser::automation::generate_bench_script` で
+自動生成するのと同じ書式のスクリプトを、テストごとに手書きして
+`VELOX_AUTOMATION_SCRIPT` に渡す — `velox-bench` と統合テストは同じ入り口を
+共有する 2 つの独立した利用者であり、どちらも本番コードに一切変更を要求
+しない (実際、本 Issue で `src/app.rs`/`src/browser/automation.rs` に変更は
+無い)。
+
+### GUI が無い環境は実行時判定でスキップする (`#[ignore]` ではなく)
+
+**要求は「開発者のマシンや GUI の無い CI で `cargo test` が赤くなっては
+いけない」。** `#[ignore]` はコンパイル時に固定される属性であり、「この
+実行で Xvfb/D-Bus が実際に使えるかどうか」というランタイムの状態を反映
+できない (CI 側ではこの統合テストを常に有効化して実行したいが、それ以外の
+実行環境では動くとも動かないとも決め打てない)。そこで各テストは冒頭で
+実際の環境変数を見て判定し、起動を試みる前に穏当にスキップする
+(`skip_without_gui!` マクロ、成功終了・stdout に理由を出力するだけで
+`#[ignore]`/failure のどちらでもない)。
+
+判定ロジックは 2 つの層に分けた (D20 の層分離を踏襲):
+
+- **純粋な決定関数** `browser::gui_probe::gui_probe_reason(has_display:
+  bool, has_dbus_session: bool) -> Option<&'static str>` — 実際の環境変数を
+  一切読まず、真偽値を受け取って「起動を試みるべきでない理由」を返すだけ。
+  `cargo test` から (ディスプレイの有無に関わらず) 完全にカバーされる、
+  `src/browser/gui_probe.rs` の単体テスト対象。
+- **実際の環境読み取り** は `tests/integration.rs` 側 (`gui_skip_reason`) —
+  Linux では `DISPLAY`/`WAYLAND_DISPLAY` と `DBUS_SESSION_BUS_ADDRESS` を
+  読み、`gui_probe_reason` に渡す。macOS/Windows は通常のデスクトップ
+  セッションが GUI アプリを動かせることを前提に無条件で `None` (スキップ
+  しない) — この 2 プラットフォームは本 Issue の実機確認対象外 (VeloX
+  自体の CI が Linux のみ、`docs/benchmarking.md`) だが、判定を "Linux 以外
+  は常に試す" にしておくことで、将来 macOS/Windows CI が追加されたときに
+  この統合テストも自動的に有効になる。
+
+**この 2 つの環境変数を選んだ理由**は `docs/benchmarking.md`「実行環境要件」
+と D46 の実測そのもの: `DISPLAY`/`WAYLAND_DISPLAY` が無ければ WebKitGTK の
+ウィンドウ自体が作れず、`DBUS_SESSION_BUS_ADDRESS` (`dbus-run-session` が
+設定する) が無ければ D-Bus 無しで WebKitGTK の web process が起動できず
+#72 と同じ無応答になる。どちらも「試す前から結果が分かっている」状況を
+検出するための最小限のシグナルであり、`gui_probe_reason` 自身のドキュメント
+コメントが明記する通り、両方揃っていることは「動作を保証」しない —
+それ以外の失敗モードまで先回りして検出することは意図的にスコープ外とした。
+
+### 何を保証し、何を保証しないテストなのか
+
+`tests/integration.rs` の 4 テストはいずれも実際に `velox` バイナリを
+起動し、外形から観測する (D19 の "browser logic を UI/engine から分離する"
+方針の裏返しとして、この統合テストは意図的に UI/engine を含む全体を
+外側から見る):
+
+1. **起動完了** (`startup_completes_and_records_a_startup_event`) — #72 の
+   壊れ方そのものへの回帰テスト。`VELOX_PERF_METRICS=1`
+   `VELOX_PERF_OUTPUT=<path>` で起動し、`startup` perf レコードが実際に
+   1 件書かれることを検証する。プロセスが自発終了しない場合
+   (`Child::try_wait` がタイムアウトまで `None` を返し続ける場合) は
+   明示的に `panic!` させ、テストヘルパがタイムアウト後に kill して
+   "成功" 扱いにすることは一切しない — この区別 (`exit_status: Option<
+   ExitStatus>` が `None` かどうか) がこのテストスイート全体の要である。
+2. **タブ操作** (`tab_operations_produce_expected_tab_create_and_tab_switch_
+   records`) — 自動操作スクリプトで複数タブを開き・切り替え・閉じ、
+   `tab_create`/`tab_switch` perf レコードの件数と `tab_id` の distinctness
+   を検証する。`browser::automation::parse_script` 自体のパース網羅性は
+   既に `automation.rs` の単体テストが持っているので、ここで検証したいのは
+   「パースされたコマンドが実際に `app::handle_automation_command` →
+   `Tabs`/`BrowserWindow` まで届くか」だけである。
+3. **永続化** (`visiting_pages_persists_history_json`) — `VELOX_DATA_DIR`
+   を一時ディレクトリに向けてページを 2 つ訪問し、`history.json` が
+   書かれ、`browser::persistence::load_history` で読み戻した内容
+   (URL の並び、`visited_at`、`visit_count`) が妥当であることを検証する。
+   `src/browser/history.rs` の単体テストは `HistoryStore` を直接叩くだけで
+   ファイル I/O も webview も経由しないため、ここが唯一の end-to-end 経路。
+4. **`quit` による自発終了** (`quit_command_exits_the_process_with_code_
+   zero`) — タイムアウト kill と自発終了を区別する
+   (`exit_status.is_some()` であることそのものを検証、`.success()` だけでは
+   「タイムアウト後に kill されて `Some` になった」場合と区別できない —
+   実際にはこのテストファイルの `launch_and_wait` はタイムアウト時に
+   `exit_status: None` を返す設計なのでこの取り違えは起きないが、それでも
+   `signal()` が `None` であることまで確認して「シグナルで終わっていない」
+   ことを明示している) 上で、終了コードが 0 であることを検証する。
+
+**保証しないもの**: トークン化された UI レンダリング (toolbar/omnibox の
+見た目)、パフォーマンス数値そのものの妥当性 (`docs/benchmarking.md` が
+別途扱う領域)、`VELOX_AUTOMATION_SCRIPT` の全コマンド・全異常系の網羅
+(既存の `automation.rs` 単体テストの役割)、macOS/Windows での実機動作。
+`docs/architecture.md`「テスト戦略」に単体テストとの守備範囲の違いを
+まとめた。
+
+### 固定ページは `file://`、ネットワークも loopback サーバも使わない
+
+`scripts/bench/pages/*.html` を `file://` URL として読み込む。loopback HTTP
+サーバ (`velox-bench`/`perf-gate.yml` が使う方式) ではなく `file://` を
+選んだのは、統合テストが複数プロセスを並行して起動しうる中で **ポートを
+一切使わなければ衝突の可能性そのものが無くなる**ため — サーバのポート
+割り当て・多重起動時の再利用待ちといった調整が不要になる。`browser::
+navigation::normalize_input` は `file` スキームを既に許可済み (アドレス
+バー・`VELOX_AUTOMATION_SCRIPT`・`VELOX_HOMEPAGE` のいずれとも同じ経路) な
+ので、この選択に本番コードの変更は要らない。
+
+### 実機確認 (Xvfb + `dbus-run-session`)
+
+```sh
+cargo build --release
+xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- cargo test
+```
+
+上記で単体テスト 478 件 (474 + `gui_probe` の新規 4 件) と統合テスト 4 件が
+全て緑になることを確認済み (統合テスト全体で約 6 秒)。GUI が無い素の
+`cargo test` (この環境の既定シェル、`DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`
+いずれも未設定) では 4 件とも即座にスキップ (0.00 秒) され、478 件の単体
+テストのみが実行されることも確認済み。
+
+**わざと壊して検出できることも確認した** (`src/app.rs` を一時的に改変・
+ビルド・実行し、確認後に元に戻す形で実施。差分はコミットしていない):
+
+- `quit` の `ControlFlow::Exit` 設定を削除 (= quit が効かなくなる) →
+  4 テスト全てがタイムアウト経由で `panic!` (「#72 と同じ無応答の可能性」
+  という明示メッセージ付き) して失敗した。kill 後に静かに成功扱いになる
+  ことはなかった。
+- `mark_startup(..., mark_first_load_finished)` の呼び出しを削除 (= quit
+  自体は正常に効くが `startup` レコードが二度と書かれなくなる) →
+  起動完了テストだけが「`startup` レコードが 0 件だった」という具体的な
+  assertion 失敗で落ち、他の 3 テストはタイムアウトではなく正常に完走
+  した (quit 自体は壊していないため) — タイムアウト起因の失敗と、レコード
+  内容起因の失敗が別々の理由で正しく区別されることも確認できた。
+
+### スキップを CI では失敗に変える (`VELOX_INTEGRATION_REQUIRE_GUI`)
+
+GUI を起動できない環境でのスキップは `cargo test` からは**ただの pass に
+見える**。開発者のマシンに X セッションが無い場合はそれが正しい挙動だが、
+**CI では正反対に危険**である。`xvfb-run` / `dbus-run-session` の設定が壊れたり
+外されたりすると、統合テストが 4 件とも黙ってスキップし、ジョブは緑のまま
+**このファイルが何も検証しなくなる**。
+
+これは #72 の失敗そのものと同じ形をしている — 単体テストが全部通っている
+一方で VeloX は起動すらしていなかった。緑であることと検証されていることは
+別である。
+
+そこで `VELOX_INTEGRATION_REQUIRE_GUI` を設けた。設定されているとスキップは
+`assert!` による明確な失敗になる。`.github/workflows/ci.yml` の
+テストステップはこれを設定するので、CI が統合テストのカバレッジを静かに
+失うことはない。ローカルの素の `cargo test` は従来どおり穏当にスキップする。
+
+実測で以下を確認済み。
+
+| 条件 | 結果 |
+| --- | --- |
+| strict + D-Bus あり (CI と同条件) | 4 件実行して pass |
+| strict + D-Bus 無し | 4 件とも FAILED |
+| 素のローカル (DISPLAY 無し) | 4 件スキップして緑 |
+
+あわせて、**テストが実際に壊れを検出することも実測で確認した。**
+`src/app.rs` の `AutomationCommand::Quit` による `ControlFlow::Exit` を無効化
+したところ、4 件すべてがタイムアウト経由で失敗した (110 秒)。確認後にソースは
+元に戻してある。
+
 ## D48: メモリ超過の主因は WebKitGTK/Blink のエンジン差ではなく、VeloX 自身の webview/`WebContext` の使い方だった
 
 **対象**: Issue #61 (「なぜ WebKitGTK ベースの VeloX が Blink より PSS で
