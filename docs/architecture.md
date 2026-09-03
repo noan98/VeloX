@@ -790,3 +790,61 @@ verified in this project's headless dev/CI environment). Issue #36's
 CI regression check is expected to call `velox-bench compare`, whose exit
 code (`0` = no regression, `1` = a metric regressed beyond
 `--threshold-pct`) is the hook it consumes.
+
+## Test strategy: unit tests vs. integration tests
+
+VeloX draws a hard line between two kinds of automated test, matching the
+layer split at the top of this document:
+
+- **Unit tests** (`#[cfg(test)]` modules throughout `src/browser/` and
+  `src/config/`, plus `src/ui/`'s own script-generation/parsing logic) —
+  the vast majority of `cargo test`'s test count. They exercise pure,
+  UI/engine-independent logic directly, with no window, no process, no
+  filesystem beyond an occasional isolated temp file. They run in a few
+  hundred milliseconds, everywhere, unconditionally, and are what
+  `cargo clippy`/CI expect to always be green.
+- **Integration tests** (`tests/integration.rs`, Issue #34, see
+  docs/decisions.md D47 for the full design rationale) — a small, separate
+  suite that launches the actual `velox` binary (`CARGO_BIN_EXE_velox`) and
+  observes it from the outside: does it finish starting up, do tab
+  operations reach real tab-management code, does history actually get
+  persisted to disk, does the process end on its own. This is the only
+  place VeloX exercises `ui::window::BrowserWindow`, the real WebKitGTK/
+  WKWebView/WebView2 engine, and `app::run`'s event loop together, end to
+  end.
+
+**Why the split matters, concretely**: Issue #72 (D46) found that VeloX
+could ship a CI run with 474/474 unit tests green while the actual `velox`
+binary never got past `BrowserWindow::new` in that same CI environment —
+no crash, no unit test anywhere near that code path, just silence. Unit
+tests alone cannot catch this class of regression *by construction*: they
+never construct a `BrowserWindow`, spawn a webview, or run the event loop.
+The integration suite exists specifically to close that gap for the one
+thing unit tests structurally cannot see — real process startup, real tab
+lifecycle through a real window, real file persistence.
+
+**Division of labor, precisely**: a behavior belongs in a unit test
+whenever it *can* be expressed as pure logic reachable without a window
+(URL normalization, tab-state transitions, ranking, automation script
+parsing, perf-record formatting, …) — that stays the default, and the vast
+majority of VeloX's logic already lives there per the four-layer split
+above. The integration suite is deliberately narrow: it does not re-verify
+anything a unit test already covers (e.g. it does not re-test every
+`VELOX_AUTOMATION_SCRIPT` command or every malformed-script error path —
+`browser::automation`'s own unit tests own that), it only proves that the
+already-unit-tested pieces are actually wired together through a real
+launch. See D47 for exactly what the four integration tests each guarantee
+and, as importantly, what they do not.
+
+**Environment gating**: launching `velox` needs a real display (and, on
+Linux, a D-Bus session bus — see docs/benchmarking.md's "実行環境要件" and
+D46). A developer machine with no X session, or a CI job with no
+Xvfb/`dbus-run-session`, must never see `cargo test` turn red over this —
+so every integration test checks the actual process environment at run
+time (`browser::gui_probe::gui_probe_reason`, a pure decision function
+taking already-read booleans, unit-tested on its own) and skips — printing
+why, to stdout, as a pass — rather than attempting a launch guaranteed to
+hang or fail. `.github/workflows/ci.yml` installs Xvfb and
+`dbus-x11` and wraps its `cargo test` step in
+`xvfb-run … dbus-run-session -- …` specifically so these tests run for
+real there instead of skipping.

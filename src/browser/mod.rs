@@ -13,6 +13,7 @@ pub mod benchmark;
 pub mod blocklist;
 pub mod bookmarks;
 pub mod downloads;
+pub mod gui_probe;
 pub mod history;
 pub mod input_history;
 pub mod metrics;
@@ -29,6 +30,7 @@ pub use automation::{AutomationCommand, AutomationError};
 pub use blocklist::FilterList;
 pub use bookmarks::{BookmarkEditError, BookmarkEntry, BookmarkFolder, BookmarkStore};
 pub use downloads::{DownloadEntry, DownloadId, DownloadState, DownloadStore};
+pub use gui_probe::gui_probe_reason;
 pub use history::{
     date_bucket, group_by_date, search as search_history, HistoryDateBucket, HistoryEntry,
     HistoryGroup, HistoryStore,
