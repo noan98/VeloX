@@ -438,6 +438,36 @@ fn with_related_content_view<'a>(
     builder
 }
 
+/// WebKitGTK's `is-playing-audio` for `webview` — see
+/// [`BrowserWindow::is_playing_audio`]. Guarded by `has_property` so a
+/// WebKitGTK build without the property (it has existed since 2.8, so this
+/// is purely defensive) reads as "not playing" instead of a GLib panic.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+))]
+fn webview_is_playing_audio(webview: &WebView) -> bool {
+    use gtk::glib::prelude::*;
+    use wry::WebViewExtUnix;
+    let inner = webview.webview();
+    inner.has_property("is-playing-audio", Some(bool::static_type()))
+        && inner.property::<bool>("is-playing-audio")
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+)))]
+fn webview_is_playing_audio(_webview: &WebView) -> bool {
+    false
+}
+
 /// One tab's content webview.
 struct ContentTab {
     /// The tab's webview.
@@ -938,6 +968,27 @@ impl BrowserWindow {
                 Ok(())
             }
         }
+    }
+
+    /// Whether tab `id`'s page is currently playing audio, for the
+    /// automatic suspension policy's "active media" protection
+    /// (`browser::suspension`, Issue #63) — a tab the user is listening
+    /// to is never suspended automatically. `false` for a suspended or
+    /// unknown tab (nothing to protect).
+    ///
+    /// Read from WebKitGTK's `WebKitWebView:is-playing-audio` property via
+    /// the `webkit2gtk::WebView` wry already hands out
+    /// (`WebViewExtUnix::webview`, the same accessor
+    /// [`with_related_content_view`] uses) — through GLib's generic
+    /// property API rather than the `webkit2gtk` crate's typed getter, so
+    /// no new dependency is needed (docs/decisions.md D6). On every other
+    /// platform this is always `false`: wry exposes no equivalent there
+    /// yet, so the protection simply does not apply (documented in D56).
+    pub fn is_playing_audio(&self, id: TabId) -> bool {
+        self.contents
+            .get(&id)
+            .and_then(|tab| tab.webview.as_ref())
+            .is_some_and(webview_is_playing_audio)
     }
 
     /// Rebuild a suspended tab's content webview, loading `url` (its last

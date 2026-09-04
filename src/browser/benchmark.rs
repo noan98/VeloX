@@ -90,6 +90,11 @@ pub enum MetricKey {
     PageLoadMs,
     TabCreateMs,
     TabSwitchMs,
+    /// Restore cost of a suspended tab (Issue #63): `tab_resume` events'
+    /// `duration_ms` — switching to a suspended tab, i.e. rebuilding its
+    /// webview and making it visible. The page reload that follows is
+    /// counted under [`MetricKey::PageLoadMs`] as usual.
+    TabResumeMs,
     RssTotalBytes,
     RssProcessCount,
     /// PSS total (Issue #108 / D42): `None`/absent in the source `rss`
@@ -111,7 +116,7 @@ impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 12] = [
+    pub const ALL: [MetricKey; 13] = [
         MetricKey::StartupWindowCreatedMs,
         MetricKey::StartupRustSetupDoneMs,
         MetricKey::StartupToolbarScriptStartedMs,
@@ -120,6 +125,7 @@ impl MetricKey {
         MetricKey::PageLoadMs,
         MetricKey::TabCreateMs,
         MetricKey::TabSwitchMs,
+        MetricKey::TabResumeMs,
         MetricKey::RssTotalBytes,
         MetricKey::RssProcessCount,
         MetricKey::PssTotalBytes,
@@ -138,6 +144,7 @@ impl MetricKey {
             MetricKey::PageLoadMs => "page_load_ms",
             MetricKey::TabCreateMs => "tab_create_ms",
             MetricKey::TabSwitchMs => "tab_switch_ms",
+            MetricKey::TabResumeMs => "tab_resume_ms",
             MetricKey::RssTotalBytes => "rss_total_bytes",
             MetricKey::RssProcessCount => "rss_process_count",
             MetricKey::PssTotalBytes => "pss_total_bytes",
@@ -178,7 +185,8 @@ impl MetricKey {
             | MetricKey::StartupFirstLoadMs
             | MetricKey::PageLoadMs
             | MetricKey::TabCreateMs
-            | MetricKey::TabSwitchMs => 20.0, // milliseconds
+            | MetricKey::TabSwitchMs
+            | MetricKey::TabResumeMs => 20.0, // milliseconds
             MetricKey::RssTotalBytes | MetricKey::PssTotalBytes => 5.0 * 1024.0 * 1024.0, // 5 MiB
             MetricKey::RssProcessCount | MetricKey::PssProcessCount => 1.0, // whole processes
         }
@@ -195,6 +203,7 @@ impl MetricKey {
             MetricKey::PageLoadMs => "page_load",
             MetricKey::TabCreateMs => "tab_create",
             MetricKey::TabSwitchMs => "tab_switch",
+            MetricKey::TabResumeMs => "tab_resume",
             MetricKey::RssTotalBytes
             | MetricKey::RssProcessCount
             | MetricKey::PssTotalBytes
@@ -214,6 +223,7 @@ impl MetricKey {
             MetricKey::PageLoadMs => "duration_ms",
             MetricKey::TabCreateMs => "duration_ms",
             MetricKey::TabSwitchMs => "duration_ms",
+            MetricKey::TabResumeMs => "duration_ms",
             MetricKey::RssTotalBytes => "total_rss_bytes",
             MetricKey::RssProcessCount => "process_count",
             MetricKey::PssTotalBytes => "total_pss_bytes",
@@ -1450,6 +1460,11 @@ pub mod scenario {
         Navigation,
         TabCreate,
         TabSwitch,
+        /// Restore cost of tab suspension (Issue #63): open a few tabs,
+        /// then repeatedly suspend one (`suspend <index>`) and switch back
+        /// to it, one `tab_resume` latency sample (plus the page reload's
+        /// `page_load`) per round.
+        TabResume,
         /// Memory (`rss_total_bytes`/`rss_process_count`) and CPU usage
         /// with exactly `tab_count` tabs open. `tab_count` is one of
         /// [`Scenario::TAB_COUNTS`].
@@ -1472,6 +1487,7 @@ pub mod scenario {
                 Scenario::Navigation,
                 Scenario::TabCreate,
                 Scenario::TabSwitch,
+                Scenario::TabResume,
             ];
             scenarios.extend(
                 Self::TAB_COUNTS
@@ -1491,6 +1507,7 @@ pub mod scenario {
                 Scenario::Navigation => "navigation".to_owned(),
                 Scenario::TabCreate => "tab_create".to_owned(),
                 Scenario::TabSwitch => "tab_switch".to_owned(),
+                Scenario::TabResume => "tab_resume".to_owned(),
                 Scenario::TabCountMemory(n) => format!("tabs_{n}"),
             }
         }
@@ -1505,6 +1522,7 @@ pub mod scenario {
                 "navigation" => Some(Scenario::Navigation),
                 "tab_create" => Some(Scenario::TabCreate),
                 "tab_switch" => Some(Scenario::TabSwitch),
+                "tab_resume" => Some(Scenario::TabResume),
                 other => other
                     .strip_prefix("tabs_")
                     .and_then(|rest| rest.parse::<u32>().ok())
@@ -1536,6 +1554,7 @@ pub mod scenario {
                 | Scenario::Navigation
                 | Scenario::TabCreate
                 | Scenario::TabSwitch
+                | Scenario::TabResume
                 | Scenario::TabCountMemory(_) => true,
             }
         }
@@ -1561,8 +1580,8 @@ pub mod scenario {
         }
 
         #[test]
-        fn all_covers_six_fixed_plus_five_tab_count_scenarios() {
-            assert_eq!(Scenario::all().len(), 6 + Scenario::TAB_COUNTS.len());
+        fn all_covers_seven_fixed_plus_five_tab_count_scenarios() {
+            assert_eq!(Scenario::all().len(), 7 + Scenario::TAB_COUNTS.len());
         }
 
         #[test]
@@ -1852,6 +1871,7 @@ mod tests {
             scenario::Scenario::Navigation,
             scenario::Scenario::TabCreate,
             scenario::Scenario::TabSwitch,
+            scenario::Scenario::TabResume,
         ] {
             assert_eq!(
                 memory_sample_confidence(scenario, 3, &metrics),

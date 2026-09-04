@@ -18,6 +18,7 @@ use crate::browser::automation::{self, AutomationCommand};
 use crate::browser::downloads;
 use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
+use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
     input_history, metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
@@ -128,6 +129,13 @@ pub enum UserEvent {
     /// new state-mutation path. `AutomationCommand::Quit` is special-cased
     /// in `run`'s event loop, before dispatch, to set `ControlFlow::Exit`.
     Automation(AutomationCommand),
+    /// A fresh process-tree memory sample from `spawn_memory_pressure_sampler`
+    /// (Issue #63): the total in bytes (PSS where the platform can read it,
+    /// RSS otherwise — see that function). Only ever sent while
+    /// `Config::suspension.memory_budget_bytes` is set. Stored as
+    /// `AppState::pending_memory_sample` and consumed by exactly one
+    /// `sweep_tabs` pass, so the memory signal acts once per sample.
+    MemorySampled(MemorySample),
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -164,6 +172,12 @@ struct AppState {
     /// Session-scoped download list (Issue #16). Not persisted to disk — see
     /// docs/decisions.md D28.
     downloads: DownloadStore,
+    /// The most recent `UserEvent::MemorySampled` not yet acted on by
+    /// `sweep_tabs` (Issue #63). `take()`n by the sweep, so each sample
+    /// drives the memory signal exactly once — re-using a stale sample on
+    /// every loop pass would keep suspending tabs before the previous
+    /// sweep's effect is even visible in the numbers.
+    pending_memory_sample: Option<MemorySample>,
 }
 
 /// What tab-latency logging needs: where to write records, and the epoch
@@ -187,6 +201,9 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     // Cloned before `proxy` is moved into `BrowserWindow::new` below — see
     // `spawn_automation`'s call site further down, once `AppState` exists.
     let automation_proxy = proxy.clone();
+    // Same story for the memory sampler (Issue #63), spawned further down
+    // once the config's suspension policy has been read.
+    let memory_sampler_proxy = proxy.clone();
 
     // `.then(...)` short-circuits: when metrics are off, no `Instant` is
     // captured here and `startup` stays `None`, so every checkpoint below
@@ -213,7 +230,17 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     }
 
     let homepage = config.homepage.clone();
-    let auto_suspend_after = config.auto_suspend_after;
+    let suspension_policy = config.suspension;
+    // Issue #63: the memory signal needs a sampler; the other two signals
+    // (idle time, live-tab cap) are evaluated from `Tabs` alone on every
+    // loop pass and need no thread. Only spawned when a budget is set, so
+    // the default configuration walks `/proc` exactly never.
+    if suspension_policy.memory_budget_bytes.is_some() {
+        spawn_memory_pressure_sampler(
+            suspension_policy.memory_check_interval,
+            memory_sampler_proxy,
+        );
+    }
     // One timer per tab: background tabs load concurrently with the active
     // one, so a single shared timer would have their loads overwrite each
     // other's start times.
@@ -250,6 +277,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
             .clone()
             .map(|log| PerfContext { process_start, log }),
         downloads: DownloadStore::new(),
+        pending_memory_sample: None,
     };
 
     // Everything above (history/bookmarks/input-history load, `AppState`
@@ -320,20 +348,19 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
             _ => {}
         }
 
-        // Automatic tab suspension: on every pass through the loop (an
-        // actual event, or the timer below waking us up), suspend whatever
-        // background tabs have gone idle long enough, then schedule the
+        // Automatic tab suspension (Issue #63, `browser::suspension`): on
+        // every pass through the loop (an actual event, or the timer below
+        // waking us up), suspend whatever background tabs the policy picks
+        // — idle too long, over the live-tab cap, or (when a fresh memory
+        // sample just arrived) over the memory budget — then schedule the
         // next wake-up for whichever background tab will go idle soonest.
-        // `Tabs::idle_background_tabs`/`next_idle_deadline` are pure and
-        // clock-injected (see `browser::tabs`), so all the policy logic
-        // this loop needs is already unit-tested without a window.
+        // `suspension::plan`/`Tabs::next_idle_deadline` are pure and
+        // clock-injected, so all the policy logic this loop needs is
+        // unit-tested without a window.
         if *control_flow != ControlFlow::Exit {
-            if let Some(next_wake) = sweep_idle_tabs(
-                &mut window,
-                &mut state.tabs,
-                auto_suspend_after,
-                Instant::now(),
-            ) {
+            if let Some(next_wake) =
+                sweep_tabs(&mut window, &mut state, &suspension_policy, Instant::now())
+            {
                 *control_flow = ControlFlow::WaitUntil(next_wake);
             }
         }
@@ -446,7 +473,11 @@ fn record_perf_event(
         // `handle_automation_command` calls the same tab-management
         // functions the toolbar path does, which already call
         // `record_tab_latency` themselves — nothing extra to log here.
-        | UserEvent::Automation(_) => {}
+        | UserEvent::Automation(_)
+        // Suspensions the sample leads to are logged by `sweep_tabs`
+        // (`record_tab_suspend`); the sample itself is not a perf event
+        // (the perf RSS sampler already logs `rss` on its own schedule).
+        | UserEvent::MemorySampled(_) => {}
     }
 }
 
@@ -512,29 +543,111 @@ fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Insta
     });
 }
 
-/// Suspend every background tab that has been idle for at least
-/// `auto_suspend_after` as of `now`, then return when the loop should next
-/// check again (the soonest a still-awake background tab would become
-/// eligible). Returns `None` when automatic suspension is disabled
-/// (`auto_suspend_after` is `None`) or there is no background tab to watch,
-/// in which case the caller should leave `control_flow` as `Wait`.
-fn sweep_idle_tabs(
+/// Spawn the background thread that feeds the automatic suspension
+/// policy's memory signal (Issue #63): every `interval`, sample the whole
+/// process tree's memory (`metrics::sample_process_tree_rss`, the same
+/// `/proc` walk the perf RSS sampler uses) and send it to the main thread
+/// as `UserEvent::MemorySampled`. Only ever spawned when
+/// `Config::suspension.memory_budget_bytes` is set.
+///
+/// PSS is used when the platform can read it (Linux with `smaps_rollup`),
+/// because that is what the budget is meant to be compared against
+/// (`docs/performance-targets.md` §3.1: RSS double-counts shared pages
+/// once per process and would put a multi-process browser "over budget"
+/// on shared library pages alone). Where PSS is unavailable the RSS total
+/// is used instead — an over-estimate, so a budget tuned for PSS will
+/// suspend slightly earlier there; documented in D56. On a platform where
+/// neither can be read (Windows today, `RssError::Unsupported`), the
+/// failure is logged once and the thread exits: the memory signal is
+/// simply inert, and the idle/tab-count signals keep working.
+///
+/// Exits when the event loop is gone (`send_event` fails), like
+/// `spawn_automation`.
+fn spawn_memory_pressure_sampler(interval: Duration, proxy: EventLoopProxy<UserEvent>) {
+    let pid = std::process::id();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        let sample = match metrics::sample_process_tree_rss(pid) {
+            Ok(sample) => sample,
+            Err(err) => {
+                eprintln!("velox: memory sampling for tab suspension stopped: {err}");
+                return;
+            }
+        };
+        let total_bytes = sample.total_pss_bytes.unwrap_or(sample.total_rss_bytes);
+        if proxy
+            .send_event(UserEvent::MemorySampled(MemorySample { total_bytes }))
+            .is_err()
+        {
+            return;
+        }
+    });
+}
+
+/// Run the automatic suspension policy once (Issue #63): suspend every
+/// background tab [`suspension::plan`] picks as of `now`, then return when
+/// the loop should next check again (the soonest a still-awake background
+/// tab would cross `idle_after`). Returns `None` when the policy is fully
+/// off, the idle signal is off, or there is no background tab to watch —
+/// the caller leaves `control_flow` as `Wait` (the tab-count signal is
+/// re-evaluated on the next event anyway, and the memory signal wakes the
+/// loop itself via `UserEvent::MemorySampled`).
+///
+/// The memory signal only sees a sample on the first sweep after it
+/// arrived (`AppState::pending_memory_sample` is `take()`n here), so a
+/// sample never suspends more than one sweep's worth of tabs.
+fn sweep_tabs(
     window: &mut BrowserWindow,
-    tabs: &mut Tabs,
-    auto_suspend_after: Option<std::time::Duration>,
+    state: &mut AppState,
+    policy: &SuspensionPolicy,
     now: Instant,
 ) -> Option<Instant> {
-    let idle_after = auto_suspend_after?;
-    let candidates = tabs.idle_background_tabs(now, idle_after);
-    if !candidates.is_empty() {
-        for id in candidates {
-            if tabs.suspend(id) {
-                log_failure("auto-suspend tab", window.suspend_tab(id));
+    if !policy.is_enabled() {
+        return None;
+    }
+    let memory = state.pending_memory_sample.take();
+    let candidates = state
+        .tabs
+        .suspension_candidates(now, |id| window.is_playing_audio(id));
+    let planned = suspension::plan(policy, &candidates, state.tabs.live_tab_count(), memory);
+    if !planned.is_empty() {
+        for (id, reason) in planned {
+            if suspend_tab(window, state, id) {
+                record_tab_suspend(state, id, reason);
             }
         }
-        sync_tab_strip(window, tabs);
+        sync_tab_strip(window, &state.tabs);
     }
-    tabs.next_idle_deadline(idle_after)
+    policy
+        .idle_after
+        .and_then(|idle_after| state.tabs.next_idle_deadline(idle_after))
+}
+
+/// Suspend tab `id` on both sides — `Tabs` state first, then the webview
+/// (`BrowserWindow::suspend_tab`) — without touching the tab strip; the
+/// caller redraws it once it is done (it may be suspending several tabs).
+/// Returns whether the tab was actually suspended: `false` for an unknown
+/// id, the active tab, or an already-suspended tab (`Tabs::suspend`'s
+/// guards), in which case nothing changed. The one implementation behind
+/// the tab strip's suspend button (`ToolbarCommand::SuspendTab`), the
+/// `suspend <index>` automation command, and [`sweep_tabs`].
+fn suspend_tab(window: &mut BrowserWindow, state: &mut AppState, id: TabId) -> bool {
+    if !state.tabs.suspend(id) {
+        return false;
+    }
+    log_failure("suspend tab", window.suspend_tab(id));
+    true
+}
+
+/// Log a `tab_suspend` perf event (Issue #63) — a no-op when metrics are
+/// off, like [`record_tab_latency`].
+fn record_tab_suspend(state: &AppState, id: TabId, reason: SuspendReason) {
+    let Some(perf) = &state.perf else {
+        return;
+    };
+    let elapsed = Instant::now().saturating_duration_since(perf.process_start);
+    perf.log
+        .write(&metrics::PerfRecord::tab_suspend(id.get(), reason), elapsed);
 }
 
 /// Dispatch one [`UserEvent`]. UI failures are logged, never fatal.
@@ -698,6 +811,12 @@ fn handle_user_event(
         UserEvent::Automation(command) => {
             handle_automation_command(window, state, command);
         }
+        UserEvent::MemorySampled(sample) => {
+            // Acted on by `sweep_tabs` at the end of this loop pass (it
+            // runs after every event), not here: the sweep is the one
+            // place that combines all three signals.
+            state.pending_memory_sample = Some(sample);
+        }
     }
 }
 
@@ -760,7 +879,7 @@ fn handle_toolbar_command(
             let started = Instant::now();
             if let Some(effect) = state.tabs.activate_at(id, started) {
                 activate_and_refresh(window, state, id, effect);
-                record_tab_latency(state, metrics::TabLatencyKind::Switch, id, started);
+                record_tab_latency(state, switch_latency_kind(effect), id, started);
             }
         }
         ToolbarCommand::CloseActiveTab => {
@@ -789,9 +908,7 @@ fn handle_toolbar_command(
             apply_activation(window, state, effect, started);
         }
         ToolbarCommand::SuspendTab { id } => {
-            let id = TabId::from(id);
-            if state.tabs.suspend(id) {
-                log_failure("suspend tab", window.suspend_tab(id));
+            if suspend_tab(window, state, TabId::from(id)) {
                 sync_tab_strip(window, &state.tabs);
             }
             // Otherwise: unknown id, the active tab (never suspended), or
@@ -1161,7 +1278,18 @@ fn apply_activation(
     if let Some(effect) = effect {
         let id = state.tabs.active_id();
         activate_and_refresh(window, state, id, effect);
-        record_tab_latency(state, metrics::TabLatencyKind::Switch, id, started);
+        record_tab_latency(state, switch_latency_kind(effect), id, started);
+    }
+}
+
+/// Which latency event a tab switch is logged as: `tab_switch` for a tab
+/// that already had a live webview, `tab_resume` when the switch had to
+/// rebuild a suspended tab's webview first (Issue #63) — see
+/// `metrics::TabLatencyKind::Resume` for why the two are kept apart.
+fn switch_latency_kind(effect: ActivationEffect) -> metrics::TabLatencyKind {
+    match effect {
+        ActivationEffect::Switch => metrics::TabLatencyKind::Switch,
+        ActivationEffect::Resume => metrics::TabLatencyKind::Resume,
     }
 }
 
@@ -1243,7 +1371,7 @@ fn handle_automation_command(
                 let started = Instant::now();
                 if let Some(effect) = state.tabs.activate_at(id, started) {
                     activate_and_refresh(window, state, id, effect);
-                    record_tab_latency(state, metrics::TabLatencyKind::Switch, id, started);
+                    record_tab_latency(state, switch_latency_kind(effect), id, started);
                 }
             }
             None => eprintln!("velox: automation: switch {index} は範囲外です"),
@@ -1251,6 +1379,16 @@ fn handle_automation_command(
         AutomationCommand::Close { index } => match tab_id_at(state, index) {
             Some(id) => close_tab(window, state, id),
             None => eprintln!("velox: automation: close {index} は範囲外です"),
+        },
+        AutomationCommand::Suspend { index } => match tab_id_at(state, index) {
+            Some(id) => {
+                if suspend_tab(window, state, id) {
+                    sync_tab_strip(window, &state.tabs);
+                }
+                // Otherwise the active or an already-suspended tab: a
+                // no-op, exactly like `ToolbarCommand::SuspendTab`.
+            }
+            None => eprintln!("velox: automation: suspend {index} は範囲外です"),
         },
         AutomationCommand::Wait { .. } | AutomationCommand::Quit => {}
     }
@@ -1616,6 +1754,7 @@ mod tests {
             history_enabled,
             perf: None,
             downloads: DownloadStore::new(),
+            pending_memory_sample: None,
         }
     }
 

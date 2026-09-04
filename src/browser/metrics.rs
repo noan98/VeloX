@@ -402,9 +402,18 @@ fn collect_descendants(root: u32, processes: &HashMap<u32, ProcInfo>) -> Vec<u32
 pub enum TabLatencyKind {
     /// `ToolbarCommand::NewTab` to the new tab's webview being usable.
     Create,
-    /// `ToolbarCommand::ActivateTab` to the switch (including resuming a
-    /// suspended tab, see `app::activate_and_refresh`) being visible.
+    /// `ToolbarCommand::ActivateTab` to the switch being visible, for a
+    /// tab that already had a live webview (`ActivationEffect::Switch`).
     Switch,
+    /// `ToolbarCommand::ActivateTab` to a *suspended* tab's rebuilt webview
+    /// being visible (`ActivationEffect::Resume`, see
+    /// `app::activate_and_refresh`) — the restore cost of tab suspension
+    /// (Issue #63). Split from [`Self::Switch`] because the two are an
+    /// order of magnitude apart (a `set_visible` vs. building a webview),
+    /// and mixing them would make `tab_switch_ms` unreadable the moment
+    /// suspension is on. The page itself reloading afterwards is reported
+    /// separately as the usual `page_load` event for that tab.
+    Resume,
 }
 
 impl TabLatencyKind {
@@ -412,6 +421,7 @@ impl TabLatencyKind {
         match self {
             TabLatencyKind::Create => "tab_create",
             TabLatencyKind::Switch => "tab_switch",
+            TabLatencyKind::Resume => "tab_resume",
         }
     }
 }
@@ -467,6 +477,15 @@ pub enum PerfRecord {
         tab_id: u64,
         duration: Duration,
     },
+    /// A background tab was suspended automatically (Issue #63,
+    /// `browser::suspension`), and why. Carries no duration — dropping a
+    /// webview is synchronous and cheap; what a reader wants to know is
+    /// *when* and *why* a tab went dormant, to line up against the `rss`
+    /// samples that follow.
+    TabSuspend {
+        tab_id: u64,
+        reason: crate::browser::suspension::SuspendReason,
+    },
     Rss(RssSample),
 }
 
@@ -494,13 +513,19 @@ impl PerfRecord {
         PerfRecord::Rss(sample)
     }
 
+    pub fn tab_suspend(tab_id: u64, reason: crate::browser::suspension::SuspendReason) -> Self {
+        PerfRecord::TabSuspend { tab_id, reason }
+    }
+
     /// The event name used by both output formats (`"startup"`,
-    /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"rss"`).
+    /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"tab_resume"`,
+    /// `"tab_suspend"`, `"rss"`).
     pub fn event_name(&self) -> &'static str {
         match self {
             PerfRecord::Startup(_) => "startup",
             PerfRecord::PageLoad { .. } => "page_load",
             PerfRecord::TabLatency { kind, .. } => kind.event_name(),
+            PerfRecord::TabSuspend { .. } => "tab_suspend",
             PerfRecord::Rss(_) => "rss",
         }
     }
@@ -523,6 +548,9 @@ impl PerfRecord {
                 kind.event_name(),
                 format_duration(*duration)
             ),
+            PerfRecord::TabSuspend { tab_id, reason } => {
+                format!("tab_suspend id={tab_id} reason={}", reason.as_str())
+            }
             PerfRecord::Rss(sample) => sample.to_string(),
         }
     }
@@ -567,6 +595,10 @@ impl PerfRecord {
             } => {
                 fields.insert("tab_id".to_owned(), json!(tab_id));
                 fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+            }
+            PerfRecord::TabSuspend { tab_id, reason } => {
+                fields.insert("tab_id".to_owned(), json!(tab_id));
+                fields.insert("reason".to_owned(), json!(reason.as_str()));
             }
             PerfRecord::Rss(sample) => {
                 fields.insert("pid".to_owned(), json!(sample.root_pid));
@@ -1253,6 +1285,31 @@ mod tests {
             PerfRecord::tab_latency(TabLatencyKind::Switch, 7, Duration::from_micros(3100));
         assert_eq!(record.to_text(), "tab_switch id=7 duration=3.1ms");
         assert_eq!(record.event_name(), "tab_switch");
+
+        let record = PerfRecord::tab_latency(TabLatencyKind::Resume, 7, Duration::from_millis(40));
+        assert_eq!(record.to_text(), "tab_resume id=7 duration=40.0ms");
+        assert_eq!(record.event_name(), "tab_resume");
+    }
+
+    #[test]
+    fn perf_record_tab_suspend_carries_the_reason_in_both_formats() {
+        use crate::browser::suspension::SuspendReason;
+        let record = PerfRecord::tab_suspend(9, SuspendReason::Memory);
+        assert_eq!(record.event_name(), "tab_suspend");
+        assert_eq!(record.to_text(), "tab_suspend id=9 reason=memory");
+        let value = record.to_json(Duration::from_millis(5));
+        assert_eq!(value["event"], "tab_suspend");
+        assert_eq!(value["ts_ms"], 5.0);
+        assert_eq!(value["tab_id"], 9);
+        assert_eq!(value["reason"], "memory");
+        assert_eq!(
+            PerfRecord::tab_suspend(1, SuspendReason::Idle).to_json(Duration::ZERO)["reason"],
+            "idle"
+        );
+        assert_eq!(
+            PerfRecord::tab_suspend(1, SuspendReason::TabCount).to_json(Duration::ZERO)["reason"],
+            "tab_count"
+        );
     }
 
     // -- PerfRecord: JSON Lines output ------------------------------------

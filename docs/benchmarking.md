@@ -52,6 +52,7 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | `navigation` | navigation latency | 可 (`--url` 必須、下記「自動操作フック」参照) |
 | `tab_create` | tab creation | 可 (`--url` 必須) |
 | `tab_switch` | tab switching | 可 (`--url` 必須) |
+| `tab_resume` | 休止タブの復帰コスト (Issue #63: `suspend` → `switch` を繰り返し、`tab_resume_ms` と復帰時の再読み込み `page_load_ms` を採る) | 可 (`--url` 必須) |
 | `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 可 (`--url` 必須) |
 
 「自動実行」列の意味は `src/browser/benchmark.rs` の
@@ -91,6 +92,7 @@ docs/decisions.md D44 (D18/D23 の IPC 信頼境界との関係) を参照。
 open <url>        # 新規タブを開いてアクティブにする
 switch <index>    # tab strip 上の position <index> (0始まり) のタブをアクティブにする
 close <index>     # position <index> のタブを閉じる
+suspend <index>   # position <index> のタブを休止する (Issue #63。アクティブタブ・休止済みタブには無視される)
 navigate <url>    # アクティブタブを <url> へ遷移させる
 wait <ms>         # 次のコマンドまで <ms> ミリ秒待つ (上限 120000ms = automation::MAX_WAIT_MS)
 quit              # アプリケーションを終了する
@@ -124,7 +126,7 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
   cargo run --release
 ```
 
-`velox-bench run` は `navigation`/`tab_create`/`tab_switch`/`tabs_N` それぞれ
+`velox-bench run` は `navigation`/`tab_create`/`tab_switch`/`tab_resume`/`tabs_N` それぞれ
 に対して、上記コマンドを組み合わせたスクリプトを自動生成し (`--url` で
 渡されたページを使う)、一時ファイルに書き出して子プロセスに
 `VELOX_AUTOMATION_SCRIPT` として渡す。生成ロジックは
@@ -151,6 +153,7 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | `page_load_ms` | `page_load` | `duration_ms` |
 | `tab_create_ms` | `tab_create` | `duration_ms` |
 | `tab_switch_ms` | `tab_switch` | `duration_ms` |
+| `tab_resume_ms` | `tab_resume` | `duration_ms` (休止タブへの切替 = webview の再構築。Issue #63) |
 | `rss_total_bytes` | `rss` | `total_rss_bytes` |
 | `rss_process_count` | `rss` | `process_count` |
 | `pss_total_bytes` | `rss` | `total_pss_bytes` |

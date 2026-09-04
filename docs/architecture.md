@@ -564,9 +564,11 @@ quick-reference summary.
 ## Tab suspension
 
 Status: manual suspension shipped, automatic suspension implemented and
-opt-in (default off). See docs/decisions.md D9 for the full rationale,
-including the WebKitGTK/WKWebView/WebView2 cache-control investigation, and
-D20 for how suspension fits into the `TabState` model above.
+opt-in (default off) with an adaptive policy (idle time, live-tab cap,
+memory budget — Issue #63). See docs/decisions.md D9 for the full
+rationale, including the WebKitGTK/WKWebView/WebView2 cache-control
+investigation, D20 for how suspension fits into the `TabState` model
+above, and D56 for the adaptive policy and its measured effect.
 
 - **What "suspended" means**: `ContentTab::webview` (`ui::window`) is
   `Option<WebView>`; suspending a tab `take()`s and drops it
@@ -597,18 +599,56 @@ D20 for how suspension fits into the `TabState` model above.
   "resume" affordance is needed). `TabSummary` carries a `suspended` flag
   (`Tab::is_suspended()`, shorthand for `state() == TabState::Suspended`) so
   the strip can render dormant tabs distinctly (dimmed, a 💤 marker).
-- **Automatic suspension**: `Config::auto_suspend_after: Option<Duration>`
-  (default `None`, i.e. disabled) is the idle threshold — how long a
-  background tab must have sat unviewed before it is eligible. The pure
-  policy logic lives entirely in `browser::tabs::Tabs`:
-  `idle_background_tabs(now, idle_after)` (which `Background`-state tabs
-  have crossed the threshold) and `next_idle_deadline(idle_after)` (the
-  soonest a still-awake background tab will cross it), both clock-injected
-  (`now: Instant` passed in, never read internally) so they are
-  unit-testable without sleeping a real thread. `app::run`'s event loop
-  calls these on every pass and drives `tao::event_loop::ControlFlow` with
-  `WaitUntil(next_deadline)` instead of a fixed `Wait`, so the loop wakes
-  itself up exactly when needed rather than polling.
+- **Automatic suspension** (Issue #63): `Config::suspension` is a
+  `browser::suspension::SuspensionPolicy` — three independent, individually
+  optional signals, all off by default (`SuspensionPolicy::default()`,
+  so a fresh checkout never suspends a tab on its own — D9's rule):
+  - *idle time* (`idle_after`, `VELOX_AUTO_SUSPEND_AFTER_MS`): every
+    background tab idle at least this long is suspended — the pre-#63
+    behavior, unchanged;
+  - *live-tab cap* (`max_live_tabs`, `VELOX_MAX_LIVE_TABS`): when more
+    tabs than this have a live webview (the active tab counts), the least
+    recently used background tabs are suspended until the count fits;
+  - *memory budget* (`memory_budget_bytes`, `VELOX_MEMORY_BUDGET_MB`):
+    when the process tree's memory exceeds the budget, enough least
+    recently used background tabs are suspended to be expected to bring it
+    back under (`ESTIMATED_BYTES_PER_TAB`, 64 MiB, from D54's per-tab
+    measurement) — the further over budget, the more tabs go in one sweep.
+    Only this signal needs a sampler: `app::spawn_memory_pressure_sampler`
+    (spawned only when a budget is set) walks the process tree every
+    `memory_check_interval` (`VELOX_MEMORY_CHECK_INTERVAL_MS`, default
+    2s) with the same `metrics::sample_process_tree_rss` the perf RSS
+    sampler uses, and posts `UserEvent::MemorySampled` (PSS where readable,
+    RSS otherwise). Each sample drives the memory signal exactly once
+    (`AppState::pending_memory_sample` is `take()`n by the sweep), so a
+    stale sample never keeps suspending tabs before the previous sweep's
+    effect is visible.
+
+  All three combine in one pure function, `suspension::plan` (clock- and
+  sample-injected, no `Tabs`/webview dependency, unit-tested exhaustively):
+  it takes the background tabs as `Candidate`s (built by
+  `Tabs::suspension_candidates`), the live tab count
+  (`Tabs::live_tab_count`) and an optional fresh sample, and returns the
+  tabs to suspend with a `SuspendReason` (`idle`/`tab_count`/`memory`,
+  logged as the `tab_suspend` perf event). Least recently used always goes
+  first, for every signal; the tab-count and memory demands take the larger
+  of the two (not the sum), and idle suspensions count toward both.
+  **Protected, never suspended automatically**: the active tab (by the
+  `TabState` invariant), a tab still loading (dropping a mid-load webview
+  wastes the work and repeats it on resume), and a tab playing audio
+  (`BrowserWindow::is_playing_audio`, WebKitGTK's `is-playing-audio`
+  property; always `false` on other platforms, so the protection simply
+  does not apply there). `app::sweep_tabs` runs the plan on every pass of
+  the event loop (after every event) and drives
+  `tao::event_loop::ControlFlow` with `WaitUntil(next_idle_deadline)` so the
+  idle signal wakes the loop exactly when a tab crosses the threshold rather
+  than polling; the memory signal wakes it via `MemorySampled`, and the
+  tab-count signal is re-evaluated on whatever event changed the tab set.
+  The `suspend <index>` automation command drives the same `suspend_tab`
+  path as the tab strip's button, which is how the `tab_resume` benchmark
+  scenario measures the restore cost (`tab_resume` perf event —
+  `TabLatencyKind::Resume`, kept apart from `tab_switch` because rebuilding
+  a webview is an order of magnitude slower than a `set_visible`).
 - **Idle clock**: a tab's "idle since" timestamp is the moment it stopped
   being the active tab, recorded by `Tabs::activate_at`/`open_at` (thin
   wrappers around the existing `activate`/`open` that additionally stamp the

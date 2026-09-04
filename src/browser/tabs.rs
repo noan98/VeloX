@@ -15,6 +15,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::suspension::Candidate;
 use super::tab::{Tab, TabId, TabState};
 
 /// What the caller must do on the *webview* side after a [`Tabs`] operation
@@ -358,6 +359,45 @@ impl Tabs {
             .iter()
             .filter(|tab| tab.state() == TabState::Background && tab.idle_for(now) >= idle_after)
             .map(Tab::id)
+            .collect()
+    }
+
+    /// How many tabs currently have a live content webview: every tab that
+    /// is not `Suspended` (the active tab, plus every `Background` tab).
+    /// The number `browser::suspension::SuspensionPolicy::max_live_tabs`
+    /// is compared against.
+    pub fn live_tab_count(&self) -> usize {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.state() != TabState::Suspended)
+            .count()
+    }
+
+    /// Every background tab as a suspension [`Candidate`] for
+    /// [`super::suspension::plan`] (Issue #63): its idle time as of `now`,
+    /// whether it is still loading, and whether the caller wants it
+    /// protected (`protect(id)` — e.g. it is playing audio, which only the
+    /// engine side can know). The active tab and already-suspended tabs
+    /// are never candidates, by the module invariant (only a `Background`
+    /// tab can be one), so no separate check is needed here.
+    ///
+    /// Pure and clock-injected like [`Self::idle_background_tabs`]; the
+    /// returned order is display order (the policy sorts by idle time
+    /// itself).
+    pub fn suspension_candidates(
+        &self,
+        now: Instant,
+        protect: impl Fn(TabId) -> bool,
+    ) -> Vec<Candidate> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.state() == TabState::Background)
+            .map(|tab| Candidate {
+                id: tab.id(),
+                idle: tab.idle_for(now),
+                loading: tab.is_loading(),
+                protected: protect(tab.id()),
+            })
             .collect()
     }
 
@@ -1070,5 +1110,53 @@ mod tests {
             tabs.get(b).unwrap().current_url(),
             "https://b.example/other"
         );
+    }
+    // -- Issue #63: live_tab_count / suspension_candidates -----------------
+
+    #[test]
+    fn live_tab_count_excludes_suspended_tabs() {
+        let mut tabs = Tabs::new("https://a.example/");
+        assert_eq!(tabs.live_tab_count(), 1);
+        let b = tabs.open("https://b.example/");
+        let _c = tabs.open("https://c.example/");
+        assert_eq!(tabs.live_tab_count(), 3);
+        assert!(tabs.suspend(b));
+        assert_eq!(tabs.live_tab_count(), 2);
+        // Resuming (by activating) brings it back.
+        tabs.activate(b);
+        assert_eq!(tabs.live_tab_count(), 3);
+    }
+
+    #[test]
+    fn suspension_candidates_are_the_background_tabs_with_their_idle_and_flags() {
+        let t0 = Instant::now();
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open_at("https://b.example/", t0);
+        let c = tabs.open_at("https://c.example/", t0 + Duration::from_secs(10));
+        // b finished loading; a (still `loading` from `Tab::new`) did not.
+        tabs.get_mut(b)
+            .unwrap()
+            .on_load_finished("https://b.example/");
+        let now = t0 + Duration::from_secs(30);
+
+        let candidates = tabs.suspension_candidates(now, |id| id == b);
+        // Display order: a, b. c is active, so never a candidate.
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].id, a);
+        assert_eq!(candidates[0].idle, Duration::from_secs(30));
+        assert!(candidates[0].loading);
+        assert!(!candidates[0].protected);
+        assert_eq!(candidates[1].id, b);
+        assert_eq!(candidates[1].idle, Duration::from_secs(20));
+        assert!(!candidates[1].loading);
+        assert!(candidates[1].protected);
+        assert!(candidates.iter().all(|candidate| candidate.id != c));
+
+        // A suspended tab drops out of the candidates.
+        assert!(tabs.suspend(a));
+        let candidates = tabs.suspension_candidates(now, |_| false);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].id, b);
     }
 }
