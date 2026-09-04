@@ -626,13 +626,21 @@ above, and D56 for the adaptive policy and its measured effect.
 
   All three combine in one pure function, `suspension::plan` (clock- and
   sample-injected, no `Tabs`/webview dependency, unit-tested exhaustively):
-  it takes the background tabs as `Candidate`s (built by
-  `Tabs::suspension_candidates`), the live tab count
-  (`Tabs::live_tab_count`) and an optional fresh sample, and returns the
+  it takes every live tab as a `Candidate` (built by
+  `Tabs::suspension_candidates` — the active tab included and flagged, so
+  the policy knows which process group it pins) and an optional fresh
+  sample, and returns the
   tabs to suspend with a `SuspendReason` (`idle`/`tab_count`/`memory`,
-  logged as the `tab_suspend` perf event). Least recently used always goes
-  first, for every signal; the tab-count and memory demands take the larger
-  of the two (not the sum), and idle suspensions count toward both.
+  logged as the `tab_suspend` perf event). The tab-count and memory
+  demands take the larger of the two (not the sum), and idle suspensions
+  count toward both. **The unit of reclaim is a web process, not a tab**
+  (`suspension::reclaim_order`, D56): dropping a webview inside a process
+  that keeps running returns little of its memory to the OS, so the demand
+  is met by emptying whole least recently used process groups first
+  (`Candidate::process_group`, from `BrowserWindow::process_group_of`) —
+  every tab of a group that holds no active/loading/protected tab, even
+  when that overshoots the demand — and only then by individual least
+  recently used tabs from groups that cannot be emptied.
   **Protected, never suspended automatically**: the active tab (by the
   `TabState` invariant), a tab still loading (dropping a mid-load webview
   wastes the work and repeats it on resume), and a tab playing audio

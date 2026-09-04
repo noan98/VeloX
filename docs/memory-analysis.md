@@ -900,3 +900,178 @@ VELOX_AUTOMATION_SCRIPT=$S/tabs5.txt xvfb-run -a --server-args="-screen 0 1280x9
   dbus-run-session -- python3 scripts/profile/process_breakdown.py --settle-secs 6 \
     --launch -- $S/velox-after --homepage file://$PWD/scripts/bench/pages/minimal.html
 ```
+
+## 11. Adaptive Tab Suspension の実装・計測結果 (Issue #63)
+
+§10.6 / `docs/decisions.md` D54 の Revisit condition が「残りの超過に最も
+効く可能性が高い」としていた **非表示タブの webview を落とす自動休止** を、
+`browser::suspension` の適応ポリシー (アイドル時間 / 生存タブ上限 / メモリ
+予算、D56) として実装し、**同一セッション内で** before/after を計測した。
+結論は `docs/decisions.md` D56 に記録した。branch
+`claude/issue-check-next-phase-r86skp` (PR #131)。
+
+測定環境は §1 と同一 (同じコンテナ、WebKitGTK 2.52.6、Chromium 141、GPU
+なし)。before は `main` (`73780db`、D54 適用済み) のバイナリ、after は本
+Issue の変更を適用したバイナリで、どちらも同じセッションで
+`cargo build --release` した。
+
+### 11.1 3 回計測した — 途中で 2 つの事実が判明したため
+
+本 Issue の after は 3 版ある。**最終版は v3** で、v1/v2 はそれぞれ次の版を
+必要にした実測として残す。
+
+| 版 | ポリシー | 20 タブ PSS (`VELOX_MAX_LIVE_TABS=4`) | 何が分かったか |
+| --- | --- | ---: | --- |
+| v1 | タブ単位 LRU | 759.3 MiB | 効くが、`process_breakdown.py` で content `WebKitWebProcess` が 4 個 (各 ~123 MiB) 残っており、生存タブ 4 個が 1 プロセスに収まっていない → 調べると D54 のコードの潜在バグ (下記) |
+| v2 | v1 + related view のバグ修正 | **903.5 MiB (悪化)** | 生存タブ 3 個のプロセスが 496 MiB を保持 (新規プロセスなら 4 ページで 286 MiB) → **同一プロセス内で webview を落としてもメモリの大半は戻らない。戻るのはプロセスが終了したとき** |
+| **v3** | **プロセスグループ単位で丸ごと休止** | **560.4 MiB** | 採用 |
+
+**v1 で見つかった D54 のバグ**: `BrowserWindow::open_tab` が related view
+を探すとき「同じ `process_group` の最初の `ContentTab`」を取っていたため、
+それが休止済み (`webview: None`) だと `related: None` になり、**既存グループ
+の id を名乗った新しい `WebKitWebProcess` が起動していた**。`VELOX_DEBUG=1`
+で新設したプロセスグループ配置ログ (`tab TabId(8) -> process group 0
+(related: false)`) で発見。休止タブが混ざったグループでしか起きないため
+D54 の計測 (休止なし) には影響していない。生存 webview を持つタブだけを
+related の候補にする修正を入れた。
+
+**v2 で分かったこと (本 Issue の主要な知見)**: 修正後は 20 タブが
+「g0 (3 生存) + g5 (1 生存)」の 2 プロセスに正しく集まったのに、PSS は v1 より
+144 MiB *増えた*。内訳 (`process_breakdown.py`、settle 12 秒):
+
+```
+comm                     pid    ppid     rss_mib     pss_mib
+WebKitWebProces        26006   25942       611.8       496.3   <- content: 生存 3 タブ、延べ 15 ページを載せた
+WebKitWebProces        26005   25942       300.1       189.9   <- toolbar
+WebKitWebProces        26193   25942       248.5       135.8   <- content: 生存 1 タブ
+velox-after            25942   25941       169.4        76.5
+WebKitNetworkPr        26003   25942        50.1        17.9
+TOTAL                                     1379.9       916.4
+```
+
+生存 3 ページで 496 MiB は、休止なしのプロセス (4 ページで 286 MiB、
+`breakdown-default`) の 1.7 倍。ページを破棄しても解放されたヒープが
+プロセス内に残り (settle 20 秒でも不変)、**プロセスの終了だけが確実に
+メモリを OS に返す**。v1 の数値が良かったのは、バグのおかげで休止対象の
+タブが個別プロセスに散っていて、そのプロセスごと終了していたからだった。
+
+**v3 の設計**: したがって休止の単位を「タブ」から「プロセスグループ」に
+変えた (`suspension::reclaim_order`)。タブ数/メモリの要求は、空にできる
+グループ (アクティブ・読み込み中・音声再生中のタブを含まない) を LRU
+グループ順に**丸ごと**休止して満たし (要求を超えてもグループ全体を落とす)、
+空にできないグループのタブはその後に LRU で 1 つずつ (部分回収) 回す。
+配置ログで確認した挙動 (`VELOX_MAX_LIVE_TABS=4`、`minimal.html` を 300ms
+間隔で 20 タブ):
+
+```
+open 1:g1  open 2:g0 3:g0 4:g0  | susp 1 (g1 空に)
+open 5:g2                       | susp 0 2 3 4 (g0 丸ごと)
+open 6:g2 7:g2 8:g2  open 9:g3  | susp 5 6 7 8 (g2 丸ごと) ...
+```
+
+### 11.2 変更前後の PSS (`scripts/bench/tab_scaling.py`, 各 3 試行の中央値)
+
+`minimal.html`、`--settle-per-open-ms 300` (既定)、既定は `--stabilize-secs 3`
+(メモリ予算の条件はサンプラ (2 秒間隔) が複数回動くよう 8 秒)。Chromium は
+before と同時に測定した対照群。
+
+| タブ数 | before (MiB) | after: ポリシー無効 (既定) | after: `VELOX_MAX_LIVE_TABS=4` | after: `VELOX_MEMORY_BUDGET_MB=700` | Chromium (MiB) |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1  | 409.0  | 409.2  | 409.3 (-0.0%)  | 407.3 (-0.4%)  | 281.9 |
+| 5  | 653.6  | 658.9  | **553.7 (-15.3%)** | 659.6 (予算内、休止なし) | 320.3 |
+| 10 | 990.6  | 992.8  | **419.8 (-57.6%)** | **476.2 (-51.9%)** | 366.9 |
+| 20 | 1612.1 | 1652.1 | **560.4 (-65.2%)** | **615.1 (-61.8%)** | 466.7 |
+
+Chromium 比: 20 タブで before +245.4% → **タブ上限 4 で +20.1%、予算 700 MiB
+で +31.8%**。10 タブではタブ上限 4 で **+14.4%**。1 タブは共有相手も休止
+対象も無いため +45% のまま (D48 の toolbar 用 webview 1 個分)。
+
+trial 間のばらつき (min–max): before 408.7–409.2 / 638.7–659.4 / 985.8–1005.4
+/ 1537.5–1638.4 MiB、タブ上限 4 は 408.9–409.8 / 536.3–553.8 / 419.8–421.0 /
+559.3–565.2 MiB、予算 700 は 406.2–409.6 / 640.2–660.2 / 475.3–477.0 /
+614.9–615.4 MiB。5 タブ以上で分布は重ならない。**ポリシー無効の after は
+before と誤差範囲で一致** (20 タブ 1648–1668 vs 1537–1638 MiB) — 既定設定に
+回帰は無い。
+
+**タブ数に対して単調でない** (タブ上限 4 で 5 タブ 554 > 10 タブ 420): プロセス
+単位で落とすため、生存タブ数は「上限を超えた瞬間に 1〜2 まで落ち、次に
+上限に達するまで増える」鋸歯状になる。10 タブ時点はちょうどグループを
+落とした直後、5/20 タブは溜まった直後に当たる。
+
+**プロセス数**: タブ上限 4 / 予算 700 とも 10/20 タブで **4** (`velox` +
+`NetworkProcess` + toolbar `WebProcess` + content `WebProcess` 1 個)。
+内訳 (20 タブ、settle 12 秒):
+
+```
+VELOX_MAX_LIVE_TABS=4                      VELOX_MEMORY_BUDGET_MB=700
+WebKitWebProces (content, 生存 3)  260.4   WebKitWebProces (content, 生存 4)  315.9
+WebKitWebProces (toolbar)          197.9   WebKitWebProces (toolbar)          199.2
+velox-after                         80.0   velox-after                         81.6
+WebKitNetworkPr                     19.5   WebKitNetworkPr                     19.5
+TOTAL                              557.8   TOTAL                              616.3
+```
+
+content プロセスの 260 MiB (3 ページ) / 316 MiB (4 ページ) は、休止なしの
+4 ページ 286 MiB とほぼ同じ「新品」の水準で、v2 の 496 MiB のような保持は
+無い — グループ単位で落とすと「延べ多数のページを載せた長寿プロセス」が
+できないため。
+
+### 11.3 復帰コスト (`velox-bench run --scenario tab_resume`)
+
+新設の `tab_resume` シナリオ (4 タブを開き、`suspend i` → `switch i` を 8
+ラウンド、8 試行)。既定設定 (自動休止なし、手動 `suspend` のみ) の after:
+
+| メトリクス | n | 中央値 | p95 | 比較 |
+| --- | ---: | ---: | ---: | --- |
+| `tab_resume_ms` (webview 再構築 + 表示) | 64 | **2.7ms** | 3.9ms | `tab_switch_ms` (生存タブへの切替) 0.5ms の約 5 倍。ただし絶対値は小さい |
+| `page_load_ms` (復帰後の再読み込み) | 104 | 10.1ms | 23.1ms | `minimal.html`。実サイトではこちらが支配的になる |
+
+復帰が速いのは、休止タブの webview を既存の content プロセスに related view
+として作り直すため (D54)、新プロセスの起動を伴わないから。ただし D9 の
+とおり、スクロール位置・フォーム入力・戻る/進む履歴は失われる。
+
+### 11.4 回帰ゲート (`velox-bench gate`、既定設定、各 8 試行 × candidate 2 回)
+
+`cold_startup` / `tab_create` / `tab_switch` すべて**総合判定 OK**
+(warn>20% / fail>60%、D46)。既定設定ではポリシーが完全に無効で、スレッドも
+`/proc` 走査も増えないため期待どおり。
+
+### 11.5 T2 (Chromium 比 +10% 以内) は達成したか
+
+**達成していない。** ただし 20 タブで +245% → +20% と、Phase 3 で最も大きく
+縮んだ。残りの超過は:
+
+1. **1 タブ時の +45%** (toolbar 用の 2 個目の `WebProcess`、D48 §5) —
+   休止では手が出せない。toolbar をネイティブ UI にするか、toolbar と
+   content の `WebProcess` を共有するか (D54 で安全境界の理由から却下) の
+   どちらかが必要。
+2. **生存タブ分**: 上限 4 なら最大 4 ページ分 (~54 MiB/ページ、D54)。上限を
+   下げれば減るが、復帰の再読み込みが増える (Epic #57 ルール 4 のトレード
+   オフ)。
+3. **`minimal.html` での結果**である点: 実サイトでは 1 ページあたりのメモリ
+   が桁で大きく、休止の効果 (絶対値) も大きくなるが、復帰コストも大きく
+   なる。実サイトでの評価は未実施。
+
+### 11.6 再現手順
+
+```sh
+S=/path/to/scratch
+cp target/release/velox $S/velox-after
+git stash && cargo build --release && cp target/release/velox $S/velox-before && git stash pop
+
+XV='xvfb-run -a --server-args=-screen 0 1280x900x24 dbus-run-session --'
+$XV python3 scripts/bench/tab_scaling.py --velox $S/velox-before \
+  --chromium /opt/pw-browsers/chromium --page minimal.html --tab-counts 1,5,10,20 --trials 3
+$XV python3 scripts/bench/tab_scaling.py --velox $S/velox-after --page minimal.html --tab-counts 1,5,10,20 --trials 3
+VELOX_MAX_LIVE_TABS=4 $XV python3 scripts/bench/tab_scaling.py --velox $S/velox-after ...
+VELOX_MEMORY_BUDGET_MB=700 $XV python3 scripts/bench/tab_scaling.py --velox $S/velox-after ... --stabilize-secs 8
+
+# 配置ログ (どのタブがどのプロセスに入り、いつ休止されたか)
+VELOX_DEBUG=1 VELOX_PERF_METRICS=1 VELOX_MAX_LIVE_TABS=4 VELOX_AUTOMATION_SCRIPT=$S/tabs20.txt \
+  $XV $S/velox-after --homepage file://$PWD/scripts/bench/pages/minimal.html 2>&1 | grep -E "process group|tab_suspend"
+
+# 復帰コスト
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+$XV target/release/velox-bench run --scenario tab_resume --trials 8 \
+  --velox-bin $S/velox-after --url http://127.0.0.1:8731/minimal.html --output $S/tab_resume.json
+```

@@ -577,6 +577,7 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   | `navigation` | `page_load_ms` | 7.45 | 23.68 | 10 |
   | `tab_create` | `tab_create_ms` | 20.65 | 50.22 | 10 |
   | `tab_switch` | `tab_switch_ms` | 0.60 | 0.85 | 16 |
+  | `tab_resume` (#63) | `tab_resume_ms` | 2.7 | 3.9 | 64 |
 
   **⚠️ 上の `tabs_5` の `pss_total_bytes` (n=2) は、上記「実行環境要件」の
   D50 が記録したサンプル不足バグの実例そのものである** — この値が採取された
