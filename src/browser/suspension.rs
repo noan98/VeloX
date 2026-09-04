@@ -208,7 +208,7 @@ pub fn plan(
         .iter()
         .filter(|tab| !tab.loading && !tab.protected)
         .collect();
-    eligible.sort_by(|a, b| b.idle.cmp(&a.idle));
+    eligible.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
 
     let mut planned: Vec<(TabId, SuspendReason)> = Vec::new();
     if let Some(idle_after) = policy.idle_after {
