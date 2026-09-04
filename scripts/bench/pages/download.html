@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <title>download</title>
+</head>
+<body>
+  <p>読み込み完了時に <code>velox-test.txt</code> を 1 回だけダウンロードします。</p>
+  <a id="link" download="velox-test.txt" href="data:text/plain;charset=utf-8,velox%20download%20test%0A">velox-test.txt</a>
+  <script>
+    // `download` 属性付きリンクをスクリプトから 1 回だけクリックする。
+    // WebKitGTK / WKWebView / WebView2 のいずれもこれを「ダウンロード」として
+    // 扱い、wry の download_started_handler が呼ばれる。
+    window.addEventListener('load', function () {
+      document.getElementById('link').click();
+    });
+  </script>
+</body>
+</html>
