@@ -1,0 +1,152 @@
+name: Auto Merge
+
+# プライベートリポジトリでは GitHub 標準の auto-merge 機能が使えないため、
+# 「この workflow 以外のすべてのチェックが成功 (success) または
+# スキップ (skipped / neutral) になった PR を自動でマージする」仕組みを
+# 自前で用意する。設計判断は docs/decisions.md D54 を参照。
+#
+# 動作の流れ:
+#   1. 他の workflow (CI / perf-gate / release-windows) が完了するたびに起動
+#      (workflow_run)。取りこぼし防止のため 30 分ごとの定期実行と手動実行も可。
+#   2. `main` 向けの open な PR を全件走査し、PR ごとに head commit の
+#      check-runs と commit status を集める (この workflow 自身は除外)。
+#   3. 1 つでも未完了があれば待つ (何もしない)。1 つでも失敗があれば
+#      スキップする。全部が success/skipped/neutral ならマージする。
+#
+# 対象外にしたい PR には `no-automerge` ラベルを付ける。Draft PR も対象外。
+#
+# 注意: GITHUB_TOKEN でマージすると、マージ後の `main` への push では他の
+# workflow (ci.yml の push トリガなど) が起動しない (GitHub の仕様)。
+# それが必要なら `AUTO_MERGE_TOKEN` シークレット (repo 権限の PAT) を
+# 登録すると、そちらが優先して使われる。
+on:
+  workflow_run:
+    workflows:
+      - CI
+      - Performance Regression Gate
+      - Release (Windows)
+    types: [completed]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  statuses: read
+
+# 同時に 2 つ走って同じ PR を二重にマージしようとしないよう直列化する。
+concurrency:
+  group: auto-merge
+  cancel-in-progress: false
+
+env:
+  # マージ方式: merge (マージコミット) / squash / rebase
+  MERGE_METHOD: merge
+  # このラベルが付いた PR は自動マージしない
+  SKIP_LABEL: no-automerge
+  # 自動マージ対象のベースブランチ
+  BASE_BRANCH: main
+
+jobs:
+  auto-merge:
+    name: Auto merge PRs whose checks all passed
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge eligible pull requests
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          # この workflow 自身が check-run に現れた場合に除外するための名前
+          SELF_WORKFLOW: ${{ github.workflow }}
+          SELF_JOB: Auto merge PRs whose checks all passed
+        run: |
+          set -euo pipefail
+
+          # PR 一覧 (open かつ BASE_BRANCH 向け)
+          prs=$(gh pr list --state open --base "$BASE_BRANCH" --limit 100 \
+                  --json number,title,isDraft,labels,headRefOid,headRefName)
+          count=$(echo "$prs" | jq 'length')
+          echo "対象候補: ${count} 件の open PR (base: ${BASE_BRANCH})"
+          if [ "$count" -eq 0 ]; then
+            exit 0
+          fi
+
+          echo "$prs" | jq -c '.[]' | while read -r pr; do
+            number=$(echo "$pr" | jq -r '.number')
+            title=$(echo "$pr" | jq -r '.title')
+            sha=$(echo "$pr" | jq -r '.headRefOid')
+            draft=$(echo "$pr" | jq -r '.isDraft')
+            has_skip=$(echo "$pr" | jq -r --arg l "$SKIP_LABEL" \
+                         '[.labels[].name] | index($l) != null')
+
+            echo "::group::PR #${number} ${title} (${sha:0:7})"
+
+            if [ "$draft" = "true" ]; then
+              echo "skip: Draft PR"
+              echo "::endgroup::"; continue
+            fi
+            if [ "$has_skip" = "true" ]; then
+              echo "skip: ラベル '${SKIP_LABEL}' が付いている"
+              echo "::endgroup::"; continue
+            fi
+
+            # --- check-runs (GitHub Actions / GitHub App のチェック) ---
+            # filter=latest (既定) なので、再実行した場合は最新の結果だけ見る。
+            # この workflow 自身 (workflow 名 / job 名) は判定から除外する。
+            runs=$(gh api --paginate \
+                     "repos/${GH_REPO}/commits/${sha}/check-runs?per_page=100" \
+                     --jq '.check_runs[]' | jq -s \
+                     --arg self "$SELF_WORKFLOW" --arg self_job "$SELF_JOB" \
+                     '[.[] | select(.name != $self and .name != $self_job)]')
+
+            # --- commit status (レガシー API を使う外部サービス向け) ---
+            statuses=$(gh api "repos/${GH_REPO}/commits/${sha}/status" \
+                         --jq '.statuses')
+
+            total=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
+                      '($r | length) + ($s | length)')
+            if [ "$total" -eq 0 ]; then
+              echo "wait: まだチェックが 1 つも登録されていない"
+              echo "::endgroup::"; continue
+            fi
+
+            echo "check-runs:"
+            echo "$runs" | jq -r '.[] | "  - \(.name): \(.status) / \(.conclusion // "-")"'
+            if [ "$(echo "$statuses" | jq 'length')" -gt 0 ]; then
+              echo "statuses:"
+              echo "$statuses" | jq -r '.[] | "  - \(.context): \(.state)"'
+            fi
+
+            pending=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
+              '([$r[] | select(.status != "completed")] | length)
+               + ([$s[] | select(.state == "pending")] | length)')
+            if [ "$pending" -gt 0 ]; then
+              echo "wait: 未完了のチェックが ${pending} 件ある"
+              echo "::endgroup::"; continue
+            fi
+
+            failed=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
+              '([$r[] | select(.conclusion != "success"
+                                and .conclusion != "skipped"
+                                and .conclusion != "neutral")] | length)
+               + ([$s[] | select(.state != "success")] | length)')
+            if [ "$failed" -gt 0 ]; then
+              echo "skip: 成功/スキップ以外のチェックが ${failed} 件ある"
+              echo "::endgroup::"; continue
+            fi
+
+            echo "all green: マージします (${MERGE_METHOD})"
+            # --match-head-commit: 判定した commit から PR が進んでいたら
+            # マージしない (新しい commit のチェックが未評価のため)。
+            if gh pr merge "$number" "--${MERGE_METHOD}" \
+                 --match-head-commit "$sha" --delete-branch; then
+              echo "merged: PR #${number}"
+            else
+              # ブランチ保護 (レビュー必須など) や競合でマージできない場合。
+              # 他の PR の処理は続ける。
+              echo "::warning::PR #${number} のマージに失敗しました (競合・ブランチ保護など)"
+            fi
+            echo "::endgroup::"
+          done
