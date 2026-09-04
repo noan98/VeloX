@@ -679,3 +679,170 @@ fn quit_command_exits_the_process_with_code_zero() {
         );
     }
 }
+
+// ---------------------------------------------------------------------
+// 6. Adaptive tab suspension (Issue #63): the live-tab cap suspends
+//    background tabs, and switching back to one resumes it.
+// ---------------------------------------------------------------------
+
+/// Guarantees: with `VELOX_MAX_LIVE_TABS=2`, opening a third tab makes
+/// the automatic policy (`browser::suspension`, docs/decisions.md D56)
+/// suspend the least recently used background tab — observable from the
+/// outside as a `tab_suspend` perf record with `reason: "tab_count"` —
+/// and a later `switch` to a suspended tab is reported as `tab_resume`
+/// (not `tab_switch`), followed by that tab's page reloading
+/// (`page_load`). Also checks that the active tab is never the one
+/// suspended, which the policy promises but only the real event loop can
+/// demonstrate end to end (the unit tests cover the pure planning).
+///
+/// The `suspend <index>` automation command is exercised too: a manual
+/// suspension of an already-suspended or active tab must be a silent
+/// no-op, exactly like the tab strip's button.
+#[test]
+fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
+    skip_without_gui!("live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("suspension");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let stderr_path = dir.join("stderr.log");
+    let homepage = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+    let page_b = fixture_url("dom_heavy.html");
+
+    // Tab strip after each step (cap = 2 live tabs):
+    //   wait                   home finishes loading first, so every tab
+    //                          below joins home's web process (D54 never
+    //                          joins a process with a loading tab): one
+    //                          group, pinned by the active tab, so the
+    //                          policy's reclaim order is plain per-tab
+    //                          LRU here (docs/decisions.md D56).
+    //   [home]                 home active, 1 live
+    //   open a -> [home, a]    a active, 2 live — at the cap, nothing to do
+    //   open b -> [home, a, b] b active, 3 live -> `home` (idle longest)
+    //                          is suspended by the sweep that follows.
+    //   suspend 2              -> active tab: refused, no-op
+    //   suspend 0              -> already suspended: no-op
+    //   switch 0               -> resumes `home` (tab_resume + page_load);
+    //                          now 3 live again -> `a` (idle longest of the
+    //                          background tabs) is suspended.
+    let script = format!(
+        "wait 800\n\
+         open {page_a}\n\
+         wait 600\n\
+         open {page_b}\n\
+         wait 800\n\
+         suspend 2\n\
+         suspend 0\n\
+         wait 200\n\
+         switch 0\n\
+         wait 1200\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let max_live_tabs = Path::new("2");
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+        &[("VELOX_MAX_LIVE_TABS", max_live_tabs)],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the suspension test. \
+             Perf records: {:?}\nstderr:\n{stderr}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let records = &launch.perf_records;
+    let tab_create: Vec<_> = events_named(records, "tab_create").collect();
+    assert_eq!(
+        tab_create.len(),
+        2,
+        "2 `open` commands should yield 2 `tab_create` records: {records:?}"
+    );
+    let created_ids: Vec<u64> = tab_create
+        .iter()
+        .filter_map(|r| r["tab_id"].as_u64())
+        .collect();
+    let home_id = 0;
+    assert!(
+        !created_ids.contains(&home_id),
+        "the initial tab is id 0 and is never re-created: {created_ids:?}"
+    );
+
+    let suspends: Vec<_> = events_named(records, "tab_suspend").collect();
+    assert_eq!(
+        suspends.len(),
+        2,
+        "expected exactly two automatic suspensions (home after the 3rd tab opened, \
+         then `a` after home was resumed), got {}: {records:?}\nstderr:\n{stderr}",
+        suspends.len()
+    );
+    assert!(
+        suspends
+            .iter()
+            .all(|r| r["reason"].as_str() == Some("tab_count")),
+        "every suspension here is driven by the live-tab cap: {suspends:?}"
+    );
+    assert_eq!(
+        suspends[0]["tab_id"].as_u64(),
+        Some(home_id),
+        "the first tab to go must be the least recently used one (home): {suspends:?}"
+    );
+    assert_eq!(
+        suspends[1]["tab_id"].as_u64(),
+        Some(created_ids[0]),
+        "after home is resumed, `a` is the idle-longest background tab: {suspends:?}"
+    );
+
+    let resumes: Vec<_> = events_named(records, "tab_resume").collect();
+    let switches: Vec<_> = events_named(records, "tab_switch").collect();
+    assert_eq!(
+        resumes.len(),
+        1,
+        "`switch 0` onto the suspended home tab must be reported as `tab_resume`: {records:?}"
+    );
+    assert_eq!(resumes[0]["tab_id"].as_u64(), Some(home_id));
+    assert!(
+        switches.is_empty(),
+        "no plain `tab_switch` is expected (the only switch was a resume): {switches:?}"
+    );
+
+    // Resuming reloads the page: at least one `page_load` for the homepage
+    // must arrive *after* the resume.
+    let resume_ts = resumes[0]["ts_ms"].as_f64().unwrap_or(0.0);
+    let reloaded = events_named(records, "page_load").any(|r| {
+        r["url"].as_str() == Some(homepage.as_str())
+            && r["ts_ms"].as_f64().unwrap_or(0.0) > resume_ts
+    });
+    assert!(
+        reloaded,
+        "expected the resumed tab to reload {homepage} after ts={resume_ts}: {records:?}"
+    );
+
+    // The two manual no-op `suspend` commands must not have produced an
+    // error line (only an out-of-range index does), and the sampler must
+    // not have started (no memory budget was set).
+    assert!(
+        !stderr.contains("automation: suspend"),
+        "in-range `suspend` on the active/already-suspended tab must be silent:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("memory sampling for tab suspension"),
+        "no memory budget => no sampler:\n{stderr}"
+    );
+}

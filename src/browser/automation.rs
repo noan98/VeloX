@@ -28,6 +28,7 @@
 //! open <url>        # open a new tab and make it active
 //! switch <index>    # activate the tab at position <index> (0-based)
 //! close <index>     # close the tab at position <index> (0-based)
+//! suspend <index>   # suspend the tab at position <index> (0-based; never the active tab)
 //! navigate <url>    # navigate the active tab
 //! wait <ms>         # sleep before the next command (<= MAX_WAIT_MS)
 //! quit              # exit the application
@@ -66,6 +67,15 @@ pub enum AutomationCommand {
     /// `close <index>` — close the tab currently at position `index`. Same
     /// out-of-range handling as `Switch`.
     Close { index: usize },
+    /// `suspend <index>` — suspend the tab currently at position `index`
+    /// (Issue #63), exactly like the tab strip's suspend button
+    /// (`ToolbarCommand::SuspendTab`). Same out-of-range handling as
+    /// `Switch`; also a no-op for the active tab or an already-suspended
+    /// tab, since `browser::tabs::Tabs::suspend` refuses those. Lets a
+    /// benchmark measure the restore cost (`tab_resume`) deterministically
+    /// — suspend, then `switch` back — without depending on the automatic
+    /// policy's timing.
+    Suspend { index: usize },
     /// `navigate <url>` — navigate the active tab to `url` (already
     /// normalized).
     Navigate { url: String },
@@ -132,6 +142,9 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
         }),
         "close" => Ok(AutomationCommand::Close {
             index: parse_index(line, "close", rest)?,
+        }),
+        "suspend" => Ok(AutomationCommand::Suspend {
+            index: parse_index(line, "suspend", rest)?,
         }),
         "wait" => Ok(AutomationCommand::Wait {
             ms: parse_wait(line, rest)?,
@@ -212,6 +225,20 @@ const TAB_SWITCH_EXTRA_TABS: usize = 4;
 /// How many `switch` commands `Scenario::TabSwitch` issues, one
 /// `tab_switch` latency sample each.
 const TAB_SWITCH_REPEATS: usize = 8;
+/// How many extra tabs `Scenario::TabResume` opens before its
+/// suspend/resume rounds — the same count as `TabSwitch`, so the two
+/// scenarios' numbers are comparable (`tab_switch_ms` for a live tab vs.
+/// `tab_resume_ms` for a suspended one, with the same tabs open).
+const TAB_RESUME_EXTRA_TABS: usize = TAB_SWITCH_EXTRA_TABS;
+/// How many suspend-then-switch rounds `Scenario::TabResume` runs, one
+/// `tab_resume` latency sample (and one reload `page_load`) each.
+const TAB_RESUME_REPEATS: usize = TAB_SWITCH_REPEATS;
+/// Pause after a resumed tab is switched to, so its reload finishes (and
+/// its `page_load` is logged) before the next round suspends a different
+/// tab — a tab that is still loading is never suspended
+/// (`browser::suspension`), so without this settle the rounds would trip
+/// over each other rather than measure anything.
+const RESUME_SETTLE_MS: u64 = 500;
 /// Pause after each `open`/`navigate` step, so the webview has a moment to
 /// actually start the load before the next command fires.
 const STEP_SETTLE_MS: u64 = 300;
@@ -268,6 +295,26 @@ pub fn generate_bench_script(
                 let index = i % total_tabs;
                 lines.push(format!("switch {index}"));
                 lines.push(format!("wait {SWITCH_SETTLE_MS}"));
+            }
+            lines
+        }
+        Scenario::TabResume => {
+            // Open the extra tabs one by one (each settles like
+            // `TabCreate`, so none is still loading when the rounds
+            // start), then in each round suspend one background tab and
+            // switch straight to it. Round `i` targets tab `i % extra`,
+            // never the active tab: after `switch k` tab `k` is active,
+            // and the next round's target is `k + 1` (mod `extra`), which
+            // is a different tab for any `extra >= 2`.
+            let mut lines: Vec<String> = (0..TAB_RESUME_EXTRA_TABS)
+                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+                .collect();
+            for i in 0..TAB_RESUME_REPEATS {
+                let index = i % TAB_RESUME_EXTRA_TABS;
+                lines.push(format!("suspend {index}"));
+                lines.push(format!("wait {SWITCH_SETTLE_MS}"));
+                lines.push(format!("switch {index}"));
+                lines.push(format!("wait {RESUME_SETTLE_MS}"));
             }
             lines
         }
@@ -330,6 +377,11 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             let switch_ms = TAB_SWITCH_REPEATS as u64 * (PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS);
             open_ms + switch_ms
         }
+        Scenario::TabResume => {
+            let open_ms = TAB_RESUME_EXTRA_TABS as u64 * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            let round_ms = 2 * PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS + RESUME_SETTLE_MS;
+            open_ms + TAB_RESUME_REPEATS as u64 * round_ms
+        }
         Scenario::TabCountMemory(tab_count) => {
             let open_ms = u64::from(tab_count.saturating_sub(1)) * PER_STEP_OVERHEAD_MS;
             open_ms + MEMORY_STABILIZE_MS
@@ -385,7 +437,8 @@ pub fn recommended_rss_interval_ms(
         | Scenario::FirstPageLoad
         | Scenario::Navigation
         | Scenario::TabCreate
-        | Scenario::TabSwitch => None,
+        | Scenario::TabSwitch
+        | Scenario::TabResume => None,
     }
 }
 
@@ -401,6 +454,7 @@ mod tests {
             open https://example.com/\n\
             switch 2\n\
             close 1\n\
+            suspend 0\n\
             navigate https://example.com/other\n\
             wait 500\n\
             quit\n";
@@ -413,6 +467,7 @@ mod tests {
                 },
                 AutomationCommand::Switch { index: 2 },
                 AutomationCommand::Close { index: 1 },
+                AutomationCommand::Suspend { index: 0 },
                 AutomationCommand::Navigate {
                     url: "https://example.com/other".to_owned()
                 },
@@ -629,6 +684,53 @@ mod tests {
             .count();
         assert_eq!(open_count, TAB_SWITCH_EXTRA_TABS);
         assert_eq!(switch_count, TAB_SWITCH_REPEATS);
+    }
+
+    #[test]
+    fn tab_resume_script_suspends_then_switches_to_a_background_tab_each_round() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        let script = generate_bench_script(Scenario::TabResume, url).unwrap();
+        let commands = parse_script(&script).unwrap();
+        let open_count = commands
+            .iter()
+            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
+            .count();
+        assert_eq!(open_count, TAB_RESUME_EXTRA_TABS);
+
+        // Replay the script against a `Tabs` to prove every `suspend`
+        // lands on a background tab (the policy refuses the active tab,
+        // so a script that targeted it would silently measure nothing)
+        // and every `switch` resumes the tab just suspended.
+        let mut tabs = crate::browser::tabs::Tabs::new(url);
+        let mut rounds = 0;
+        let mut pending: Option<usize> = None;
+        for command in &commands {
+            match command {
+                AutomationCommand::Open { url } => {
+                    tabs.open(url.clone());
+                }
+                AutomationCommand::Suspend { index } => {
+                    let id = tabs.iter().nth(*index).unwrap().id();
+                    assert!(
+                        tabs.suspend(id),
+                        "round {rounds}: suspend {index} hit the active tab"
+                    );
+                    pending = Some(*index);
+                }
+                AutomationCommand::Switch { index } => {
+                    assert_eq!(pending.take(), Some(*index));
+                    let id = tabs.iter().nth(*index).unwrap().id();
+                    assert_eq!(
+                        tabs.activate(id),
+                        Some(crate::browser::tabs::ActivationEffect::Resume)
+                    );
+                    rounds += 1;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(rounds, TAB_RESUME_REPEATS);
+        assert_eq!(commands.last(), Some(&AutomationCommand::Quit));
     }
 
     #[test]

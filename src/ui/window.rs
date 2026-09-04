@@ -438,6 +438,36 @@ fn with_related_content_view<'a>(
     builder
 }
 
+/// WebKitGTK's `is-playing-audio` for `webview` — see
+/// [`BrowserWindow::is_playing_audio`]. Guarded by `has_property` so a
+/// WebKitGTK build without the property (it has existed since 2.8, so this
+/// is purely defensive) reads as "not playing" instead of a GLib panic.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+))]
+fn webview_is_playing_audio(webview: &WebView) -> bool {
+    use gtk::glib::prelude::*;
+    use wry::WebViewExtUnix;
+    let inner = webview.webview();
+    inner.has_property("is-playing-audio", Some(bool::static_type()))
+        && inner.property::<bool>("is-playing-audio")
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+)))]
+fn webview_is_playing_audio(_webview: &WebView) -> bool {
+    false
+}
+
 /// One tab's content webview.
 struct ContentTab {
     /// The tab's webview.
@@ -815,10 +845,18 @@ impl BrowserWindow {
             .map(|(tab_id, tab)| (tab.process_group, is_loading(*tab_id)));
         let (process_group, related) = match pick_process_group(live) {
             Some(group) => {
+                // Only a tab that still *has* a webview can be related to
+                // (a suspended tab's entry keeps its stale `process_group`
+                // with `webview: None`). Matching on the group alone here
+                // used to pick such an entry first, yielding `related:
+                // None` — a fresh `WebKitWebProcess` wearing an existing
+                // group id, so every later tab "joining" that group also
+                // got its own process (found by the `VELOX_DEBUG` trace
+                // below; see docs/decisions.md D56).
                 let related = self
                     .contents
                     .values()
-                    .find(|tab| tab.process_group == group)
+                    .find(|tab| tab.process_group == group && tab.webview.is_some())
                     .and_then(|tab| tab.webview.as_ref());
                 (group, related)
             }
@@ -863,6 +901,16 @@ impl BrowserWindow {
             target_os = "netbsd",
         )))]
         let webview = Self::attach_webview(&self.window, builder)?;
+        if std::env::var_os("VELOX_DEBUG").is_some() {
+            // Which `WebKitWebProcess` group this tab landed in (D54) —
+            // the one piece of placement state nothing else surfaces, and
+            // exactly what a memory investigation (D48/D54/D56) needs to
+            // see. Same opt-in as `app.rs`'s event tracing.
+            eprintln!(
+                "velox[debug]: tab {id:?} -> process group {process_group} (related: {})",
+                related.is_some()
+            );
+        }
         self.contents.insert(
             id,
             ContentTab {
@@ -938,6 +986,42 @@ impl BrowserWindow {
                 Ok(())
             }
         }
+    }
+
+    /// Whether tab `id`'s page is currently playing audio, for the
+    /// automatic suspension policy's "active media" protection
+    /// (`browser::suspension`, Issue #63) — a tab the user is listening
+    /// to is never suspended automatically. `false` for a suspended or
+    /// unknown tab (nothing to protect).
+    ///
+    /// Read from WebKitGTK's `WebKitWebView:is-playing-audio` property via
+    /// the `webkit2gtk::WebView` wry already hands out
+    /// (`WebViewExtUnix::webview`, the same accessor
+    /// [`with_related_content_view`] uses) — through GLib's generic
+    /// property API rather than the `webkit2gtk` crate's typed getter, so
+    /// no new dependency is needed (docs/decisions.md D6). On every other
+    /// platform this is always `false`: wry exposes no equivalent there
+    /// yet, so the protection simply does not apply (documented in D56).
+    pub fn is_playing_audio(&self, id: TabId) -> bool {
+        self.contents
+            .get(&id)
+            .and_then(|tab| tab.webview.as_ref())
+            .is_some_and(webview_is_playing_audio)
+    }
+
+    /// Which `WebKitWebProcess` group (D54, [`pick_process_group`]) tab
+    /// `id`'s live webview is in, for the process-unit reclaim order of the
+    /// automatic suspension policy (`browser::suspension::reclaim_order`,
+    /// docs/decisions.md D56). `None` for a suspended or unknown tab (no
+    /// webview, so no process). On platforms other than Linux/BSD the group
+    /// id is still assigned but does not correspond to a shared process
+    /// (see [`with_related_content_view`]); the policy then merely prefers
+    /// emptying "groups" that are not real, which is harmless.
+    pub fn process_group_of(&self, id: TabId) -> Option<u64> {
+        self.contents
+            .get(&id)
+            .filter(|tab| tab.webview.is_some())
+            .map(|tab| tab.process_group)
     }
 
     /// Rebuild a suspended tab's content webview, loading `url` (its last

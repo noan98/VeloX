@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use crate::browser::metrics::PerfFormat;
 use crate::browser::navigation;
+use crate::browser::suspension::SuspensionPolicy;
 
 /// Default interval between process-tree RSS samples when performance
 /// metrics are enabled but no explicit interval was requested.
@@ -140,18 +141,18 @@ pub struct Config {
     /// Maximum number of entries sent to the history panel at once (the
     /// store itself may hold more, up to `history_max_entries`).
     pub history_panel_limit: usize,
-    /// Tab suspension policy: how long a background tab must sit idle
-    /// (elapsed time since it was last the active tab) before it becomes
-    /// eligible for *automatic* suspension — see
-    /// `browser::tabs::Tabs::idle_background_tabs`.
-    ///
-    /// `None` disables automatic suspension entirely; manual suspension
-    /// (the tab strip's suspend button, `ui::toolbar::ToolbarCommand::SuspendTab`)
-    /// is always available regardless of this setting. Defaults to `None`
-    /// so a fresh checkout never suspends a tab the user did not ask to
-    /// suspend — see docs/decisions.md D9 for why automatic suspension is
-    /// opt-in for now.
-    pub auto_suspend_after: Option<Duration>,
+    /// Automatic tab suspension policy (Issue #63, see
+    /// `browser::suspension`): idle time, live-tab cap and memory budget,
+    /// each individually optional. Defaults to every signal off
+    /// ([`SuspensionPolicy::default`]) so a fresh checkout never suspends a
+    /// tab the user did not ask to suspend — see docs/decisions.md D9 for
+    /// why automatic suspension is opt-in, and D56 for the policy. Manual
+    /// suspension (the tab strip's suspend button,
+    /// `ui::toolbar::ToolbarCommand::SuspendTab`) is always available
+    /// regardless. Configured via `VELOX_AUTO_SUSPEND_AFTER_MS`,
+    /// `VELOX_MAX_LIVE_TABS`, `VELOX_MEMORY_BUDGET_MB` and
+    /// `VELOX_MEMORY_CHECK_INTERVAL_MS` — see [`Config::from_env_and_args`].
+    pub suspension: SuspensionPolicy,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
     /// data store and page visits are not recorded to `HistoryStore`.
@@ -183,7 +184,7 @@ impl Default for Config {
             bookmark_bar_height: 30,
             history_max_entries: 5000,
             history_panel_limit: 200,
-            auto_suspend_after: None,
+            suspension: SuspensionPolicy::default(),
             private: false,
             search_engine: SearchEngine::default(),
             perf_metrics: false,
@@ -220,6 +221,22 @@ impl Config {
     /// - `VELOX_PERF_OUTPUT` — only consulted when `VELOX_PERF_METRICS` is
     ///   set; a file path to append perf lines to instead of stderr. Unset
     ///   or empty keeps stderr.
+    /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
+    ///   has been idle this many milliseconds (Issue #63,
+    ///   `browser::suspension`). Unset, `0` or not a number leaves the
+    ///   idle signal off.
+    /// - `VELOX_MAX_LIVE_TABS` — keep at most this many tabs alive at once
+    ///   (the active tab included); the least recently used background
+    ///   tabs beyond it are suspended. Unset, `0` or not a number leaves
+    ///   the tab-count signal off.
+    /// - `VELOX_MEMORY_BUDGET_MB` — suspend least recently used background
+    ///   tabs whenever the whole process tree's memory (PSS on Linux)
+    ///   exceeds this many MiB. Unset, `0` or not a number leaves the
+    ///   memory signal off (and no memory sampling runs).
+    /// - `VELOX_MEMORY_CHECK_INTERVAL_MS` — only consulted when
+    ///   `VELOX_MEMORY_BUDGET_MB` is set; how often memory is sampled.
+    ///   Unset, `0` or not a number keeps
+    ///   [`SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`].
     /// - `VELOX_SEARCH_ENGINE` — select a built-in preset by name
     ///   (`duckduckgo`/`ddg`, `google`, `bing`, `startpage`, `ecosia`;
     ///   case-insensitive). Unset or unrecognized keeps the default
@@ -263,10 +280,19 @@ impl Config {
             std::env::var("VELOX_SEARCH_ENGINE_NAME").ok().as_deref(),
             std::env::var("VELOX_SEARCH_ENGINE_URL").ok().as_deref(),
         );
+        let suspension = resolve_suspension(
+            std::env::var("VELOX_AUTO_SUSPEND_AFTER_MS").ok().as_deref(),
+            std::env::var("VELOX_MAX_LIVE_TABS").ok().as_deref(),
+            std::env::var("VELOX_MEMORY_BUDGET_MB").ok().as_deref(),
+            std::env::var("VELOX_MEMORY_CHECK_INTERVAL_MS")
+                .ok()
+                .as_deref(),
+        );
         Self {
             homepage,
             private,
             search_engine,
+            suspension,
             perf_metrics,
             perf_rss_interval,
             perf_format,
@@ -392,6 +418,37 @@ fn resolve_perf_output(
     (format, output_path)
 }
 
+/// Pure decision logic behind [`Config::from_env_and_args`]'s
+/// `suspension` (Issue #63), factored out like [`resolve_perf_env`] so the
+/// parsing rules are unit-tested without touching the process environment.
+/// Every knob follows the same rule: unset, empty, `0`, or not a number
+/// means "off" (or "default", for the interval) — a typo in a shell
+/// profile must never produce a surprising policy, only the conservative
+/// one.
+fn resolve_suspension(
+    idle_after_ms_raw: Option<&str>,
+    max_live_tabs_raw: Option<&str>,
+    memory_budget_mb_raw: Option<&str>,
+    check_interval_ms_raw: Option<&str>,
+) -> SuspensionPolicy {
+    fn positive(raw: Option<&str>) -> Option<u64> {
+        raw.map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+    }
+    let defaults = SuspensionPolicy::default();
+    SuspensionPolicy {
+        idle_after: positive(idle_after_ms_raw).map(Duration::from_millis),
+        max_live_tabs: positive(max_live_tabs_raw)
+            .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
+        memory_budget_bytes: positive(memory_budget_mb_raw)
+            .map(|mib| mib.saturating_mul(1024 * 1024)),
+        memory_check_interval: positive(check_interval_ms_raw)
+            .map(Duration::from_millis)
+            .unwrap_or(defaults.memory_check_interval),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,7 +464,8 @@ mod tests {
         assert!(config.history_panel_limit > 0);
         // Automatic suspension must be opt-in: a fresh checkout should never
         // surprise a user by suspending a tab on its own.
-        assert_eq!(config.auto_suspend_after, None);
+        assert_eq!(config.suspension, SuspensionPolicy::default());
+        assert!(!config.suspension.is_enabled());
         assert!(!config.private);
         assert!(!config.perf_metrics);
         assert_eq!(config.perf_rss_interval, None);
@@ -715,5 +773,46 @@ mod tests {
             resolve_search_engine(Some("google"), Some("  "), Some("  ")),
             SearchEngine::google()
         );
+    }
+    // -- resolve_suspension (Issue #63) -----------------------------------
+
+    #[test]
+    fn resolve_suspension_defaults_to_everything_off() {
+        let policy = resolve_suspension(None, None, None, None);
+        assert_eq!(policy, SuspensionPolicy::default());
+        assert!(!policy.is_enabled());
+    }
+
+    #[test]
+    fn resolve_suspension_parses_each_knob_independently() {
+        let policy = resolve_suspension(Some("30000"), Some("5"), Some("700"), Some("500"));
+        assert_eq!(policy.idle_after, Some(Duration::from_secs(30)));
+        assert_eq!(policy.max_live_tabs, Some(5));
+        assert_eq!(policy.memory_budget_bytes, Some(700 * 1024 * 1024));
+        assert_eq!(policy.memory_check_interval, Duration::from_millis(500));
+        assert!(policy.is_enabled());
+
+        // One knob alone is enough to enable the policy.
+        let only_count = resolve_suspension(None, Some(" 3 "), None, None);
+        assert_eq!(only_count.max_live_tabs, Some(3));
+        assert_eq!(only_count.idle_after, None);
+        assert_eq!(only_count.memory_budget_bytes, None);
+        assert!(only_count.is_enabled());
+    }
+
+    #[test]
+    fn resolve_suspension_treats_zero_empty_and_garbage_as_off() {
+        for raw in ["0", "", "  ", "-1", "abc", "1.5"] {
+            let policy = resolve_suspension(Some(raw), Some(raw), Some(raw), Some(raw));
+            assert_eq!(policy, SuspensionPolicy::default(), "raw was {raw:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_suspension_interval_falls_back_to_default_without_a_budget() {
+        // The interval alone never enables anything.
+        let policy = resolve_suspension(None, None, None, Some("100"));
+        assert!(!policy.is_enabled());
+        assert_eq!(policy.memory_check_interval, Duration::from_millis(100));
     }
 }
