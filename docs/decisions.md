@@ -3763,3 +3763,39 @@ WebKit 側がメモリを「温める」時間が長い。タブ数に応じて�
 
 **検証コマンド・詳細な数値・`memory_sample_confidence` の境界値テストの
 一覧は `docs/benchmarking.md`「実行環境要件」の該当箇所を参照。**
+
+## D51: Windows リリースビルドは GitHub Actions (`release-windows.yml`) で行う
+
+**対象**: 「Windows だけで良いので release ビルドが欲しい」という要望。
+開発環境 (Linux/macOS) からは Windows バイナリをクロスコンパイルできない
+(wry の WebView2 バックエンドが Windows SDK/リンカを必要とする) ため、
+GitHub Actions の `windows-latest` ランナーで `cargo build --release
+--locked` を実行する専用 workflow を追加した。
+
+**判断**:
+
+- **`ci.yml` とは分離する。** Linux CI は PR ごとに走る品質ゲートで、
+  Windows のリリースビルドは「配布物を作る」という別の目的である。同居
+  させると PR のたびに Windows ビルド (数分) が走り、CI の待ち時間だけが
+  増える。
+- **起動方法は `workflow_dispatch` と `v*` タグ push の 2 つ。** 前者は
+  どのブランチからでも手動で試せる (成果物は Actions の Artifacts、30 日
+  保持)。後者はそれに加えて GitHub Release を作成し zip を添付する。
+  `main` への push では走らせない — 毎回 Release を作る必要は無い。
+- **`--locked` を付ける。** `Cargo.lock` と一致しない依存解決になった場合
+  はビルドを失敗させ、「リポジトリにあるロックファイルで再現できる
+  バイナリ」だけを配布物にする。
+- **スモークテストは「実行ファイルの存在とサイズ」のみ。** `velox` は
+  `--help` のような GUI を開かずに終了する引数を持たないので、ヘッドレス
+  なランナーで起動しても検証にならない。将来 `--version`/`--help` を
+  追加すればそれを呼ぶ形に置き換える。
+- **コード署名はしない。** 署名証明書が無いため、配布した exe は初回
+  実行時に SmartScreen の警告が出る。個人利用の範囲では許容し、必要に
+  なった時点で別途検討する。
+- **`#![windows_subsystem = "windows"]` は付けない (現状維持)。** 付けると
+  exe 起動時のコンソールウィンドウは消えるが、`eprintln!` によるエラー
+  ログ (`app.rs` の `log_failure` パターン) が見えなくなる。ログの扱いを
+  決めてから別 Issue で対応する。
+
+**成果物**: `velox-<version>-windows-x86_64.zip` (velox.exe, velox-bench.exe,
+README.md, LICENSE) と、その SHA-256 (`.zip.sha256`)。
