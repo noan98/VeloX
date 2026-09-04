@@ -558,6 +558,22 @@ impl BrowserWindow {
             .with_ipc_handler(move |request| {
                 let _ = ipc_proxy.send_event(UserEvent::ToolbarMessage(request.into_body()));
             });
+        // Downloads (docs/decisions.md D53): on WebKitGTK, wry registers a
+        // webview's download handlers on the `WebContext` it is built
+        // against, not on the webview — so with the shared `context` above
+        // they must be registered exactly once, on the first webview built
+        // against it (this toolbar), and never again on the content
+        // webviews. See `download_handler_host` for the full reasoning and
+        // for why the toolbar in particular (wry's default per-webview
+        // "accept" handler would otherwise win the `decide-destination`
+        // signal and VeloX's handler would never run).
+        let toolbar_builder =
+            match download_handler_host(config.private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
+                DownloadHandlerHost::SharedContext => {
+                    with_download_handlers(toolbar_builder, &proxy)
+                }
+                DownloadHandlerHost::EachContentWebview => toolbar_builder,
+            };
         let toolbar = attach(toolbar_builder)?;
 
         let content_blocking_enabled = config.content_blocking_enabled;
@@ -1115,9 +1131,7 @@ fn content_webview_builder<'a>(
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
-    let download_started_proxy = proxy.clone();
-    let download_completed_proxy = proxy.clone();
-    new_webview_builder(context)
+    let builder = new_webview_builder(context)
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
         // Ephemeral (non-persistent) cookies/storage/cache for the page
@@ -1186,20 +1200,112 @@ fn content_webview_builder<'a>(
         .with_new_window_req_handler(move |url, _features| {
             let _ = new_window_proxy.send_event(UserEvent::NewTabRequested(url));
             wry::NewWindowResponse::Deny
-        })
-        // Downloads (Issue #16, see docs/decisions.md D28): both handlers
-        // fire on every backend VeloX ships on (confirmed from wry 0.56.1's
-        // source — see D28). `with_download_started_handler` must decide
-        // synchronously (return `bool`) and may rewrite the destination
-        // `PathBuf` in place, so the destination resolution itself
-        // (`browser::downloads::prepare_destination`, which sanitizes the
-        // suggested file name and avoids same-name collisions) has to run
-        // right here, not after a round trip through the event loop — the
-        // same synchronous-decision-then-async-notify shape
-        // `with_navigation_handler` above already uses for content
-        // blocking. VeloX always accepts every download (`true`, matching
-        // wry's own default), so this only ever *redirects* a download,
-        // never blocks one.
+        });
+    // Downloads (Issue #16, docs/decisions.md D28 / D53): only where wry
+    // scopes download handlers to the webview itself. On WebKitGTK in
+    // non-private mode they belong to the shared `WebContext` and are
+    // registered once, on the toolbar webview in `BrowserWindow::new` —
+    // see `download_handler_host`.
+    match download_handler_host(private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
+        DownloadHandlerHost::EachContentWebview => with_download_handlers(builder, proxy),
+        DownloadHandlerHost::SharedContext => builder,
+    }
+}
+
+/// Whether wry registers a webview's download handlers on the
+/// [`WebContext`] the webview is built against rather than on the webview
+/// itself. `true` on WebKitGTK, where `with_download_started_handler` /
+/// `with_download_completed_handler` end up in
+/// `WebContext::register_download_handler` →
+/// `WebKitWebContext::connect_download_started` (wry 0.56.1,
+/// `src/webkitgtk/mod.rs` → `webkitgtk/web_context.rs`); `false` on
+/// WKWebView (a per-webview download delegate) and WebView2 (a
+/// per-controller `add_DownloadStarting`). See docs/decisions.md D53.
+const DOWNLOAD_HANDLERS_PER_CONTEXT: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+));
+
+/// Which webview(s) VeloX's download handlers are registered on — the
+/// output of [`download_handler_host`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DownloadHandlerHost {
+    /// Register once, on the first webview built against the shared
+    /// `WebContext` (the toolbar, built before any tab in
+    /// `BrowserWindow::new`), and on no content webview.
+    SharedContext,
+    /// Register on every content webview, never on the toolbar.
+    EachContentWebview,
+}
+
+/// Decide where VeloX's download handlers go (docs/decisions.md D53).
+///
+/// `per_context` is [`DOWNLOAD_HANDLERS_PER_CONTEXT`] in production (a
+/// parameter so the decision table below is unit-testable on every
+/// platform); `private` is whole-app private browsing (D14).
+///
+/// - `per_context && !private` (WebKitGTK, normal mode): the toolbar and
+///   every tab share one `WebContext` (D49), and wry appends *each*
+///   webview's handlers to that context's `download-started` signal. Two
+///   things go wrong if the handlers are attached per content webview as
+///   they are elsewhere:
+///   1. wry's `WebViewAttributes::default()` already carries a
+///      `download_started_handler: Some(|_, _| true)`, so even the toolbar
+///      webview (which registers no handler of its own) adds a
+///      `download-started` listener. `WebKitDownload::decide-destination`
+///      uses `g_signal_accumulator_true_handled`, so the *first* connected
+///      listener that returns `true` stops the rest — and since the
+///      toolbar is built first, its do-nothing default wins every time:
+///      VeloX's real handler never runs, `UserEvent::DownloadStarted` is
+///      never sent, the downloads panel stays empty, and the file lands
+///      in wry's own default directory (bypassing `VELOX_DOWNLOAD_DIR`
+///      and `downloads::prepare_destination`'s sanitizing).
+///   2. `WebKitDownload::finished` has no such accumulator, so every
+///      content webview ever built on the context — closed tabs included,
+///      nothing ever disconnects — fires `UserEvent::DownloadCompleted`
+///      once per download: N tabs, N events.
+///
+///   Registering exactly once, on the toolbar (the first webview on the
+///   shared context), makes VeloX's handler the first `decide-destination`
+///   listener and the only `finished` listener. Content webviews still
+///   add wry's default started handler each (unavoidable with wry 0.56.1's
+///   builder API), but it is never reached.
+/// - Otherwise (private mode: every webview gets its own ephemeral
+///   context per D15; or WKWebView/WebView2: per-webview delegates): the
+///   handlers must live on each content webview, exactly as before D53.
+fn download_handler_host(private: bool, per_context: bool) -> DownloadHandlerHost {
+    if per_context && !private {
+        DownloadHandlerHost::SharedContext
+    } else {
+        DownloadHandlerHost::EachContentWebview
+    }
+}
+
+/// Attach VeloX's download handlers (Issue #16, docs/decisions.md D28) to
+/// `builder`. Called from exactly one place per webview kind, chosen by
+/// [`download_handler_host`].
+///
+/// Both handlers fire on every backend VeloX ships on (confirmed from wry
+/// 0.56.1's source — see D28). `with_download_started_handler` must decide
+/// synchronously (return `bool`) and may rewrite the destination `PathBuf`
+/// in place, so the destination resolution itself
+/// (`browser::downloads::prepare_destination`, which sanitizes the
+/// suggested file name and avoids same-name collisions) has to run right
+/// here, not after a round trip through the event loop — the same
+/// synchronous-decision-then-async-notify shape the navigation handler in
+/// [`content_webview_builder`] uses for content blocking. VeloX always
+/// accepts every download (`true`, matching wry's own default), so this
+/// only ever *redirects* a download, never blocks one.
+fn with_download_handlers<'a>(
+    builder: WebViewBuilder<'a>,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> WebViewBuilder<'a> {
+    let download_started_proxy = proxy.clone();
+    let download_completed_proxy = proxy.clone();
+    builder
         .with_download_started_handler(move |url, destination| {
             let suggested_name = destination
                 .file_name()
@@ -1299,6 +1405,31 @@ impl BrowserWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_handlers_go_to_shared_context_only_on_webkitgtk_normal_mode() {
+        // WebKitGTK, normal mode: one registration on the shared context.
+        assert_eq!(
+            download_handler_host(false, true),
+            DownloadHandlerHost::SharedContext
+        );
+        // WebKitGTK, private mode: every webview has its own ephemeral
+        // context (D15), so per-webview registration is both correct and
+        // the only option.
+        assert_eq!(
+            download_handler_host(true, true),
+            DownloadHandlerHost::EachContentWebview
+        );
+        // WKWebView / WebView2: per-webview delegates, regardless of mode.
+        assert_eq!(
+            download_handler_host(false, false),
+            DownloadHandlerHost::EachContentWebview
+        );
+        assert_eq!(
+            download_handler_host(true, false),
+            DownloadHandlerHost::EachContentWebview
+        );
+    }
 
     #[test]
     fn layout_splits_toolbar_and_content() {

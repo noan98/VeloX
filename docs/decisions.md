@@ -1491,6 +1491,10 @@ still parse as valid JSON, just an older shape of it.
 
 ## D28: Downloads (#16) — wry 0.56's started/completed handlers, no progress or mid-transfer cancel
 
+> **追記 (D53)**: WebKitGTK ではこれらのハンドラは webview ではなく
+> `WebContext` 単位で登録される。D49 の共有 context では toolbar webview に
+> 1 回だけ登録する必要がある — 経緯と実測は D53 を参照。
+
 **Scope**: Issue #16 ("ダウンロード管理"): start/complete/fail events, a save
 location, progress display, cancel, a download list, opening a completed
 file, opening the downloads folder, and same-name handling.
@@ -3510,6 +3514,11 @@ PSS 超過分の大半が、実測すると VeloX 自身の実装 (wry への we
 
 ## D49: toolbar/タブ間で `WebContext` を共有 — 効果は部分的 (`NetworkProcess` は統合できたが `WebProcess` は残った)、実装は残す
 
+> **追記 (D53)**: この共有により、Linux の非プライベートモードでは
+> ダウンロードハンドラ (D28) が一度も呼ばれなくなっていた (toolbar webview
+> が持つ wry の既定ハンドラが `decide-destination` を先に処理する)。
+> 原因と修正は D53 を参照。
+
 **対象**: Issue #118 (D48/#61 が「有望だが未検証」とした仮説の実装フェーズ。
 Epic #57)。詳細な測定データ・再現手順は `docs/memory-analysis.md` §9。
 
@@ -3850,3 +3859,155 @@ README.md, LICENSE) と、その SHA-256 (`.zip.sha256`)。
 - **macOS は対象外 (現状維持)。** `.app` バンドルを作っていないので Dock
   アイコンの設定経路が無い。バンドル化 (cargo-bundle 等) を導入するときに
   `velox-256.png` から `.icns` を生成して合わせて対応する。
+
+## D53: ダウンロードハンドラは WebKitGTK では `WebContext` 単位 — 共有 context (D49) では toolbar webview に 1 回だけ登録する
+
+**対象**: Issue #127。「D49 で toolbar と全タブが 1 つの `WebContext` を
+共有するようになった結果、`content_webview_builder` が webview ごとに登録している
+`with_download_started_handler` / `with_download_completed_handler` が同じ
+`WebContext` に N 個積まれるのではないか」という調査依頼。関連: D28
+(ダウンロード)、D49 (`WebContext` 共有)、#124 / PR #125 (related view による
+`WebProcess` 共有。同じ `content_webview_builder` を触る)。
+
+### 結論 (先に要約)
+
+- **重複どころか、Linux の非プライベートモードでは VeloX のダウンロード
+  ハンドラが D49 (#118) 以降まったく呼ばれていなかった。** ダウンロードは
+  完了するが、`UserEvent::DownloadStarted` は届かず、ダウンロードパネルは
+  常に空、保存先は `VELOX_DOWNLOAD_DIR` でも `prepare_destination` の
+  サニタイズ済みパスでもなく wry の既定 (`dirs::download_dir()`、無ければ
+  **カレントディレクトリ**) だった。
+- `UserEvent::DownloadCompleted` は「これまでに作られた content webview の
+  数」だけ届く (閉じたタブの分も含む)。エントリが無いので実害は
+  `could not correlate download completion` のログが N 行出るだけだが、
+  構造としては予想どおり N 重登録になっていた。
+- プライベートモード (webview ごとに ephemeral context) では 1 回ずつ
+  正しく動いており、差は D49 の共有 context の有無そのものだった。
+- 修正: ダウンロードハンドラの登録先を `download_handler_host` で決める。
+  WebKitGTK かつ非プライベートなら **共有 context 上に最初に作られる
+  toolbar webview に 1 回だけ**、それ以外 (プライベートモード、macOS/Windows)
+  は従来どおり各 content webview。修正後は 1/3 タブ・タブクローズ後・
+  同名 2 回・プライベート 1/3 タブの全シナリオで Started/Completed が
+  各 1 回、パネル 1 件、保存先は `VELOX_DOWNLOAD_DIR`、同名 2 回目は
+  `(1)` 付きになった。
+
+### 原因 (wry 0.56.1 のソースから確認)
+
+1. **登録単位が `WebContext`。** `src/webkitgtk/mod.rs` (671 行付近) は
+   `attributes.download_started_handler` / `download_completed_handler` の
+   どちらかが `Some` なら `web_context.register_download_handler(...)` を
+   呼び、`webkitgtk/web_context.rs` の同関数は
+   `WebKitWebContext::connect_download_started` にクロージャを 1 つ
+   **追加**する (置き換えではない)。その中で各 `WebKitDownload` に
+   `decide-destination` / `failed` / `finished` を接続する。
+2. **wry の既定属性が「何もしない started ハンドラ」を持つ。**
+   `src/lib.rs` の `WebViewAttributes::default()` は
+   `download_started_handler: Some(Box::new(|_, _| true))` を設定している
+   (868 行付近)。つまり **ダウンロードハンドラを付けていない toolbar
+   webview も** `download-started` リスナを共有 context に登録する。
+   `BrowserWindow::new` は toolbar を最初に作るので、このリスナが先頭に
+   来る。
+3. **`decide-destination` は `g_signal_accumulator_true_handled`。**
+   WebKitGTK 2.52.6 `WebKitDownload.cpp` (`webkit_download_class_init`) で
+   確認。`TRUE` を返したハンドラで伝播が止まるため、先頭にいる toolbar の
+   既定ハンドラ (`|_, _| true`、保存先は wry の既定のまま) が毎回勝ち、
+   後ろに並ぶ content webview の VeloX ハンドラには順番が回らない。
+4. **`finished` にはアキュムレータが無い** (void シグナル) ので、
+   `with_download_completed_handler` を付けた content webview の数だけ
+   `DownloadCompleted` が飛ぶ。toolbar は completed ハンドラを持たない
+   (`None`) ので、その分は数に入らない。閉じたタブの分も残る — wry は
+   `WebView` の drop でシグナルを切断しない。
+
+### 実測 (このコンテナ、`xvfb-run`、WebKitGTK 2.52.6、debug ビルド)
+
+再現手順: `scripts/bench/pages/download.html` (読み込み完了時に
+`download` 属性付きリンクを 1 回クリックし `velox-test.txt` を data: URL
+からダウンロードする) を loopback で配信し、`VELOX_AUTOMATION_SCRIPT` で
+タブを開いてから `navigate` する。計測用に `app.rs` の
+`DownloadStarted`/`DownloadCompleted` 分岐と、ローカルにコピーした wry の
+`register_download_handler` に一時的な `eprintln!` を入れた (コミットして
+いない)。
+
+| シナリオ | context 上の `download-started` リスナ数 | `DownloadStarted` | `DownloadCompleted` | パネル件数 | 保存先 |
+|---|---|---|---|---|---|
+| 修正前・1 タブ | 2 (toolbar 既定 + タブ) | 0 | 1 | 0 | **cwd** (`scripts/bench/pages/velox-test.txt`) |
+| 修正前・3 タブ | 4 | 0 | 3 | 0 | cwd |
+| 修正前・3 タブ → 2 タブ閉じて 1 タブ | 4 (閉じた分も残る) | 0 | 3 | 0 | cwd |
+| 修正前・プライベート 1 / 3 タブ | 1 (ephemeral context 単位) | 1 | 1 | 1 | `VELOX_DOWNLOAD_DIR` |
+| 修正後・1 / 3 タブ / クローズ後 | 2 / 4 / 4 (wry の既定分は残る) | 1 | 1 | 1 | `VELOX_DOWNLOAD_DIR` |
+| 修正後・同名 2 回 (2 タブ) | 3 | 2 | 2 | 2 | `velox-test.txt`, `velox-test (1).txt` |
+| 修正後・プライベート 1 / 3 タブ | 1 | 1 | 1 | 1 | `VELOX_DOWNLOAD_DIR` |
+
+修正前の「cwd に保存」は wry の `dirs::download_dir()` がこのコンテナでは
+`None` (XDG user dirs 未設定) で `current_dir()` にフォールバックした結果。
+XDG が設定された通常のデスクトップなら `~/Downloads` になるが、いずれにせよ
+`VELOX_DOWNLOAD_DIR` と D28 のファイル名サニタイズ (`sanitize_filename`) を
+素通りしている点は同じで、D28 が「security-critical」とした経路が Linux
+では機能していなかった。
+
+### 修正の設計
+
+- `src/ui/window.rs` に `DOWNLOAD_HANDLERS_PER_CONTEXT` (WebKitGTK 系
+  target で `true`) と純粋関数 `download_handler_host(private, per_context)
+  -> DownloadHandlerHost { SharedContext | EachContentWebview }` を追加し、
+  決定表を単体テストで固定した。ハンドラ本体は `with_download_handlers`
+  に切り出し、呼び出し箇所は `BrowserWindow::new` の toolbar builder
+  (`SharedContext` のとき) と `content_webview_builder` (`EachContentWebview`
+  のとき) の 2 箇所だけ。
+- **なぜ toolbar なのか。** 共有 context に最初に作られる webview だから。
+  wry 0.56.1 の builder API では既定の started ハンドラを `None` に戻す手段
+  が無く、`WebContext` に直接ハンドラを登録する公開 API も無い
+  (`WebContextImpl::context` は非公開、`webkit2gtk` を直接依存に足せば
+  可能だが D6 の依存最小方針に反する)。「最初の webview に付ける」以外に
+  先頭を取る方法が無い。toolbar HTML 自身がダウンロードを起こすことは
+  無いが、ハンドラは context 単位なので toolbar に付いていることに意味上の
+  問題は無い。
+- **content webview には付けない** (共有 context のとき)。付けると
+  `finished` リスナが N 個になる (上記 4)。wry の既定 started ハンドラは
+  content webview ごとに残るが、先頭にいる VeloX のハンドラが `true` を
+  返して止めるので到達しない。1 クロージャ + シグナル接続 1 つが閉じた
+  タブの分も残るが、`EventLoopProxy` すら掴んでいない (`|_, _| true`) ので
+  リークとしては無視できる。
+- **他の案を退けた理由。** `app.rs` 側で `(url, started_at)` により重複
+  排除する案は、そもそも `DownloadStarted` が届いていない (原因 3) ので
+  解決にならない。「最初の content タブだけに付ける」案は toolbar の既定
+  ハンドラより後ろになるので同じく効かない。webview 構築順を変えて content
+  を先に作る案は D49/PR #125 の構造と z-order に手を入れることになり、
+  toolbar に付けるより広い変更になる。
+- プライベートモードと macOS/Windows は経路を一切変えていない
+  (`EachContentWebview` = 修正前と同じ呼び出し)。
+
+### テスト
+
+- 単体: `ui::window::tests::download_handlers_go_to_shared_context_only_on_webkitgtk_normal_mode`
+  (決定表 4 通り)。
+- 統合 (`tests/integration.rs`
+  `downloads_with_several_tabs_open_are_handled_exactly_once`): 3 タブで
+  `download.html` を 2 回 `navigate` し、`VELOX_DOWNLOAD_DIR` に
+  `velox-test.txt` と `velox-test (1).txt` だけができること、stderr に
+  `could not correlate download completion` が 0 行であることを確認する。
+  修正前のコードではこのテストが失敗する (ファイルが cwd = リポジトリ
+  ルートに落ち、ダウンロード先ディレクトリが空になる) ことを確認済み。
+  `launch_and_wait_with` (追加環境変数 + stderr のファイル出力) を
+  そのために足した。
+
+### 残る留保 (未計測、ソース読みのみ)
+
+- wry 0.56.1 の `register_download_handler` は `failed` フラグ
+  (`Rc<RefCell<bool>>`) を **登録 1 回につき 1 つ** 作り、`connect_failed`
+  で `true` にした後リセットしない。ソース上は「一度失敗したら、その登録
+  経由の以後の完了通知がすべて `success = false` になる」ように読める。
+  D53 で登録が 1 つに集約されたことで、その影響範囲は「タブ 1 つ」から
+  「セッション全体」に広がる。このコンテナでは途中切断するサーバを
+  用意してもダウンロードが `finished` まで到達せず (WebKit 側で失敗が
+  通知されないまま終わった) 再現できなかったため、事実確認と
+  `app.rs` 側の緩和策 (`success = false` でも保存先ファイルの存在で
+  再判定する等) は Issue #128 とする。
+- 上記の「失敗したダウンロードで `DownloadCompleted` 自体が届かない」
+  挙動 (パネルのエントリが `InProgress` のまま残る) も #128 で扱う。
+
+**Revisit condition**: wry をアップグレードしたとき。`WebViewAttributes::
+default()` の `download_started_handler` が `None` になる、あるいは
+`WebContext` にハンドラを直接登録できる API が入れば、toolbar に付ける
+迂回は不要になる。`download_handler_host` の決定表を変えるだけで済む
+構造にしてある。

@@ -808,7 +808,8 @@ layer split at the top of this document:
   suite that launches the actual `velox` binary (`CARGO_BIN_EXE_velox`) and
   observes it from the outside: does it finish starting up, do tab
   operations reach real tab-management code, does history actually get
-  persisted to disk, does the process end on its own. This is the only
+  persisted to disk, does a download from a page reach VeloX's own
+  handler exactly once (D53), does the process end on its own. This is the only
   place VeloX exercises `ui::window::BrowserWindow`, the real WebKitGTK/
   WKWebView/WebView2 engine, and `app::run`'s event loop together, end to
   end.
@@ -833,8 +834,8 @@ anything a unit test already covers (e.g. it does not re-test every
 `VELOX_AUTOMATION_SCRIPT` command or every malformed-script error path —
 `browser::automation`'s own unit tests own that), it only proves that the
 already-unit-tested pieces are actually wired together through a real
-launch. See D47 for exactly what the four integration tests each guarantee
-and, as importantly, what they do not.
+launch. See D47 (and D53 for the downloads test) for exactly what the five
+integration tests each guarantee and, as importantly, what they do not.
 
 **Environment gating**: launching `velox` needs a real display (and, on
 Linux, a D-Bus session bus — see docs/benchmarking.md's "実行環境要件" and

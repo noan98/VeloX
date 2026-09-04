@@ -177,12 +177,16 @@ wrong.
 ### 固定テストページ
 
 `scripts/bench/pages/` に、ネットワークに依存しないローカル固定ページを
-3 種類置いている (`file://` で開く)。`navigation` シナリオや将来の自動化で
+4 種類置いている (`file://` で開く)。`navigation` シナリオや将来の自動化で
 使う想定。
 
 - `minimal.html` — ほぼ空の最小ページ (ベースライン)
 - `text.html` — 200 段落のテキスト中心ページ
 - `dom_heavy.html` — 5000 個の `<div>` を持つ DOM 高負荷ページ
+- `download.html` — 読み込み完了時に `download` 属性付きリンクを 1 回
+  クリックし、data: URL から `velox-test.txt` (20 バイト) をダウンロード
+  させるページ。ベンチマーク用ではなく、ダウンロード経路の統合テスト
+  (`tests/integration.rs`) と手動再現 (docs/decisions.md D53) 用
 
 固定内容の静的 HTML なので、実行するたびに内容が変わらず、同一条件での
 比較に使える。

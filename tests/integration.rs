@@ -182,6 +182,32 @@ fn launch_and_wait(
     script_path: &Path,
     timeout: Duration,
 ) -> Launch {
+    launch_and_wait_with(
+        perf_output,
+        data_dir,
+        homepage,
+        script_path,
+        timeout,
+        &[],
+        None,
+    )
+}
+
+/// [`launch_and_wait`], plus `extra_env` (additional environment variables
+/// for the child, e.g. `VELOX_DOWNLOAD_DIR`) and, when `stderr_path` is
+/// `Some`, the child's stderr redirected to that file so a test can assert
+/// on `velox: ...` log lines afterwards. A file rather than a pipe: nothing
+/// here reads the pipe while the child runs, so a chatty WebKitGTK could
+/// otherwise fill it and block the child forever.
+fn launch_and_wait_with(
+    perf_output: &Path,
+    data_dir: &Path,
+    homepage: &str,
+    script_path: &Path,
+    timeout: Duration,
+    extra_env: &[(&str, &Path)],
+    stderr_path: Option<&Path>,
+) -> Launch {
     let velox_bin = env!("CARGO_BIN_EXE_velox");
     let mut command = Command::new(velox_bin);
     command
@@ -191,6 +217,14 @@ fn launch_and_wait(
         .env("VELOX_DATA_DIR", data_dir)
         .env("VELOX_HOMEPAGE", homepage)
         .env("VELOX_AUTOMATION_SCRIPT", script_path);
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+    if let Some(stderr_path) = stderr_path {
+        let stderr_file = fs::File::create(stderr_path)
+            .unwrap_or_else(|err| panic!("create {}: {err}", stderr_path.display()));
+        command.stderr(stderr_file);
+    }
 
     let mut child = command
         .spawn()
@@ -480,7 +514,116 @@ fn visiting_pages_persists_history_json() {
 }
 
 // ---------------------------------------------------------------------
-// 4. `quit` ends the process on its own, exit code 0.
+// 4. Downloads: one download → one panel entry, saved where VeloX says.
+// ---------------------------------------------------------------------
+
+/// Guarantees: with several tabs open on the shared `WebContext`
+/// (docs/decisions.md D49), a download started from a page reaches
+/// *VeloX's* download handler exactly once — not wry's do-nothing default
+/// handler, and not N copies of VeloX's (see D53 for the bug this pins
+/// down: before D53, on WebKitGTK, `UserEvent::DownloadStarted` never
+/// fired at all and `DownloadCompleted` fired once per content webview
+/// ever built).
+///
+/// Externally observable proof, without reaching into `DownloadStore`:
+///
+/// - The file lands in `VELOX_DOWNLOAD_DIR`, under the sanitized/
+///   collision-checked name `browser::downloads::prepare_destination`
+///   picks. Only VeloX's started handler honors that variable; wry's
+///   default would have written into `dirs::download_dir()`/the current
+///   directory instead. Two downloads of the same suggested name must
+///   therefore yield exactly `velox-test.txt` and `velox-test (1).txt`.
+/// - stderr carries no `could not correlate download completion` line:
+///   `app.rs` logs that for every `DownloadCompleted` it cannot match to an
+///   in-progress entry, which is exactly what each duplicate completion
+///   (or a completion with no preceding `DownloadStarted`) produces.
+#[test]
+fn downloads_with_several_tabs_open_are_handled_exactly_once() {
+    skip_without_gui!("downloads_with_several_tabs_open_are_handled_exactly_once");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("downloads");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let download_dir = dir.join("downloads");
+    let stderr_path = dir.join("stderr.log");
+    let homepage = fixture_url("minimal.html");
+    let download_page = fixture_url("download.html");
+
+    // Three tabs on the shared context (toolbar + 3 content webviews), then
+    // the same download twice from the active tab, with a detour through
+    // `minimal.html` in between so the second `navigate` is a real
+    // navigation and not a same-URL no-op.
+    let script = format!(
+        "open {homepage}\nwait 1000\nopen {homepage}\nwait 1000\n\
+         navigate {download_page}\nwait 2500\n\
+         navigate {homepage}\nwait 700\n\
+         navigate {download_page}\nwait 2500\nquit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(40),
+        &[("VELOX_DOWNLOAD_DIR", download_dir.as_path())],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 40s during the downloads test. \
+             stderr:\n{stderr}"
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let mut names: Vec<String> = fs::read_dir(&download_dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", download_dir.display()))
+        .map(|entry| {
+            entry
+                .expect("read dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["velox-test (1).txt".to_owned(), "velox-test.txt".to_owned()],
+        "expected exactly the two downloads, saved under VELOX_DOWNLOAD_DIR with \
+         prepare_destination's collision suffix; got {names:?}.\nstderr:\n{stderr}"
+    );
+    for name in &names {
+        let content = fs::read_to_string(download_dir.join(name)).expect("read downloaded file");
+        assert_eq!(
+            content, "velox download test\n",
+            "unexpected contents in {name}"
+        );
+    }
+
+    let uncorrelated = stderr
+        .lines()
+        .filter(|line| line.contains("could not correlate download completion"))
+        .count();
+    assert_eq!(
+        uncorrelated, 0,
+        "every DownloadCompleted must match the one DownloadStarted that preceded it — \
+         {uncorrelated} uncorrelated completion(s) means duplicate or orphaned completion \
+         events (D53).\nstderr:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 5. `quit` ends the process on its own, exit code 0.
 // ---------------------------------------------------------------------
 
 /// Guarantees: the `quit` automation command genuinely ends the process
