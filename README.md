@@ -99,6 +99,9 @@ Web engine (wry → WebKitGTK / WKWebView / WebView2)
 - `src/browser/` — engine-independent logic: URL normalization, tab state
 - `src/app.rs` — event loop wiring
 - `src/config/` — startup configuration
+- `assets/logo/` — the VeloX logo; `assets/icon/` — the app icon derived
+  from it (`velox.ico` is embedded into `velox.exe` by `build.rs`, the PNG
+  is the runtime window icon; see docs/decisions.md D52)
 
 See [docs/architecture.md](docs/architecture.md) for the full design and
 [docs/decisions.md](docs/decisions.md) for why wry was chosen over embedding
