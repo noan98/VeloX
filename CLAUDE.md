@@ -103,6 +103,12 @@ macOS (WKWebView) / Windows (WebView2) は追加のシステム依存なしで�
 CI は `.github/workflows/ci.yml` が PR と `main` push で
 fmt → clippy → test → build を Linux 上で実行します。
 
+`.github/workflows/auto-merge.yml` は、`main` 向けの open な PR のうち
+「Auto Merge 自身を除くすべてのチェックが success / skipped になった」ものを
+自動でマージします (プライベートリポジトリでは GitHub 標準の auto-merge が
+使えないための代替。docs/decisions.md D55 を参照)。自動マージさせたくない
+PR には `no-automerge` ラベルを付けるか、Draft のままにしてください。
+
 ## Rust コード品質
 
 - stable Rust を基本とし、`unsafe` は原則使用しません (使用する場合は理由を

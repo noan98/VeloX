@@ -4114,3 +4114,59 @@ Chromium 比は 20 タブで +365.0% → +246.2% と大幅に縮んだが +10% �
 `MAX_TABS_PER_WEB_PROCESS` は実機 (GPU あり、コア数の異なる環境) で再評価
 する。(3) wry が `webkit2gtk` 型を隠す API を提供したら
 `with_related_content_view` をそれに置き換える。
+
+## D55: PR の自動マージは自前の workflow (`auto-merge.yml`) で行う
+
+**対象**: 「CI が全部通ったら PR を自動でマージしたい」という要望。
+GitHub 標準の auto-merge (PR 画面の「Enable auto-merge」) はプライベート
+リポジトリの Free プランでは使えない (ブランチ保護ルールが前提で、それが
+有料機能) ため、GitHub Actions で同等の仕組みを自前で用意した。
+
+**判断**:
+
+- **判定基準は「この workflow 以外のチェックが全部 success / skipped /
+  neutral」。** PR の head commit に付いた check-runs (GitHub Actions と
+  GitHub App のチェック) と commit status (レガシー API) を両方集め、
+  Auto Merge 自身の workflow 名 / job 名だけを除外する。1 つでも未完了
+  (`status != completed` または `state == pending`) なら「待つ」、1 つでも
+  失敗 (failure / cancelled / timed_out / action_required など) なら
+  「見送る」。perf-gate の WARN 判定は job が成功終了するので、マージを
+  妨げない (FAIL は job が失敗するので妨げる)。チェックがまだ 1 つも無い
+  commit もマージしない (push 直後の一瞬をすり抜けさせないため)。
+- **起動は `workflow_run` (CI / perf-gate / release-windows の完了時) +
+  30 分ごとの `schedule` + `workflow_dispatch`。** `check_run` /
+  `check_suite` の completed イベントは Auto Merge 自身の完了でも発火して
+  無限ループになり得る (job を `if` でスキップしても skipped の check-run
+  が生まれて再発火する) ため使わない。`workflow_run` は監視対象を明示列挙
+  するので自己再帰しない。代わりに列挙漏れや、GitHub App のチェックが
+  後から完了するケースを `schedule` の定期実行で拾う。新しい workflow を
+  追加したら `workflows:` リストにも追加する (漏れても最大 30 分遅れで
+  マージされるだけで、誤マージにはならない)。
+- **`pull_request` トリガは使わない。** PR ブランチ側の workflow 定義で
+  走るうえ、PR に "Auto Merge" のチェックが並んで判定対象から除外する
+  手間が増える。Draft 解除直後などはスケジュール実行を待つ (≤ 30 分)。
+- **PR ごとの走査で、イベントの payload に依存しない。** どのトリガで
+  起動しても「`main` 向け open PR を全件見て、条件を満たすものをマージ」
+  という同じ処理をする。イベント種別ごとの分岐が無いぶん単純で、
+  `workflow_run` の payload から PR 番号を復元する不安定さも避けられる。
+- **マージ方式は merge commit (`MERGE_METHOD: merge`)。** これまでの手動
+  マージ (#123, #126, #129 など) と同じ。`--match-head-commit` で判定した
+  commit から PR が進んでいたらマージせず、次回の実行で新しい commit の
+  チェック結果を見る。マージ後はブランチを削除する。
+- **対象外にする手段は `no-automerge` ラベルと Draft。** レビューを挟みたい
+  PR は、ラベルを付けるか Draft にしておく。マージ失敗 (競合・ブランチ
+  保護など) は warning を出して他の PR の処理を続け、workflow 自体は
+  失敗させない。
+- **同時実行は `concurrency` で直列化する。** 複数 workflow がほぼ同時に
+  完了したとき、2 つの Auto Merge が同じ PR をマージしようとするのを防ぐ。
+
+**既知の制約**: `GITHUB_TOKEN` で行ったマージは、その後の `main` への
+push で他の workflow (`ci.yml` の `push: main`) を起動しない (GitHub の
+仕様: GITHUB_TOKEN が起こしたイベントは新しい workflow run を作らない)。
+PR 段階で同じ CI が通っているので実害は小さいが、必要なら repo 権限の
+PAT を `AUTO_MERGE_TOKEN` シークレットに登録すると、そちらが優先して
+使われる。
+
+**Revisit condition**: リポジトリを public にする、または有料プランで
+ブランチ保護ルール + 標準 auto-merge が使えるようになったとき。その場合は
+標準機能に置き換えて本 workflow を削除できる。
