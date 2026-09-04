@@ -845,10 +845,18 @@ impl BrowserWindow {
             .map(|(tab_id, tab)| (tab.process_group, is_loading(*tab_id)));
         let (process_group, related) = match pick_process_group(live) {
             Some(group) => {
+                // Only a tab that still *has* a webview can be related to
+                // (a suspended tab's entry keeps its stale `process_group`
+                // with `webview: None`). Matching on the group alone here
+                // used to pick such an entry first, yielding `related:
+                // None` — a fresh `WebKitWebProcess` wearing an existing
+                // group id, so every later tab "joining" that group also
+                // got its own process (found by the `VELOX_DEBUG` trace
+                // below; see docs/decisions.md D56).
                 let related = self
                     .contents
                     .values()
-                    .find(|tab| tab.process_group == group)
+                    .find(|tab| tab.process_group == group && tab.webview.is_some())
                     .and_then(|tab| tab.webview.as_ref());
                 (group, related)
             }
@@ -893,6 +901,16 @@ impl BrowserWindow {
             target_os = "netbsd",
         )))]
         let webview = Self::attach_webview(&self.window, builder)?;
+        if std::env::var_os("VELOX_DEBUG").is_some() {
+            // Which `WebKitWebProcess` group this tab landed in (D54) —
+            // the one piece of placement state nothing else surfaces, and
+            // exactly what a memory investigation (D48/D54/D56) needs to
+            // see. Same opt-in as `app.rs`'s event tracing.
+            eprintln!(
+                "velox[debug]: tab {id:?} -> process group {process_group} (related: {})",
+                related.is_some()
+            );
+        }
         self.contents.insert(
             id,
             ContentTab {
