@@ -60,6 +60,19 @@ Uses WebView2, which is preinstalled on Windows 11 (and modern Windows 10).
 cargo build
 ```
 
+#### Release build via GitHub Actions
+
+`.github/workflows/release-windows.yml` builds `velox.exe` (and
+`velox-bench.exe`) in release mode on a `windows-latest` runner:
+
+- **Manual**: Actions → "Release (Windows)" → "Run workflow". The zip is
+  attached to the run as the `velox-windows-x86_64` artifact.
+- **Tag push**: `git tag v0.1.0 && git push origin v0.1.0` additionally
+  creates a GitHub Release with the zip and its SHA-256 attached.
+
+The zip contains the two executables plus README/LICENSE. WebView2 Runtime
+must be present on the target machine (it is on Windows 11).
+
 ## Run
 
 ```sh
