@@ -3813,6 +3813,53 @@ GitHub Actions の `windows-latest` ランナーで `cargo build --release
 **成果物**: `velox-<version>-windows-x86_64.zip` (velox.exe, velox-bench.exe,
 README.md, LICENSE) と、その SHA-256 (`.zip.sha256`)。
 
+## D52: アプリアイコン — `.exe` リソースは `build.rs` で埋め込み、ウィンドウアイコンは実行時に設定
+
+**対象**: `assets/logo/VeloX.svg` として追加されたロゴをアプリのアイコンに
+する。「アイコン」は表示される場所ごとに設定経路が異なる:
+
+| 場所 | 設定経路 | 対象 OS |
+|---|---|---|
+| Explorer / タスクバー / スタートメニューの exe アイコン | exe のリソースセクション | Windows |
+| ウィンドウのタイトルバー / タスクバー / Alt+Tab | `tao::window::Icon` (`WindowBuilder::with_window_icon`) | Windows, Linux |
+| Dock / Finder | `.app` バンドルの `.icns` | macOS (バンドル化していないため未対応) |
+
+**判断**:
+
+- **元画像から派生アセットを事前生成してコミットする** (`assets/icon/`)。
+  `VeloX.svg` は実体が base64 埋め込みの 526×514 PNG なので、SVG として
+  実行時にラスタライズする価値がない。純 Python スクリプトで PNG を取り
+  出し (`scripts/icon/generate.py`)、正方形にパディングして面積平均で縮小し、`velox.ico` (256/128/64/
+  48/32/16、256 のみ PNG 圧縮エントリ、他は BMP エントリ) と
+  `velox-128.png` / `velox-256.png` を生成した。ビルド時に画像処理クレート
+  (`image` 等) を持ち込むより依存が軽く (D6)、生成物は差分レビューできる。
+  ロゴを差し替えるときは `python3 scripts/icon/generate.py` で再生成する (縮小時はアルファを
+  プリマルチプライして平均する — 透明部分の黒縁を避けるため)。
+- **exe のリソースアイコンは `build.rs` + `winresource` で埋め込む。**
+  `[target.'cfg(windows)'.build-dependencies]` に限定し、Linux/macOS では
+  `build.rs` が no-op になるため、Linux CI (`ci.yml`) のビルド時間や依存に
+  影響しない。`winresource` は `winres` の保守されているフォークで、
+  `.rc` をコンパイルするのに MSVC ツールチェーンの `rc.exe` を使う (GitHub
+  Actions の `windows-latest` に同梱)。埋め込みに失敗しても
+  `cargo:warning` を出すだけでビルドは失敗させない — アイコンは見た目の
+  問題であり、リリース workflow (D51) を止める理由にはならない。
+- **ウィンドウアイコンは実行時に `velox-128.png` をデコードして設定する。**
+  `include_bytes!` で埋め込むので実行ファイルの隣に assets ディレクトリは
+  不要。デコードには純 Rust の `png` クレートを追加した (D6 の「必要最小限」
+  の範囲内: 依存は `png` とその圧縮ライブラリのみで、システムライブラリを
+  要求しない)。生の RGBA バイト列をコミットする案も検討したが、画像として
+  プレビューも差分確認もできず保守性が悪いので退けた。128px にしたのは
+  各 OS がタイトルバー / タスクバー用に縮小しかしないため (256px にしても
+  バイナリが 15KB 増えるだけで見た目は変わらない)。
+- **デコード失敗はログして続行する。** `load_window_icon` は `Option<Icon>`
+  を返し、失敗時は stderr に出して `None` を渡す (`app.rs` の `log_failure`
+  パターンと同じ方針)。アイコンが無くてもブラウザは起動しなければならない。
+  埋め込み PNG が期待する 8-bit RGBA でデコードできることは単体テスト
+  (`embedded_window_icon_decodes`) で担保する。
+- **macOS は対象外 (現状維持)。** `.app` バンドルを作っていないので Dock
+  アイコンの設定経路が無い。バンドル化 (cargo-bundle 等) を導入するときに
+  `velox-256.png` から `.icns` を生成して合わせて対応する。
+
 ## D53: ダウンロードハンドラは WebKitGTK では `WebContext` 単位 — 共有 context (D49) では toolbar webview に 1 回だけ登録する
 
 **対象**: Issue #127。「D49 で toolbar と全タブが 1 つの `WebContext` を
@@ -3820,7 +3867,7 @@ README.md, LICENSE) と、その SHA-256 (`.zip.sha256`)。
 `with_download_started_handler` / `with_download_completed_handler` が同じ
 `WebContext` に N 個積まれるのではないか」という調査依頼。関連: D28
 (ダウンロード)、D49 (`WebContext` 共有)、#124 / PR #125 (related view による
-`WebProcess` 共有。D52 はそちらに割り当てる)。
+`WebProcess` 共有。同じ `content_webview_builder` を触る)。
 
 ### 結論 (先に要約)
 
