@@ -713,3 +713,190 @@ VeloX が現状 `wry::WebView` しか保持していない設計 (D20 の「`bro
 使えるかは未検証。WebKitGTK の related-view process pool の一般的な挙動
 (#61 §5.4 が未検証としていた点) も含め、次の Issue で検証することを
 推奨する。
+
+---
+
+## 10. `WebKitWebProcess` 共有 (`with_related_view`) の実装・計測結果 (Issue #124)
+
+§9.9 / `docs/decisions.md` D49 の Revisit condition が「次の Issue」として
+推奨していた、wry 0.56.1 の `WebViewBuilderExtUnix::with_related_view` に
+よる **タブ間の `WebKitWebProcess` 共有** を実装し、**同一セッション内で**
+before/after を計測した。結論は `docs/decisions.md` D52 に記録した。
+branch `claude/next-phase-issue-check-8xyj9u`。
+
+測定環境は §1 と同一 (同じコンテナ、WebKitGTK 2.52.6、Chromium 141、GPU
+なし)。before は `main` (`eeb609c`、D49 適用済み) のバイナリ、after は本
+Issue の変更を適用したバイナリで、どちらも同じセッションで
+`cargo build --release` した。
+
+### 10.1 実装 (3 段階で確定した)
+
+**前提の確認**: `webkit2gtk::WebView` という wry の外側の型は、wry 自身の
+`WebViewExtUnix::webview(&self) -> webkit2gtk::WebView` アクセサで既存の
+`wry::WebView` から取り出せるため、**新しい依存クレートは不要**で、
+`browser::` は引き続き `wry`/`gtk` 型を一切知らない (D20 の層分離は維持)。
+また wry は related view が指定されていると builder に `.web_context()` を
+呼ばず (`wry-0.56.1/src/webkitgtk/mod.rs` の `create_webview`)、WebKitGTK が
+related view の `WebContext` を継承するため、D49 の共有 `WebContext` と
+整合する。
+
+1. **案 A — 全タブを 1 つの `WebProcess` に乗せる**: `open_tab` で、生存中の
+   content webview を 1 つ選んで related view として渡す。toolbar は対象
+   外 (信頼境界: 特権 UI とページコンテンツを同一レンダラプロセスに
+   置かない、D18/D23)。プライベートモードも対象外 (D15: wry の
+   `.with_incognito(true)` は webview ごとに ephemeral context を作り、
+   related view を指定すると WebKitGTK が related view 側の context を
+   使ってしまうため、「private が何を分離するか」が変わってしまう)。
+   → メモリは最大 -33% だが **burst オープン時のページロードが直列化**
+   した (§10.4)。
+2. **案 B — 1 プロセスあたりのタブ数に上限 (4) を設ける**: `ContentTab` に
+   `process_group` を持たせ、空きのある最も埋まったグループに相乗り、
+   全部埋まっていれば新しいグループ (= 新しい `WebProcess`)。
+   → 上限 4 でも 4 ページの同時ロードは直列化され、`tab_switch` の
+   `page_load_ms` は依然 +380% (§10.4)。
+3. **案 C (採用) — B に加えて「読み込み中のタブがいるグループには相乗り
+   しない」**: `app.rs` が `Tabs` の `is_loading` を probe クロージャで
+   `open_tab`/`resume_tab` に渡し、グループ選択 (`pick_process_group`、
+   純粋関数・単体テスト済み) がそのグループを除外する。burst オープン
+   (前のタブがまだ読み込み中に次を開く) は従来どおり別プロセスに散って
+   並列にロードされ、定常状態 (前のタブの読み込みが済んでから次を開く)
+   だけ共有される。
+
+### 10.2 変更前後の PSS (`scripts/bench/tab_scaling.py`, 各 3 試行の中央値)
+
+`minimal.html`、`--settle-per-open-ms 300` (既定)。Chromium は対照群として
+before と案 A の計測で同時に測定した (案 C の計測では時間短縮のため VeloX
+のみ。Chromium は同セッション 2 回の計測で ±0.4% 以内だった)。
+
+| タブ数 | before PSS (MiB) | 案 A: 全共有 (MiB) | **案 C: 採用 (MiB)** | 案 C の before 比 | Chromium (MiB) | 案 C の Chromium 比 (before 比) |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1  | 409.2  | 409.6  | **409.0**  | -0.1%  | 281.2 | +45.4% (+45.5%) |
+| 5  | 787.9  | 625.1  | **655.7**  | -16.8% | 320.4 | +104.6% (+145.9%) |
+| 10 | 1277.7 | 907.2  | **989.5**  | -22.6% | 367.3 | +169.4% (+247.9%) |
+| 20 | 2165.8 | 1441.8 | **1612.3** | -25.6% | 465.8 | +246.2% (+365.0%) |
+
+trial 間のばらつき (min–max) は before 409.0–422.7 / 769.2–791.0 /
+1208.3–1278.8 / 2157.7–2199.6 MiB、案 C 408.2–409.1 / 640.3–657.1 /
+973.1–990.6 / 1559.8–1635.6 MiB で、**5 タブ以上では before の最小値より
+案 C の最大値のほうが小さい** (分布が重ならない)。
+
+**1 タブあたりの増分 (1→20 タブの平均)**: before 92.4 MiB/タブ → 案 A
+54.3 MiB/タブ → **案 C 63.3 MiB/タブ** (Chromium 9.7 MiB/タブ)。
+
+**プロセス数 (中央値、3 trial とも一致・分散ゼロ)**: 1/5/10/20 タブで
+before 4/8/13/23 → 案 A 4/4/4/4 → 案 C 4/5/6/8。案 C は
+「`velox` + `NetworkProcess` + toolbar の `WebProcess` + ⌈タブ数/4⌉ 個の
+content `WebProcess`」の計算どおり。
+
+### 10.3 プロセス内訳の直接確認 (`scripts/profile/process_breakdown.py`)
+
+`VELOX_AUTOMATION_SCRIPT` で toolbar+5 タブ (content webview 5 個) を開かせ、
+settle 6 秒後にスナップショット (案 A):
+
+| comm | before (§9.3、webview 6 個) | 案 A |
+| --- | ---: | ---: |
+| `WebKitWebProces` | 6 | **2** (toolbar 1 + 全 content タブ共有 1) |
+| `WebKitNetworkPr` | 1 | 1 |
+| `velox` | 1 | 1 |
+| 合計 PSS | 約 791 MiB (§9.2 の 5 タブ) | **518.8 MiB** |
+
+案 C では同じスクリプトで `WebKitWebProces` が **3** (toolbar 1 + content
+グループ 2: 最初の `open` は初期タブの読み込み中に実行されるため別
+グループになり、以降のタブがそこに相乗りする)。
+
+追加で確認したこと (案 C):
+
+- **クロスオリジン遷移で分裂しない**: `file://` のタブを
+  `http://127.0.0.1:8731/text.html` へ `navigate` し、さらに
+  `http://127.0.0.1:8731/dom_heavy.html` を `open` しても `WebProcess` は
+  増えない (WebKitGTK 2.52.6 のこの構成では process swap on navigation は
+  起きなかった)。
+- **タブを全部閉じてから開き直しても共有が続く**: 初期タブを含む 3 タブを
+  `close 0` ×3 で閉じ、新たに 2 タブ開いた状態で `WebProcess` は 2 個
+  (toolbar + 共有 1)。生存 webview が無いときは新グループを作り、次の
+  タブがそこに相乗りする、という設計どおり。
+- **プライベートモードは無変更**: `VELOX_PRIVATE=1` で toolbar+4 タブ
+  (webview 5 個) → `WebKitWebProcess` 5 個 + `WebKitNetworkProcess` 5 個。
+  §9.4 と同じく完全に 1:1 のままで、本変更の影響を受けていない。
+
+### 10.4 なぜ案 A/B を採用しなかったか: burst オープン時のページロード直列化
+
+`velox-bench gate` (各 8 試行、baseline = before、candidate = after ×2、
+既定閾値 warn 20% / fail 60%、D46) を `tab_switch` シナリオ (タブ 4 個を
+**待ち時間なしで連続オープン**してから切替を繰り返す) で評価した:
+
+| 案 | `page_load_ms` baseline → candidate 1 / 2 | 判定 |
+| --- | --- | --- |
+| A: 全共有 | 18.4 → 135.9 (+638.6%) / 133.1 (+623.4%) | **FAIL** |
+| B: 上限 4 のみ | 18.4 → 88.5 (+381.0%) / 98.3 (+434.5%) | **FAIL** |
+| **C: 上限 4 + 読み込み中を避ける** | 18.4 → 21.8 (+18.5%) / 21.1 (+14.7%) | **OK** |
+
+案 A の min 値でさえ 39.9ms (before の min は 10.3ms) で、1 つの
+`WebProcess` の単一メインスレッドに 5 ページの読み込みが乗ると**直列化**
+される (4 コアの環境で 5 プロセスなら並列に進む) ことが原因。
+Epic #57 のルール 4 (「メモリを過剰に解放して復帰時のページロードが遅く
+なる場合は改善とみなさない」) に照らして A/B は採用できず、C に至った。
+C の残り +15〜18% は多数決・絶対差フロアの範囲内 (D46) で、`tab_create`
+シナリオ (300ms 間隔で逐次オープン) では逆に **`page_load_ms` が
+-31.6〜-34.4%、`tab_create_ms` が -11.9%** 改善している (既存プロセスに
+ページを追加するほうが新プロセスを起こすより速い)。
+
+### 10.5 startup / page load への影響 (`velox-bench gate`、案 C)
+
+| シナリオ | 総合判定 | 主な指標 (baseline → candidate 1 / 2) |
+| --- | --- | --- |
+| `cold_startup` | **OK** | `startup_first_load_ms` 280.8 → 290.8 (+3.5%) / 285.4 (+1.6%)、`startup_toolbar_ready_ms` 281.4 → 289.4 (+2.8%) / 281.0 (-0.1%)、`page_load_ms` 16.2 → 20.1 (+24.4%) / 18.2 (+12.3%) |
+| `tab_create` | **OK** | `page_load_ms` 14.4 → 9.4 (-34.4%) / 9.8 (-31.6%)、`tab_create_ms` 2.95 → 2.6 (-11.9%) / 2.6 (-11.9%)、`startup_first_load_ms` 267.1 → 302.5 (+13.3%) / 283.3 (+6.1%) |
+| `tab_switch` | **OK** | `page_load_ms` 18.4 → 21.8 (+18.5%) / 21.1 (+14.7%)、`tab_switch_ms` 0.5 → 0.5 / 0.6、`tab_create_ms` 6.1 → 5.3 (-12.3%) / 6.8 (+11.5%) |
+
+1 タブ時 (cold_startup) は共有相手がいないため、構成・PSS ともに before と
+同一 (`pss_process_count` 4 → 4)。`page_load_ms` の +12〜24% は絶対値で
+2〜4ms、D46 の絶対差フロア未満で、trial 間ばらつき (§7) の範囲。
+
+### 10.6 T2 (Chromium 比 +10% 以内) は達成したか
+
+**達成していない。** ただし差は大幅に縮んだ: 20 タブで +365.0% → +246.2%、
+10 タブで +247.9% → +169.4%。1 タブ (toolbar + content 1 個) は共有相手が
+無いため +45% のまま — ここは D48 §5 の「toolbar 用 2 個目の webview 1 個
+分」がそのまま残っている。
+
+**残っている超過の内訳 (次の切り分けポイント)**: 案 A (全タブ 1 プロセス)
+でも 1 タブあたり **54.3 MiB** 増える。プロセスの固定費 (before との差、
+約 38 MiB/プロセス) は消えたのに、同一プロセス内のページ 1 枚あたり
+Chromium の 5.6 倍のメモリを使っている。候補は (1) GPU 無し環境での
+ページごとのソフトウェアレンダリング用バッキングストア (非表示タブ分も
+保持されている可能性 — Chromium は非表示タブの描画リソースを破棄する)、
+(2) 非表示タブの JS heap / DOM。**どちらも未検証**で、#63 (Adaptive Tab
+Suspension: 非表示タブの webview を落とす) がこの残りに効く可能性が高い。
+
+### 10.7 再現手順
+
+```sh
+S=/path/to/scratch
+cp target/release/velox $S/velox-after        # after: 本 Issue 適用後
+git stash && cargo build --release && cp target/release/velox $S/velox-before && git stash pop
+
+xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+  python3 scripts/bench/tab_scaling.py --velox $S/velox-before \
+    --chromium /opt/pw-browsers/chromium --page minimal.html \
+    --tab-counts 1,5,10,20 --trials 3 --output $S/tab-scaling-before.json
+# after も同様 (--velox $S/velox-after)
+
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+for sc in cold_startup tab_create tab_switch; do
+  xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+    target/release/velox-bench run --scenario $sc --trials 8 \
+      --velox-bin $S/velox-before --url http://127.0.0.1:8731/minimal.html \
+      --output $S/$sc-baseline.json
+  # candidate-1 / candidate-2 も同様 (--velox-bin $S/velox-after)
+  target/release/velox-bench gate --baseline $S/$sc-baseline.json \
+    --candidate $S/$sc-candidate-1.json --candidate $S/$sc-candidate-2.json
+done
+
+# プロセス内訳 (toolbar+5 タブ)
+printf 'open file://%s\nwait 300\n' $PWD/scripts/bench/pages/minimal.html > $S/tabs5.txt  # ×5
+printf 'wait 8000\nquit\n' >> $S/tabs5.txt
+VELOX_AUTOMATION_SCRIPT=$S/tabs5.txt xvfb-run -a --server-args="-screen 0 1280x900x24" \
+  dbus-run-session -- python3 scripts/profile/process_breakdown.py --settle-secs 6 \
+    --launch -- $S/velox-after --homepage file://$PWD/scripts/bench/pages/minimal.html
+```

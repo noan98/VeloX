@@ -1074,6 +1074,15 @@ fn navigate_active_tab(window: &mut BrowserWindow, state: &mut AppState, url: &s
     log_failure("navigate", window.navigate(url));
 }
 
+/// The `is_loading` probe `BrowserWindow::open_tab`/`resume_tab` take (see
+/// docs/decisions.md D52): whether tab `id`'s page is still loading, read
+/// from the `Tabs` state that `LoadStarted`/`LoadFinished` keep current, so
+/// the window never puts a new tab into a web process busy loading another
+/// tab's page. Unknown ids (never the case in practice) count as idle.
+fn loading_probe(tabs: &Tabs) -> impl Fn(TabId) -> bool + '_ {
+    move |id| tabs.get(id).is_some_and(|tab| tab.is_loading())
+}
+
 /// Open a new tab at `url` and make it active. The one path every "open a
 /// new tab" trigger funnels through — `ToolbarCommand::NewTab` (homepage),
 /// `ContentShortcut::NewTab` (homepage), `UserEvent::NewTabRequested`
@@ -1085,7 +1094,10 @@ fn open_new_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
     // latency costs no extra clock read when metrics are off (D19).
     let started = Instant::now();
     let id = state.tabs.open_at(url.to_owned(), started);
-    log_failure("open tab", window.open_tab(id, url));
+    log_failure(
+        "open tab",
+        window.open_tab(id, url, loading_probe(&state.tabs)),
+    );
     // A brand new tab's webview was just built above; only its visibility
     // needs to change, never a resume.
     activate_and_refresh(window, state, id, ActivationEffect::Switch);
@@ -1125,7 +1137,10 @@ fn reopen_closed_tab(window: &mut BrowserWindow, state: &mut AppState) {
         .get(id)
         .map(|tab| tab.current_url().to_owned())
         .unwrap_or_default();
-    log_failure("reopen tab", window.open_tab(id, &url));
+    log_failure(
+        "reopen tab",
+        window.open_tab(id, &url, loading_probe(&state.tabs)),
+    );
     activate_and_refresh(window, state, id, ActivationEffect::Switch);
     // A reopened tab builds a fresh webview at the remembered URL, so it is
     // a tab creation as far as D19's latency metric is concerned.
@@ -1302,7 +1317,11 @@ fn activate_and_refresh(
     effect: ActivationEffect,
 ) {
     let result = match effect {
-        ActivationEffect::Resume => window.resume_tab(id, state.tabs.active().current_url()),
+        ActivationEffect::Resume => window.resume_tab(
+            id,
+            state.tabs.active().current_url(),
+            loading_probe(&state.tabs),
+        ),
         ActivationEffect::Switch => window.activate_tab(id),
     };
     log_failure(

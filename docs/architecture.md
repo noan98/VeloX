@@ -57,6 +57,20 @@ widget placed in one shared `gtk::Fixed` inside the tao window; on
 macOS/Windows they are true child webviews (`build_as_child`).
 `src/ui/window.rs` hides this difference behind `BrowserWindow`.
 
+On Linux/BSD (WebKitGTK) the engine processes behind those webviews are
+shared deliberately rather than one-per-webview: in non-private mode every
+webview is built against one `WebContext` (one `WebKitNetworkProcess` for
+the whole window, docs/decisions.md D49), and content webviews are built as
+*related views* of an existing tab so that up to `MAX_TABS_PER_WEB_PROCESS`
+tabs share one `WebKitWebProcess` (D52). A new tab never joins a process
+that is still loading another tab's page — a burst of tabs opened
+back-to-back fans out over fresh processes and loads in parallel — and the
+toolbar webview is never related to content, so the chrome/content security
+boundary above is also a process boundary. Private mode keeps one process
+pair per webview (wry builds an ephemeral context per incognito webview,
+D15). `browser::Tabs` never sees any of this; `BrowserWindow::open_tab`
+only takes an `is_loading` probe from `app.rs`.
+
 ## UI ↔ engine responsibilities
 
 | Concern | Owner |
