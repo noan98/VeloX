@@ -106,7 +106,7 @@ fmt → clippy → test → build を Linux 上で実行します。
 `.github/workflows/auto-merge.yml` は、`main` 向けの open な PR のうち
 「Auto Merge 自身を除くすべてのチェックが success / skipped になった」ものを
 自動でマージします (プライベートリポジトリでは GitHub 標準の auto-merge が
-使えないための代替。docs/decisions.md D54 を参照)。自動マージさせたくない
+使えないための代替。docs/decisions.md D55 を参照)。自動マージさせたくない
 PR には `no-automerge` ラベルを付けるか、Draft のままにしてください。
 
 ## Rust コード品質

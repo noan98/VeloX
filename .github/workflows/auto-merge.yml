@@ -3,7 +3,7 @@ name: Auto Merge
 # プライベートリポジトリでは GitHub 標準の auto-merge 機能が使えないため、
 # 「この workflow 以外のすべてのチェックが成功 (success) または
 # スキップ (skipped / neutral) になった PR を自動でマージする」仕組みを
-# 自前で用意する。設計判断は docs/decisions.md D54 を参照。
+# 自前で用意する。設計判断は docs/decisions.md D55 を参照。
 #
 # 動作の流れ:
 #   1. 他の workflow (CI / perf-gate / release-windows) が完了するたびに起動
