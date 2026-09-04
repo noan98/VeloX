@@ -376,6 +376,68 @@ fn new_webview_builder(context: Option<&mut WebContext>) -> WebViewBuilder<'_> {
     }
 }
 
+/// Ask WebKitGTK to put the webview `builder` is about to create into the
+/// same `WebKitWebProcess` as `related` (docs/decisions.md D54).
+///
+/// D49's shared `WebContext` merged the per-webview `WebKitNetworkProcess`
+/// but left one `WebKitWebProcess` per webview (`docs/memory-analysis.md`
+/// §9.3): WebKitGTK only shares a web process between views that are
+/// explicitly *related*, which wry exposes as
+/// `WebViewBuilderExtUnix::with_related_view`. A content webview built
+/// after the first (a newly opened tab, a suspended tab rebuilt on resume)
+/// is therefore related to one that is already alive — which one, and
+/// whether at all, is decided by [`pick_process_group`] — so a window's
+/// tabs end up in a handful of shared `WebKitWebProcess`es instead of one
+/// each.
+///
+/// The toolbar is deliberately *never* passed here: it is VeloX's trusted
+/// UI (docs/decisions.md D18/D23 draw the IPC trust boundary around it),
+/// and sharing a renderer process with page content would put untrusted
+/// pages on the same side of that boundary as the toolbar's own DOM.
+///
+/// `webkit2gtk::WebView` (the type `with_related_view` wants) is obtained
+/// from wry's own `WebViewExtUnix::webview` accessor on the existing
+/// `wry::WebView`, so no new dependency crate is needed and nothing outside
+/// this function ever names a WebKitGTK type — the layering rule in D20
+/// (`browser::` never sees `wry`/`gtk`) is untouched, and `src/ui/` already
+/// depends on the platform backend.
+///
+/// On every other platform this is the identity: wry has no equivalent
+/// there (WKWebView shares its content process pool per
+/// `WKProcessPool`/configuration automatically, WebView2 per environment),
+/// and D48/D49 measured this problem on WebKitGTK only.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+))]
+fn with_related_content_view<'a>(
+    builder: WebViewBuilder<'a>,
+    related: Option<&WebView>,
+) -> WebViewBuilder<'a> {
+    use wry::{WebViewBuilderExtUnix, WebViewExtUnix};
+    match related {
+        Some(related) => builder.with_related_view(related.webview()),
+        None => builder,
+    }
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+)))]
+fn with_related_content_view<'a>(
+    builder: WebViewBuilder<'a>,
+    _related: Option<&WebView>,
+) -> WebViewBuilder<'a> {
+    builder
+}
+
 /// One tab's content webview.
 struct ContentTab {
     /// The tab's webview.
@@ -386,6 +448,61 @@ struct ContentTab {
     /// `browser::Tabs`, outside this struct) is enough to rebuild it on
     /// reactivation via [`BrowserWindow::resume_tab`].
     webview: Option<WebView>,
+    /// Which `WebKitWebProcess` this tab's webview lives in, as an opaque
+    /// id handed out by [`BrowserWindow::next_process_group`] (docs/
+    /// decisions.md D54). Tabs built with `related` pointing at a tab in
+    /// group `g` join group `g`; a tab built with no related view starts a
+    /// new group. Only meaningful on WebKitGTK (elsewhere the id is
+    /// assigned but never influences anything) and only while `webview`
+    /// is `Some` — a suspended tab has left its process, so it does not
+    /// count towards the group's size.
+    process_group: u64,
+}
+
+/// Upper bound on how many content webviews are put into one
+/// `WebKitWebProcess` (docs/decisions.md D54).
+///
+/// Sharing *every* tab through one process (the first cut of D54) cut PSS
+/// by up to a third at 20 tabs, but a web process has a single main
+/// thread: opening several tabs back-to-back (`velox-bench`'s `tab_switch`
+/// scenario opens 4 at once) serialized their page loads, `page_load_ms`
+/// going from 18ms to 136ms (median) — a regression Epic #57's rule 4
+/// ("memory savings that slow loading are not an improvement") does not
+/// allow. The fix is two-fold: [`pick_process_group`] never puts a tab
+/// into a process that is still loading another tab's page (that alone
+/// brought `tab_switch` back to +15〜18%), and this cap bounds how much a
+/// single renderer crash or main-thread stall can take down — 20 tabs
+/// collapse into 5 processes instead of 20. The value is a tuning knob,
+/// not a measured optimum: it matches the core count of the fixed
+/// benchmark environment (`docs/performance-targets.md` §1).
+const MAX_TABS_PER_WEB_PROCESS: usize = 4;
+
+/// Pick the process group a new tab should join, given `(group, loading)`
+/// for every tab that currently has a live webview: the fullest group that
+/// still has room under [`MAX_TABS_PER_WEB_PROCESS`] *and* has no tab
+/// currently loading a page (so processes fill up before a new one is
+/// started, but a burst of tabs opened back-to-back — each still loading
+/// when the next one is opened — fans out over fresh processes and loads
+/// in parallel, exactly as it did before D54). `None` when no such group
+/// exists, meaning the tab should start a fresh process/group.
+///
+/// Pure so it can be unit-tested without a display; the caller maps the
+/// chosen group back to one of its live webviews.
+fn pick_process_group(live_tabs: impl IntoIterator<Item = (u64, bool)>) -> Option<u64> {
+    // (size, has a loading tab) per group.
+    let mut groups: HashMap<u64, (usize, bool)> = HashMap::new();
+    for (group, loading) in live_tabs {
+        let entry = groups.entry(group).or_insert((0, false));
+        entry.0 += 1;
+        entry.1 |= loading;
+    }
+    groups
+        .into_iter()
+        .filter(|(_, (size, busy))| *size < MAX_TABS_PER_WEB_PROCESS && !busy)
+        // Ties broken by the lower group id so the choice is deterministic
+        // regardless of `HashMap` iteration order.
+        .max_by_key(|(group, (size, _))| (*size, std::cmp::Reverse(*group)))
+        .map(|(group, _)| group)
 }
 
 /// The main browser window: the toolbar webview and one content webview per
@@ -423,6 +540,9 @@ pub struct BrowserWindow {
     proxy: EventLoopProxy<UserEvent>,
     contents: HashMap<TabId, ContentTab>,
     active: Option<TabId>,
+    /// Next unused [`ContentTab::process_group`] id (docs/decisions.md
+    /// D54). Only ever incremented; group ids are never reused.
+    next_process_group: u64,
     /// The `WebContext` shared by the toolbar and every tab's content
     /// webview (see docs/decisions.md D49). `Some` only in non-private mode:
     /// `wry`'s WebKitGTK backend ignores any custom context passed via
@@ -585,6 +705,10 @@ impl BrowserWindow {
             WebviewIsolation {
                 private: config.private,
                 context: context.as_mut(),
+                // The first content webview: nothing to relate to yet. It
+                // starts process group 0, the first group later tabs can
+                // join (D54).
+                related: None,
             },
             Arc::clone(&blocklist),
             content_blocking_enabled,
@@ -596,6 +720,7 @@ impl BrowserWindow {
             initial_tab,
             ContentTab {
                 webview: Some(content),
+                process_group: 0,
             },
         );
 
@@ -618,6 +743,7 @@ impl BrowserWindow {
             proxy,
             contents,
             active: Some(initial_tab),
+            next_process_group: 1,
             context,
             private: config.private,
             blocklist,
@@ -663,8 +789,45 @@ impl BrowserWindow {
     /// `id`. The new webview starts hidden; the caller (`app.rs`) always
     /// follows up with [`Self::activate_tab`], since a newly opened tab is
     /// also the newly active one.
-    pub fn open_tab(&mut self, id: TabId, url: &str) -> wry::Result<()> {
+    ///
+    /// `is_loading` answers, for an already-open tab, whether its page is
+    /// still loading (`browser::Tab::is_loading`, owned by `app.rs`'s
+    /// `Tabs`, which is why it is passed in rather than looked up here):
+    /// this tab's webview is not put into a `WebKitWebProcess` that is busy
+    /// loading another tab's page — see [`pick_process_group`] and
+    /// docs/decisions.md D54.
+    pub fn open_tab(
+        &mut self,
+        id: TabId,
+        url: &str,
+        is_loading: impl Fn(TabId) -> bool,
+    ) -> wry::Result<()> {
         let (_, content_rect) = self.layout();
+        // Which `WebKitWebProcess` to put this tab in (D54): join the
+        // fullest idle group that still has room, through any live webview
+        // of that group (they are all in the same process, so which one
+        // does not matter); otherwise start a new group, which makes
+        // WebKitGTK start a fresh web process for this tab.
+        let live = self
+            .contents
+            .iter()
+            .filter(|(_, tab)| tab.webview.is_some())
+            .map(|(tab_id, tab)| (tab.process_group, is_loading(*tab_id)));
+        let (process_group, related) = match pick_process_group(live) {
+            Some(group) => {
+                let related = self
+                    .contents
+                    .values()
+                    .find(|tab| tab.process_group == group)
+                    .and_then(|tab| tab.webview.as_ref());
+                (group, related)
+            }
+            None => {
+                let group = self.next_process_group;
+                self.next_process_group += 1;
+                (group, None)
+            }
+        };
         let builder = content_webview_builder(
             id,
             url,
@@ -673,6 +836,7 @@ impl BrowserWindow {
             WebviewIsolation {
                 private: self.private,
                 context: self.context.as_mut(),
+                related,
             },
             Arc::clone(&self.blocklist),
             self.content_blocking_enabled,
@@ -703,6 +867,7 @@ impl BrowserWindow {
             id,
             ContentTab {
                 webview: Some(webview),
+                process_group,
             },
         );
         Ok(())
@@ -785,8 +950,15 @@ impl BrowserWindow {
     /// tracks is the same operation as building the first one for a new
     /// tab, so there is nothing suspension-specific to do here beyond
     /// reusing that path.
-    pub fn resume_tab(&mut self, id: TabId, url: &str) -> wry::Result<()> {
-        self.open_tab(id, url)?;
+    ///
+    /// `is_loading` is passed through to [`Self::open_tab`].
+    pub fn resume_tab(
+        &mut self,
+        id: TabId,
+        url: &str,
+        is_loading: impl Fn(TabId) -> bool,
+    ) -> wry::Result<()> {
+        self.open_tab(id, url, is_loading)?;
         self.activate_tab(id)
     }
 
@@ -1100,6 +1272,17 @@ struct WebviewIsolation<'a> {
     /// `BrowserWindow::context`'s doc comment) rather than relying on that
     /// downstream behavior to discard a real one.
     context: Option<&'a mut WebContext>,
+    /// An already-alive content webview whose `WebKitWebProcess` this one
+    /// should join (docs/decisions.md D54, see [`with_related_content_view`]).
+    /// `None` for the very first content webview (there is nothing to join
+    /// yet) and always `None` when `private` is `true`: a private webview
+    /// goes through wry's `.with_incognito(true)` path, which builds its
+    /// own ephemeral `WebContext` per webview (D15) — relating it to
+    /// another view would make WebKitGTK take the *related* view's context
+    /// instead, silently changing what "private" isolates, so the private
+    /// process layout stays exactly as it was before D54 (see
+    /// `docs/memory-analysis.md` §9.4/§10).
+    related: Option<&'a WebView>,
 }
 
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
@@ -1125,13 +1308,19 @@ fn content_webview_builder<'a>(
     blocklist: Arc<FilterList>,
     content_blocking_enabled: bool,
 ) -> WebViewBuilder<'a> {
-    let WebviewIsolation { private, context } = isolation;
+    let WebviewIsolation {
+        private,
+        context,
+        related,
+    } = isolation;
+    // Never relate a private webview (see `WebviewIsolation::related`).
+    let related = if private { None } else { related };
     let nav_proxy = proxy.clone();
     let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
-    let builder = new_webview_builder(context)
+    let builder = with_related_content_view(new_webview_builder(context), related)
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
         // Ephemeral (non-persistent) cookies/storage/cache for the page
@@ -1405,6 +1594,44 @@ impl BrowserWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_group_starts_fresh_when_nothing_is_live() {
+        assert_eq!(pick_process_group([]), None);
+    }
+
+    #[test]
+    fn process_group_joins_the_fullest_idle_group_with_room() {
+        // Group 1 has 2 live tabs, group 0 has 1: fill group 1 first.
+        assert_eq!(
+            pick_process_group([(0, false), (1, false), (1, false)]),
+            Some(1)
+        );
+        // Ties go to the lower id, deterministically.
+        assert_eq!(pick_process_group([(3, false), (2, false)]), Some(2));
+    }
+
+    #[test]
+    fn process_group_starts_fresh_once_every_group_is_full() {
+        let full: Vec<(u64, bool)> = vec![(0, false); MAX_TABS_PER_WEB_PROCESS];
+        assert_eq!(pick_process_group(full.iter().copied()), None);
+        // A full group is skipped in favor of one with room, however small.
+        let mut mixed = full;
+        mixed.push((7, false));
+        assert_eq!(pick_process_group(mixed), Some(7));
+    }
+
+    #[test]
+    fn process_group_never_joins_a_group_that_is_still_loading() {
+        // One loading tab makes its whole group busy, however much room
+        // it has; with no other group, start fresh (parallel loads).
+        assert_eq!(pick_process_group([(0, true), (0, false)]), None);
+        // A smaller idle group beats a bigger busy one.
+        assert_eq!(
+            pick_process_group([(0, true), (0, false), (1, false)]),
+            Some(1)
+        );
+    }
 
     #[test]
     fn download_handlers_go_to_shared_context_only_on_webkitgtk_normal_mode() {

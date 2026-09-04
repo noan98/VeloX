@@ -4011,3 +4011,106 @@ default()` の `download_started_handler` が `None` になる、あるいは
 `WebContext` にハンドラを直接登録できる API が入れば、toolbar に付ける
 迂回は不要になる。`download_handler_host` の決定表を変えるだけで済む
 構造にしてある。
+
+## D54: タブ間で `WebKitWebProcess` を共有 (`with_related_view`) — 最大 4 タブ/プロセス、読み込み中のプロセスには相乗りしない
+
+**対象**: Issue #124 (D49 の Revisit condition「T2 達成には `WebKitWebProcess`
+自体の共有が必要」の実装フェーズ。Epic #57)。詳細な測定データ・再現手順は
+`docs/memory-analysis.md` §10。
+
+**背景**: D49 (#118) で `WebContext` を共有しても `WebKitNetworkProcess` しか
+統合されず、PSS の大半 (1 タブ時で 74.4%) を占める `WebKitWebProcess` は
+webview ごとに残った。WebKitGTK が web process を共有するのは明示的に
+*related* な view 同士だけで、wry 0.56.1 はこれを
+`WebViewBuilderExtUnix::with_related_view(webkit2gtk::WebView)` として公開
+している。D49 が未検証としていた 2 点 — (1) `webkit2gtk::WebView` という
+wry の外側の型を D20 の層分離を崩さずに扱えるか、(2) related-view process
+pool が実際に `WebProcess` を統合するか — を実装して確かめた。
+
+### 実装
+
+- **(1) は問題なかった**: wry 自身の `WebViewExtUnix::webview()` が既存の
+  `wry::WebView` から `webkit2gtk::WebView` を返すので、新しい依存クレート
+  は不要。WebKitGTK 型に触るのは `src/ui/window.rs` の
+  `with_related_content_view` 1 関数 (Linux/BSD 以外では恒等関数) だけで、
+  `browser::` は引き続き `wry`/`gtk` 型を知らない。
+- **(2) も成立した**: toolbar+5 タブで `WebKitWebProcess` 6 個 → 2 個
+  (toolbar 1 + content 共有 1)。
+- **toolbar は共有しない**: 特権 UI (D18/D23 の IPC 信頼境界の内側) と
+  ページコンテンツを同一レンダラプロセスに置かない。D3 の「chrome と
+  content を別 webview に分ける」セキュリティ境界がプロセス境界にもなる。
+- **プライベートモードは対象外**: wry は `.with_incognito(true)` で webview
+  ごとに ephemeral `WebContext` を作る (D15) が、related view を指定すると
+  WebKitGTK は related view 側の context を使うため、「private が何を分離
+  するか」が変わってしまう。従来どおり webview ごとに独立したプロセス
+  ペアのまま (実測で無変更を確認)。
+- **`WebContext` との整合**: wry は related view 指定時に builder へ
+  `.web_context()` を呼ばず、WebKitGTK が related view の context を継承
+  するため、D49 の共有 `WebContext` と矛盾しない。
+
+### 3 段階で確定した設計 — 「全タブ 1 プロセス」は採用しなかった
+
+| 案 | 20 タブ PSS (before 2165.8 MiB) | `tab_switch` の `page_load_ms` (before 18.4ms) | 判定 |
+| --- | ---: | ---: | --- |
+| A: 全タブを 1 つの `WebProcess` に | 1441.8 (-33.4%) | 135.9 / 133.1 (+638% / +623%) | **不採用** (gate FAIL) |
+| B: 1 プロセス最大 4 タブ | 1609.6 (-25.7%) | 88.5 / 98.3 (+381% / +435%) | **不採用** (gate FAIL) |
+| **C: B + 読み込み中のプロセスには相乗りしない** | **1612.3 (-25.6%)** | **21.8 / 21.1 (+18.5% / +14.7%)** | **採用** (gate OK) |
+
+`WebProcess` のメインスレッドは 1 本なので、タブを待ち時間なしで連続オープン
+すると (`velox-bench` の `tab_switch` シナリオ) 同一プロセスに乗った
+ページの読み込みが直列化する — 4 コア環境で別プロセスなら並列に進んでいた
+ものが、案 A では min 値ですら 10.3ms → 39.9ms。Epic #57 のルール 4
+(「メモリを過剰に解放して復帰時のページロードが遅くなる場合は改善と
+みなさない」) はこれを許さない。案 B の上限だけでは 4 ページの同時ロードが
+残るため足りず、**案 C: 「読み込み中のタブがいるプロセスには新しいタブを
+入れない」** で解決した。burst オープン (前のタブがまだ読み込み中) は従来
+どおり新しいプロセスに散り、定常状態 (前のタブの読み込みが済んでから次を
+開く) だけ共有される。逐次オープンの `tab_create` シナリオでは逆に
+`page_load_ms` が -32〜-34%、`tab_create_ms` が -12% 速くなった (既存
+プロセスにページを足すほうが新プロセスを起こすより速い)。
+
+機構: `ContentTab::process_group` (プロセスごとの不透明な id) と純粋関数
+`pick_process_group(live_tabs: (group, loading))` — 空きがあり、かつ読み込み
+中のタブを含まないグループのうち最も埋まったものを選ぶ (プロセスを埋めて
+から新しいものを作る)。無ければ新グループ = 新プロセス。読み込み状態は
+`browser::Tabs` が持つので、`app.rs` が `is_loading` probe クロージャを
+`open_tab`/`resume_tab` に渡す。`MAX_TABS_PER_WEB_PROCESS = 4` は計測
+環境のコア数に合わせた**チューニングノブであって計測で最適化した値では
+ない**。
+
+### 実測結果 (同一セッション内 before/after、`docs/memory-analysis.md` §10)
+
+- **PSS**: 1/5/10/20 タブで -0.1% / -16.8% / -22.6% / -25.6%。1 タブあたり
+  92.4 → 63.3 MiB/タブ (Chromium 9.7)。5 タブ以上では before/after の trial
+  分布が重ならない。対照群の Chromium は同時測定 2 回で ±0.4% 以内。
+- **プロセス数**: 4/8/13/23 → 4/5/6/8 (分散ゼロ)、計算どおり
+  ⌈タブ数/4⌉ 個の content `WebProcess`。
+- **回帰ゲート**: `cold_startup` / `tab_create` / `tab_switch` すべて総合
+  判定 OK (D46、各 8 試行 × candidate 2 回)。
+- **クロスオリジン遷移**: `file://` → `http://127.0.0.1` へ遷移してもプロセス
+  は分裂しない (この構成では process swap on navigation は起きなかった)。
+- **タブを全部閉じて開き直しても**共有は続く (生存 webview が無ければ新
+  グループを作り、次のタブがそこに入る)。
+- **統合テスト・単体テスト**とも通過 (`pick_process_group` に単体テスト追加)。
+
+### T2 は未達 — 残りの超過は「プロセスの固定費」ではなく「ページ 1 枚あたりのコスト」
+
+Chromium 比は 20 タブで +365.0% → +246.2% と大幅に縮んだが +10% には遠い。
+案 A (全タブ 1 プロセス) でも 1 タブあたり 54.3 MiB 増えており、プロセスの
+固定費を完全に消してもページ 1 枚あたり Chromium の 5.6 倍を使っている。
+1 タブ時 (+45%) は共有相手が無く、D48 の「toolbar 用 2 個目の webview 1 個
+分」がそのまま残る。
+
+**トレードオフ (記録)**: 1 つの `WebProcess` に最大 4 タブが乗るため、
+レンダラのクラッシュが同じプロセスの他のタブに波及する (Chromium のサイト
+分離とは逆方向)。VeloX は現状クラッシュ復旧 (#25) を持たないので、実害は
+「1 タブ分が 4 タブ分になる」に留まるが、#25/#89 で扱うときはこの共有を
+前提にすること。
+
+**Revisit condition**: (1) 残りの超過の切り分け — 候補は GPU 無し環境での
+非表示タブのソフトウェアレンダリング用バッキングストア、または非表示タブ
+の JS heap/DOM。どちらも未検証で、#63 (Adaptive Tab Suspension: 非表示
+タブの webview を落とす) が最も効く可能性が高い。(2)
+`MAX_TABS_PER_WEB_PROCESS` は実機 (GPU あり、コア数の異なる環境) で再評価
+する。(3) wry が `webkit2gtk` 型を隠す API を提供したら
+`with_related_content_view` をそれに置き換える。
