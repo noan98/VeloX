@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
-use tao::window::{Window, WindowBuilder};
+use tao::window::{Icon, Window, WindowBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
 
@@ -250,6 +250,49 @@ fn tab_shortcut_script() -> String {
     )
 }
 
+/// The VeloX logo, embedded at build time so the binary needs no asset
+/// directory next to it at runtime. 128x128 is plenty: every platform scales
+/// the window icon down (title bar / taskbar / alt-tab), never up.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icon/velox-128.png");
+
+/// Decodes [`WINDOW_ICON_PNG`] into the RGBA buffer `tao` wants for the
+/// title-bar/taskbar icon. Returns `None` (and logs to stderr) instead of
+/// failing window creation if the embedded PNG cannot be decoded: a missing
+/// icon is cosmetic and must never keep the browser from starting. See
+/// docs/decisions.md D52 for why the window icon is set here at runtime
+/// while the `.exe` resource icon is embedded by `build.rs`.
+fn load_window_icon() -> Option<Icon> {
+    match decode_window_icon() {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            eprintln!("velox: failed to load the window icon: {err}");
+            None
+        }
+    }
+}
+
+fn decode_window_icon() -> Result<Icon, Box<dyn std::error::Error>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(WINDOW_ICON_PNG));
+    // Normalize whatever the asset happens to be (palette, 16-bit, no alpha)
+    // to the 8-bit RGBA layout `Icon::from_rgba` requires.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info()?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or("icon dimensions overflow the output buffer size")?;
+    let mut buf = vec![0; size];
+    let info = reader.next_frame(&mut buf)?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "unexpected pixel format {:?}/{:?} (want 8-bit RGBA)",
+            info.color_type, info.bit_depth
+        )
+        .into());
+    }
+    buf.truncate(info.buffer_size());
+    Ok(Icon::from_rgba(buf, info.width, info.height)?)
+}
+
 /// Initialization script that resolves this page's favicon URL on demand:
 /// its `<link rel="icon">` (or the closest relative, `rel~="icon"`, which
 /// also matches `shortcut icon`/`apple-touch-icon` etc.) if the page
@@ -436,6 +479,7 @@ impl BrowserWindow {
                 config.window_width,
                 config.window_height,
             ))
+            .with_window_icon(load_window_icon())
             .build(event_loop)?;
 
         // On Linux/BSD, tao windows are gtk windows and wry webviews are gtk
@@ -1410,5 +1454,14 @@ mod tests {
     fn favicon_script_falls_back_to_a_same_origin_guess() {
         assert!(RESOLVE_FAVICON_SCRIPT.contains("link[rel~=\"icon\"]"));
         assert!(RESOLVE_FAVICON_SCRIPT.contains("/favicon.ico"));
+    }
+
+    /// The embedded logo must stay decodable into the 8-bit RGBA layout the
+    /// window icon needs; a regenerated asset in another format would
+    /// otherwise only show up as a missing icon at runtime.
+    #[test]
+    fn embedded_window_icon_decodes() {
+        let icon = decode_window_icon();
+        assert!(icon.is_ok(), "{:?}", icon.err());
     }
 }
