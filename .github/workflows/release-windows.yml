@@ -16,6 +16,12 @@ on:
   push:
     tags:
       - "v*"
+  # この workflow 自身を変更する PR では実際にビルドして検証する
+  # (workflow_dispatch は main にマージされるまで Actions タブに現れない
+  # ため、PR の段階では手動実行できない)。それ以外の PR では走らない。
+  pull_request:
+    paths:
+      - ".github/workflows/release-windows.yml"
 
 env:
   CARGO_TERM_COLOR: always

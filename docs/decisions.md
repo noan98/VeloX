@@ -3782,6 +3782,10 @@ GitHub Actions の `windows-latest` ランナーで `cargo build --release
   どのブランチからでも手動で試せる (成果物は Actions の Artifacts、30 日
   保持)。後者はそれに加えて GitHub Release を作成し zip を添付する。
   `main` への push では走らせない — 毎回 Release を作る必要は無い。
+  例外として、この workflow ファイル自身を変更する PR では走らせる
+  (`pull_request` + `paths` フィルタ)。`workflow_dispatch` は `main` に
+  マージされるまで Actions タブに現れず手動実行できないため、これが無いと
+  workflow の変更をマージ前に検証する手段が無い。
 - **`--locked` を付ける。** `Cargo.lock` と一致しない依存解決になった場合
   はビルドを失敗させ、「リポジトリにあるロックファイルで再現できる
   バイナリ」だけを配布物にする。
