@@ -721,7 +721,7 @@ VeloX が現状 `wry::WebView` しか保持していない設計 (D20 の「`bro
 §9.9 / `docs/decisions.md` D49 の Revisit condition が「次の Issue」として
 推奨していた、wry 0.56.1 の `WebViewBuilderExtUnix::with_related_view` に
 よる **タブ間の `WebKitWebProcess` 共有** を実装し、**同一セッション内で**
-before/after を計測した。結論は `docs/decisions.md` D53 に記録した。
+before/after を計測した。結論は `docs/decisions.md` D54 に記録した。
 branch `claude/next-phase-issue-check-8xyj9u`。
 
 測定環境は §1 と同一 (同じコンテナ、WebKitGTK 2.52.6、Chromium 141、GPU
