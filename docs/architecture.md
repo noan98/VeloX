@@ -62,7 +62,7 @@ shared deliberately rather than one-per-webview: in non-private mode every
 webview is built against one `WebContext` (one `WebKitNetworkProcess` for
 the whole window, docs/decisions.md D49), and content webviews are built as
 *related views* of an existing tab so that up to `MAX_TABS_PER_WEB_PROCESS`
-tabs share one `WebKitWebProcess` (D52). A new tab never joins a process
+tabs share one `WebKitWebProcess` (D53). A new tab never joins a process
 that is still loading another tab's page — a burst of tabs opened
 back-to-back fans out over fresh processes and loads in parallel — and the
 toolbar webview is never related to content, so the chrome/content security

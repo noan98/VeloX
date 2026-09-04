@@ -1075,7 +1075,7 @@ fn navigate_active_tab(window: &mut BrowserWindow, state: &mut AppState, url: &s
 }
 
 /// The `is_loading` probe `BrowserWindow::open_tab`/`resume_tab` take (see
-/// docs/decisions.md D52): whether tab `id`'s page is still loading, read
+/// docs/decisions.md D53): whether tab `id`'s page is still loading, read
 /// from the `Tabs` state that `LoadStarted`/`LoadFinished` keep current, so
 /// the window never puts a new tab into a web process busy loading another
 /// tab's page. Unknown ids (never the case in practice) count as idle.

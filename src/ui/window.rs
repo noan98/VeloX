@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
-use tao::window::{Window, WindowBuilder};
+use tao::window::{Icon, Window, WindowBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
 use wry::{PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
 
@@ -250,6 +250,49 @@ fn tab_shortcut_script() -> String {
     )
 }
 
+/// The VeloX logo, embedded at build time so the binary needs no asset
+/// directory next to it at runtime. 128x128 is plenty: every platform scales
+/// the window icon down (title bar / taskbar / alt-tab), never up.
+const WINDOW_ICON_PNG: &[u8] = include_bytes!("../../assets/icon/velox-128.png");
+
+/// Decodes [`WINDOW_ICON_PNG`] into the RGBA buffer `tao` wants for the
+/// title-bar/taskbar icon. Returns `None` (and logs to stderr) instead of
+/// failing window creation if the embedded PNG cannot be decoded: a missing
+/// icon is cosmetic and must never keep the browser from starting. See
+/// docs/decisions.md D52 for why the window icon is set here at runtime
+/// while the `.exe` resource icon is embedded by `build.rs`.
+fn load_window_icon() -> Option<Icon> {
+    match decode_window_icon() {
+        Ok(icon) => Some(icon),
+        Err(err) => {
+            eprintln!("velox: failed to load the window icon: {err}");
+            None
+        }
+    }
+}
+
+fn decode_window_icon() -> Result<Icon, Box<dyn std::error::Error>> {
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(WINDOW_ICON_PNG));
+    // Normalize whatever the asset happens to be (palette, 16-bit, no alpha)
+    // to the 8-bit RGBA layout `Icon::from_rgba` requires.
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    let mut reader = decoder.read_info()?;
+    let size = reader
+        .output_buffer_size()
+        .ok_or("icon dimensions overflow the output buffer size")?;
+    let mut buf = vec![0; size];
+    let info = reader.next_frame(&mut buf)?;
+    if info.color_type != png::ColorType::Rgba || info.bit_depth != png::BitDepth::Eight {
+        return Err(format!(
+            "unexpected pixel format {:?}/{:?} (want 8-bit RGBA)",
+            info.color_type, info.bit_depth
+        )
+        .into());
+    }
+    buf.truncate(info.buffer_size());
+    Ok(Icon::from_rgba(buf, info.width, info.height)?)
+}
+
 /// Initialization script that resolves this page's favicon URL on demand:
 /// its `<link rel="icon">` (or the closest relative, `rel~="icon"`, which
 /// also matches `shortcut icon`/`apple-touch-icon` etc.) if the page
@@ -334,7 +377,7 @@ fn new_webview_builder(context: Option<&mut WebContext>) -> WebViewBuilder<'_> {
 }
 
 /// Ask WebKitGTK to put the webview `builder` is about to create into the
-/// same `WebKitWebProcess` as `related` (docs/decisions.md D52).
+/// same `WebKitWebProcess` as `related` (docs/decisions.md D53).
 ///
 /// D49's shared `WebContext` merged the per-webview `WebKitNetworkProcess`
 /// but left one `WebKitWebProcess` per webview (`docs/memory-analysis.md`
@@ -407,7 +450,7 @@ struct ContentTab {
     webview: Option<WebView>,
     /// Which `WebKitWebProcess` this tab's webview lives in, as an opaque
     /// id handed out by [`BrowserWindow::next_process_group`] (docs/
-    /// decisions.md D52). Tabs built with `related` pointing at a tab in
+    /// decisions.md D53). Tabs built with `related` pointing at a tab in
     /// group `g` join group `g`; a tab built with no related view starts a
     /// new group. Only meaningful on WebKitGTK (elsewhere the id is
     /// assigned but never influences anything) and only while `webview`
@@ -417,9 +460,9 @@ struct ContentTab {
 }
 
 /// Upper bound on how many content webviews are put into one
-/// `WebKitWebProcess` (docs/decisions.md D52).
+/// `WebKitWebProcess` (docs/decisions.md D53).
 ///
-/// Sharing *every* tab through one process (the first cut of D52) cut PSS
+/// Sharing *every* tab through one process (the first cut of D53) cut PSS
 /// by up to a third at 20 tabs, but a web process has a single main
 /// thread: opening several tabs back-to-back (`velox-bench`'s `tab_switch`
 /// scenario opens 4 at once) serialized their page loads, `page_load_ms`
@@ -440,7 +483,7 @@ const MAX_TABS_PER_WEB_PROCESS: usize = 4;
 /// currently loading a page (so processes fill up before a new one is
 /// started, but a burst of tabs opened back-to-back — each still loading
 /// when the next one is opened — fans out over fresh processes and loads
-/// in parallel, exactly as it did before D52). `None` when no such group
+/// in parallel, exactly as it did before D53). `None` when no such group
 /// exists, meaning the tab should start a fresh process/group.
 ///
 /// Pure so it can be unit-tested without a display; the caller maps the
@@ -498,7 +541,7 @@ pub struct BrowserWindow {
     contents: HashMap<TabId, ContentTab>,
     active: Option<TabId>,
     /// Next unused [`ContentTab::process_group`] id (docs/decisions.md
-    /// D52). Only ever incremented; group ids are never reused.
+    /// D53). Only ever incremented; group ids are never reused.
     next_process_group: u64,
     /// The `WebContext` shared by the toolbar and every tab's content
     /// webview (see docs/decisions.md D49). `Some` only in non-private mode:
@@ -556,6 +599,7 @@ impl BrowserWindow {
                 config.window_width,
                 config.window_height,
             ))
+            .with_window_icon(load_window_icon())
             .build(event_loop)?;
 
         // On Linux/BSD, tao windows are gtk windows and wry webviews are gtk
@@ -647,7 +691,7 @@ impl BrowserWindow {
                 context: context.as_mut(),
                 // The first content webview: nothing to relate to yet. It
                 // starts process group 0, the first group later tabs can
-                // join (D52).
+                // join (D53).
                 related: None,
             },
             Arc::clone(&blocklist),
@@ -735,7 +779,7 @@ impl BrowserWindow {
     /// `Tabs`, which is why it is passed in rather than looked up here):
     /// this tab's webview is not put into a `WebKitWebProcess` that is busy
     /// loading another tab's page — see [`pick_process_group`] and
-    /// docs/decisions.md D52.
+    /// docs/decisions.md D53.
     pub fn open_tab(
         &mut self,
         id: TabId,
@@ -743,7 +787,7 @@ impl BrowserWindow {
         is_loading: impl Fn(TabId) -> bool,
     ) -> wry::Result<()> {
         let (_, content_rect) = self.layout();
-        // Which `WebKitWebProcess` to put this tab in (D52): join the
+        // Which `WebKitWebProcess` to put this tab in (D53): join the
         // fullest idle group that still has room, through any live webview
         // of that group (they are all in the same process, so which one
         // does not matter); otherwise start a new group, which makes
@@ -1213,14 +1257,14 @@ struct WebviewIsolation<'a> {
     /// downstream behavior to discard a real one.
     context: Option<&'a mut WebContext>,
     /// An already-alive content webview whose `WebKitWebProcess` this one
-    /// should join (docs/decisions.md D52, see [`with_related_content_view`]).
+    /// should join (docs/decisions.md D53, see [`with_related_content_view`]).
     /// `None` for the very first content webview (there is nothing to join
     /// yet) and always `None` when `private` is `true`: a private webview
     /// goes through wry's `.with_incognito(true)` path, which builds its
     /// own ephemeral `WebContext` per webview (D15) — relating it to
     /// another view would make WebKitGTK take the *related* view's context
     /// instead, silently changing what "private" isolates, so the private
-    /// process layout stays exactly as it was before D52 (see
+    /// process layout stays exactly as it was before D53 (see
     /// `docs/memory-analysis.md` §9.4/§10).
     related: Option<&'a WebView>,
 }
@@ -1637,5 +1681,14 @@ mod tests {
     fn favicon_script_falls_back_to_a_same_origin_guess() {
         assert!(RESOLVE_FAVICON_SCRIPT.contains("link[rel~=\"icon\"]"));
         assert!(RESOLVE_FAVICON_SCRIPT.contains("/favicon.ico"));
+    }
+
+    /// The embedded logo must stay decodable into the 8-bit RGBA layout the
+    /// window icon needs; a regenerated asset in another format would
+    /// otherwise only show up as a missing icon at runtime.
+    #[test]
+    fn embedded_window_icon_decodes() {
+        let icon = decode_window_icon();
+        assert!(icon.is_ok(), "{:?}", icon.err());
     }
 }
