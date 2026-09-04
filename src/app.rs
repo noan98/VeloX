@@ -606,10 +606,12 @@ fn sweep_tabs(
         return None;
     }
     let memory = state.pending_memory_sample.take();
-    let candidates = state
-        .tabs
-        .suspension_candidates(now, |id| window.is_playing_audio(id));
-    let planned = suspension::plan(policy, &candidates, state.tabs.live_tab_count(), memory);
+    let candidates = state.tabs.suspension_candidates(
+        now,
+        |id| window.is_playing_audio(id),
+        |id| window.process_group_of(id),
+    );
+    let planned = suspension::plan(policy, &candidates, memory);
     if !planned.is_empty() {
         for (id, reason) in planned {
             if suspend_tab(window, state, id) {

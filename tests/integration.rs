@@ -714,6 +714,12 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     let page_b = fixture_url("dom_heavy.html");
 
     // Tab strip after each step (cap = 2 live tabs):
+    //   wait                   home finishes loading first, so every tab
+    //                          below joins home's web process (D54 never
+    //                          joins a process with a loading tab): one
+    //                          group, pinned by the active tab, so the
+    //                          policy's reclaim order is plain per-tab
+    //                          LRU here (docs/decisions.md D56).
     //   [home]                 home active, 1 live
     //   open a -> [home, a]    a active, 2 live — at the cap, nothing to do
     //   open b -> [home, a, b] b active, 3 live -> `home` (idle longest)
@@ -724,7 +730,8 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     //                          now 3 live again -> `a` (idle longest of the
     //                          background tabs) is suspended.
     let script = format!(
-        "open {page_a}\n\
+        "wait 800\n\
+         open {page_a}\n\
          wait 600\n\
          open {page_b}\n\
          wait 800\n\

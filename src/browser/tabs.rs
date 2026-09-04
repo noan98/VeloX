@@ -373,30 +373,32 @@ impl Tabs {
             .count()
     }
 
-    /// Every background tab as a suspension [`Candidate`] for
-    /// [`super::suspension::plan`] (Issue #63): its idle time as of `now`,
-    /// whether it is still loading, and whether the caller wants it
-    /// protected (`protect(id)` — e.g. it is playing audio, which only the
-    /// engine side can know). The active tab and already-suspended tabs
-    /// are never candidates, by the module invariant (only a `Background`
-    /// tab can be one), so no separate check is needed here.
+    /// Every live (not suspended) tab as a suspension [`Candidate`] for
+    /// [`super::suspension::plan`] (Issue #63): whether it is the active
+    /// tab, its idle time as of `now`, whether it is still loading, and
+    /// what the caller knows from the engine side — `protect(id)` (e.g. it
+    /// is playing audio) and `process_group(id)` (which web process its
+    /// webview is in, D54) — neither of which `Tabs` can know itself.
+    /// Suspended tabs are never candidates.
     ///
     /// Pure and clock-injected like [`Self::idle_background_tabs`]; the
-    /// returned order is display order (the policy sorts by idle time
-    /// itself).
+    /// returned order is display order (the policy orders by itself).
     pub fn suspension_candidates(
         &self,
         now: Instant,
         protect: impl Fn(TabId) -> bool,
+        process_group: impl Fn(TabId) -> Option<u64>,
     ) -> Vec<Candidate> {
         self.tabs
             .iter()
-            .filter(|tab| tab.state() == TabState::Background)
+            .filter(|tab| tab.state() != TabState::Suspended)
             .map(|tab| Candidate {
                 id: tab.id(),
+                active: tab.state() != TabState::Background,
                 idle: tab.idle_for(now),
                 loading: tab.is_loading(),
                 protected: protect(tab.id()),
+                process_group: process_group(tab.id()),
             })
             .collect()
     }
@@ -1128,7 +1130,7 @@ mod tests {
     }
 
     #[test]
-    fn suspension_candidates_are_the_background_tabs_with_their_idle_and_flags() {
+    fn suspension_candidates_are_the_live_tabs_with_their_idle_and_flags() {
         let t0 = Instant::now();
         let mut tabs = Tabs::new("https://a.example/");
         let a = tabs.active_id();
@@ -1140,23 +1142,31 @@ mod tests {
             .on_load_finished("https://b.example/");
         let now = t0 + Duration::from_secs(30);
 
-        let candidates = tabs.suspension_candidates(now, |id| id == b);
-        // Display order: a, b. c is active, so never a candidate.
-        assert_eq!(candidates.len(), 2);
+        let candidates = tabs.suspension_candidates(now, |id| id == b, |id| Some(id.get() / 2));
+        // Display order: a, b, c — c is the active tab, flagged as such.
+        assert_eq!(candidates.len(), 3);
         assert_eq!(candidates[0].id, a);
+        assert!(!candidates[0].active);
         assert_eq!(candidates[0].idle, Duration::from_secs(30));
         assert!(candidates[0].loading);
         assert!(!candidates[0].protected);
+        assert_eq!(candidates[0].process_group, Some(0));
         assert_eq!(candidates[1].id, b);
+        assert!(!candidates[1].active);
         assert_eq!(candidates[1].idle, Duration::from_secs(20));
         assert!(!candidates[1].loading);
         assert!(candidates[1].protected);
-        assert!(candidates.iter().all(|candidate| candidate.id != c));
+        assert_eq!(candidates[1].process_group, Some(0));
+        assert_eq!(candidates[2].id, c);
+        assert!(candidates[2].active);
+        assert_eq!(candidates[2].process_group, Some(1));
 
         // A suspended tab drops out of the candidates.
         assert!(tabs.suspend(a));
-        let candidates = tabs.suspension_candidates(now, |_| false);
-        assert_eq!(candidates.len(), 1);
+        let candidates = tabs.suspension_candidates(now, |_| false, |_| None);
+        assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0].id, b);
+        assert_eq!(candidates[0].process_group, None);
+        assert!(candidates[1].active);
     }
 }

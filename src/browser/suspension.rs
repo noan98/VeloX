@@ -34,18 +34,29 @@
 //!   suspending it would cut the sound off, the most user-visible way a
 //!   background tab can be disrupted.
 //!
-//! **Ordering** — among eligible tabs, the least recently used (longest
-//! idle) is always suspended first, for every signal. That is the tab whose
-//! state the user is least likely to miss, and it keeps the three signals
-//! from disagreeing about *which* tabs go — they only ever disagree about
-//! *how many*.
+//! **Ordering — the unit of reclaim is a web process, not a tab.** D54
+//! packs up to four tabs into one `WebKitWebProcess`, and D56 measured
+//! that dropping a webview inside a process that keeps running reclaims
+//! only a fraction of that page's memory (the freed heap stays resident
+//! in the process; a process that hosted 15 pages over time still held
+//! 496 MiB for its 3 live tabs), whereas a process whose last webview is
+//! dropped exits and returns everything. So when the tab-count or memory
+//! signal asks for tabs to go, [`plan`] first empties whole process groups
+//! — every tab of the least recently used *group* that contains no
+//! ineligible tab (active, loading, protected) — even when that overshoots
+//! the demand, and only then falls back to individual least recently used
+//! tabs from groups it cannot empty (a partial reclaim, better than
+//! nothing). Within a group, and for the idle signal (which is per tab by
+//! definition), the least recently used tab goes first. A group's own
+//! recency is that of its most recently used tab: a group whose newest
+//! tab is older than every tab of another group goes first.
 //!
 //! This module is pure, clock-injected Rust with no UI/engine dependency
 //! (D20): it never reads a clock or `/proc` itself. [`plan`] takes a
-//! snapshot of the background tabs ([`Candidate`]), the live tab count, and
-//! an optional fresh memory sample, and returns which tabs to suspend and
-//! why ([`SuspendReason`]). Acting on that (dropping webviews, logging) is
-//! `app.rs`'s job.
+//! snapshot of every live tab ([`Candidate`], including the active one and
+//! which process group each is in) and an optional fresh memory sample,
+//! and returns which tabs to suspend and why ([`SuspendReason`]). Acting on
+//! that (dropping webviews, logging) is `app.rs`'s job.
 
 use std::time::Duration;
 
@@ -145,13 +156,20 @@ impl SuspendReason {
     }
 }
 
-/// One background, not-yet-suspended tab as [`plan`] sees it. Built by the
-/// caller from `Tabs` plus whatever the engine side knows (`protected`),
-/// so this module needs neither `Tabs` nor a webview.
+/// One live (not suspended) tab as [`plan`] sees it — the active tab
+/// included, flagged, so the policy knows which process group it pins.
+/// Built by the caller from `Tabs` plus whatever the engine side knows
+/// (`protected`, `process_group`), so this module needs neither `Tabs` nor
+/// a webview.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     pub id: TabId,
-    /// How long this tab has been in the background (`Tab::idle_for`).
+    /// Whether this is the active (visible) tab. Never suspended, and it
+    /// pins its process group: a group holding the active tab can never be
+    /// emptied.
+    pub active: bool,
+    /// How long this tab has been in the background (`Tab::idle_for`);
+    /// meaningless (and unused) when `active`.
     pub idle: Duration,
     /// Whether the tab's page is still loading (`Tab::is_loading`). Never
     /// suspended — see the module doc comment.
@@ -159,6 +177,19 @@ pub struct Candidate {
     /// Whether the caller wants this tab kept alive regardless of the
     /// signals (today: it is playing audio). Never suspended.
     pub protected: bool,
+    /// Which web process this tab's webview lives in (D54's process group
+    /// id, `BrowserWindow::process_group_of`). `None` when the caller does
+    /// not know (a platform without process groups, or a tab the window
+    /// does not track): such a tab is treated as its own, never-emptyable
+    /// group, i.e. it only ever goes through the per-tab fallback path.
+    pub process_group: Option<u64>,
+}
+
+impl Candidate {
+    /// Whether the policy may suspend this tab at all.
+    fn eligible(&self) -> bool {
+        !self.active && !self.loading && !self.protected
+    }
 }
 
 /// A fresh memory sample for [`plan`]'s memory signal: the process tree's
@@ -174,50 +205,49 @@ pub struct MemorySample {
 
 /// Decide which tabs to suspend right now.
 ///
-/// - `candidates`: every background tab that is not already suspended, in
-///   any order.
-/// - `live_tabs`: how many tabs currently have a webview — the active tab
-///   plus every candidate (suspended tabs are not counted). Passed
-///   separately rather than derived as `candidates.len() + 1` so the
-///   caller's notion of "live" (which includes loading/protected tabs
-///   this function will refuse to suspend) is the one the tab-count signal
-///   compares against.
+/// - `candidates`: every live tab (not already suspended), the active one
+///   included, in any order. Their count is what the tab-count signal
+///   compares against [`SuspensionPolicy::max_live_tabs`].
 /// - `memory`: a fresh memory sample, or `None` to skip the memory signal
 ///   this sweep (no new sample, or memory checking is off).
 ///
-/// Returns the tabs to suspend, least recently used first, each tagged
-/// with the signal that demanded it. Tabs that are loading or protected
-/// are never returned. The three signals combine as follows: every idle
-/// tab is returned (idle signal); then, if the tab-count or memory signal
-/// still wants more tabs gone *after* those idle ones are subtracted, the
-/// next least recently used eligible tabs are added, up to the larger of
-/// the two demands (they are not additive — both are estimates of "how
-/// many tabs need to go", and suspending one tab satisfies both).
+/// Returns the tabs to suspend, in the order they should be suspended,
+/// each tagged with the signal that demanded it. The active tab and tabs
+/// that are loading or protected are never returned. The signals combine
+/// as follows:
+///
+/// 1. every eligible tab idle for at least `idle_after` is returned (idle
+///    signal — per tab, by definition);
+/// 2. the tab-count and memory demands ("how many more tabs must go") are
+///    computed, the idle tabs already taken are subtracted from both, and
+///    the larger remaining demand (not the sum — suspending one tab
+///    satisfies both) is met by walking [`reclaim_order`]: whole emptyable
+///    process groups first, least recently used group first. Starting a
+///    group means taking *all* of it, so the demand may be overshot by up
+///    to a group's worth of tabs — that overshoot is the point (see the
+///    module doc comment: only an exiting process gives the memory back);
+///    tabs from groups that cannot be emptied come last, one at a time.
 pub fn plan(
     policy: &SuspensionPolicy,
     candidates: &[Candidate],
-    live_tabs: usize,
     memory: Option<MemorySample>,
 ) -> Vec<(TabId, SuspendReason)> {
     if !policy.is_enabled() {
         return Vec::new();
     }
-    // Least recently used first; a stable sort keeps the caller's order
-    // for ties (equal idle times — e.g. tabs opened in one burst).
-    let mut eligible: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|tab| !tab.loading && !tab.protected)
-        .collect();
-    eligible.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+    let live_tabs = candidates.len();
 
     let mut planned: Vec<(TabId, SuspendReason)> = Vec::new();
     if let Some(idle_after) = policy.idle_after {
-        planned.extend(
-            eligible
-                .iter()
-                .filter(|tab| tab.idle >= idle_after)
-                .map(|tab| (tab.id, SuspendReason::Idle)),
-        );
+        // Least recently used first; a stable sort keeps the caller's
+        // order for ties (equal idle times — e.g. tabs opened in one
+        // burst).
+        let mut idle: Vec<&Candidate> = candidates
+            .iter()
+            .filter(|tab| tab.eligible() && tab.idle >= idle_after)
+            .collect();
+        idle.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+        planned.extend(idle.iter().map(|tab| (tab.id, SuspendReason::Idle)));
     }
 
     let count_demand = policy
@@ -234,27 +264,85 @@ pub fn plan(
     let memory_remaining = memory_demand.saturating_sub(already);
     let extra = count_remaining.max(memory_remaining);
     if extra > 0 {
-        let taken: Vec<(TabId, SuspendReason)> = eligible
-            .iter()
-            .filter(|tab| !planned.iter().any(|(id, _)| *id == tab.id))
-            .take(extra)
-            .enumerate()
-            .map(|(i, tab)| {
-                // Attribute each extra tab to the signal that still needed
-                // it: the first `count_remaining` go to the tab-count
-                // signal, anything beyond that only the memory signal
-                // asked for.
-                let reason = if i < count_remaining {
-                    SuspendReason::TabCount
-                } else {
-                    SuspendReason::Memory
-                };
-                (tab.id, reason)
-            })
-            .collect();
-        planned.extend(taken);
+        let mut taken = 0;
+        for chunk in reclaim_order(candidates) {
+            if taken >= extra {
+                break;
+            }
+            // Attribute the whole chunk to the signal that still needed
+            // more tabs when the chunk was started: the tab-count signal
+            // while its demand is unmet, the memory signal after that. A
+            // group's overshoot is credited to the same signal as its
+            // first tab — it went for that signal's sake.
+            let reason = if taken < count_remaining {
+                SuspendReason::TabCount
+            } else {
+                SuspendReason::Memory
+            };
+            for tab in chunk {
+                if planned.iter().any(|(id, _)| *id == tab.id) {
+                    continue;
+                }
+                planned.push((tab.id, reason));
+                taken += 1;
+            }
+        }
     }
     planned
+}
+
+/// The order in which eligible tabs should be reclaimed to free the most
+/// memory soonest, as a list of chunks that must be taken whole:
+///
+/// 1. one chunk per *emptyable* process group — a group (`Some` id) whose
+///    every tab is eligible, so suspending all of them makes the process
+///    exit — least recently used group first (by its most recently used
+///    tab), each chunk's tabs least recently used first;
+/// 2. then one single-tab chunk per remaining eligible tab (a tab in a
+///    group pinned by the active/a loading/a protected tab, or with no
+///    known group), least recently used first.
+///
+/// Public for the same reason as [`plan`]: `app.rs` never calls it, but a
+/// caller that wants to explain *why* a tab went (a debug view) can.
+pub fn reclaim_order(candidates: &[Candidate]) -> Vec<Vec<&Candidate>> {
+    use std::collections::BTreeMap;
+
+    // group id -> (its tabs, whether every one of them is eligible).
+    let mut groups: BTreeMap<u64, (Vec<&Candidate>, bool)> = BTreeMap::new();
+    let mut ungrouped: Vec<&Candidate> = Vec::new();
+    for tab in candidates {
+        match tab.process_group {
+            Some(group) => {
+                let entry = groups.entry(group).or_insert((Vec::new(), true));
+                entry.0.push(tab);
+                entry.1 &= tab.eligible();
+            }
+            None => ungrouped.push(tab),
+        }
+    }
+
+    let mut emptyable: Vec<Vec<&Candidate>> = Vec::new();
+    let mut leftovers: Vec<&Candidate> = ungrouped.into_iter().filter(|t| t.eligible()).collect();
+    for (_, (mut tabs, all_eligible)) in groups {
+        if all_eligible && !tabs.is_empty() {
+            tabs.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+            emptyable.push(tabs);
+        } else {
+            leftovers.extend(tabs.into_iter().filter(|t| t.eligible()));
+        }
+    }
+    // A group's recency is its *most* recently used tab (the smallest
+    // idle, i.e. the last element after the sort above): the group whose
+    // newest tab is the oldest goes first. `BTreeMap` iteration made the
+    // input order deterministic, and the sort is stable, so ties (equal
+    // recency) resolve by ascending group id.
+    emptyable
+        .sort_by_key(|tabs| std::cmp::Reverse(tabs.last().map(|tab| tab.idle).unwrap_or_default()));
+    leftovers.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+
+    let mut order = emptyable;
+    order.extend(leftovers.into_iter().map(|tab| vec![tab]));
+    order
 }
 
 /// How many tabs' worth of memory `total` is over `budget`, rounded up —
@@ -275,13 +363,42 @@ mod tests {
 
     const MIB: u64 = 1024 * 1024;
 
+    /// A background tab in its own process group (id = tab id), so the
+    /// per-signal tests below behave exactly as a per-tab policy would:
+    /// every group is a one-tab emptyable group.
     fn tab(id: u64, idle_secs: u64) -> Candidate {
         Candidate {
             id: TabId::from(id),
+            active: false,
             idle: Duration::from_secs(idle_secs),
             loading: false,
             protected: false,
+            process_group: Some(id),
         }
+    }
+
+    /// A background tab in process group `group`.
+    fn grouped(id: u64, idle_secs: u64, group: u64) -> Candidate {
+        Candidate {
+            process_group: Some(group),
+            ..tab(id, idle_secs)
+        }
+    }
+
+    /// The active tab (never suspended; pins its group).
+    fn active(id: u64, group: u64) -> Candidate {
+        Candidate {
+            active: true,
+            ..grouped(id, 0, group)
+        }
+    }
+
+    /// `candidates` plus one active tab (id 1000, its own group), so the
+    /// live count `plan` derives is "active + these", as in `app.rs`.
+    fn with_active(candidates: &[Candidate]) -> Vec<Candidate> {
+        let mut all = candidates.to_vec();
+        all.push(active(1000, 1000));
+        all
     }
 
     fn ids(planned: &[(TabId, SuspendReason)]) -> Vec<u64> {
@@ -311,7 +428,7 @@ mod tests {
         let memory = Some(MemorySample {
             total_bytes: 10_000 * MIB,
         });
-        assert!(plan(&policy(), &candidates, 3, memory).is_empty());
+        assert!(plan(&policy(), &with_active(&candidates), memory).is_empty());
     }
 
     // -- idle signal (pre-#63 behavior) ------------------------------------
@@ -323,7 +440,7 @@ mod tests {
             ..policy()
         };
         let candidates = [tab(1, 10), tab(2, 60), tab(3, 600)];
-        let planned = plan(&policy, &candidates, 4, None);
+        let planned = plan(&policy, &with_active(&candidates), None);
         // Longest idle first; the tab under the threshold is left alone.
         assert_eq!(ids(&planned), vec![3, 2]);
         assert!(planned.iter().all(|(_, r)| *r == SuspendReason::Idle));
@@ -339,7 +456,7 @@ mod tests {
         };
         // 5 live tabs (active + 4 background): two must go.
         let candidates = [tab(1, 5), tab(2, 50), tab(3, 1), tab(4, 20)];
-        let planned = plan(&policy, &candidates, 5, None);
+        let planned = plan(&policy, &with_active(&candidates), None);
         assert_eq!(ids(&planned), vec![2, 4]);
         assert!(planned.iter().all(|(_, r)| *r == SuspendReason::TabCount));
     }
@@ -351,7 +468,7 @@ mod tests {
             ..policy()
         };
         let candidates = [tab(1, 5), tab(2, 50)];
-        assert!(plan(&policy, &candidates, 3, None).is_empty());
+        assert!(plan(&policy, &with_active(&candidates), None).is_empty());
     }
 
     #[test]
@@ -363,7 +480,10 @@ mod tests {
         let candidates = [tab(1, 5), tab(2, 50)];
         // live = active + 2 background = 3; with a floor of 1 live tab,
         // exactly the two background tabs go (never "3").
-        assert_eq!(ids(&plan(&policy, &candidates, 3, None)), vec![2, 1]);
+        assert_eq!(
+            ids(&plan(&policy, &with_active(&candidates), None)),
+            vec![2, 1]
+        );
     }
 
     // -- memory signal ---------------------------------------------------
@@ -381,18 +501,27 @@ mod tests {
             })
         };
         // Just over: one tab. 64 MiB over: still one. 65 MiB over: two.
-        assert_eq!(ids(&plan(&policy, &candidates, 6, over_by(1))), vec![5]);
-        assert_eq!(ids(&plan(&policy, &candidates, 6, over_by(64))), vec![5]);
-        assert_eq!(ids(&plan(&policy, &candidates, 6, over_by(65))), vec![5, 4]);
+        assert_eq!(
+            ids(&plan(&policy, &with_active(&candidates), over_by(1))),
+            vec![5]
+        );
+        assert_eq!(
+            ids(&plan(&policy, &with_active(&candidates), over_by(64))),
+            vec![5]
+        );
+        assert_eq!(
+            ids(&plan(&policy, &with_active(&candidates), over_by(65))),
+            vec![5, 4]
+        );
         // 200 MiB over: four tabs in one sweep.
         assert_eq!(
-            ids(&plan(&policy, &candidates, 6, over_by(200))),
+            ids(&plan(&policy, &with_active(&candidates), over_by(200))),
             vec![5, 4, 3, 2]
         );
         // Far more than there are tabs to free: everything eligible, no
         // panic.
         assert_eq!(
-            ids(&plan(&policy, &candidates, 6, over_by(100_000))),
+            ids(&plan(&policy, &with_active(&candidates), over_by(100_000))),
             vec![5, 4, 3, 2, 1]
         );
     }
@@ -406,7 +535,7 @@ mod tests {
         let candidates = [tab(1, 1), tab(2, 2)];
         for total in [0, 100 * MIB, 500 * MIB] {
             let memory = Some(MemorySample { total_bytes: total });
-            assert!(plan(&policy, &candidates, 3, memory).is_empty());
+            assert!(plan(&policy, &with_active(&candidates), memory).is_empty());
         }
     }
 
@@ -419,7 +548,7 @@ mod tests {
         let candidates = [tab(1, 1), tab(2, 2)];
         // Budget is effectively zero, but with no sample this sweep the
         // memory signal must stay quiet.
-        assert!(plan(&policy, &candidates, 3, None).is_empty());
+        assert!(plan(&policy, &with_active(&candidates), None).is_empty());
     }
 
     #[test]
@@ -461,7 +590,10 @@ mod tests {
             total_bytes: 10_000 * MIB,
         });
         // Every signal is screaming, yet only the plain tab goes.
-        assert_eq!(ids(&plan(&policy, &candidates, 4, memory)), vec![3]);
+        assert_eq!(
+            ids(&plan(&policy, &with_active(&candidates), memory)),
+            vec![3]
+        );
     }
 
     // -- combining signals -------------------------------------------------
@@ -476,7 +608,7 @@ mod tests {
         // Live = 5, limit 3 -> two must go. Tab 4 is idle anyway, so the
         // tab-count signal only needs one more (the next LRU: tab 2).
         let candidates = [tab(1, 5), tab(2, 50), tab(3, 1), tab(4, 500)];
-        let planned = plan(&policy, &candidates, 5, None);
+        let planned = plan(&policy, &with_active(&candidates), None);
         assert_eq!(
             planned,
             vec![
@@ -498,7 +630,7 @@ mod tests {
         let memory = Some(MemorySample {
             total_bytes: 650 * MIB,
         });
-        let planned = plan(&policy, &candidates, 6, memory);
+        let planned = plan(&policy, &with_active(&candidates), memory);
         assert_eq!(
             planned,
             vec![
@@ -518,7 +650,125 @@ mod tests {
         // All opened in one burst (equal idle): the caller's order wins,
         // deterministically.
         let candidates = [tab(7, 10), tab(8, 10), tab(9, 10)];
-        assert_eq!(ids(&plan(&policy, &candidates, 4, None)), vec![7, 8]);
+        assert_eq!(
+            ids(&plan(&policy, &with_active(&candidates), None)),
+            vec![7, 8]
+        );
+    }
+
+    // -- process-unit reclaim (D56) ----------------------------------------
+
+    #[test]
+    fn an_emptyable_group_is_taken_whole_even_when_it_overshoots_the_demand() {
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(5),
+            ..policy()
+        };
+        // Group 0: four background tabs. Group 1: the active tab plus one
+        // background tab (pinned). Live = 6, limit 5 -> demand 1, but the
+        // whole of group 0 goes so its process can exit.
+        let candidates = [
+            grouped(1, 40, 0),
+            grouped(2, 30, 0),
+            grouped(3, 20, 0),
+            grouped(4, 10, 0),
+            grouped(5, 50, 1),
+            active(6, 1),
+        ];
+        let planned = plan(&policy, &candidates, None);
+        assert_eq!(ids(&planned), vec![1, 2, 3, 4]);
+        // The overshoot is credited to the signal the group went for.
+        assert!(planned.iter().all(|(_, r)| *r == SuspendReason::TabCount));
+    }
+
+    #[test]
+    fn groups_go_least_recently_used_group_first_by_their_newest_tab() {
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(1),
+            ..policy()
+        };
+        // Group 0's newest tab (idle 5) is newer than group 1's newest
+        // (idle 8), even though group 0 also holds the oldest tab of all.
+        let candidates = [
+            grouped(1, 100, 0),
+            grouped(2, 5, 0),
+            grouped(3, 9, 1),
+            grouped(4, 8, 1),
+            active(9, 7),
+        ];
+        let planned = plan(&policy, &candidates, None);
+        assert_eq!(ids(&planned), vec![3, 4, 1, 2]);
+    }
+
+    #[test]
+    fn a_group_pinned_by_an_ineligible_tab_falls_back_to_per_tab_lru_last() {
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(1),
+            ..policy()
+        };
+        let candidates = [
+            // Group 0 pinned by the active tab: its background tabs are
+            // leftovers.
+            active(0, 0),
+            grouped(1, 500, 0),
+            // Group 1 pinned by a loading tab.
+            Candidate {
+                loading: true,
+                ..grouped(2, 400, 1)
+            },
+            grouped(3, 300, 1),
+            // Group 2 emptyable, but its tabs are the newest of all.
+            grouped(4, 2, 2),
+            grouped(5, 1, 2),
+            // No known group: never emptyable, a leftover.
+            Candidate {
+                process_group: None,
+                ..tab(6, 450)
+            },
+        ];
+        let planned = plan(&policy, &candidates, None);
+        // Emptyable group 2 first (whole), then leftovers by idle: 1
+        // (500), 6 (450), 3 (300). Tab 2 (loading) never.
+        assert_eq!(ids(&planned), vec![4, 5, 1, 6, 3]);
+    }
+
+    #[test]
+    fn reclaim_order_stops_at_the_demand_between_groups() {
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(3),
+            ..policy()
+        };
+        // Two emptyable one-tab groups and a pinned group. Live = 5,
+        // limit 3 -> demand 2: both single-tab groups, nothing from the
+        // pinned group.
+        let candidates = [
+            grouped(1, 10, 0),
+            grouped(2, 20, 1),
+            grouped(3, 30, 2),
+            grouped(4, 40, 2),
+            active(5, 3),
+        ];
+        // Groups 0 and 1 are single-tab; group 2 is emptyable too and its
+        // newest tab (30) is older than groups 0 (10) and 1 (20), so it
+        // goes first — and whole (its own tabs least recently used first):
+        // demand 2 is met by it alone.
+        let planned = plan(&policy, &candidates, None);
+        assert_eq!(ids(&planned), vec![4, 3]);
+    }
+
+    #[test]
+    fn the_active_tab_is_never_planned_even_when_alone_in_its_group() {
+        let policy = SuspensionPolicy {
+            idle_after: Some(Duration::ZERO),
+            max_live_tabs: Some(1),
+            memory_budget_bytes: Some(1),
+            ..policy()
+        };
+        let candidates = [active(0, 0)];
+        let memory = Some(MemorySample {
+            total_bytes: 10_000 * MIB,
+        });
+        assert!(plan(&policy, &candidates, memory).is_empty());
     }
 
     #[test]

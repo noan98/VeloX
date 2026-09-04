@@ -1009,6 +1009,21 @@ impl BrowserWindow {
             .is_some_and(webview_is_playing_audio)
     }
 
+    /// Which `WebKitWebProcess` group (D54, [`pick_process_group`]) tab
+    /// `id`'s live webview is in, for the process-unit reclaim order of the
+    /// automatic suspension policy (`browser::suspension::reclaim_order`,
+    /// docs/decisions.md D56). `None` for a suspended or unknown tab (no
+    /// webview, so no process). On platforms other than Linux/BSD the group
+    /// id is still assigned but does not correspond to a shared process
+    /// (see [`with_related_content_view`]); the policy then merely prefers
+    /// emptying "groups" that are not real, which is harmless.
+    pub fn process_group_of(&self, id: TabId) -> Option<u64> {
+        self.contents
+            .get(&id)
+            .filter(|tab| tab.webview.is_some())
+            .map(|tab| tab.process_group)
+    }
+
     /// Rebuild a suspended tab's content webview, loading `url` (its last
     /// known address — everything else, scroll position, in-progress form
     /// input, and JS-side session history, was lost when the webview was
