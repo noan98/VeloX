@@ -505,6 +505,11 @@ struct ContentTab {
 /// collapse into 5 processes instead of 20. The value is a tuning knob,
 /// not a measured optimum: it matches the core count of the fixed
 /// benchmark environment (`docs/performance-targets.md` §1).
+/// Default cap, kept as a named constant for the unit tests below; the
+/// running value comes from `Config::max_tabs_per_web_process`
+/// (`VELOX_MAX_TABS_PER_PROCESS`, Issue #60 / D57) so the trade-off can be
+/// measured without rebuilding.
+#[cfg(test)]
 const MAX_TABS_PER_WEB_PROCESS: usize = 4;
 
 /// Pick the process group a new tab should join, given `(group, loading)`
@@ -518,7 +523,10 @@ const MAX_TABS_PER_WEB_PROCESS: usize = 4;
 ///
 /// Pure so it can be unit-tested without a display; the caller maps the
 /// chosen group back to one of its live webviews.
-fn pick_process_group(live_tabs: impl IntoIterator<Item = (u64, bool)>) -> Option<u64> {
+fn pick_process_group(
+    live_tabs: impl IntoIterator<Item = (u64, bool)>,
+    max_tabs_per_process: usize,
+) -> Option<u64> {
     // (size, has a loading tab) per group.
     let mut groups: HashMap<u64, (usize, bool)> = HashMap::new();
     for (group, loading) in live_tabs {
@@ -528,7 +536,7 @@ fn pick_process_group(live_tabs: impl IntoIterator<Item = (u64, bool)>) -> Optio
     }
     groups
         .into_iter()
-        .filter(|(_, (size, busy))| *size < MAX_TABS_PER_WEB_PROCESS && !busy)
+        .filter(|(_, (size, busy))| *size < max_tabs_per_process.max(1) && !busy)
         // Ties broken by the lower group id so the choice is deterministic
         // regardless of `HashMap` iteration order.
         .max_by_key(|(group, (size, _))| (*size, std::cmp::Reverse(*group)))
@@ -573,6 +581,10 @@ pub struct BrowserWindow {
     /// Next unused [`ContentTab::process_group`] id (docs/decisions.md
     /// D54). Only ever incremented; group ids are never reused.
     next_process_group: u64,
+    /// How many tabs may share one `WebKitWebProcess`
+    /// ([`pick_process_group`], D54/D57) — `Config::max_tabs_per_web_process`
+    /// as of window creation.
+    max_tabs_per_web_process: usize,
     /// The `WebContext` shared by the toolbar and every tab's content
     /// webview (see docs/decisions.md D49). `Some` only in non-private mode:
     /// `wry`'s WebKitGTK backend ignores any custom context passed via
@@ -774,6 +786,7 @@ impl BrowserWindow {
             contents,
             active: Some(initial_tab),
             next_process_group: 1,
+            max_tabs_per_web_process: config.max_tabs_per_web_process,
             context,
             private: config.private,
             blocklist,
@@ -843,7 +856,8 @@ impl BrowserWindow {
             .iter()
             .filter(|(_, tab)| tab.webview.is_some())
             .map(|(tab_id, tab)| (tab.process_group, is_loading(*tab_id)));
-        let (process_group, related) = match pick_process_group(live) {
+        let (process_group, related) = match pick_process_group(live, self.max_tabs_per_web_process)
+        {
             Some(group) => {
                 // Only a tab that still *has* a webview can be related to
                 // (a suspended tab's entry keeps its stale `process_group`
@@ -1681,38 +1695,67 @@ mod tests {
 
     #[test]
     fn process_group_starts_fresh_when_nothing_is_live() {
-        assert_eq!(pick_process_group([]), None);
+        assert_eq!(pick_process_group([], MAX_TABS_PER_WEB_PROCESS), None);
+    }
+
+    #[test]
+    fn the_cap_is_configurable_and_one_disables_sharing() {
+        // cap 1: every group is already full, so a new tab always starts
+        // its own process (the pre-D54 behavior, D57).
+        assert_eq!(pick_process_group([(0, false)], 1), None);
+        // A higher cap keeps taking tabs into the same group.
+        let three: Vec<(u64, bool)> = vec![(0, false); 3];
+        assert_eq!(pick_process_group(three.iter().copied(), 4), Some(0));
+        assert_eq!(pick_process_group(three.iter().copied(), 3), None);
+        // 0 is meaningless (a tab must live somewhere) and is read as 1,
+        // matching `Config`'s own "0 means unset" rule.
+        assert_eq!(pick_process_group([(0, false)], 0), None);
     }
 
     #[test]
     fn process_group_joins_the_fullest_idle_group_with_room() {
         // Group 1 has 2 live tabs, group 0 has 1: fill group 1 first.
         assert_eq!(
-            pick_process_group([(0, false), (1, false), (1, false)]),
+            pick_process_group(
+                [(0, false), (1, false), (1, false)],
+                MAX_TABS_PER_WEB_PROCESS
+            ),
             Some(1)
         );
         // Ties go to the lower id, deterministically.
-        assert_eq!(pick_process_group([(3, false), (2, false)]), Some(2));
+        assert_eq!(
+            pick_process_group([(3, false), (2, false)], MAX_TABS_PER_WEB_PROCESS),
+            Some(2)
+        );
     }
 
     #[test]
     fn process_group_starts_fresh_once_every_group_is_full() {
         let full: Vec<(u64, bool)> = vec![(0, false); MAX_TABS_PER_WEB_PROCESS];
-        assert_eq!(pick_process_group(full.iter().copied()), None);
+        assert_eq!(
+            pick_process_group(full.iter().copied(), MAX_TABS_PER_WEB_PROCESS),
+            None
+        );
         // A full group is skipped in favor of one with room, however small.
         let mut mixed = full;
         mixed.push((7, false));
-        assert_eq!(pick_process_group(mixed), Some(7));
+        assert_eq!(pick_process_group(mixed, MAX_TABS_PER_WEB_PROCESS), Some(7));
     }
 
     #[test]
     fn process_group_never_joins_a_group_that_is_still_loading() {
         // One loading tab makes its whole group busy, however much room
         // it has; with no other group, start fresh (parallel loads).
-        assert_eq!(pick_process_group([(0, true), (0, false)]), None);
+        assert_eq!(
+            pick_process_group([(0, true), (0, false)], MAX_TABS_PER_WEB_PROCESS),
+            None
+        );
         // A smaller idle group beats a bigger busy one.
         assert_eq!(
-            pick_process_group([(0, true), (0, false), (1, false)]),
+            pick_process_group(
+                [(0, true), (0, false), (1, false)],
+                MAX_TABS_PER_WEB_PROCESS
+            ),
             Some(1)
         );
     }
