@@ -916,7 +916,7 @@ fn mark_excludes_warm_up_tabs_from_the_aggregated_metrics() {
 
     // The aggregate — what a benchmark actually reads — sees only the two
     // creations after the marker.
-    let aggregated = aggregate_trials(&[records.clone()]);
+    let aggregated = aggregate_trials(std::slice::from_ref(records));
     let stats = aggregated
         .get("tab_create_ms")
         .expect("tab_create_ms should be present");
@@ -926,8 +926,9 @@ fn mark_excludes_warm_up_tabs_from_the_aggregated_metrics() {
         stats.count
     );
 
-    // And the ones it kept are the later tabs: ids 3 and 4 (the initial
-    // tab is id 0), never the warm-up ids 1 and 2.
+    // And the ones it kept are the later tabs. The initial tab is id 0 and
+    // each `open` takes the next id, so the five opens are ids 1..=5 and
+    // the two after the marker are 4 and 5 — never the warm-up 1, 2, 3.
     let after_marker = markers[0]["ts_ms"].as_f64().unwrap_or(0.0);
     let kept: HashSet<u64> = all_creates
         .iter()
@@ -936,7 +937,7 @@ fn mark_excludes_warm_up_tabs_from_the_aggregated_metrics() {
         .collect();
     assert_eq!(
         kept,
-        HashSet::from([3, 4]),
+        HashSet::from([4, 5]),
         "the measured phase should be the last two tabs, got {kept:?}"
     );
 }

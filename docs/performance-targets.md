@@ -235,7 +235,7 @@ Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」�
 | T1 | 起動〜load の優位を**維持**する | Chromium 比 -22〜-32% | **Chromium より速い状態を維持** (目安 -20%) | 既に勝っている領域を最適化で失わないことが最優先。回帰ゲート (#72) の対象 — **判定方式は §10 で確定**。単発の測定値で -20% を割ったことを回帰と判定してはならない (§10 参照) |
 | T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +45% (1 タブ)。**自動休止を有効にすると** 10/20 タブで +14% / +20% (`VELOX_MAX_LIVE_TABS=4`)、既定 (無効) では +171% / +245% (§12・`docs/memory-analysis.md` §11) | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。**#61 で主因を特定 → #118 で `WebContext` 共有 (-2.5〜-11%) → #124 で `WebKitWebProcess` 共有 (5/10/20 タブで -17/-23/-26%、D54) → #63 で Adaptive Tab Suspension (D56): 空にできるプロセスグループを丸ごと休止する適応ポリシーで、有効時は 20 タブ -65% (1612 → 560 MiB、Chromium 比 +245% → +20%)。既定は無効 (D9) のため、T2 の「現在値」は設定次第。残りは 1 タブ時の toolbar 用 `WebProcess` (+45%) と生存タブ分 — §12 参照**
 | T3 | `startup_toolbar_ready_ms` を短縮する | 528.4ms | **300ms 以下** | ⚠️ **保留**。当初「この区間は VeloX 自身のコードでエンジン差ではないから確実に手が出せる」と設定したが、**#59 の実測でこの前提は誤りと判明した** (支配的なのは tao/GTK の初期化と WebKitGTK の webview 生成)。目標値は据え置くが、達成手段は現時点で不明。§9 参照 |
-| T4 | 20 タブ時に操作不能な遅延を出さない | `tab_switch` 0.5ms、休止タブへの切替 `tab_resume` 2.7ms + 再読み込み 10ms (`minimal.html`、§12) | タブ切替 median **100ms 以下** | #60 の受け入れ条件。#63 で `tab_resume` シナリオが加わり、休止タブの復帰も計測できるようになった (実サイトでは再読み込みが支配的になる点に注意) |
+| T4 | 20 タブ時に操作不能な遅延を出さない | **20 タブでタブ切替 0.40ms** (`tab_switch_20`、48 サンプル)、休止タブへの切替 `tab_resume` 2.7ms + 再読み込み 10ms | タブ切替 median **100ms 以下** | ✅ **達成** (#60、§13)。目標を 2 桁下回る。ただしこの指標はメインスレッドのハンドラが返るまでで、描画完了までではない (D57 の「残る限界」) |
 
 > **⚠️ この節の当初の記述は #59 の実測で覆っている。**
 >
@@ -542,3 +542,93 @@ MiB) という、明らかに誤った値を返すことが分かった。原因
 (1) 1 タブ時の toolbar 用 `WebProcess` (+45%、休止では届かない)、(2) 生存
 タブ分 (上限を下げるほど減るが復帰が増える)、(3) 本計測が `minimal.html`
 であること (実サイト未評価)。D56 の Revisit condition を参照。
+
+## 13. タブ生成・切替のベースラインとボトルネック (Issue #60, 2026-09-05)
+
+**設計判断と考察は `docs/decisions.md` D57 を参照。** ここでは数値だけ記録する。
+
+### 13.1 ベースライン (既定設定、`minimal.html`、各 6 試行 = 48 サンプル)
+
+`velox-bench run --scenario tab_create_N|tab_switch_N` で、**すべてのサンプルを
+タブ数 N ちょうどで**採ったもの (`mark` による warm-up 切り捨て、D57)。
+
+| タブ数 | `tab_create_ms` | `tab_switch_ms` | `page_load_ms` (新しいタブ) | プロセスに空きがあるか |
+| ---: | ---: | ---: | ---: | --- |
+| 1  | 2.00 | 0.10 | 6.95  | あり |
+| 5  | 2.25 | 0.50 | 6.00  | あり |
+| 10 | 2.20 | 0.50 | 6.70  | あり |
+| 20 | 2.60 | 0.40 | **14.60** | **無し (20 は上限 4 の倍数)** |
+
+`tab_switch_1` の 0.10ms は「自分自身への切替」で、下限の目安。
+
+### 13.2 ボトルネック: web プロセスを起こすかどうか
+
+20 タブでの `VELOX_MAX_TABS_PER_PROCESS` スイープ (各 3 試行):
+
+| 上限 | グループ構成 | `page_load_ms` | `tab_create_ms` | プロセス数 |
+| ---: | --- | ---: | ---: | ---: |
+| 4  | 4×5 (満杯)      | 15.8 | 2.75 | 8 |
+| 5  | 5×4 (満杯)      | 15.1 | 2.90 | 8 |
+| 6  | 6+6+6+2         | 7.3  | 2.15 | – |
+| 7  | 7+7+6           | 9.2  | 2.00 | 6 |
+| 8  | 8+8+4           | 7.8  | 2.10 | – |
+| 9  | 9+9+2           | 6.5  | 2.00 | 6 |
+| 10 | 10+10 (満杯)    | 16.1 | 2.70 | 6 |
+| 12 | 12+8            | 8.2  | 2.05 | – |
+
+**上限 9 と 10 はプロセス数が同じ 6 なのに 6.5ms と 14.6〜16.1ms に分かれる。**
+効いているのはプロセス数ではなく、新しいタブが既存プロセスに相乗りできるか
+(空きがあるか) である。相乗りできれば 6.5〜9.2ms、新しいプロセスを起こすなら
+14.6〜16.1ms と約 2 倍。
+
+### 13.3 上限 8 との比較 (既定を変えなかった根拠)
+
+| 指標 (20 タブ) | 上限 4 (既定) | 上限 8 | 判定 |
+| --- | ---: | ---: | --- |
+| PSS | 1652.0 MiB | 1543.7 MiB | 上限 8 が -6.6% |
+| プロセス数 | 8 | 6 | 上限 8 が少ない |
+| `tab_switch` シナリオ (バースト) `page_load_ms` | 17.6 | 19.8 | 誤差範囲 |
+| `tab_resume` シナリオ `page_load_ms` | 7.6 | 8.5 | 誤差範囲 |
+
+D54 が上限を設けた理由 (バースト時のページロード直列化) は、上限ではなく
+「読み込み中のプロセスには相乗りしない」規則が抑えていることが確認できた。
+それでも既定を 4 のままにした理由は D57 を参照。
+
+### 13.4 再現手順
+
+```sh
+S=/path/to/scratch
+cargo build --release
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+URL=http://127.0.0.1:8731/minimal.html
+XV='xvfb-run -a --server-args=-screen 0 1280x900x24 dbus-run-session --'
+
+# 13.1 ベースライン
+for n in 1 5 10 20; do
+  $XV target/release/velox-bench run --scenario tab_create_$n --trials 6 \
+    --velox-bin target/release/velox --url $URL --output $S/create-$n.json
+  $XV target/release/velox-bench run --scenario tab_switch_$n --trials 6 \
+    --velox-bin target/release/velox --url $URL --output $S/switch-$n.json
+done
+
+# 13.2 上限スイープ (順序の影響を避けるため上限をラウンドロビンで回す)
+for trial in 1 2 3; do for cap in 4 5 6 7 8 9 10 12; do
+  VELOX_MAX_TABS_PER_PROCESS=$cap $XV target/release/velox-bench run \
+    --scenario tab_create_20 --trials 1 --velox-bin target/release/velox \
+    --url $URL --output $S/cap-$cap-$trial.json
+done; done
+
+# 13.3 メモリ
+for cap in 4 8; do
+  VELOX_MAX_TABS_PER_PROCESS=$cap $XV python3 scripts/bench/tab_scaling.py \
+    --velox target/release/velox --page minimal.html --tab-counts 1,5,10,20 --trials 3
+done
+```
+
+### 13.5 計測上の注意 (実際に踏んだ罠)
+
+**同一バイナリ・同一スクリプトでも、実行順で結果が 3 倍変わる。** 最初の調査で
+`page_load_ms` が 20 タブで 25.4ms と出たが、同じ設定を後から測ると 7.8ms
+だった。差はタブ数ではなく「その run がその日の 1 本目か」で、ページキャッシュ
+などのウォームアップが効いている。**条件をまとめて連続実行すると、最初に測った
+条件だけが不当に遅く出る。** 条件はラウンドロビンで回し、1 回目は捨てること。
