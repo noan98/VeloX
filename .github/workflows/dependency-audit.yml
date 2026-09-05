@@ -1,0 +1,65 @@
+name: Dependency Audit
+
+# Issue #37: Rust 依存クレートの脆弱性・ライセンス・更新状況を CI で継続監視する。
+# `cargo deny` (advisories / bans / licenses / sources の 4 領域を 1 本の
+# ツールでカバーし、cargo-audit の脆弱性チェックを内包する) を、
+# リポジトリルートの deny.toml の設定で走らせる。cargo-audit を別途 CI に
+# 足していない理由や、deny.toml のライセンス許可リスト・advisories の
+# 例外運用の詳細は docs/decisions.md D63 を参照。
+#
+# トリガーを 2 系統に分けているのがこのワークフローの要点:
+#
+#   1. pull_request (`Cargo.toml` / `Cargo.lock` / `deny.toml` /
+#      このワークフロー自身のいずれかが変わった PR のみ、`paths` で限定):
+#      依存グラフを変える PR 自身の責任として扱い、通常どおりマージ
+#      ブロッカーにする (continue-on-error は使わない — 新しい依存や
+#      ライセンス違反はその場で直してもらうのが筋)。`paths` フィルタに
+#      より、依存を一切触らない大多数の PR ではこのジョブ自体が起動せず
+#      check-run も作られない。つまり auto-merge.yml
+#      (`.github/workflows/auto-merge.yml`) の判定 (head commit の
+#      check-runs が全部 success/skipped になっているか) にもそもそも
+#      現れない。「VeloX 側に非がなく突然公表される advisory で、依存を
+#      何も動かしていない無関係な PR まで巻き込んで auto-merge が
+#      止まる」という事態を、continue-on-error に頼らず構造的に避ける
+#      設計にした。
+#   2. schedule (毎日 1 回、既定ブランチを対象): 依存を全く動かしていない
+#      期間でも、後から新しい advisory が公表されるケースを拾うための
+#      定期監視。PR に紐付かないため失敗しても auto-merge.yml には一切
+#      影響しない (auto-merge が見るのは PR の head commit に付いた
+#      check-runs だけで、schedule 実行はどの PR の head commit にも
+#      紐付かない)。ここは素直に失敗させ、Actions タブの実行履歴と
+#      GitHub のデフォルトのワークフロー失敗通知で気づけるようにする。
+#
+# 新しい advisory が見つかった場合の対応: 誤検知 (VeloX が実際には使って
+# いない API のみに影響する unsound、対応版が無い unmaintained など) は
+# deny.toml の `[advisories].ignore` に理由付きで追加する。本物の脆弱性は
+# 依存の更新 (可能なら) か、代替クレートの検討が必要。
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - ".github/workflows/dependency-audit.yml"
+  schedule:
+    # 03:00 JST (UTC+9) = 前日 18:00 UTC
+    - cron: "0 18 * * *"
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cargo-deny:
+    name: cargo deny check (advisories / bans / licenses / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # EmbarkStudios/cargo-deny-action は runner 向けにビルド済みの
+      # cargo-deny バイナリを取得して deny.toml に従って実行する
+      # (ソースからのビルドは ~3 分かかることをローカル検証済み — D63)。
+      # `command` を省略すると advisories/bans/licenses/sources の
+      # 4 領域すべてを検査する。
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@v2
