@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VeloX busy fixture</title>
+<!--
+  CPU を使い続ける固定ページ (Issue #64)。バックグラウンドタブが CPU を
+  使い続けていないかを測るための負荷源で、ブラウザが「隠れているタブ」に
+  対して行う 3 種類の抑制すべてに反応するように作ってある:
+
+    1. requestAnimationFrame ループ  — 隠れたタブでは呼ばれなくなるはず
+    2. setInterval のタイマー        — 隠れたタブでは間隔が伸ばされるはず
+    3. CSS アニメーション            — 隠れたタブでは描画されないはず
+
+  どれも「動いていること」がカウンタで分かるようにしてあり、
+  visibilitychange のたびに現在の状態を <title> に書き出すので、VeloX 側の
+  PageTitleResolved 経由で外から観測できる。
+-->
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1rem; }
+  .spinner {
+    width: 64px; height: 64px; background: #48f;
+    animation: spin 1s linear infinite;
+  }
+  /* `?idle=1` では CSS アニメーションも止める。 */
+  body.idle .spinner { animation: none; }
+  @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="spinner"></div>
+<p id="out">starting…</p>
+<script>
+  /* `?idle=1` を付けると負荷ループを一切動かさない静的ページになる。
+     `velox-bench` のシナリオは URL を 1 つしか受け取らないので、
+     「重いタブをバックグラウンドに、軽いタブをフォアグラウンドに」という
+     配置を 1 つの固定ページで作るために使う (Issue #64)。 */
+  const PARAMS = new URLSearchParams(location.search);
+  const IDLE = PARAMS.get("idle") === "1";
+  /* `?beacon=1` を付けると、report() のたびに同じオリジンへ 1 本
+     リクエストを投げる。バックグラウンドタブでタイマーが「遅くなって
+     いるだけ」なのか「完全に止まっている」のかを、外側 (サーバのアクセス
+     ログ) から数えられるようにするため (Issue #64)。CPU 使用量は
+     「少ない」ことしか示せず、0 との区別がつかない。 */
+  const BEACON = PARAMS.get("beacon") === "1";
+
+  let frames = 0;      // requestAnimationFrame の呼ばれた回数
+  let ticks = 0;       // setInterval の発火回数
+  let spins = 0;       // 1 回あたりの CPU 仕事量 (単位なし)
+
+  /* 1 フレームあたり少しだけ実際に CPU を回す。空の rAF ループだと
+     「呼ばれてはいるが CPU は使っていない」状態になり、抑制されている
+     かどうかが CPU 使用量に出てこない。 */
+  function burn() {
+    let x = 0;
+    for (let i = 0; i < 200000; i++) x += Math.sqrt(i);
+    spins += x > 0 ? 1 : 0;
+  }
+
+  function frame() {
+    frames++;
+    burn();
+    requestAnimationFrame(frame);
+  }
+  if (!IDLE) {
+    requestAnimationFrame(frame);
+    setInterval(() => { ticks++; burn(); }, 10);
+  }
+
+  /* 状態をタイトルに出す。VeloX は document.title を読んで
+     UserEvent::PageTitleResolved にするので、外から観測できる。 */
+  function report() {
+    const state = document.visibilityState;
+    document.title = `${IDLE ? "idle" : "busy"} ${state} f=${frames} t=${ticks}`;
+    document.getElementById("out").textContent = document.title;
+    if (BEACON) {
+      /* 到達したことだけが分かればよいので、応答は読まないし失敗も無視する。 */
+      fetch(`beacon?state=${state}&f=${frames}&t=${ticks}`, { cache: "no-store" })
+        .catch(() => {});
+    }
+  }
+  if (IDLE) document.body.classList.add("idle");
+  setInterval(report, 500);
+  document.addEventListener("visibilitychange", report);
+  report();
+</script>
+</body>
+</html>

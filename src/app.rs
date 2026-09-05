@@ -540,15 +540,34 @@ fn record_tab_latency(
 /// otherwise.
 fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Instant) {
     let pid = std::process::id();
-    std::thread::spawn(move || loop {
-        match metrics::sample_process_tree_rss(pid) {
-            Ok(sample) => {
-                let elapsed = Instant::now().saturating_duration_since(process_start);
-                log.write(&metrics::PerfRecord::rss(sample), elapsed);
+    std::thread::spawn(move || {
+        // The previous sample and when it was taken, so each pass can turn
+        // two cumulative CPU readings into a rate over the interval that
+        // actually elapsed (Issue #64). The real elapsed time is used
+        // rather than `interval`, because a loaded machine can stretch the
+        // sleep and a fixed divisor would then overstate CPU use.
+        let mut previous: Option<(metrics::RssSample, Instant)> = None;
+        loop {
+            match metrics::sample_process_tree_rss(pid) {
+                Ok(sample) => {
+                    let now = Instant::now();
+                    let elapsed = now.saturating_duration_since(process_start);
+                    if let Some((prev_sample, prev_at)) = &previous {
+                        if let Some(percent) = metrics::PerfRecord::cpu_percent_between(
+                            prev_sample,
+                            &sample,
+                            now.saturating_duration_since(*prev_at),
+                        ) {
+                            log.write(&metrics::PerfRecord::cpu(percent), elapsed);
+                        }
+                    }
+                    log.write(&metrics::PerfRecord::rss(sample), elapsed);
+                    previous = Some((sample, now));
+                }
+                Err(err) => eprintln!("velox: rss sampling failed: {err}"),
             }
-            Err(err) => eprintln!("velox: rss sampling failed: {err}"),
+            std::thread::sleep(interval);
         }
-        std::thread::sleep(interval);
     });
 }
 

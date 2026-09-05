@@ -216,7 +216,7 @@ Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」�
 
 ### 未測定
 
-バックグラウンド CPU、ページロードの内訳 (DNS/TLS/レンダリング)、バッテリー/
+ページロードの内訳 (DNS/TLS/レンダリング)、バッテリー/
 アイドル消費。タブ生成/切替のレイテンシと複数タブ時のメモリは #61/#112 で
 測定可能になった (`velox-bench run --scenario tab_create|tab_switch|tabs_N`、
 `scripts/bench/tab_scaling.py`) — メモリ側は上表のとおり測定済み。ただし
@@ -632,3 +632,69 @@ done
 だった。差はタブ数ではなく「その run がその日の 1 本目か」で、ページキャッシュ
 などのウォームアップが効いている。**条件をまとめて連続実行すると、最初に測った
 条件だけが不当に遅く出る。** 条件はラウンドロビンで回し、1 回目は捨てること。
+
+## 14. バックグラウンドタブの CPU (Issue #64, 2026-09-05)
+
+**設計判断と考察は `docs/decisions.md` D58 を参照。**
+
+### 14.1 実測 (各 3 試行、16 秒窓、`scripts/profile/cpu_usage.py`)
+
+負荷源は `scripts/bench/pages/busy.html` (`requestAnimationFrame` ループ +
+10ms タイマー + CSS アニメーションで実際に CPU を焼く)。1 コアを 100% と
+した比率。
+
+| 状態 | CPU | 内訳 |
+| --- | ---: | --- |
+| busy がアクティブタブ | **100.0〜101.2%** | WebProcess 92〜93% + `velox` 本体 7.7〜7.9% |
+| busy がバックグラウンドタブ | **0.4〜0.6%** | WebProcess 0.3% |
+| busy を休止 (#63) | 0.0〜0.2% | — |
+| 静的ページ 2 タブ (対照) | 0.1% | — |
+
+**バックグラウンド化だけで 99.4% 減る。** VeloX 側の実装によるものではなく、
+タブ切替の `set_visible(false)` が GTK ウィジェットを hide し、WebKitGTK が
+そのページを「隠れている」と扱う結果である (D58)。
+
+### 14.2 止まってはいない (`?beacon=1` による外形計測)
+
+| 状態 | ビーコン到達 | 元の間隔 |
+| --- | ---: | --- |
+| visible | 2.17 件/秒 | 500ms タイマー = 2 件/秒 |
+| hidden  | 1.10 件/秒 | 約 1000ms に間引き |
+
+タイマーは約 1/2 の頻度で回り続け、バックグラウンドからのネットワーク
+リクエストも通る。`document.visibilityState` が `hidden` を返していることも
+同時に確認できる。
+
+### 14.3 2 つの計測手段の使い分け
+
+| 手段 | 出せるもの | 注意 |
+| --- | --- | --- |
+| `scripts/profile/cpu_usage.py` | **絶対値** (「何 % 使っているか」) | VeloX の外から `/proc` を 2 点だけ読むので測定コストが被測定側に乗らない |
+| `velox-bench run --scenario background_cpu` の `cpu_percent` | **回帰検知** (before/after 比較) | VeloX 自身のサンプラが /proc を歩くコストが乗る (この環境で数 %)。同一シナリオ同士なら打ち消し合う |
+
+この環境での `background_cpu` の `cpu_percent` は中央値 5.45% (3 試行、
+12 サンプル)。上表の 0.5% と食い違うのはサンプラ自身のコストで、**絶対値を
+語るときは `cpu_usage.py` の数字を使うこと。**
+
+### 14.4 再現手順
+
+```sh
+P=$PWD/scripts/bench/pages
+XV='xvfb-run -a --server-args=-screen 0 1280x900x24 dbus-run-session --'
+
+# 14.1 アクティブ / バックグラウンド
+printf 'wait 60000\nquit\n' > /tmp/active.txt
+printf 'open file://%s/busy.html\nwait 1500\nopen file://%s/minimal.html\nwait 60000\nquit\n' \
+  $P $P > /tmp/bg.txt
+VELOX_MAX_TABS_PER_PROCESS=1 $XV python3 scripts/profile/cpu_usage.py \
+  --velox target/release/velox --script /tmp/active.txt \
+  --homepage file://$P/busy.html --label active --window-secs 16
+VELOX_MAX_TABS_PER_PROCESS=1 $XV python3 scripts/profile/cpu_usage.py \
+  --velox target/release/velox --script /tmp/bg.txt \
+  --homepage file://$P/minimal.html --label background --window-secs 16
+
+# 14.3 回帰検知用のシナリオ
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+$XV target/release/velox-bench run --scenario background_cpu --trials 3 \
+  --velox-bin target/release/velox --url http://127.0.0.1:8731/busy.html
+```
