@@ -13,6 +13,11 @@ use crate::browser::suspension::SuspensionPolicy;
 /// metrics are enabled but no explicit interval was requested.
 const DEFAULT_PERF_RSS_INTERVAL: Duration = Duration::from_millis(5000);
 
+/// Default for [`Config::max_tabs_per_web_process`] — D54's original
+/// compile-time constant, kept as the default so behavior is unchanged
+/// unless someone sets `VELOX_MAX_TABS_PER_PROCESS`.
+const DEFAULT_MAX_TABS_PER_WEB_PROCESS: usize = 4;
+
 /// One selectable search engine: a display name plus the query template URL
 /// the omnibox builds a search request from (see
 /// `browser::navigation::build_search_url`). `query_template` must contain
@@ -141,6 +146,19 @@ pub struct Config {
     /// Maximum number of entries sent to the history panel at once (the
     /// store itself may hold more, up to `history_max_entries`).
     pub history_panel_limit: usize,
+    /// How many tabs at most share one `WebKitWebProcess` on Linux/BSD
+    /// (docs/decisions.md D54, `ui::window::pick_process_group`). `1`
+    /// disables sharing entirely (one renderer process per tab, the
+    /// pre-D54 behavior). Ignored on macOS/Windows, where wry has no
+    /// equivalent knob.
+    ///
+    /// D54 shipped this as a compile-time constant and said so plainly:
+    /// "a tuning knob, not a measured optimum", matching the benchmark
+    /// machine's core count. Issue #60 made it settable
+    /// (`VELOX_MAX_TABS_PER_PROCESS`) so the trade-off can be measured
+    /// against tab-creation and switching latency on one binary instead of
+    /// five — see docs/decisions.md D57.
+    pub max_tabs_per_web_process: usize,
     /// Automatic tab suspension policy (Issue #63, see
     /// `browser::suspension`): idle time, live-tab cap and memory budget,
     /// each individually optional. Defaults to every signal off
@@ -184,6 +202,7 @@ impl Default for Config {
             bookmark_bar_height: 30,
             history_max_entries: 5000,
             history_panel_limit: 200,
+            max_tabs_per_web_process: DEFAULT_MAX_TABS_PER_WEB_PROCESS,
             suspension: SuspensionPolicy::default(),
             private: false,
             search_engine: SearchEngine::default(),
@@ -221,6 +240,10 @@ impl Config {
     /// - `VELOX_PERF_OUTPUT` — only consulted when `VELOX_PERF_METRICS` is
     ///   set; a file path to append perf lines to instead of stderr. Unset
     ///   or empty keeps stderr.
+    /// - `VELOX_MAX_TABS_PER_PROCESS` — how many tabs may share one
+    ///   `WebKitWebProcess` (Linux/BSD only, docs/decisions.md D54/D57).
+    ///   `1` turns sharing off. Unset, `0` or not a number keeps the
+    ///   default (4).
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
     ///   `browser::suspension`). Unset, `0` or not a number leaves the
@@ -280,6 +303,9 @@ impl Config {
             std::env::var("VELOX_SEARCH_ENGINE_NAME").ok().as_deref(),
             std::env::var("VELOX_SEARCH_ENGINE_URL").ok().as_deref(),
         );
+        let max_tabs_per_web_process = resolve_max_tabs_per_web_process(
+            std::env::var("VELOX_MAX_TABS_PER_PROCESS").ok().as_deref(),
+        );
         let suspension = resolve_suspension(
             std::env::var("VELOX_AUTO_SUSPEND_AFTER_MS").ok().as_deref(),
             std::env::var("VELOX_MAX_LIVE_TABS").ok().as_deref(),
@@ -292,6 +318,7 @@ impl Config {
             homepage,
             private,
             search_engine,
+            max_tabs_per_web_process,
             suspension,
             perf_metrics,
             perf_rss_interval,
@@ -419,6 +446,19 @@ fn resolve_perf_output(
 }
 
 /// Pure decision logic behind [`Config::from_env_and_args`]'s
+/// `max_tabs_per_web_process` (Issue #60). Unset, empty, `0` or not a
+/// number keeps [`DEFAULT_MAX_TABS_PER_WEB_PROCESS`] — the same
+/// conservative rule every other knob here follows, so a typo can never
+/// silently turn process sharing into something the measurements never
+/// covered.
+fn resolve_max_tabs_per_web_process(raw: Option<&str>) -> usize {
+    raw.map(str::trim)
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_TABS_PER_WEB_PROCESS)
+}
+
+/// Pure decision logic behind [`Config::from_env_and_args`]'s
 /// `suspension` (Issue #63), factored out like [`resolve_perf_env`] so the
 /// parsing rules are unit-tested without touching the process environment.
 /// Every knob follows the same rule: unset, empty, `0`, or not a number
@@ -464,6 +504,10 @@ mod tests {
         assert!(config.history_panel_limit > 0);
         // Automatic suspension must be opt-in: a fresh checkout should never
         // surprise a user by suspending a tab on its own.
+        assert_eq!(
+            config.max_tabs_per_web_process,
+            DEFAULT_MAX_TABS_PER_WEB_PROCESS
+        );
         assert_eq!(config.suspension, SuspensionPolicy::default());
         assert!(!config.suspension.is_enabled());
         assert!(!config.private);
@@ -774,6 +818,21 @@ mod tests {
             SearchEngine::google()
         );
     }
+    // -- resolve_max_tabs_per_web_process (Issue #60) ---------------------
+
+    #[test]
+    fn max_tabs_per_web_process_parses_a_positive_value_and_falls_back_otherwise() {
+        assert_eq!(resolve_max_tabs_per_web_process(Some("1")), 1);
+        assert_eq!(resolve_max_tabs_per_web_process(Some(" 16 ")), 16);
+        for raw in [None, Some("0"), Some(""), Some("  "), Some("-1"), Some("x")] {
+            assert_eq!(
+                resolve_max_tabs_per_web_process(raw),
+                DEFAULT_MAX_TABS_PER_WEB_PROCESS,
+                "raw was {raw:?}"
+            );
+        }
+    }
+
     // -- resolve_suspension (Issue #63) -----------------------------------
 
     #[test]

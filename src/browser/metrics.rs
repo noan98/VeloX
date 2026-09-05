@@ -477,6 +477,13 @@ pub enum PerfRecord {
         tab_id: u64,
         duration: Duration,
     },
+    /// The benchmark script reached its measured phase (Issue #60): the
+    /// `mark` automation command. Everything logged before it is warm-up —
+    /// `benchmark::aggregate_trials` drops it, so a scenario can set up a
+    /// given number of tabs without those setup operations polluting the
+    /// numbers the scenario is actually about. Carries nothing but its
+    /// position in the log.
+    MeasureStart,
     /// A background tab was suspended automatically (Issue #63,
     /// `browser::suspension`), and why. Carries no duration — dropping a
     /// webview is synchronous and cheap; what a reader wants to know is
@@ -517,15 +524,20 @@ impl PerfRecord {
         PerfRecord::TabSuspend { tab_id, reason }
     }
 
+    pub fn measure_start() -> Self {
+        PerfRecord::MeasureStart
+    }
+
     /// The event name used by both output formats (`"startup"`,
     /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"tab_resume"`,
-    /// `"tab_suspend"`, `"rss"`).
+    /// `"tab_suspend"`, `"measure_start"`, `"rss"`).
     pub fn event_name(&self) -> &'static str {
         match self {
             PerfRecord::Startup(_) => "startup",
             PerfRecord::PageLoad { .. } => "page_load",
             PerfRecord::TabLatency { kind, .. } => kind.event_name(),
             PerfRecord::TabSuspend { .. } => "tab_suspend",
+            PerfRecord::MeasureStart => "measure_start",
             PerfRecord::Rss(_) => "rss",
         }
     }
@@ -551,6 +563,7 @@ impl PerfRecord {
             PerfRecord::TabSuspend { tab_id, reason } => {
                 format!("tab_suspend id={tab_id} reason={}", reason.as_str())
             }
+            PerfRecord::MeasureStart => "measure_start".to_owned(),
             PerfRecord::Rss(sample) => sample.to_string(),
         }
     }
@@ -600,6 +613,9 @@ impl PerfRecord {
                 fields.insert("tab_id".to_owned(), json!(tab_id));
                 fields.insert("reason".to_owned(), json!(reason.as_str()));
             }
+            // Only `event`/`ts_ms` — the marker's whole content is where it
+            // sits in the log.
+            PerfRecord::MeasureStart => {}
             PerfRecord::Rss(sample) => {
                 fields.insert("pid".to_owned(), json!(sample.root_pid));
                 fields.insert("process_count".to_owned(), json!(sample.process_count));
@@ -1289,6 +1305,18 @@ mod tests {
         let record = PerfRecord::tab_latency(TabLatencyKind::Resume, 7, Duration::from_millis(40));
         assert_eq!(record.to_text(), "tab_resume id=7 duration=40.0ms");
         assert_eq!(record.event_name(), "tab_resume");
+    }
+
+    #[test]
+    fn perf_record_measure_start_is_just_the_marker() {
+        let record = PerfRecord::measure_start();
+        assert_eq!(record.event_name(), "measure_start");
+        assert_eq!(record.to_text(), "measure_start");
+        let value = record.to_json(Duration::from_millis(12));
+        assert_eq!(value["event"], "measure_start");
+        assert_eq!(value["ts_ms"], 12.0);
+        // Nothing else: the marker carries no payload of its own.
+        assert_eq!(value.as_object().unwrap().len(), 2);
     }
 
     #[test]

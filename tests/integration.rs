@@ -54,7 +54,7 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use velox::browser::benchmark::parse_jsonl;
+use velox::browser::benchmark::{aggregate_trials, parse_jsonl};
 use velox::browser::{gui_probe_reason, navigation, persistence};
 
 /// Serializes the GUI-launching tests in this file against each other —
@@ -844,5 +844,100 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     assert!(
         !stderr.contains("memory sampling for tab suspension"),
         "no memory budget => no sampler:\n{stderr}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 7. The `mark` command cuts warm-up out of the aggregated numbers
+//    (Issue #60).
+// ---------------------------------------------------------------------
+
+/// Guarantees: `mark` reaches the perf log as a `measure_start` record at
+/// the point the script asked for, and `benchmark::aggregate_trials` — the
+/// same function `velox-bench aggregate` uses — pools only what came after
+/// it. This is what makes `tab_create_20` mean "creating a tab with 20 open"
+/// rather than "the average of creating tabs 2 through 21"; the unit tests
+/// cover the cut itself, and this one covers the whole path from an
+/// automation script through the running browser to the aggregate.
+#[test]
+fn mark_excludes_warm_up_tabs_from_the_aggregated_metrics() {
+    skip_without_gui!("mark_excludes_warm_up_tabs_from_the_aggregated_metrics");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("mark");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let homepage = fixture_url("minimal.html");
+    let page = fixture_url("text.html");
+
+    // Three tabs opened as warm-up, then the marker, then two more.
+    let script = format!(
+        "open {page}\nwait 400\n\
+         open {page}\nwait 400\n\
+         open {page}\nwait 400\n\
+         mark\n\
+         open {page}\nwait 400\n\
+         open {page}\nwait 400\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+    );
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the mark test. \
+             Perf records: {:?}",
+            launch.perf_records
+        );
+    };
+    assert!(status.success(), "velox exited abnormally: {status:?}");
+
+    let records = &launch.perf_records;
+    let markers: Vec<_> = events_named(records, "measure_start").collect();
+    assert_eq!(
+        markers.len(),
+        1,
+        "`mark` must produce exactly one measure_start record: {records:?}"
+    );
+    let all_creates: Vec<_> = events_named(records, "tab_create").collect();
+    assert_eq!(
+        all_creates.len(),
+        5,
+        "5 `open` commands should still log 5 tab_create records: {records:?}"
+    );
+
+    // The aggregate — what a benchmark actually reads — sees only the two
+    // creations after the marker.
+    let aggregated = aggregate_trials(std::slice::from_ref(records));
+    let stats = aggregated
+        .get("tab_create_ms")
+        .expect("tab_create_ms should be present");
+    assert_eq!(
+        stats.count, 2,
+        "aggregate must drop the 3 warm-up creations, got {} samples",
+        stats.count
+    );
+
+    // And the ones it kept are the later tabs. The initial tab is id 0 and
+    // each `open` takes the next id, so the five opens are ids 1..=5 and
+    // the two after the marker are 4 and 5 — never the warm-up 1, 2, 3.
+    let after_marker = markers[0]["ts_ms"].as_f64().unwrap_or(0.0);
+    let kept: HashSet<u64> = all_creates
+        .iter()
+        .filter(|r| r["ts_ms"].as_f64().unwrap_or(0.0) > after_marker)
+        .filter_map(|r| r["tab_id"].as_u64())
+        .collect();
+    assert_eq!(
+        kept,
+        HashSet::from([4, 5]),
+        "the measured phase should be the last two tabs, got {kept:?}"
     );
 }

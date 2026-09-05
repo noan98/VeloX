@@ -53,6 +53,8 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | `tab_create` | tab creation | 可 (`--url` 必須) |
 | `tab_switch` | tab switching | 可 (`--url` 必須) |
 | `tab_resume` | 休止タブの復帰コスト (Issue #63: `suspend` → `switch` を繰り返し、`tab_resume_ms` と復帰時の再読み込み `page_load_ms` を採る) | 可 (`--url` 必須) |
+| `tab_create_1` / `_5` / `_10` / `_20` / `_50` | **N タブ開いた状態で**もう 1 つタブを作るコスト (Issue #60)。N タブまで開いてから `mark` し、以降「1 つ開いて閉じる」を 8 回繰り返すので、`tab_create_ms` のサンプルはすべてタブ数 N で採られる | 可 (`--url` 必須) |
+| `tab_switch_1` / `_5` / `_10` / `_20` / `_50` | **N タブ開いた状態で**のタブ切替コスト (Issue #60)。同様に `mark` 後の 8 回の `switch` だけを測る | 可 (`--url` 必須) |
 | `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 可 (`--url` 必須) |
 
 「自動実行」列の意味は `src/browser/benchmark.rs` の
@@ -93,6 +95,7 @@ open <url>        # 新規タブを開いてアクティブにする
 switch <index>    # tab strip 上の position <index> (0始まり) のタブをアクティブにする
 close <index>     # position <index> のタブを閉じる
 suspend <index>   # position <index> のタブを休止する (Issue #63。アクティブタブ・休止済みタブには無視される)
+mark              # ここまでを準備 (warm-up) として集計から捨てる (Issue #60)
 navigate <url>    # アクティブタブを <url> へ遷移させる
 wait <ms>         # 次のコマンドまで <ms> ミリ秒待つ (上限 120000ms = automation::MAX_WAIT_MS)
 quit              # アプリケーションを終了する
@@ -139,6 +142,20 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 `browser::automation::recommended_timeout_secs` が決める (`--warmup-secs`
 で明示的に上書きできる)。
 
+#### `mark` と warm-up の切り捨て (Issue #60)
+
+`tab_create_20` のように「**N タブ開いた状態での**操作」を測るシナリオは、
+測定に入る前に N 個のタブを開く準備フェーズを必ず持つ。この準備で発生する
+`tab_create` / `page_load` は「1 タブ時」「2 タブ時」… の値であり、
+本来測りたい「20 タブ時」の値と混ぜてしまうと中央値はどちらでもない数字に
+なる。
+
+`mark` はその境界を perf ログに `measure_start` イベントとして書き込み、
+`velox-bench aggregate` (`benchmark::aggregate_trials`) が**最後の
+`measure_start` より後のイベントだけ**を集計対象にする。マーカーが 1 つも
+無い試行 (Issue #60 より前からある全シナリオ) は全イベントが対象のままなので、
+既存シナリオの数値は変わらない。
+
 ### 計測される生データとの対応
 
 すべて `docs/architecture.md`「Output format and destination」の JSON Lines
@@ -154,6 +171,7 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | `tab_create_ms` | `tab_create` | `duration_ms` |
 | `tab_switch_ms` | `tab_switch` | `duration_ms` |
 | `tab_resume_ms` | `tab_resume` | `duration_ms` (休止タブへの切替 = webview の再構築。Issue #63) |
+| (集計対象の境界) | `measure_start` | フィールド無し。`mark` コマンドが書き込むマーカーで、これより前のイベントは集計から捨てられる (Issue #60) |
 | `rss_total_bytes` | `rss` | `total_rss_bytes` |
 | `rss_process_count` | `rss` | `process_count` |
 | `pss_total_bytes` | `rss` | `total_pss_bytes` |
