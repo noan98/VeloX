@@ -20,9 +20,10 @@ use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
-    input_history, metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore,
-    DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
-    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, TabId, Tabs,
+    input_history, metrics, navigation, omnibox, persistence, site_data, ActivationEffect,
+    BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList,
+    HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore,
+    TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -1004,6 +1005,7 @@ fn handle_toolbar_command(
             persist_input_history(state);
             refresh_history_panel(window, state, config);
         }
+        ToolbarCommand::ClearSiteData => clear_all_site_data(window),
         ToolbarCommand::SearchHistory { query } => {
             // An empty query means "search cleared" (see
             // `browser::history::search`'s doc comment and D30) — go back
@@ -1732,6 +1734,39 @@ fn persist_input_history(state: &AppState) {
             "save input history",
             persistence::save_input_history(dir, &state.input_history),
         );
+    }
+}
+
+/// Handle `ToolbarCommand::ClearSiteData` (Issue #26, docs/decisions.md
+/// D66): delegate to `BrowserWindow::clear_all_site_data` and log the
+/// outcome. Never returns an error to the caller — a failed clear is not
+/// fatal (the acceptance condition "削除失敗時に安全にエラー処理される") —
+/// and stays silent on full success the same way `persist_*`'s
+/// `log_io_failure` calls do, only speaking up when there is something the
+/// user might need to know about.
+fn clear_all_site_data(window: &BrowserWindow) {
+    let result = window.clear_all_site_data();
+    match site_data::summarize(result.attempted, result.failed) {
+        ClearOutcome::Success | ClearOutcome::Nothing => {}
+        ClearOutcome::Partial => eprintln!(
+            "velox: cleared site data on {}/{} webviews; first error: {}",
+            result.attempted - result.failed,
+            result.attempted,
+            result
+                .first_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        ),
+        ClearOutcome::AllFailed => eprintln!(
+            "velox: failed to clear site data on all {} webview(s): {}",
+            result.attempted,
+            result
+                .first_error
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_default()
+        ),
     }
 }
 

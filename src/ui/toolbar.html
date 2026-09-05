@@ -632,6 +632,10 @@
     <div class="panel-header">
       <span>履歴</span>
       <button id="history-clear">すべて削除</button>
+      <button id="site-data-clear"
+              title="開いているすべてのタブの Cookie・キャッシュ・localStorage/sessionStorage・IndexedDB を削除します（履歴は残ります）">
+        サイトデータを削除
+      </button>
     </div>
     <div class="panel-search">
       <input id="history-search" type="text" spellcheck="false" autocomplete="off"
@@ -740,6 +744,9 @@
   });
   document.getElementById("history-clear").addEventListener("click", () => {
     send({ cmd: "clear_history" });
+  });
+  document.getElementById("site-data-clear").addEventListener("click", () => {
+    send({ cmd: "clear_site_data" });
   });
   /* Sent on every keystroke; `app.rs` treats an empty query as "search
      cleared" and falls back to the normal recency-ordered panel — see

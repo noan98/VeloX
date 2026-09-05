@@ -612,6 +612,19 @@ pub struct BrowserWindow {
     content_blocking_enabled: bool,
 }
 
+/// Result of [`BrowserWindow::clear_all_site_data`]: how many webviews were
+/// asked to clear their site data and how many of those returned an error.
+/// `first_error` is kept only for the stderr message (`app.rs`'s
+/// `log_failure` pattern) — the pass/fail judgement itself is
+/// [`crate::browser::site_data::summarize`] (docs/decisions.md D66), which
+/// takes only `attempted`/`failed` and stays engine-agnostic.
+#[derive(Debug)]
+pub struct SiteDataClearResult {
+    pub attempted: usize,
+    pub failed: usize,
+    pub first_error: Option<wry::Error>,
+}
+
 impl BrowserWindow {
     /// Create the window, the toolbar webview, and the first tab's content
     /// webview (bound to `initial_tab`, loading `config.homepage`).
@@ -1098,6 +1111,75 @@ impl BrowserWindow {
         match self.active_webview() {
             Some(webview) => webview.reload(),
             None => Ok(()),
+        }
+    }
+
+    /// Clear all site data (cookies, cache, local/session storage,
+    /// IndexedDB, service workers — `WebsiteDataTypes::ALL`/
+    /// `WKWebsiteDataStore::allWebsiteDataTypes`/`COREWEBVIEW2_BROWSING_
+    /// DATA_KINDS` on the three engines VeloX ships, see docs/decisions.md
+    /// D66) for every webview this window currently holds a handle to.
+    ///
+    /// This calls `wry::WebView::clear_all_browsing_data()` — a public,
+    /// safe, cross-platform method wry 0.56.1 already implements for
+    /// WebKitGTK/WKWebView/WebView2 (D66) — once per webview, never touching
+    /// files on disk directly: the engine owns whatever store backs it
+    /// (WebKitGTK's `WebsiteDataManager`, WKWebView's
+    /// `WKWebsiteDataStore`, WebView2's `ICoreWebView2Profile`) and clears
+    /// it through its own API while the webview keeps running, so there is
+    /// no risk of deleting a file the running process still has open (the
+    /// danger called out in the issue).
+    ///
+    /// Iterating the toolbar plus every awake tab, rather than clearing
+    /// once through a single webview, is what makes this correct in *both*
+    /// data-boundary modes without branching on `self.private` at all
+    /// (D14/D15/D49):
+    /// - **Normal mode**: the toolbar and every tab share one `WebContext`
+    ///   (D49), so clearing through any one of them clears the same
+    ///   underlying store the others see too — attempting all of them is
+    ///   redundant but harmless, and guarantees something is cleared even
+    ///   if every tab happens to be suspended (`ContentTab::webview` is
+    ///   `None` then; the always-live toolbar still shares the context).
+    /// - **Private mode**: the toolbar and every tab instead each get their
+    ///   *own* ephemeral, unshared store (D15) — clearing only one would
+    ///   leave the others' cookies/storage behind — so every live webview
+    ///   must be attempted individually to actually clear all of them. A
+    ///   suspended private tab has nothing to attempt: its ephemeral store
+    ///   already went away with its webview.
+    ///
+    /// Never aborts partway through: every webview is attempted regardless
+    /// of earlier failures (the acceptance condition "削除失敗時に安全に
+    /// エラー処理される" — a stuck/torn-down webview should not stop the
+    /// rest from being cleared), and the outcome is reported as counts
+    /// rather than propagated as a single `wry::Result` so `app.rs` can
+    /// still log something useful (`browser::site_data::summarize`) instead
+    /// of only the first error.
+    pub fn clear_all_site_data(&self) -> SiteDataClearResult {
+        let mut attempted = 0usize;
+        let mut failed = 0usize;
+        let mut first_error = None;
+
+        let mut attempt = |result: wry::Result<()>| {
+            attempted += 1;
+            if let Err(err) = result {
+                failed += 1;
+                if first_error.is_none() {
+                    first_error = Some(err);
+                }
+            }
+        };
+
+        attempt(self.toolbar.clear_all_browsing_data());
+        for tab in self.contents.values() {
+            if let Some(webview) = &tab.webview {
+                attempt(webview.clear_all_browsing_data());
+            }
+        }
+
+        SiteDataClearResult {
+            attempted,
+            failed,
+            first_error,
         }
     }
 

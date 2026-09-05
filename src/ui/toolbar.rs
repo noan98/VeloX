@@ -101,6 +101,14 @@ pub enum ToolbarCommand {
     },
     /// Remove every history entry ("clear history" in the panel).
     ClearHistory,
+    /// Clear all site data (cookies, cache, local/session storage,
+    /// IndexedDB, service workers — see docs/decisions.md D66) for every
+    /// webview this window currently holds a handle to. Unlike
+    /// `ClearHistory` this is not VeloX's own state — it is delegated
+    /// straight to `wry::WebView::clear_all_browsing_data()` per webview
+    /// (`ui::window::BrowserWindow::clear_all_site_data`), so there is no
+    /// local store to clear here and no panel to refresh afterwards.
+    ClearSiteData,
     /// The history panel's search box changed. `query` is the raw typed
     /// text; an empty `query` means "search cleared", which `app.rs`
     /// answers by going back to the normal recency-ordered panel instead of
@@ -529,6 +537,10 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"clear_history"}"#).unwrap(),
             ToolbarCommand::ClearHistory
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"clear_site_data"}"#).unwrap(),
+            ToolbarCommand::ClearSiteData
         );
         assert_eq!(
             parse_command(r#"{"cmd":"search_history","query":"rust"}"#).unwrap(),
@@ -986,6 +998,8 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("toggle_panel"));
         assert!(TOOLBAR_HTML.contains("delete_history_entry"));
         assert!(TOOLBAR_HTML.contains("clear_history"));
+        // Site data (cookies/cache/storage) clearing, Issue #26 (D66).
+        assert!(TOOLBAR_HTML.contains("clear_site_data"));
         assert!(TOOLBAR_HTML.contains("search_history"));
         assert!(TOOLBAR_HTML.contains("remove_bookmark"));
         // Keyboard shortcuts (see docs/decisions.md D23): the toolbar's own
