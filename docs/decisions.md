@@ -4553,17 +4553,50 @@ D57 と同じく、Epic #57 のルール 1 の裏返しとして、測って効�
 - **依存キャッシュは Linux ジョブと同じ `Swatinem/rust-cache@v2` を使う。**
   ランナー OS ごとにキーが分かれるため、Linux 用キャッシュと衝突しない。
 
+**追加したジョブが初回実行で既存バグを 1 件検出した**: `check-windows` を
+入れた最初の CI 実行で `cargo test --lib` が**コンパイルエラー**で落ちた。
+`src/browser/downloads.rs` の `resolve_unix_download_dir` は
+`#[cfg(not(any(target_os = "macos", target_os = "windows")))]` でガードされて
+いるのに、それを呼ぶ 3 つのテスト (`unix_dir_*`) には同じ cfg が付いておらず、
+Windows/macOS では「存在しない関数を呼ぶテスト」が残ってしまう、という
+書き漏れである。同ファイルの `open_path_command_*` テストは最初から同じ cfg
+を持っており、そこと不揃いだった。**この不整合は main に元からあったもので、
+CI が Linux 専用だったために誰も気づけなかった** — Windows ジョブを足す価値が
+そのまま出た形なので、本 PR のスコープ内 (追加したジョブを緑にする) として
+同じ PR で修正した。テストを削除・スキップしたのではなく、テスト対象の関数と
+同じ cfg をテスト側にも付けて対象プラットフォームを揃えただけであり、Linux
+では従来通り 3 件とも実行される。
+
+**Linux から Windows のコンパイルを事前検証できる**: 上記の切り分けの過程で、
+`rustup target add x86_64-pc-windows-msvc` を入れれば Linux 上でも
+
+```sh
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+が通ることを確認した。リンクを伴わない型チェックのみなので MSVC ツール
+チェーンは不要で、`webview2-com` / `tao` の Windows 版まで検査される。実際、
+修正前はこのコマンドが CI と同一の 3 エラーを再現し、修正後は解消した。
+Windows 固有コードや cfg 分岐を触るときは、CI を一往復させる前にこれで
+確認できる。ただし**リンクと実行を伴わないため、これが通っても
+`cargo build` / `cargo test` が Windows で通る保証にはならない** — 実行時の
+挙動を見るのは引き続き `check-windows` ジョブの役割である。この事情から、
+このコマンドを CI に足すことはしない (Windows ジョブが上位互換であり、
+Linux ジョブに足しても検査が重複するだけ)。開発者の手元での事前確認手段と
+して CLAUDE.md に記載するに留める。
+
 **検証の限界 (正直な記録)**: 本 Issue の実装は Linux 環境で行っており、
-`check-windows` ジョブが実際に GitHub Actions の `windows-latest` 上で
-グリーンになるかどうかは実機で確認できていない。YAML 構文の妥当性
-(`yaml.safe_load`) と、既存 Linux ジョブのコマンドがローカルで通ることは
-確認したが、Windows ジョブ自体の動作確認は本 PR のマージ後、実際の CI 実行
-結果を見て行う必要がある。
+`check-windows` ジョブが `windows-latest` 上で最終的にグリーンになるかは
+本 PR の CI 実行結果で確認する。上記の Windows ターゲット型チェック、YAML
+構文の妥当性 (`yaml.safe_load`)、既存 Linux ジョブのコマンドがローカルで
+通ることは確認済みだが、Windows ランナー上での実行時の挙動 (WebView2 を
+含む) はこの環境では確かめられない。
 
 **Revisit condition**: (1) `windows-latest` 上で `tests/integration.rs` の
 GUI 起動 (WebView2) が安定して動くことを実際の CI 実行で確認できたら、
 `check-windows` にも統合テスト (`cargo test` 全体、あるいは
 `VELOX_INTEGRATION_REQUIRE_GUI` 相当の仕組み) を追加する。(2) 3 OS の
 品質が担保できた段階 (CLAUDE.md「対応 OS の優先度」) で macOS ジョブの
-追加を再検討する。(3) Windows ジョブが実際に赤くなるようなら、原因が
-CI 環境固有の問題なのか実コードの Windows 対応不足なのかを切り分ける。
+追加を再検討する。(3) Windows ジョブが赤くなったときは、原因が CI 環境
+固有の問題なのか実コードの Windows 対応不足なのかを切り分ける — 初回の
+`resolve_unix_download_dir` は後者だった。
