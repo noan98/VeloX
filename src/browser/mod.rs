@@ -29,7 +29,7 @@ pub mod tab;
 pub mod tabs;
 
 pub use automation::{AutomationCommand, AutomationError};
-pub use blocklist::FilterList;
+pub use blocklist::{FilterList, MatchContext, RuleResourceType};
 pub use bookmarks::{BookmarkEditError, BookmarkEntry, BookmarkFolder, BookmarkStore};
 pub use downloads::{DownloadEntry, DownloadId, DownloadState, DownloadStore};
 pub use gui_probe::gui_probe_reason;

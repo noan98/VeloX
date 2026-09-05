@@ -8,12 +8,14 @@
 ! merged in later (see `Config::extra_blocklist_path`) without changing the
 ! parser.
 !
-! Format understood by VeloX's parser (see `blocklist.rs`):
-!   ||domain^        block `domain` and any subdomain of it
-!   @@||domain^      exception: never block `domain` (or its subdomains)
-!   ! comment        ignored
-!   anything with ## or #@# (element hiding)  ignored
-!   anything else that isn't a ||domain^ rule  ignored
+! This file only uses the `||domain^` form, but VeloX's parser (see
+! `blocklist.rs`, extended for Issue #23) understands considerably more of
+! the real EasyList/EasyPrivacy syntax now: generic `*`/`^`/`|`-anchored
+! patterns (not just domain anchors), `$` options (resource type,
+! `domain=` scoping), and `@@` exceptions on either rule form. See
+! `blocklist.rs`'s module doc comment for the exact supported subset and
+! what's intentionally not implemented (regex filters, cosmetic/element
+! hiding, content-modifying options).
 
 ! --- Ad networks / ad serving ---
 ||doubleclick.net^

@@ -4662,3 +4662,224 @@ Windows についてはその「手を伸ばす」経路が wry 自身によっ�
    判断し、今回は追わなかった。
 4. **サイト例外は静的設定のみ**: `VELOX_CONTENT_BLOCKING_ALLOW` による
    起動時指定のみで、ツールバーからのトグル UI は無い。UI 化は follow-up。
+
+## D64: EasyList/EasyPrivacy 対応 (#23) — 自前パーサを拡張、実データは同梱もダウンロードもしない
+
+**対象**: Issue #23 (依存する #22 は D59 で Windows 限定のサブリソースブロックとして
+実装済み)。既存の `browser::blocklist::FilterList` (Issue #21/#51、D17 で
+`||domain^`/`@@||domain^` のみ対応) を拡張し、EasyList/EasyPrivacy が実際に
+使う構文をどこまで解釈できるかを広げた。`browser::subresource`
+(`src/browser/subresource.rs`) と `ui::webview2_blocking` は #22 の成果物
+としてこの PR では一切変更していない。
+
+### ライセンス調査（実際に確認した一次情報）
+
+EasyList/EasyPrivacy のデータそのものをリポジトリに同梱するか判断するため、
+公式ソースを実際に確認した:
+
+- `https://easylist.to/pages/licence.html` — このプロキシ環境からは
+  `EGRESS_BLOCKED` (easylist.to へのアクセスがネットワークプロキシで
+  ブロックされている) で直接は開けなかった。
+- `https://github.com/easylist/easylist` — リポジトリのルートに
+  `LICENSE`/`LICENCE`/`COPYING` の類は存在しない (`README.md`,
+  `CONTRIBUTING.md` 等のファイル一覧を実際に取得して確認した)。
+  `README.md` はライセンスについて
+  `Visit easylist.to/pages/licence.html.` と外部ページへの参照のみで、
+  リポジトリ内には条文そのものが無い。
+- Web 検索で easylist.to のライセンスページの実際の文言を確認したところ
+  (検索結果に埋め込まれた引用): *"dual licensed under the GNU General
+  Public License version 3 of the License, or (at your option) any later
+  version, and Creative Commons Attribution-ShareAlike 3.0 Unported, or (at
+  your option) any later version. ... 'The EasyList authors
+  (https://easylist.to/)' should be attributed as the source of the
+  material."* — Issue に書かれていた GPLv3 / CC BY-SA 3.0 のデュアル
+  ライセンスという理解と一致する。
+- `https://github.com/gorhill/uBlock/wiki/Filter-list-licenses` (uBlock
+  Origin 側が主要フィルタリストのライセンスを一覧化している wiki) を
+  実際に取得し確認: EasyList・EasyPrivacy はどちらも「GPL3」と
+  「CC BY-SA 3.0」の両方が列挙されている一方、AdGuard 系フィルタは
+  GPL3 のみで CC BY-SA を含まない、という比較が明記されていた —
+  EasyList/EasyPrivacy がこの二重ライセンス構造を持つという事実の
+  独立した裏付けとして扱った。
+
+**判断**: **実データ（本物の EasyList/EasyPrivacy ファイル）はリポジトリに
+同梱しない。ネットワークから自動ダウンロードもしない。** 根拠:
+
+1. GPLv3 は同梱物が「一体として」配布される場合にコピーレフトの影響範囲
+   (どこまでが「派生物」か) が争点になりやすく、CC BY-SA 3.0 は
+   ShareAlike (同一ライセンスでの再頒布) を要求する — VeloX 本体は MIT
+   であり、フィルタデータをリポジトリに静的に同梱すると「MIT ライセンスの
+   リポジトリの一部として GPLv3/CC BY-SA 3.0 のデータを配布する」形になり、
+   帰属表示 (attribution) 義務も含めてリリース物のライセンス整合性が
+   複雑になる。この複雑さを本 Issue のスコープで精査しきる時間的余裕は
+   ないため、同梱しない選択が安全側。
+2. 自動ダウンロードも見送った。ネットワークから毎回 (または定期的に)
+   フェッチする実装は、取得したデータをアプリの動作の一部として利用する
+   点でライセンス上の扱いは同梱と大差なく、かつ D6 が明示的に除外している
+   「HTTP クライアント依存の追加」(D6: "Notably absent on purpose: ...
+   any HTTP client (the engine owns networking)") と、更新スケジューリング・
+   キャッシュ・失敗時のフォールバックといった実装コストを新たに持ち込む。
+   D17 の時点で既に「ネットワークからのフェッチは follow-up」と決めており、
+   本 Issue でもその判断を維持する。
+3. 採用したのは **「ユーザーが自分で easylist.to から手動ダウンロードした
+   ファイルを、既存の `Config::extra_blocklist_path`
+   (`VELOX_EXTRA_BLOCKLIST` 相当の起動時設定) で読み込ませる」** という
+   D17 由来の pull 型・手動更新モデルの継続。VeloX 自身はどのライセンスの
+   データも配布・複製しないため、VeloX 自体の頒布物 (MIT のソース +
+   ビルド成果物) はライセンス上クリーンなまま — GPLv3/CC BY-SA 3.0 の
+   遵守義務 (帰属表示など) は、そのファイルをダウンロードして使う
+   ユーザー自身の利用行為に付随する (これは実際のリストファイル自身が
+   ヘッダコメントに明記している内容でもある)。
+4. **更新方式**: ユーザーが `https://easylist.to/easylist/easylist.txt` /
+   `https://easylist.to/easylist/easyprivacy.txt` を任意の頻度 (EasyList
+   自体はほぼ毎日更新されている) で再ダウンロードし、
+   `extra_blocklist_path` の指すファイルを置き換えて VeloX を再起動する
+   運用を前提とする。VeloX 側にホットリロードや自動更新チェックの機構は
+   無い (`Config` は起動時に一度だけ解決される既存の設計と一貫)。
+   バックグラウンドでの自動フェッチ・更新は、上記の理由により本 Issue
+   のスコープ外として follow-up 送りとする。
+
+### 既存クレート評価: `adblock` (Brave, crates.io)
+
+crates.io/docs.rs (docs.rs 自体はプロキシで `EGRESS_BLOCKED`) を実際に
+確認した:
+
+- `https://crates.io/api/v1/crates/adblock` (JSON API): 最新バージョン
+  `0.13.3`、**ライセンス `MPL-2.0`**、説明は "Native Rust module for
+  Adblock Plus syntax (e.g. EasyList, EasyPrivacy) filter parsing and
+  matching."、最終更新 2026-08-20、累計ダウンロード数 1,139,645
+  (broadly 使われている、メンテナンスも継続中と判断できる)。
+- ライセンス適合性: **MPL-2.0 は VeloX (MIT) と両立する** — MPL-2.0
+  §3.3 は MPL 対象ファイルをより大きな作品 (Larger Work) の一部として
+  別ライセンスで配布することを許しており (MPL 対象のソース自体は MPL の
+  まま公開されていればよい)、多くの MIT/Apache プロジェクトが MPL-2.0
+  クレートに依存する実例がある。**ライセンスは不採用の理由ではない。**
+- 依存ツリー: `https://raw.githubusercontent.com/brave/adblock-rust/master/Cargo.toml`
+  を実際に取得して `[dependencies]` を確認したところ、必須依存だけで
+  `regex`, `flatbuffers`, `idna`, `itertools`, `cssparser`/`selectors`
+  (コスメティックフィルタ用、feature gated), `seahash`, `rustc-hash`,
+  `memchr`, `base64`, `arrayvec`, `bitflags`, `serde`/`serde_json`,
+  `thiserror`, `percent-encoding` など (crates.io 側の依存一覧 API では
+  必須 16 件 + オプション 3 件 (`addr`/PSL, `cssparser`, `selectors`))。
+- **不採用の理由は D6 の依存最小化方針**: VeloX が実際に使える機能は
+  「ネットワークレベルのドメイン/パターンブロック」だけで、`adblock`
+  クレートが提供する正規表現マッチング・コスメティックフィルタ
+  (`cssparser`/`selectors`)・PSL 付き third-party 判定・
+  `flatbuffers` シリアライズといった機能の大半は VeloX には適用先が無い
+  (DOM 操作フックが無い、レスポンス書き換えフックも無い)。D6 の
+  「依存クレートは必要最小限」「1 クレート 1 役割」の原則に照らすと、
+  使わない機能のために正規表現エンジンや CSS パーサをバイナリに含める
+  コストに見合わない。D17 が同じ理由で `adblock` 系クレートを見送った
+  判断を、実際にクレートの中身を確認したうえで踏襲した。
+- 一方で、自前実装が「一部の構文しか解釈できない」ままでは Issue の受け
+  入れ条件を満たせないため、単純なドメイン一致だけだった D17 時点の
+  `FilterList` を、**ワイルドカード/セパレータ/アンカー付きの汎用パターン
+  ルール**と**`$` オプション (リソースタイプ・`domain=`)**まで理解できる
+  よう拡張した — 「自前実装で済ませる場合、どこまでのルール構文を
+  サポートすれば実用に足りるか」を実際に手を動かして見極めた結果である。
+
+### サポートしたルール構文 (`src/browser/blocklist.rs`)
+
+モジュール冒頭のドキュメントコメントに正式な一覧があるが、要点:
+
+- `||domain^` ドメインアンカー (既存、`$options` 付きも可)。
+- **新規**: `||...` 以外の一般パターン — リテラル文字列、`*` (任意長
+  ワイルドカード)、`^` (セパレータ — 英数字/`.`/`-`/`_`/`%` 以外の 1 文字、
+  または URL 末尾)、先頭/末尾の `|` アンカー。Adblock Plus 自体が定義する
+  非正規表現フィルタと同じアルゴリズム。バックトラックはしない
+  (リテラルの最初の出現位置がセパレータ条件を満たさなければ、それ以降の
+  出現位置は試さない) — ブロック漏れ方向の簡略化であり、誤ブロックの
+  方向には倒れない。
+- `@@` 例外 — ドメインアンカー/汎用パターンどちらにも付けられる。
+- **新規**: `$` オプションのうちリソースタイプ (`script`/`image`/
+  `stylesheet`/`xmlhttprequest`/`subdocument`/`font`/`media`/`websocket`/
+  `ping`/`popup`/`document`/`other` とその別名) と `domain=a.com|~b.com`
+  はパース・評価する (`MatchContext` 経由)。`third-party`/`important`/
+  `match-case`/`all`/`empty`/`mp4` は認識するがマッチングには影響させない
+  (後述)。それ以外の未知オプション (`$csp=`/`$redirect=`/`$rewrite=`/
+  `$badfilter`/`$genericblock`/`$elemhide` 等) や否定リソースタイプ
+  (`$~script`) は**ルール全体を安全に読み飛ばす** — 中途半端に適用する
+  方が誤動作リスクが高いと判断した。
+- **新規**: `/regex/` (パターン全体が `/` で始まり `/` で終わる)
+  形式の正規表現フィルタは Adblock Plus の仕様どおり正規表現として認識し、
+  VeloX は正規表現エンジンを持たない (意図的 — 依存追加を避ける) ため
+  安全に読み飛ばす。
+- コメント (`!`)、`[Adblock Plus 2.0]` 形式のヘッダ行、要素非表示/
+  スクリプトレット行 (`##`/`#@#`/`#$#`/`#%#`/`#?#` を含む行) は既存どおり
+  無視。
+- **意図的に実装しなかったもの**: 正確な third-party 判定 (public suffix
+  list 相当の実装が要り D6 に反するため、`domain=` の実装だけに留めた)、
+  `$important` の優先度上書き、`$badfilter` のルール取り消しセマンティクス
+  (取り消し対象ではなく通常ブロックとして誤適用するとむしろ危険なため
+  ルールごと破棄)、コスメティック/スクリプトレット/レスポンス書き換え系
+  オプション全般。
+
+### 不正ルールへの耐性
+
+- 1 行が `MAX_RULE_LINE_LEN` (8192 バイト) を超える場合はパースせず
+  読み飛ばす — 巨大な 1 行によるパースコスト膨張を防ぐ。
+- リスト全体は `MAX_RULES` (300,000 ルール — EasyList + EasyPrivacy を
+  合わせても現状 15 万行程度なので十分な余裕を持たせた) で頭打ちにし、
+  それ以降の行は解析せず無視する (エラーにはしない) — 異常に巨大な
+  ファイルによる無制限のメモリ消費を防ぐ。
+- ワイルドカードのみで構成される (リテラルを一切含まない) パターンは
+  「実質すべてのリクエストをブロックする」事故になるため、明示的に
+  ルールとして採用しない (`*` 単独や `****` のような行は無視)。
+- 未対応の `$` オプション・否定リソースタイプ・不正な `domain=` 値・
+  壊れた `||domain^` (ドメイン部分に許可されない文字を含む) は、いずれも
+  そのルール 1 行を安全に無視するだけで、パニックや他ルールへの影響は
+  無い。
+- 単体テスト (`src/browser/blocklist.rs` の `tests` モジュール) に、
+  上記すべてを固定化するケースに加え、コメント・ヘッダ・不正オプション・
+  正規表現・巨大ファイルをランダムに混在させた 5,000 行のガベージ
+  ファイルでパニックしないことを確認するテスト、`MAX_RULE_LINE_LEN`
+  境界のテスト、`MAX_RULES` の頭打ちを 30 万件超のファイルで確認する
+  テストを含む。Issue #35 が並行して進めている「クラッシュしないこと」を
+  固定化する堅牢性テストと同じ発想。
+
+### 検証できたこと・できなかったこと（正直な記録）
+
+**ルールマッチングの単体テスト**: `cargo test` で 35 件
+(`browser::blocklist::tests::*`、D17 時点の 10 件から追加) が
+ライブラリテスト全体 582 件の一部として実行され、すべて成功。
+ドメインアンカー・汎用パターン (リテラル/ワイルドカード/セパレータ/
+アンカー)・例外・リソースタイプ/`domain=` オプション・未対応オプションの
+ルール破棄・巨大ファイル/巨大行への耐性のいずれもここでカバーしている。
+
+**「既存サイトで広告/トラッカーがブロックされる」は部分的にしか検証できて
+いない**。この開発環境は Linux (WebKitGTK) のみで、D59 の結論どおり
+サブリソースブロック自体が Windows (WebView2) 限定であり、Linux では
+そもそも `browser::subresource`/`ui::webview2_blocking` が動作対象外。
+検証できた範囲とできなかった範囲を分けて記録する:
+
+- 検証できた: `FilterList::is_blocked`/`is_blocked_with_context` の
+  単体テスト (実際のリクエスト URL 文字列に対する判定ロジック)。
+  `src/ui/window.rs` の `content_webview_builder` が
+  `content_blocking_enabled && blocklist.is_blocked(&url)` を
+  変更なく呼び出しており (このシグネチャは #22/#59 と同じく維持)、
+  main-frame ナビゲーションレベルのブロックは既存の統合テスト基盤
+  (`tests/integration.rs`) の対象範囲内で壊れていないことを
+  `cargo test`/`xvfb-run` で確認した。
+- 検証できなかった: Windows 実機 (または WebView2 ランタイム) が
+  この環境に無いため、拡張した `FilterList` を実際の広告/トラッカー
+  リクエスト (例えば EasyList を読み込んだ状態でのブラウジング) に
+  対して動かし、ブロック件数バッジが増える・広告が消えることを
+  目視確認することはできていない。これは D59 が既に記録した制約
+  (Windows 実機未検証) の範囲内であり、今回新たに増えた制約ではない。
+
+### 残っている制約 (revisit condition)
+
+1. **third-party/`$important`/`$badfilter` は未実装** — 上記のとおり
+   意図的な見送り。third-party は PSL 相当の実装が必要になった時点で、
+   `$important`/`$badfilter` は優先度付きマッチングモデルが必要になった
+   時点で再評価する。
+2. **`browser::subresource::is_blocked_resource` はリソースタイプ/
+   `domain=` オプションを未だ利用しない** — #22 の成果物としてこの PR
+   では変更していないため、`FilterList::is_blocked_with_context` は
+   実装・テスト済みだが実際の呼び出し元からはまだ配線されていない。
+   `browser::subresource::ResourceType` → `browser::RuleResourceType`
+   の変換を追加する follow-up で接続できる (両者は語彙が完全一致しない
+   ため素朴な `From` 変換にはならない点に注意)。
+3. **実データの動作確認が Windows 実機でしかできない** — 上記のとおり。
+4. **自動更新の UI/機構は無い** — `extra_blocklist_path` の手動再配置 +
+   再起動のみ。ホットリロードや定期フェッチは follow-up。
