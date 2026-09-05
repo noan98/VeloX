@@ -53,6 +53,7 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | `tab_create` | tab creation | 可 (`--url` 必須) |
 | `tab_switch` | tab switching | 可 (`--url` 必須) |
 | `tab_resume` | 休止タブの復帰コスト (Issue #63: `suspend` → `switch` を繰り返し、`tab_resume_ms` と復帰時の再読み込み `page_load_ms` を採る) | 可 (`--url` 必須) |
+| `background_cpu` | バックグラウンドタブの CPU 消費 (Issue #64)。`busy.html` を開いてから `?idle=1` 版を新しいタブで開き、busy 側をバックグラウンドに送って測る。`--url` には `busy.html` を渡す | 可 (`--url` 必須) |
 | `tab_create_1` / `_5` / `_10` / `_20` / `_50` | **N タブ開いた状態で**もう 1 つタブを作るコスト (Issue #60)。N タブまで開いてから `mark` し、以降「1 つ開いて閉じる」を 8 回繰り返すので、`tab_create_ms` のサンプルはすべてタブ数 N で採られる | 可 (`--url` 必須) |
 | `tab_switch_1` / `_5` / `_10` / `_20` / `_50` | **N タブ開いた状態で**のタブ切替コスト (Issue #60)。同様に `mark` 後の 8 回の `switch` だけを測る | 可 (`--url` 必須) |
 | `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 可 (`--url` 必須) |
@@ -171,6 +172,7 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | `tab_create_ms` | `tab_create` | `duration_ms` |
 | `tab_switch_ms` | `tab_switch` | `duration_ms` |
 | `tab_resume_ms` | `tab_resume` | `duration_ms` (休止タブへの切替 = webview の再構築。Issue #63) |
+| `cpu_percent` | `cpu` | `percent` (直近 2 回の `rss` サンプル間の、プロセスツリー全体の CPU 使用率。1 コアを 100 とする。Issue #64) |
 | (集計対象の境界) | `measure_start` | フィールド無し。`mark` コマンドが書き込むマーカーで、これより前のイベントは集計から捨てられる (Issue #60) |
 | `rss_total_bytes` | `rss` | `total_rss_bytes` |
 | `rss_process_count` | `rss` | `process_count` |

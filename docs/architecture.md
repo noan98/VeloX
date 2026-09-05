@@ -756,7 +756,7 @@ Every event kind above goes through one type, `metrics::PerfRecord`,
 written by a shared `perf_log::PerfLog` (stderr by default, or a file — see
 below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
 `tab_create`, `tab_switch`, `tab_resume` (Issue #63), `tab_suspend`
-(Issue #63), `measure_start` (Issue #60), `rss`.
+(Issue #63), `measure_start` (Issue #60), `cpu` (Issue #64), `rss`.
 
 - **`VELOX_PERF_FORMAT=text|json`** (default `text`; unset/unrecognized also
   falls back to `text`): selects `Config::perf_format`.
@@ -772,12 +772,14 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     velox[perf] tab_resume id=3 duration=2.7ms
     velox[perf] tab_suspend id=1 reason=tab_count
     velox[perf] measure_start
-    velox[perf] rss pid=4821 processes=5 total_mib=312.4 pss_processes=5/5 pss_mib=180.2
+    velox[perf] cpu percent=0.6
+    velox[perf] rss pid=4821 processes=5 total_mib=312.4 pss_processes=5/5 pss_mib=180.2 cpu_s=12.34
     ```
     (Issue #108 / D42: `pss_processes=<readable>/<processes>` and `pss_mib`
     were appended to the `rss` line, not inserted — an existing scraper
     matching the original prefix still works. `pss_mib=n/a` when PSS could
-    not be read for any process in the tree.)
+    not be read for any process in the tree. Issue #64 appended `cpu_s`
+    the same way, `n/a` on platforms where CPU time cannot be read.)
   - `json` emits one JSON object per line (JSON Lines) — **this is the
     format Issue #14's benchmark runner and Issue #36's CI regression check
     should parse.** No `velox[perf] ` prefix, so every line parses as JSON
@@ -797,7 +799,8 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     | `tab_resume` | `tab_id` (uint), `duration_ms` (float ms) — a switch that had to rebuild a suspended tab's webview (Issue #63); kept apart from `tab_switch` because the two are an order of magnitude apart |
     | `tab_suspend`| `tab_id` (uint), `reason` (string: `idle` / `tab_count` / `memory`) — an automatic suspension (Issue #63); no duration, dropping a webview is synchronous |
     | `measure_start` | *(none)* — the `mark` automation command (Issue #60). Everything logged before the last one is warm-up: `benchmark::aggregate_trials` pools only what follows it, which is what lets a scenario open N tabs before measuring an operation *at* N tabs |
-    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint) |
+    | `cpu`        | `percent` (float) — CPU used by the whole process tree between the two most recent `rss` samples, as a percentage of one core (Issue #64). A rate, so the first sample of a run emits none |
+    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint), `total_cpu_seconds` (float or `null`) |
 
     `total_pss_bytes`/`pss_process_count` were added by Issue #108 (D42).
     `total_pss_bytes` is the PSS counterpart to `total_rss_bytes` — see

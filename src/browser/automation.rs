@@ -240,6 +240,16 @@ const TAB_SWITCH_EXTRA_TABS: usize = 4;
 /// How many `switch` commands `Scenario::TabSwitch` issues, one
 /// `tab_switch` latency sample each.
 const TAB_SWITCH_REPEATS: usize = 8;
+/// How long `Scenario::BackgroundCpu` lets the busy tab sit in the
+/// background before quitting. The CPU sampler is paced to fit several
+/// samples inside this window ([`recommended_rss_interval_ms`]), and a
+/// `cpu_percent` value only exists from the *second* sample onwards (it is
+/// a rate between two), so this has to comfortably outlast a couple of
+/// intervals rather than just one.
+const BACKGROUND_CPU_WINDOW_MS: u64 = 8_000;
+/// Settle time after loading the busy page and after opening the idle one,
+/// so neither page's initial load lands inside the measured window.
+const BACKGROUND_CPU_SETTLE_MS: u64 = 1_500;
 /// How many extra tabs `Scenario::TabResume` opens before its
 /// suspend/resume rounds — the same count as `TabSwitch`, so the two
 /// scenarios' numbers are comparable (`tab_switch_ms` for a live tab vs.
@@ -342,6 +352,19 @@ pub fn generate_bench_script(
             }
             lines
         }
+        Scenario::BackgroundCpu => {
+            // The `--url` is the busy page and is already loaded as the
+            // homepage; opening it again with `?idle=1` gives a visible
+            // tab that does nothing, leaving the busy one hidden.
+            let separator = if url.contains('?') { '&' } else { '?' };
+            vec![
+                format!("wait {BACKGROUND_CPU_SETTLE_MS}"),
+                format!("open {url}{separator}idle=1"),
+                format!("wait {BACKGROUND_CPU_SETTLE_MS}"),
+                "mark".to_owned(),
+                format!("wait {BACKGROUND_CPU_WINDOW_MS}"),
+            ]
+        }
         Scenario::TabCreateAt(tab_count) => {
             // Setup: reach `tab_count` live tabs, each settled so the next
             // `open` is a steady-state one (D54 never joins a web process
@@ -437,6 +460,7 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             let round_ms = 2 * PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS + RESUME_SETTLE_MS;
             open_ms + TAB_RESUME_REPEATS as u64 * round_ms
         }
+        Scenario::BackgroundCpu => 2 * BACKGROUND_CPU_SETTLE_MS + BACKGROUND_CPU_WINDOW_MS,
         Scenario::TabCreateAt(tab_count) => {
             let setup_ms =
                 u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
@@ -498,6 +522,10 @@ pub fn recommended_rss_interval_ms(
     use crate::browser::benchmark::scenario::Scenario;
     match scenario {
         Scenario::TabCountMemory(_) => Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES),
+        // Same reasoning for the CPU window (Issue #64): the default 5000ms
+        // would fit at most one sample inside it, and one sample yields no
+        // `cpu_percent` at all (a rate needs two).
+        Scenario::BackgroundCpu => Some(BACKGROUND_CPU_WINDOW_MS / TARGET_STABILIZED_RSS_SAMPLES),
         Scenario::ColdStartup
         | Scenario::WarmStartup
         | Scenario::FirstPageLoad
@@ -645,6 +673,61 @@ mod tests {
     }
 
     #[test]
+    fn background_cpu_script_backgrounds_the_busy_tab_and_marks_before_measuring() {
+        let url = "http://127.0.0.1:8731/busy.html";
+        let script = generate_bench_script(Scenario::BackgroundCpu, url).unwrap();
+        let commands = parse_script(&script).unwrap();
+        let marker = commands
+            .iter()
+            .position(|c| *c == AutomationCommand::Mark)
+            .expect("background_cpu must mark its measured phase");
+
+        // Exactly one `open`, before the marker, and it must be the idle
+        // variant — the busy page is already the homepage, so opening the
+        // idle one is what pushes it into the background.
+        let opened: Vec<&str> = commands
+            .iter()
+            .filter_map(|c| match c {
+                AutomationCommand::Open { url } => Some(url.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(opened.len(), 1);
+        assert!(opened[0].contains("idle=1"), "{}", opened[0]);
+        assert!(commands[..marker]
+            .iter()
+            .any(|c| matches!(c, AutomationCommand::Open { .. })));
+
+        // Nothing after the marker may touch the tabs: the window has to be
+        // the browser sitting still with one hidden busy tab.
+        assert!(commands[marker + 1..]
+            .iter()
+            .all(|c| matches!(c, AutomationCommand::Wait { .. } | AutomationCommand::Quit)));
+    }
+
+    #[test]
+    fn background_cpu_appends_its_query_parameter_correctly() {
+        // A URL that already carries a query must get `&`, not a second `?`,
+        // or the fixture never sees `idle=1`.
+        let script =
+            generate_bench_script(Scenario::BackgroundCpu, "http://h/busy.html?a=1").unwrap();
+        assert!(script.contains("busy.html?a=1&idle=1"), "{script}");
+        let script = generate_bench_script(Scenario::BackgroundCpu, "http://h/busy.html").unwrap();
+        assert!(script.contains("busy.html?idle=1"), "{script}");
+    }
+
+    #[test]
+    fn background_cpu_gets_a_sampling_interval_that_fits_several_samples() {
+        // One sample yields no `cpu_percent` at all (it is a rate between
+        // two), so the window must hold several.
+        let interval = recommended_rss_interval_ms(Scenario::BackgroundCpu).unwrap();
+        assert!(
+            BACKGROUND_CPU_WINDOW_MS / interval >= TARGET_STABILIZED_RSS_SAMPLES,
+            "interval {interval}ms is too coarse for a {BACKGROUND_CPU_WINDOW_MS}ms window"
+        );
+    }
+
+    #[test]
     fn only_the_parameterized_scenarios_emit_a_marker() {
         let url = "http://127.0.0.1:8731/minimal.html";
         for scenario in Scenario::all() {
@@ -656,7 +739,7 @@ mod tests {
                 .contains(&AutomationCommand::Mark);
             let expected = matches!(
                 scenario,
-                Scenario::TabCreateAt(_) | Scenario::TabSwitchAt(_)
+                Scenario::TabCreateAt(_) | Scenario::TabSwitchAt(_) | Scenario::BackgroundCpu
             );
             assert_eq!(has_mark, expected, "{scenario:?}");
         }

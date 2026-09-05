@@ -110,13 +110,18 @@ pub enum MetricKey {
     /// the same sample, out of [`MetricKey::RssProcessCount`] total —
     /// compare the two to tell a complete PSS total from a partial one.
     PssProcessCount,
+    /// CPU utilization of the whole process tree between two consecutive
+    /// RSS samples, as a percentage of one core (Issue #64): 100 is one
+    /// core fully busy. The metric background-tab work is judged by — see
+    /// `docs/decisions.md` D58.
+    CpuPercent,
 }
 
 impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 13] = [
+    pub const ALL: [MetricKey; 14] = [
         MetricKey::StartupWindowCreatedMs,
         MetricKey::StartupRustSetupDoneMs,
         MetricKey::StartupToolbarScriptStartedMs,
@@ -130,6 +135,7 @@ impl MetricKey {
         MetricKey::RssProcessCount,
         MetricKey::PssTotalBytes,
         MetricKey::PssProcessCount,
+        MetricKey::CpuPercent,
     ];
 
     /// The key's name as stored in [`BenchmarkResult::metrics`] and printed
@@ -149,6 +155,7 @@ impl MetricKey {
             MetricKey::RssProcessCount => "rss_process_count",
             MetricKey::PssTotalBytes => "pss_total_bytes",
             MetricKey::PssProcessCount => "pss_process_count",
+            MetricKey::CpuPercent => "cpu_percent",
         }
     }
 
@@ -189,6 +196,9 @@ impl MetricKey {
             | MetricKey::TabResumeMs => 20.0, // milliseconds
             MetricKey::RssTotalBytes | MetricKey::PssTotalBytes => 5.0 * 1024.0 * 1024.0, // 5 MiB
             MetricKey::RssProcessCount | MetricKey::PssProcessCount => 1.0, // whole processes
+            // 5 percentage points of one core. Below that, the difference
+            // between two runs on a shared machine is scheduling noise.
+            MetricKey::CpuPercent => 5.0,
         }
     }
 
@@ -208,6 +218,7 @@ impl MetricKey {
             | MetricKey::RssProcessCount
             | MetricKey::PssTotalBytes
             | MetricKey::PssProcessCount => "rss",
+            MetricKey::CpuPercent => "cpu",
         }
     }
 
@@ -228,6 +239,10 @@ impl MetricKey {
             MetricKey::RssProcessCount => "process_count",
             MetricKey::PssTotalBytes => "total_pss_bytes",
             MetricKey::PssProcessCount => "pss_process_count",
+            // The `cpu` event names its own field simply `percent`; the
+            // metric is called `cpu_percent` to stay unambiguous in a
+            // result file that also carries byte and millisecond metrics.
+            MetricKey::CpuPercent => "percent",
         }
     }
 
@@ -1486,6 +1501,15 @@ pub mod scenario {
         Navigation,
         TabCreate,
         TabSwitch,
+        /// CPU used by a *background* tab that is trying hard to be busy
+        /// (Issue #64). Loads `scripts/bench/pages/busy.html` (a page with
+        /// a `requestAnimationFrame` loop, a 10ms timer and a CSS
+        /// animation, all burning real CPU) as the first tab, then opens
+        /// the same page with `?idle=1` — which turns every loop off — as
+        /// a second tab, so the busy one is backgrounded and the visible
+        /// one costs nothing. What is left in `cpu_percent` is what the
+        /// hidden tab still consumes.
+        BackgroundCpu,
         /// Cost of creating one more tab with `tab_count` tabs already
         /// open (Issue #60). Every sample is taken at that exact tab
         /// count: the scenario opens `tab_count` tabs as setup, `mark`s
@@ -1523,6 +1547,7 @@ pub mod scenario {
                 Scenario::TabCreate,
                 Scenario::TabSwitch,
                 Scenario::TabResume,
+                Scenario::BackgroundCpu,
             ];
             scenarios.extend(
                 Self::TAB_COUNTS
@@ -1545,6 +1570,7 @@ pub mod scenario {
                 Scenario::TabCreate => "tab_create".to_owned(),
                 Scenario::TabSwitch => "tab_switch".to_owned(),
                 Scenario::TabResume => "tab_resume".to_owned(),
+                Scenario::BackgroundCpu => "background_cpu".to_owned(),
                 Scenario::TabCreateAt(n) => format!("tab_create_{n}"),
                 Scenario::TabSwitchAt(n) => format!("tab_switch_{n}"),
                 Scenario::TabCountMemory(n) => format!("tabs_{n}"),
@@ -1562,6 +1588,7 @@ pub mod scenario {
                 "tab_create" => Some(Scenario::TabCreate),
                 "tab_switch" => Some(Scenario::TabSwitch),
                 "tab_resume" => Some(Scenario::TabResume),
+                "background_cpu" => Some(Scenario::BackgroundCpu),
                 // Parameterized ids, checked after the exact matches above
                 // so `tab_create`/`tab_switch` keep their own meaning.
                 other => Self::parse_parameterized(other),
@@ -1613,6 +1640,7 @@ pub mod scenario {
                 | Scenario::TabCreate
                 | Scenario::TabSwitch
                 | Scenario::TabResume
+                | Scenario::BackgroundCpu
                 | Scenario::TabCreateAt(_)
                 | Scenario::TabSwitchAt(_)
                 | Scenario::TabCountMemory(_) => true,
@@ -1659,8 +1687,8 @@ pub mod scenario {
         }
 
         #[test]
-        fn all_covers_seven_fixed_plus_three_parameterized_families() {
-            assert_eq!(Scenario::all().len(), 7 + 3 * Scenario::TAB_COUNTS.len());
+        fn all_covers_eight_fixed_plus_three_parameterized_families() {
+            assert_eq!(Scenario::all().len(), 8 + 3 * Scenario::TAB_COUNTS.len());
         }
 
         #[test]
@@ -1770,6 +1798,20 @@ mod tests {
         // Not a panic and not a silent fallback to the warm-up numbers:
         // the metric is simply absent.
         assert!(!aggregate_trials(&[trial]).contains_key("tab_create_ms"));
+    }
+
+    #[test]
+    fn cpu_percent_is_read_from_the_cpu_event() {
+        let events = vec![
+            event(r#"{"event":"cpu","percent":97.5,"ts_ms":10.0}"#),
+            event(r#"{"event":"cpu","percent":0.6,"ts_ms":20.0}"#),
+            // An `rss` event must not contribute to it, and vice versa.
+            event(
+                r#"{"event":"rss","process_count":4,"total_rss_bytes":10,"total_cpu_seconds":3.0,"ts_ms":20.0}"#,
+            ),
+        ];
+        assert_eq!(MetricKey::CpuPercent.extract(&events), vec![97.5, 0.6]);
+        assert_eq!(MetricKey::RssProcessCount.extract(&events), vec![4.0]);
     }
 
     #[test]
@@ -2007,6 +2049,7 @@ mod tests {
             scenario::Scenario::TabCreate,
             scenario::Scenario::TabSwitch,
             scenario::Scenario::TabResume,
+            scenario::Scenario::BackgroundCpu,
         ] {
             assert_eq!(
                 memory_sample_confidence(scenario, 3, &metrics),

@@ -457,6 +457,40 @@ elapsed_ms,timestamp_iso,rss_bytes,pss_bytes,process_count,pss_process_count
 
 ---
 
+## 3.5 CPU 使用率の観測 (Issue #64)
+
+メモリと同じく、CPU も**外から測る手段**と**VeloX 自身が記録する手段**の
+2 つがある。使い分けを間違えると数字がずれる。
+
+| 手段 | 何が出るか | いつ使うか |
+| --- | --- | --- |
+| `scripts/profile/cpu_usage.py` | プロセスツリー全体の CPU 使用率 (1 コア = 100%)、プロセス別内訳 | **絶対値**が要るとき。VeloX の外から `/proc/<pid>/stat` を 2 点だけ読むので、測定コストが被測定側に乗らない |
+| `velox-bench run --scenario background_cpu` の `cpu_percent` | 同上を VeloX 自身のサンプラが記録したもの | **回帰検知**。サンプラが /proc を歩くコストが乗るが、同一シナリオの before/after では打ち消し合う |
+| `perf` (§1) | どの関数が CPU を使っているか | 使用率が高い原因を特定するとき |
+
+`cpu_usage.py` は `velox` を自動操作スクリプト付きで起動し、`--settle-secs`
+待ってから `--window-secs` の窓で CPU 時間の差を取る。起動とページ読み込みの
+コストは窓の外に出る。
+
+```sh
+P=$PWD/scripts/bench/pages
+printf 'open file://%s/busy.html\nwait 1500\nopen file://%s/minimal.html\nwait 60000\nquit\n' \
+  $P $P > /tmp/bg.txt
+VELOX_MAX_TABS_PER_PROCESS=1 xvfb-run -a --server-args="-screen 0 1280x900x24" \
+  dbus-run-session -- python3 scripts/profile/cpu_usage.py \
+    --velox target/release/velox --script /tmp/bg.txt \
+    --homepage file://$P/minimal.html --label background --window-secs 16
+```
+
+`VELOX_MAX_TABS_PER_PROCESS=1` を付けるとタブごとに web プロセスが分かれる
+ので、内訳からどのタブが使っているかを読み取れる (D54/D57)。
+
+**負荷源**: `scripts/bench/pages/busy.html` が `requestAnimationFrame`
+ループ・10ms タイマー・CSS アニメーションで実際に CPU を焼く。`?idle=1` で
+全ループを止めた静的版、`?beacon=1` で発火ごとに同一オリジンへ 1 本投げる版に
+なる。ビーコンは「CPU が少ない」と「完全に止まっている」を区別するために
+使う — 詳細は `docs/decisions.md` D58。
+
 ## 4. profiling プロファイルとベンチマーク baseline の紐付け
 
 `docs/benchmarking.md` の「baseline の保存形式」と同じ方針を踏襲する:

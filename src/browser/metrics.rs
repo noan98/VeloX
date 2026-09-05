@@ -216,7 +216,9 @@ pub fn format_page_load(url: &str, duration: Duration) -> String {
 /// enough privilege to read it, neither of which is guaranteed. See D42 in
 /// `docs/decisions.md` for why PSS — not summed RSS — is the right total
 /// when comparing browsers with different process counts.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No `Eq`: `total_cpu_seconds` is an `f64` (Issue #64). `PartialEq` is
+// kept for the tests that compare whole samples.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RssSample {
     pub root_pid: u32,
     /// Total number of processes in the tree (root plus every descendant),
@@ -235,6 +237,18 @@ pub struct RssSample {
     /// `total_pss_bytes`. Compare against `process_count` to tell a
     /// complete PSS total from a partial one.
     pub pss_process_count: usize,
+    /// Total CPU time (user + system) consumed by the whole tree since each
+    /// process started, in seconds (Issue #64). Cumulative, not a rate:
+    /// subtract two samples and divide by the wall time between them to get
+    /// a percentage — `spawn_rss_sampler` does exactly that and logs
+    /// `cpu_percent` alongside.
+    ///
+    /// `None` when no process's CPU time could be read (a non-Linux
+    /// platform, where the `ps` fallback does not provide it). A process
+    /// that exits between two samples takes its accumulated time with it,
+    /// which can make a delta *negative*; callers must clamp rather than
+    /// assume monotonicity.
+    pub total_cpu_seconds: Option<f64>,
 }
 
 impl fmt::Display for RssSample {
@@ -249,8 +263,14 @@ impl fmt::Display for RssSample {
             self.process_count,
         )?;
         match self.total_pss_bytes {
-            Some(bytes) => write!(f, " pss_mib={:.1}", bytes as f64 / (1024.0 * 1024.0)),
-            None => write!(f, " pss_mib=n/a"),
+            Some(bytes) => write!(f, " pss_mib={:.1}", bytes as f64 / (1024.0 * 1024.0))?,
+            None => write!(f, " pss_mib=n/a")?,
+        }
+        // Appended, never inserted — same rule D42 followed for the PSS
+        // fields, so a scraper matching the original prefix keeps working.
+        match self.total_cpu_seconds {
+            Some(secs) => write!(f, " cpu_s={secs:.2}"),
+            None => write!(f, " cpu_s=n/a"),
         }
     }
 }
@@ -337,6 +357,10 @@ struct ProcInfo {
     ppid: u32,
     rss_bytes: u64,
     pss_bytes: Option<u64>,
+    /// User + system CPU time this process has used since it started, in
+    /// seconds. `None` where the platform does not provide it (see
+    /// [`RssSample::total_cpu_seconds`]).
+    cpu_seconds: Option<f64>,
 }
 
 /// Pure tree-walk + summation, independent of how `processes` was obtained
@@ -349,11 +373,17 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
     let mut total_rss_bytes = 0u64;
     let mut total_pss_bytes = 0u64;
     let mut pss_process_count = 0usize;
+    let mut total_cpu_seconds = 0.0f64;
+    let mut cpu_process_count = 0usize;
     for info in tree.iter().filter_map(|pid| processes.get(pid)) {
         total_rss_bytes += info.rss_bytes;
         if let Some(pss) = info.pss_bytes {
             total_pss_bytes += pss;
             pss_process_count += 1;
+        }
+        if let Some(cpu) = info.cpu_seconds {
+            total_cpu_seconds += cpu;
+            cpu_process_count += 1;
         }
     }
     Ok(RssSample {
@@ -362,6 +392,7 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
         total_rss_bytes,
         total_pss_bytes: (pss_process_count > 0).then_some(total_pss_bytes),
         pss_process_count,
+        total_cpu_seconds: (cpu_process_count > 0).then_some(total_cpu_seconds),
     })
 }
 
@@ -494,6 +525,15 @@ pub enum PerfRecord {
         reason: crate::browser::suspension::SuspendReason,
     },
     Rss(RssSample),
+    /// CPU utilization of the whole process tree over the interval between
+    /// the two most recent [`PerfRecord::Rss`] samples (Issue #64), as a
+    /// percentage of one core. A separate record rather than a field on
+    /// `Rss` because it describes an *interval*, not the instant the sample
+    /// was taken: the first sample of a run has no predecessor and so emits
+    /// no `Cpu` record at all, which a field would have had to fake as 0.
+    Cpu {
+        percent: f64,
+    },
 }
 
 impl PerfRecord {
@@ -520,6 +560,35 @@ impl PerfRecord {
         PerfRecord::Rss(sample)
     }
 
+    /// Average CPU utilization of the whole process tree between two
+    /// samples, as a percentage of one core (Issue #64): 100 means one core
+    /// fully busy, 400 means four. `None` when either sample lacks CPU
+    /// times, when no wall time passed, or when the delta came out negative
+    /// (a process in the tree exited between the samples and took its
+    /// accumulated time with it — see [`RssSample::total_cpu_seconds`]).
+    ///
+    /// A free function rather than a method so the caller keeps ownership
+    /// of both samples and of the clock: the sampler already knows the wall
+    /// time between its own two reads, and nothing here should read a clock
+    /// of its own.
+    pub fn cpu(percent: f64) -> Self {
+        PerfRecord::Cpu { percent }
+    }
+
+    pub fn cpu_percent_between(
+        previous: &RssSample,
+        current: &RssSample,
+        wall: Duration,
+    ) -> Option<f64> {
+        let before = previous.total_cpu_seconds?;
+        let after = current.total_cpu_seconds?;
+        let elapsed = wall.as_secs_f64();
+        if elapsed <= 0.0 || after < before {
+            return None;
+        }
+        Some((after - before) / elapsed * 100.0)
+    }
+
     pub fn tab_suspend(tab_id: u64, reason: crate::browser::suspension::SuspendReason) -> Self {
         PerfRecord::TabSuspend { tab_id, reason }
     }
@@ -530,7 +599,7 @@ impl PerfRecord {
 
     /// The event name used by both output formats (`"startup"`,
     /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"tab_resume"`,
-    /// `"tab_suspend"`, `"measure_start"`, `"rss"`).
+    /// `"tab_suspend"`, `"measure_start"`, `"cpu"`, `"rss"`).
     pub fn event_name(&self) -> &'static str {
         match self {
             PerfRecord::Startup(_) => "startup",
@@ -538,6 +607,7 @@ impl PerfRecord {
             PerfRecord::TabLatency { kind, .. } => kind.event_name(),
             PerfRecord::TabSuspend { .. } => "tab_suspend",
             PerfRecord::MeasureStart => "measure_start",
+            PerfRecord::Cpu { .. } => "cpu",
             PerfRecord::Rss(_) => "rss",
         }
     }
@@ -564,6 +634,7 @@ impl PerfRecord {
                 format!("tab_suspend id={tab_id} reason={}", reason.as_str())
             }
             PerfRecord::MeasureStart => "measure_start".to_owned(),
+            PerfRecord::Cpu { percent } => format!("cpu percent={percent:.1}"),
             PerfRecord::Rss(sample) => sample.to_string(),
         }
     }
@@ -616,6 +687,9 @@ impl PerfRecord {
             // Only `event`/`ts_ms` — the marker's whole content is where it
             // sits in the log.
             PerfRecord::MeasureStart => {}
+            PerfRecord::Cpu { percent } => {
+                fields.insert("percent".to_owned(), json!(percent));
+            }
             PerfRecord::Rss(sample) => {
                 fields.insert("pid".to_owned(), json!(sample.root_pid));
                 fields.insert("process_count".to_owned(), json!(sample.process_count));
@@ -629,6 +703,13 @@ impl PerfRecord {
                 fields.insert(
                     "pss_process_count".to_owned(),
                     json!(sample.pss_process_count),
+                );
+                // Cumulative CPU time; `cpu_percent` (the rate a benchmark
+                // actually compares) is added by the sampler, which is the
+                // only caller that knows the interval between two samples.
+                fields.insert(
+                    "total_cpu_seconds".to_owned(),
+                    json!(sample.total_cpu_seconds),
                 );
             }
         }
@@ -657,6 +738,7 @@ fn ms(duration: Duration) -> f64 {
 mod imp {
     use super::{HashMap, ProcInfo};
     use std::fs;
+    use std::path::Path;
 
     /// Build a `pid -> ProcInfo` map for every process currently visible
     /// under `/proc`. Processes that exit mid-scan are silently skipped
@@ -688,6 +770,7 @@ mod imp {
             // in the map (RSS is still valid) and is excluded from the PSS
             // total by `build_sample` rather than treated as 0 bytes.
             info.pss_bytes = read_pss_bytes(&entry.path());
+            info.cpu_seconds = read_cpu_seconds(&entry.path());
             map.insert(pid, info);
         }
         Ok(map)
@@ -717,7 +800,30 @@ mod imp {
             ppid: ppid?,
             rss_bytes: rss_kb.unwrap_or(0) * 1024,
             pss_bytes: None,
+            cpu_seconds: None,
         })
+    }
+
+    /// User + system CPU time from `/proc/<pid>/stat`, in seconds (Issue
+    /// #64). Fields 14 and 15 (1-based, `utime`/`stime`) counted in clock
+    /// ticks; the divisor is `sysconf(_SC_CLK_TCK)`, which is 100 on every
+    /// Linux this project targets and is hardcoded rather than pulling in
+    /// a libc dependency for one constant (docs/decisions.md D6).
+    ///
+    /// The `comm` field can itself contain spaces and parentheses, so the
+    /// line is split at the **last** `)` before the fields are counted —
+    /// splitting on whitespace from the start would misalign for a process
+    /// named e.g. `WebKitWebProcess (1)`.
+    fn read_cpu_seconds(pid_path: &Path) -> Option<f64> {
+        const CLOCK_TICKS_PER_SEC: f64 = 100.0;
+        let raw = fs::read_to_string(pid_path.join("stat")).ok()?;
+        let after_comm = raw.rsplit_once(')')?.1;
+        let mut fields = after_comm.split_whitespace();
+        // After `)` the next field is `state` (field 3), so `utime`
+        // (field 14) is 11 positions further on, and `stime` right after.
+        let utime: u64 = fields.nth(11)?.parse().ok()?;
+        let stime: u64 = fields.next()?.parse().ok()?;
+        Some((utime + stime) as f64 / CLOCK_TICKS_PER_SEC)
     }
 
     /// Read the `Pss:` line (kB) out of `<pid_path>/smaps_rollup`, VeloX's
@@ -858,6 +964,11 @@ mod imp {
                     // `total_pss_bytes` stays `None` for every sample taken
                     // here (see `sample_process_tree_rss`'s platform docs).
                     pss_bytes: None,
+                    // Likewise no CPU time: the `ps` call above asks for
+                    // pid/ppid/rss only, and adding a second invocation for
+                    // a platform this project's CI never exercises is not
+                    // worth it (Issue #64).
+                    cpu_seconds: None,
                 },
             );
         }
@@ -991,6 +1102,7 @@ mod tests {
                 ppid: 0,
                 rss_bytes: 1000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         );
         processes.insert(
@@ -999,6 +1111,7 @@ mod tests {
                 ppid: 1,
                 rss_bytes: 2000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         ); // child of 1
         processes.insert(
@@ -1007,6 +1120,7 @@ mod tests {
                 ppid: 2,
                 rss_bytes: 3000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         ); // grandchild
         processes.insert(
@@ -1015,6 +1129,7 @@ mod tests {
                 ppid: 0,
                 rss_bytes: 4000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         ); // unrelated
 
@@ -1033,6 +1148,7 @@ mod tests {
                 ppid: 0,
                 rss_bytes: 999,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         );
         let sample = build_sample(5, &processes).unwrap();
@@ -1060,6 +1176,7 @@ mod tests {
                 ppid: 0,
                 rss_bytes: 1000,
                 pss_bytes: Some(400),
+                cpu_seconds: None,
             },
         );
         processes.insert(
@@ -1068,6 +1185,7 @@ mod tests {
                 ppid: 1,
                 rss_bytes: 2000,
                 pss_bytes: Some(600),
+                cpu_seconds: None,
             },
         );
 
@@ -1086,6 +1204,7 @@ mod tests {
                 ppid: 0,
                 rss_bytes: 1000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         );
         processes.insert(
@@ -1094,6 +1213,7 @@ mod tests {
                 ppid: 1,
                 rss_bytes: 2000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         );
 
@@ -1117,6 +1237,7 @@ mod tests {
                 ppid: 0,
                 rss_bytes: 1000,
                 pss_bytes: Some(300),
+                cpu_seconds: None,
             },
         );
         processes.insert(
@@ -1125,6 +1246,7 @@ mod tests {
                 ppid: 1,
                 rss_bytes: 2000,
                 pss_bytes: None,
+                cpu_seconds: None,
             },
         );
         processes.insert(
@@ -1133,6 +1255,7 @@ mod tests {
                 ppid: 1,
                 rss_bytes: 500,
                 pss_bytes: Some(150),
+                cpu_seconds: None,
             },
         );
 
@@ -1154,10 +1277,11 @@ mod tests {
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 3,
+            total_cpu_seconds: None,
         };
         assert_eq!(
             sample.to_string(),
-            "rss pid=42 processes=3 total_mib=2.0 pss_processes=3/3 pss_mib=1.0"
+            "rss pid=42 processes=3 total_mib=2.0 pss_processes=3/3 pss_mib=1.0 cpu_s=n/a"
         );
     }
 
@@ -1169,10 +1293,11 @@ mod tests {
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: None,
             pss_process_count: 0,
+            total_cpu_seconds: None,
         };
         assert_eq!(
             sample.to_string(),
-            "rss pid=42 processes=3 total_mib=2.0 pss_processes=0/3 pss_mib=n/a"
+            "rss pid=42 processes=3 total_mib=2.0 pss_processes=0/3 pss_mib=n/a cpu_s=n/a"
         );
     }
 
@@ -1285,6 +1410,7 @@ mod tests {
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 3,
+            total_cpu_seconds: None,
         };
         let expected = sample.to_string();
         assert_eq!(PerfRecord::rss(sample).to_text(), expected);
@@ -1305,6 +1431,75 @@ mod tests {
         let record = PerfRecord::tab_latency(TabLatencyKind::Resume, 7, Duration::from_millis(40));
         assert_eq!(record.to_text(), "tab_resume id=7 duration=40.0ms");
         assert_eq!(record.event_name(), "tab_resume");
+    }
+
+    #[test]
+    fn cpu_percent_between_is_a_rate_over_the_interval() {
+        let sample = |cpu: Option<f64>| RssSample {
+            root_pid: 1,
+            process_count: 2,
+            total_rss_bytes: 0,
+            total_pss_bytes: None,
+            pss_process_count: 0,
+            total_cpu_seconds: cpu,
+        };
+        // 2 CPU-seconds over 1 second of wall time = two cores busy.
+        let percent = PerfRecord::cpu_percent_between(
+            &sample(Some(1.0)),
+            &sample(Some(3.0)),
+            Duration::from_secs(1),
+        );
+        assert_eq!(percent, Some(200.0));
+        // Half a core over 4 seconds.
+        let percent = PerfRecord::cpu_percent_between(
+            &sample(Some(10.0)),
+            &sample(Some(12.0)),
+            Duration::from_secs(4),
+        );
+        assert_eq!(percent, Some(50.0));
+
+        // A process exiting between samples can make the total go *down*;
+        // that is not a negative CPU rate, it is an unusable interval.
+        assert_eq!(
+            PerfRecord::cpu_percent_between(
+                &sample(Some(5.0)),
+                &sample(Some(4.0)),
+                Duration::from_secs(1)
+            ),
+            None
+        );
+        // No wall time, or no CPU reading at either end: no rate.
+        assert_eq!(
+            PerfRecord::cpu_percent_between(&sample(Some(1.0)), &sample(Some(2.0)), Duration::ZERO),
+            None
+        );
+        assert_eq!(
+            PerfRecord::cpu_percent_between(
+                &sample(None),
+                &sample(Some(2.0)),
+                Duration::from_secs(1)
+            ),
+            None
+        );
+        assert_eq!(
+            PerfRecord::cpu_percent_between(
+                &sample(Some(1.0)),
+                &sample(None),
+                Duration::from_secs(1)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn perf_record_cpu_renders_in_both_formats() {
+        let record = PerfRecord::cpu(97.5);
+        assert_eq!(record.event_name(), "cpu");
+        assert_eq!(record.to_text(), "cpu percent=97.5");
+        let value = record.to_json(Duration::from_millis(20));
+        assert_eq!(value["event"], "cpu");
+        assert_eq!(value["percent"], 97.5);
+        assert_eq!(value["ts_ms"], 20.0);
     }
 
     #[test]
@@ -1388,6 +1583,7 @@ mod tests {
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 2,
+            total_cpu_seconds: None,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         assert_eq!(value["pid"], 42);
@@ -1405,6 +1601,7 @@ mod tests {
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: None,
             pss_process_count: 0,
+            total_cpu_seconds: None,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         // `null`, not an absent key — a consumer must be able to tell
