@@ -13,7 +13,7 @@ jobs:
     name: Build, lint & test (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install WebKitGTK + Xvfb
         run: |
@@ -62,7 +62,7 @@ jobs:
     name: Build & test (Windows)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Windows (WebView2) はビルドに追加のシステム依存が無い
       # (release-windows.yml と同じ前提。CLAUDE.md「対応 OS の優先度」参照)。

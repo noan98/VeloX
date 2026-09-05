@@ -54,7 +54,7 @@ jobs:
     name: cargo deny check (advisories / bans / licenses / sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # EmbarkStudios/cargo-deny-action は runner 向けにビルド済みの
       # cargo-deny バイナリを取得して deny.toml に従って実行する
