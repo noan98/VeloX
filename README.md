@@ -11,13 +11,20 @@ top of it, not bolted on.
 
 - [x] Basic browser window (toolbar + content area)
 - [x] URL navigation (typed input, `example.com` is auto-completed to `https://example.com`)
-- [x] Back
-- [x] Forward
-- [x] Reload
-- [ ] Tabs
-- [ ] History UI / bookmarks / downloads
-- [ ] Ad & tracker blocking
-- [ ] DevTools
+- [x] Back / Forward / Reload
+- [x] Tabs (create, switch, close, suspend & resume)
+- [x] Omnibox with suggestions ranked from history and bookmarks
+- [x] History UI (search, delete)
+- [x] Bookmarks (bookmark bar, folders, inline editing)
+- [x] Downloads (list, open the download folder)
+- [x] Ad & tracker blocking — top-level navigation only; subresource
+      blocking is not possible with the current engine API
+      (see docs/decisions.md D17)
+- [x] Private browsing — whole-app, via `--private` / `VELOX_PRIVATE`;
+      a separate private *window* needs multi-window support first
+- [x] Tab suspension driven by idle time, tab count and a memory budget
+- [x] Performance instrumentation and a benchmark suite (`velox-bench`)
+- [x] DevTools (F12)
 
 ## Development
 
@@ -96,7 +103,8 @@ Web engine (wry → WebKitGTK / WKWebView / WebView2)
 
 - `src/ui/` — window, layout, toolbar (the toolbar is a small HTML page in a
   dedicated webview, isolated from page content)
-- `src/browser/` — engine-independent logic: URL normalization, tab state
+- `src/browser/` — engine-independent logic: URL normalization, tab state,
+  history, bookmarks, downloads, block list, suspension policy, metrics
 - `src/app.rs` — event loop wiring
 - `src/config/` — startup configuration
 - `assets/logo/` — the VeloX logo; `assets/icon/` — the app icon derived
@@ -109,13 +117,27 @@ Servo directly.
 
 ## Roadmap
 
-- Multiple tabs (the core already talks to a `Tab` abstraction)
-- History and bookmarks
-- Performance instrumentation: startup time, memory, page load time
-- Tab suspension and cache tuning
-- Content blocking (ads / trackers)
-- Private browsing
-- DevTools integration
+The first roadmap is done (it is the Features list above). What is
+being worked on next:
+
+**Performance** (Phase 3)
+
+- Startup, tab creation/switching and page load optimization
+- Memory footprint reduction and leak/lifetime auditing
+- Background tab CPU and network throttling
+- IPC / serialization overhead reduction
+- Competitive benchmarks against Chrome / Firefox, and regression detection in CI
+
+**Browser features** (Phase 2, still open)
+
+- Subresource ad/tracker blocking, EasyList / EasyPrivacy list updates
+- Site permissions UI, cookie & storage management
+- Multiple windows, private windows, session restore and crash recovery
+- Settings UI, dark mode, keyboard shortcut management, context menus
+- Find in page, view source, save page, print / save as PDF
+- Packaging, code signing and notarization for macOS / Windows
+
+Progress is tracked in the Phase 2 (#53) and Phase 3 (#57) epics.
 
 ## License
 
