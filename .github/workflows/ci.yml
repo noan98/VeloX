@@ -57,3 +57,38 @@ jobs:
 
       - name: Build
         run: cargo build
+
+  check-windows:
+    name: Build & test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Windows (WebView2) はビルドに追加のシステム依存が無い
+      # (release-windows.yml と同じ前提。CLAUDE.md「対応 OS の優先度」参照)。
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build
+
+      # `cargo test` (引数なし) は `tests/integration.rs` も含めて実行し、
+      # 実際に `velox` バイナリを起動する。Linux 版の
+      # skip_without_gui!() は DISPLAY/DBUS が無ければ自動でスキップするが、
+      # macOS/Windows は「デスクトップ OS なら追加の下準備なしに GUI が
+      # 起動できるはず」という前提で意図的に *スキップしない*
+      # (tests/integration.rs の gui_skip_reason を参照)。
+      #
+      # つまり windows-latest のホストランナー上で実際にウィンドウを開く
+      # ことになるが、GitHub Actions の Windows ランナーでそれが安定して
+      # 成立するかは未検証・不確実 (docs/decisions.md D61)。ここで
+      # ごまかして「素通りさせて緑にする」(#34 が防ごうとした形そのもの) の
+      # を避けるため、Windows ジョブでは `--lib` に絞って単体テスト
+      # (`src/browser/` 配下の純粋ロジック) だけを実行し、GUI を起動する
+      # 統合テストは対象外にする。将来 Windows ランナーでの GUI 起動が
+      # 検証できたら、このジョブにも統合テストを追加する (D61 の
+      # Revisit condition)。
+      - name: Test (unit only — see D61 for why integration tests are excluded here)
+        run: cargo test --lib
