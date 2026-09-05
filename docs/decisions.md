@@ -4494,3 +4494,160 @@ D57 と同じく、Epic #57 のルール 1 の裏返しとして、測って効�
 いる状態なので影響は小さいが、実機で再測定する価値はある。(3) 音声再生中の
 タブ (#63 で保護対象にした) が本当にバックグラウンドでも再生を続けるかは、
 この環境に音声デバイスが無いため未検証。
+
+## D62: セキュリティ・入力値堅牢性 (#35) — スキーム許可リストは維持、IPC に
+サイズ上限、JS 埋め込みに追加エスケープ、ブックマークの壊れた `folder_id` を
+ロード時に自己修復
+
+**対象**: Issue #35。外部入力の境界 (URL 正規化、トールバー IPC、Rust→JS の
+文字列埋め込み、`history.json`/`bookmarks.json`/`input_history.json` の永続化
+読み込み、`VELOX_AUTOMATION_SCRIPT`) を総点検し、攻撃パターンをテストで固定
+化した。テストは 100 件以上追加 (`src/browser/navigation.rs`,
+`src/ui/toolbar.rs`, `src/ui/window.rs`, `src/browser/persistence.rs`,
+`src/browser/history.rs`, `src/browser/bookmarks.rs`,
+`src/browser/input_history.rs`, `src/config/mod.rs`, `src/app.rs`)。
+
+### 見つかったもの・直したもの
+
+**クラッシュ (パニック) は見つからなかった。** `url`/`serde_json` はどちらも
+不正入力に対して `Err` を返す設計で、本体コードもその `Err` を
+`unwrap()`/`expect()` せず `Option`/`Result` で素通りさせる既存の書き方が
+既に徹底されていた (`normalize_input`, `parse_command`,
+`persistence::read_json` はいずれも失敗を吸収して `None`/`Err`/デフォルト値
+に倒す)。`serde_json` 自体もパース時の再帰深度に上限を持つため、数万階層の
+配列/オブジェクトのネスト ("JSON 爆弾") を IPC・永続化ファイルの双方に流し
+込んでもスタックオーバーフローせず `Err` になることをテストで確認した
+(`toolbar::tests::does_not_panic_or_hang_on_deeply_nested_json`,
+`persistence::tests::deeply_nested_json_does_not_panic`)。
+
+見つかった実際の問題は次の 3 点、いずれも修正済み:
+
+1. **ブックマークの `folder_id` が壊れたまま読み込まれる。**
+   `BookmarkEntry::folder_id` の「`None` か実在する folder id のどちらか」
+   という不変条件は `BookmarkStore::edit`/`remove_folder` が能動的に守って
+   いるだけで、`#[derive(Deserialize)]` によるファイル読み込みはこの不変条件
+   を一切検証しない。手編集や部分的に壊れた `bookmarks.json` が存在しない
+   `folder_id` を指すエントリを持っていた場合、そのブックマークは
+   `entries_in(None)` (root) にも `entries_in(Some(壊れたid))` にも現れず、
+   パネル/ブックマークバーのどちらからも永久に見えなくなる ("消えた"よう
+   に見えるブックマーク)。`BookmarkStore::repair_dangling_folder_ids` を
+   追加し、`persistence::load_bookmarks` がロード直後に必ず呼ぶようにした。
+   壊れた `folder_id` は root に付け替えられ、次に保存されれば
+   ファイル自体も修復される。
+2. **不正/巨大な IPC メッセージをそのまま stderr に全文出力していた。**
+   `app::handle_user_event` の `ToolbarMessage` 分岐は、パースに失敗した
+   `body` を `{body:?}` でそのまま `eprintln!` していた。IPC にサイズ上限が
+   無かった当時の設計では、数百万文字のアドレスバー貼り付けが弾かれた場合、
+   その全文がそのままログに落ちる — クラッシュはしないが、ログを肥大化させ
+   る/機微情報を丸ごと残すという別種の「サイズに比例したコスト」の穴だった。
+   `app::log_preview` (最大 200 文字、`char` 境界で切り詰め) を追加し、常に
+   これ経由でログに出すようにした。
+3. **U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) が JS 文字列リテラルの終端に
+   なり得る。** `ui::toolbar` の `set_*_script` 関数群は、以前から
+   `serde_json` の文字列シリアライズ (`"`/`\`/制御文字のエスケープ) だけで
+   `evaluate_script` に渡す JS を組み立てていた。RFC 8259 は U+2028/U+2029 を
+   JSON 文字列中でエスケープ不要としているが、これらは ES2019 より前の
+   ECMAScript 文法では文字列リテラルの内部でも行終端子として扱われていた
+   — つまりエンジンによっては、タイトルや URL にこの 2 文字が混じるだけで
+   文字列が意図せず終端し、後続の生 JS が別の文としてそのまま実行されかね
+   ない。`escape_js_line_terminators` を追加し、`evaluate_script` に渡す
+   すべての JSON 埋め込み (`set_url_script`, `set_focus_address_bar_script`,
+   `set_tabs_script`, `set_candidates_script`, `set_history_script`,
+   `set_bookmarks_script`, `set_bookmark_bar_script`,
+   `set_downloads_script`) がこれを通るようにした。
+
+### スキーム許可リストは変更しなかった
+
+`ALLOWED_SCHEMES = ["http", "https", "file", "about", "data"]`
+(`browser::navigation`、命名決定前からの既存コード) はそのまま維持した。
+`javascript:`/`vbscript:`/`livescript:` などスクリプト実行系スキームは元々
+拒否されており、大文字小文字・前後の空白・`javascript:alert(1)//`のような
+コメント付与では回避できないことをテストで固定化した
+(`rejects_dangerous_schemes_regardless_of_case_or_whitespace_tricks`)。
+`data:`/`file:` は Issue #35 の対象ではなく、ダウンロード機能のテスト
+(D28 関連) や `about:blank` 的な用途で既に前提にされている既存動作のため、
+「危険そうだから」で新たに絞り込むことはしなかった — 制限を強めることが
+今回のスコープではなく、CLAUDE.md の「正常系を壊さない」方針にも反する。
+
+### IPC ペイロード上限をどう決めたか
+
+`ui::toolbar::MAX_IPC_PAYLOAD_BYTES = 1 MiB`。トールバー Webview は VeloX
+自身がバンドルする信頼済み HTML (`TOOLBAR_HTML`) であり、任意の外部 Web
+コンテンツではないため、これは「攻撃者からの入力を弾く」ためというより
+**多層防御**として入れた: 上限が無いと、アドレスバーへの巨大なクリップ
+ボード貼り付けや (トールバー Webview 自体に将来何らかの脆弱性が入った場合
+の) 悪意ある巨大メッセージが、`ToolbarCommand` のフィールド型チェックに
+たどり着く前に `serde_json::from_str` へそのまま渡り、無制限に時間/メモリ
+を消費し得る。1 MiB は「実用上あり得る最大の正当な入力 (アドレスバーへの
+非常に長い URL や検索クエリ) に対して十分な余裕を残しつつ、明らかに
+病的なサイズは弾く」という基準で選んだ — Chromium の URL 長上限が概ね
+2MB 程度であることも参考にしたが、厳密にそれへ揃える理由はないため、
+JSON のオーバーヘッドを差し引いても十分な余裕を持つ 1 MiB とした。
+上限超過はパースを試みる前に `ParseCommandError::TooLarge` を返し、
+`serde_json` には一切渡さない。
+
+一方、**コンテンツ Webview → Rust のショートカット IPC
+(`ui::window::parse_content_shortcut`)** はそもそも JSON を解釈しない —
+固定の合言葉文字列 (`velox:new-tab` 等) との完全一致比較のみで、一致しな
+ければ即座に無視する (D18/D23)。この経路は任意の Web ページ (信頼できない
+入力) から届くため、こちらにこそサイズ上限が要ると思われるかもしれないが、
+文字列の完全一致比較はサイズに比例したコストしかかからず (パース木を作ら
+ない)、巨大な文字列を送っても最初のバイト不一致で早期に `None` へ落ちる
+ため、明示的な上限を追加する必要はないと判断した。実際に 500 万文字の
+入力でパニックしないことをテストで確認した
+(`parse_content_shortcut_does_not_panic_on_hostile_content_webview_input`)。
+
+### JS エスケープの方針
+
+Rust → JS の文字列埋め込みは今後も **`serde_json` の文字列/値シリアライズ
+を経由するのが唯一の方法** とする — 独自のエスケープ関数を書き足さない。
+`"`/`\`/制御文字は `serde_json` が RFC 8259 通りにエスケープするため、URL
+やタイトルにこれらがいくら含まれても JS 文字列リテラルの外へ抜け出すことは
+ない (`url_script_escapes_quotes_and_backslashes` 等で既存)。今回追加した
+`escape_js_line_terminators` は、その `serde_json` の出力に対する**後処理**
+として U+2028/U+2029 だけを追加でエスケープするもので、JSON のパース結果を
+変えない (エスケープ後の文字列も同じ JSON として解釈できる) ため、
+`serde_json` を経由する既存の安全性の議論をそのまま維持できる。
+
+`</script>` 等の HTML 的な文字列 (`url_script_neutralizes_script_closing_and_html_sequences`)
+は `evaluate_script` が HTML パーサではなく JS エンジンへ文字列をそのまま
+渡す API であるため、そもそも特別扱いする理由がない — これは今回のテストで
+挙動を確認しただけで、コード変更はしていない。
+
+### 永続化ファイルの壊れ方への方針
+
+`browser::persistence::read_json` は元々「読めない/パースできない/型が
+合わない」の区別をせず、すべて `None` (呼び出し側でデフォルト値) に丸めて
+いた。この方針は変更していない — 部分的に読めたフィールドだけ救おうとする
+部分復旧は複雑さの割に価値が低く (`#[serde(default)]` で吸収できる
+フィールド追加は D27/D32 で既にその形になっている)、壊れたファイル全体を
+安全に空として扱う方が事故が少ない。今回追加したのは
+`BookmarkStore::repair_dangling_folder_ids` (上記) のみで、これは
+「パース自体は成功するが、パースだけでは守れない構造的不変条件」という
+別種の問題に対する追加のポスト処理であり、`read_json` 自体の方針変更では
+ない。
+
+### 対応しなかったもの (アドレス表示の見た目に関わる既知の限界)
+
+以下はいずれも「クラッシュしない」ことは確認したが、意図的に**未対応**の
+まま残した — URL 自体の解析/読み込みは正しく行われるが、アドレスバーに
+表示される見た目が本来のホストと異なって見えうるという、実在するブラウザ
+共通の課題であり、今回のスコープ (堅牢性テストの整備) を超える表示層の
+設計判断が要るため:
+
+- **userinfo によるホスト偽装** (`https://google.com@evil.com/` は
+  `evil.com` が実ホストで `google.com` は捨てられる userinfo) —
+  `userinfo_before_the_host_does_not_change_the_actual_host` で挙動を固定化
+  したのみ。
+- **Bidi override 文字によるパス偽装** (`\u{202E}` でファイル名の見た目を
+  反転させる) — `does_not_panic_on_bidi_override_characters_in_a_url` で
+  パニックしないことのみ固定化。
+- **IDN ホモグラフ攻撃** (punycode 変換自体は `url`/`idna` クレートに委譲
+  済みで正しく動くが、見た目が似た文字を使ったなりすましドメインをどう
+  警告表示するかは対象外)。
+
+**Revisit condition**: アドレスバーの表示ロジック自体に手を入れる Issue が
+立ったら、上記 3 点をまとめて検討する。userinfo は本来「表示前に取り除く」
+判断がしやすい (URL としての意味を変えずに済む) ので着手コストが低く、
+bidi override / IDN ホモグラフは表示ポリシーの設計判断 (どこまで punycode
+表示に倒すか) が要るため、着手コストが相対的に高い。

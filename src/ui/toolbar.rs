@@ -291,9 +291,82 @@ impl<'a> BookmarksView<'a> {
     }
 }
 
-/// Parse a raw IPC message body into a [`ToolbarCommand`].
-pub fn parse_command(body: &str) -> Result<ToolbarCommand, serde_json::Error> {
-    serde_json::from_str(body)
+/// Hard ceiling on one IPC message's raw body, in bytes — rejected outright,
+/// before `serde_json` ever sees it (Issue #35, see docs/decisions.md D62
+/// for how the number was chosen). The toolbar webview is VeloX's own
+/// trusted, bundled HTML (`TOOLBAR_HTML`), not attacker-controlled content,
+/// but this is still cheap defense in depth against a pathological payload —
+/// the largest realistic legitimate message is a giant clipboard paste into
+/// the address bar (`navigate`) or an omnibox keystroke, both many orders of
+/// magnitude smaller than this — and it keeps a single malformed/huge
+/// message from spending unbounded time/memory in the JSON parser before
+/// `ToolbarCommand`'s own field types get a chance to reject it.
+pub const MAX_IPC_PAYLOAD_BYTES: usize = 1 << 20; // 1 MiB
+
+/// Why [`parse_command`] failed: the body was larger than
+/// [`MAX_IPC_PAYLOAD_BYTES`] (rejected before parsing), or it was not valid
+/// JSON / did not match [`ToolbarCommand`]'s shape.
+#[derive(Debug)]
+pub enum ParseCommandError {
+    /// `len` is the rejected body's byte length.
+    TooLarge {
+        len: usize,
+    },
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for ParseCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParseCommandError::TooLarge { len } => write!(
+                f,
+                "IPC メッセージが大きすぎます ({len} bytes > {MAX_IPC_PAYLOAD_BYTES} bytes)"
+            ),
+            ParseCommandError::Json(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for ParseCommandError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            ParseCommandError::TooLarge { .. } => None,
+            ParseCommandError::Json(err) => Some(err),
+        }
+    }
+}
+
+/// Parse a raw IPC message body into a [`ToolbarCommand`]. Rejects a body
+/// over [`MAX_IPC_PAYLOAD_BYTES`] outright (see its doc comment) before
+/// attempting to parse it at all.
+pub fn parse_command(body: &str) -> Result<ToolbarCommand, ParseCommandError> {
+    if body.len() > MAX_IPC_PAYLOAD_BYTES {
+        return Err(ParseCommandError::TooLarge { len: body.len() });
+    }
+    serde_json::from_str(body).map_err(ParseCommandError::Json)
+}
+
+/// Escape U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) in an
+/// already-serialized JSON document before splicing it into JS source via
+/// `evaluate_script`.
+///
+/// RFC 8259 only requires a JSON string to escape `"`, `\`, and control
+/// characters — U+2028/U+2029 are allowed to appear literally — but older
+/// ECMAScript grammars treated both as line terminators *even inside a
+/// string literal*, so an unescaped one could end a JS string early and let
+/// whatever followed run as its own statement. ES2019 fixed this for every
+/// engine VeloX ships on (see docs/decisions.md D62), so this is defense in
+/// depth rather than a fix for an observed break — but it costs nothing and
+/// removes the dependency on that guarantee entirely. Safe to run over a
+/// whole serialized JSON document (an object/array, not just one string),
+/// since `\u{2028}`/`\u{2029}` can only occur inside a JSON string value to
+/// begin with, never as JSON structural syntax.
+fn escape_js_line_terminators(json: &str) -> String {
+    if !json.contains('\u{2028}') && !json.contains('\u{2029}') {
+        return json.to_owned();
+    }
+    json.replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
 }
 
 /// JS snippet that updates the address bar text.
@@ -301,10 +374,8 @@ pub fn parse_command(body: &str) -> Result<ToolbarCommand, serde_json::Error> {
 /// The URL is embedded as a JSON string literal, so arbitrary URLs cannot
 /// break out of the script.
 pub fn set_url_script(url: &str) -> String {
-    format!(
-        "veloxSetUrl({});",
-        serde_json::Value::String(url.to_owned())
-    )
+    let json = serde_json::Value::String(url.to_owned()).to_string();
+    format!("veloxSetUrl({});", escape_js_line_terminators(&json))
 }
 
 /// JS snippet that toggles the loading indicator.
@@ -325,7 +396,7 @@ pub fn set_block_count_script(count: u32) -> String {
 /// rather than panicking.
 pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
     let json = serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned());
-    format!("veloxSetTabs({json});")
+    format!("veloxSetTabs({});", escape_js_line_terminators(&json))
 }
 
 /// JS snippet that replaces the omnibox candidate dropdown's contents.
@@ -336,7 +407,7 @@ pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
 /// back to an empty list rather than panicking.
 pub fn set_candidates_script(candidates: &[Candidate]) -> String {
     let json = serde_json::to_string(candidates).unwrap_or_else(|_| "[]".to_owned());
-    format!("veloxSetCandidates({json});")
+    format!("veloxSetCandidates({});", escape_js_line_terminators(&json))
 }
 
 /// JS snippet that forces the address bar's text to `url`, focuses it, and
@@ -347,9 +418,10 @@ pub fn set_candidates_script(candidates: &[Candidate]) -> String {
 /// point here), so it is a distinct JS entry point rather than a call to
 /// `veloxSetUrl`.
 pub fn set_focus_address_bar_script(url: &str) -> String {
+    let json = serde_json::Value::String(url.to_owned()).to_string();
     format!(
         "veloxFocusAddressBar({});",
-        serde_json::Value::String(url.to_owned())
+        escape_js_line_terminators(&json)
     )
 }
 
@@ -424,14 +496,20 @@ pub fn set_downloads_script(entries: &[&DownloadEntry]) -> String {
     format!("veloxSetDownloads({});", entries_to_json(entries))
 }
 
-fn entries_to_json<T: Serialize>(entries: &[T]) -> serde_json::Value {
-    serde_json::to_value(entries).unwrap_or_else(|_| serde_json::Value::Array(Vec::new()))
+/// Serialize `entries` to a JSON array text, with the same
+/// U+2028/U+2029-escaping [`set_url_script`] applies to its own string, and
+/// the same "cannot actually fail for these types, but never panic if it
+/// somehow did" fallback every other `set_*_script` function here uses.
+fn entries_to_json<T: Serialize>(entries: &[T]) -> String {
+    let json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_owned());
+    escape_js_line_terminators(&json)
 }
 
-/// Same fallback-on-failure behavior as [`entries_to_json`], for a single
-/// (non-slice) value such as [`BookmarksView`].
-fn value_to_json<T: Serialize>(value: &T) -> serde_json::Value {
-    serde_json::to_value(value).unwrap_or(serde_json::Value::Null)
+/// Same shape and reasoning as [`entries_to_json`], for a single (non-slice)
+/// value such as [`BookmarksView`].
+fn value_to_json<T: Serialize>(value: &T) -> String {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
+    escape_js_line_terminators(&json)
 }
 
 #[cfg(test)]
@@ -502,6 +580,124 @@ mod tests {
     fn rejects_unknown_commands() {
         assert!(parse_command(r#"{"cmd":"self_destruct"}"#).is_err());
         assert!(parse_command("not json").is_err());
+    }
+
+    // --- IPC robustness (Issue #35): malformed JSON, huge/deeply-nested
+    // payloads, and wrong-shaped fields must all be a clean `Err`, never a
+    // panic. The toolbar webview is VeloX's own trusted, bundled HTML, not
+    // attacker-controlled content, but `parse_command` is still the one
+    // trust boundary between "whatever `window.ipc.postMessage` sent" and
+    // real `ToolbarCommand` values — see docs/decisions.md D62. ---
+
+    #[test]
+    fn does_not_panic_on_a_grab_bag_of_malformed_ipc_bodies() {
+        let bodies = [
+            "",
+            "   ",
+            "{",
+            "}",
+            "[",
+            "null",
+            "true",
+            "42",
+            "\"just a string\"",
+            "[1,2,3]",
+            "{}",
+            r#"{"cmd":null}"#,
+            r#"{"cmd":123}"#,
+            r#"{"cmd":"navigate"}"#,            // missing required `input`
+            r#"{"cmd":"navigate","input":42}"#, // wrong field type
+            r#"{"cmd":"navigate","input":null}"#,
+            r#"{"cmd":"close_tab","id":"not-a-number"}"#,
+            r#"{"cmd":"close_tab","id":-1}"#,
+            r#"{"cmd":"close_tab","id":1.5}"#,
+            r#"{"cmd":"back","extra_field":"unexpected"}"#, // deny_unknown_fields
+            r#"{"CMD":"back"}"#,                            // wrong key case
+            "\u{0}\u{0}\u{0}",
+            "{\"cmd\":\"navigate\",\"input\":\"\u{0}\"}",
+            "not json at all, just text",
+            "{\"cmd\": \"navigate\", \"input\": \"a\nb\"}",
+        ];
+        for body in bodies {
+            // Must return, not panic, whichever way it resolves.
+            let _ = parse_command(body);
+        }
+    }
+
+    #[test]
+    fn rejects_a_payload_over_the_ipc_size_cap() {
+        // A `navigate` command whose `input` alone is comfortably past
+        // `MAX_IPC_PAYLOAD_BYTES` — must be rejected as `TooLarge` before
+        // `serde_json` ever tries to parse it, and must not panic or hang.
+        let huge_input = "a".repeat(MAX_IPC_PAYLOAD_BYTES + 1);
+        let body = format!(r#"{{"cmd":"navigate","input":"{huge_input}"}}"#);
+        assert!(body.len() > MAX_IPC_PAYLOAD_BYTES);
+        match parse_command(&body) {
+            Err(ParseCommandError::TooLarge { len }) => assert_eq!(len, body.len()),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn accepts_a_large_payload_comfortably_under_the_cap() {
+        // A generous but legitimate payload (e.g. a large clipboard paste
+        // into the address bar) must still parse normally — the cap exists
+        // to reject pathological sizes, not to second-guess ordinary input.
+        let big_input = "a".repeat(MAX_IPC_PAYLOAD_BYTES / 4);
+        let body = format!(r#"{{"cmd":"navigate","input":"{big_input}"}}"#);
+        assert!(body.len() < MAX_IPC_PAYLOAD_BYTES);
+        assert_eq!(
+            parse_command(&body).unwrap(),
+            ToolbarCommand::Navigate { input: big_input }
+        );
+    }
+
+    #[test]
+    fn size_cap_error_message_mentions_the_limit() {
+        let huge_input = "a".repeat(MAX_IPC_PAYLOAD_BYTES + 1);
+        let body = format!(r#"{{"cmd":"navigate","input":"{huge_input}"}}"#);
+        let err = parse_command(&body).unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains(&MAX_IPC_PAYLOAD_BYTES.to_string()),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn does_not_panic_or_hang_on_deeply_nested_json() {
+        // A JSON "bomb": thousands of nested arrays. `ToolbarCommand` could
+        // never actually be shaped like this, but the parser still has to
+        // walk (or reject) the structure before it can say so — this must
+        // come back as an `Err` (serde_json's own recursion-depth guard),
+        // never a stack overflow.
+        let depth = 100_000;
+        let body = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(parse_command(&body).is_err());
+
+        // Same shape, but nested objects instead of arrays.
+        let nested_objects = format!(
+            "{}{}",
+            r#"{"a":"#.repeat(depth),
+            "1".to_owned() + &"}".repeat(depth)
+        );
+        assert!(parse_command(&nested_objects).is_err());
+    }
+
+    #[test]
+    fn handles_unicode_and_control_characters_in_command_fields_without_panicking() {
+        let bodies = [
+            r#"{"cmd":"navigate","input":"日本語のURL.example/パス"}"#,
+            r#"{"cmd":"navigate","input":"🚀🔥emoji.example/"}"#,
+            "{\"cmd\":\"navigate\",\"input\":\"\u{202e}reversed-looking.example/\"}",
+            r#"{"cmd":"search_history","query":"line1\nline2\ttabbed"}"#,
+            r#"{"cmd":"create_bookmark_folder","name":"  "}"#,
+        ];
+        for body in bodies {
+            // Every one of these is well-formed JSON with the right field
+            // types, so it must parse successfully and never panic.
+            assert!(parse_command(body).is_ok(), "{body}");
+        }
     }
 
     #[test]
@@ -598,6 +794,85 @@ mod tests {
     fn url_script_escapes_quotes_and_backslashes() {
         let script = set_url_script(r#"https://example.com/?q="a"\b"#);
         assert_eq!(script, r#"veloxSetUrl("https://example.com/?q=\"a\"\\b");"#);
+    }
+
+    // --- JS injection hardening (Issue #35): a URL/title/etc. containing a
+    // JS/HTML-meaningful sequence must end up embedded as inert JSON string
+    // content, never something that changes what statement runs. See
+    // docs/decisions.md D62. ---
+
+    #[test]
+    fn url_script_neutralizes_script_closing_and_html_sequences() {
+        // `evaluate_script` hands this straight to the JS engine, not the
+        // HTML parser, so `</script>` has no special meaning here — but it
+        // must still come through as inert string content, not break the
+        // surrounding `veloxSetUrl(...)` call.
+        let script = set_url_script(r#"https://example.com/</script><script>alert(1)</script>"#);
+        assert!(script.starts_with("veloxSetUrl(\""));
+        assert!(script.ends_with("\");"));
+        assert!(script.contains(r#"</script><script>alert(1)</script>"#));
+    }
+
+    #[test]
+    fn url_script_escapes_u2028_and_u2029_line_terminators() {
+        // U+2028/U+2029 are valid, unescaped JSON string content (RFC 8259)
+        // but were historically JS statement terminators even inside a
+        // string literal -- must come through as the literal escape
+        // sequence, never the raw codepoint, so the string can never end
+        // early no matter which engine evaluates it (see D62).
+        let script = set_url_script("https://example.com/\u{2028}payload\u{2029}");
+        assert!(script.contains("\\u2028"), "{script}");
+        assert!(script.contains("\\u2029"), "{script}");
+        assert!(!script.contains('\u{2028}'));
+        assert!(!script.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn focus_address_bar_script_escapes_u2028_and_u2029() {
+        let script = set_focus_address_bar_script("https://example.com/\u{2028}\u{2029}");
+        assert!(script.contains("\\u2028"), "{script}");
+        assert!(script.contains("\\u2029"), "{script}");
+        assert!(!script.contains('\u{2028}'));
+        assert!(!script.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn tabs_script_escapes_u2028_and_u2029_in_titles() {
+        let tabs = vec![TabSummary {
+            id: 1,
+            url: "https://example.com/".to_owned(),
+            title: Some("line one\u{2028}line two\u{2029}line three".to_owned()),
+            favicon: None,
+            loading: false,
+            active: true,
+            suspended: false,
+        }];
+        let script = set_tabs_script(&tabs);
+        assert!(script.contains("\\u2028"), "{script}");
+        assert!(script.contains("\\u2029"), "{script}");
+        assert!(!script.contains('\u{2028}'));
+        assert!(!script.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn history_script_escapes_u2028_and_u2029_in_titles_and_urls() {
+        let entry = HistoryEntry {
+            id: 1,
+            url: "https://example.com/\u{2028}".to_owned(),
+            title: Some("title\u{2029}with separator".to_owned()),
+            visited_at: 1,
+            favicon: None,
+            visit_count: 1,
+        };
+        let groups = [HistoryGroup {
+            bucket: HistoryDateBucket::Today,
+            entries: vec![&entry],
+        }];
+        let script = set_history_script(&groups);
+        assert!(script.contains("\\u2028"), "{script}");
+        assert!(script.contains("\\u2029"), "{script}");
+        assert!(!script.contains('\u{2028}'));
+        assert!(!script.contains('\u{2029}'));
     }
 
     #[test]
@@ -845,7 +1120,7 @@ mod tests {
         };
         assert_eq!(
             set_bookmarks_script(&empty_view),
-            r#"veloxSetBookmarks({"folders":[],"root":[]});"#.to_owned()
+            r#"veloxSetBookmarks({"root":[],"folders":[]});"#.to_owned()
         );
     }
 

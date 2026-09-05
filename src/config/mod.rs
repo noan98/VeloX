@@ -874,4 +874,74 @@ mod tests {
         assert!(!policy.is_enabled());
         assert_eq!(policy.memory_check_interval, Duration::from_millis(100));
     }
+
+    // --- Robustness against hostile/malformed env values (Issue #35): a
+    // config knob is external input the same way a URL or an IPC message
+    // is — a broken/adversarial environment must never panic the browser
+    // at startup, only ever fall back to a safe default. ---
+
+    #[test]
+    fn numeric_env_knobs_do_not_panic_on_a_value_that_overflows_its_integer_type() {
+        // One digit past u64::MAX — `str::parse` must return `Err`, not
+        // panic, and every resolver here already treats a parse failure as
+        // "use the default".
+        let overflowing = format!("{}0", u64::MAX);
+        assert_eq!(
+            resolve_max_tabs_per_web_process(Some(&overflowing)),
+            DEFAULT_MAX_TABS_PER_WEB_PROCESS
+        );
+        let policy = resolve_suspension(
+            Some(&overflowing),
+            Some(&overflowing),
+            Some(&overflowing),
+            Some(&overflowing),
+        );
+        assert_eq!(policy, SuspensionPolicy::default());
+        // `resolve_perf_env` treats an unparseable value the same as an
+        // absent one (falls back to the default interval, not "off" — see
+        // `unparseable_interval_falls_back_to_default` above), so an
+        // overflowing value follows that same documented rule.
+        assert_eq!(
+            resolve_perf_env(true, Some(&overflowing)).1,
+            Some(DEFAULT_PERF_RSS_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn resolve_homepage_does_not_panic_on_an_extremely_long_or_hostile_value() {
+        let huge = format!("https://example.com/{}", "a".repeat(2_000_000));
+        assert_eq!(
+            resolve_homepage(None, &args(&["--homepage", &huge]), DEFAULT_HOME),
+            huge
+        );
+
+        for hostile in [
+            "javascript:alert(document.cookie)",
+            "\0\0\0",
+            "   \n\t  ",
+            &"a".repeat(2_000_000), // not URL-shaped at all once huge
+        ] {
+            // Must not panic; a rejected/unparseable value always falls
+            // back to the compiled-in default (see
+            // `homepage_rejects_dangerous_schemes_and_falls_back` above).
+            let _ = resolve_homepage(None, &args(&["--homepage", hostile]), DEFAULT_HOME);
+        }
+    }
+
+    #[test]
+    fn search_engine_env_values_do_not_panic_on_extreme_or_unicode_input() {
+        let huge_name = "エ".repeat(500_000);
+        let huge_template = format!("https://example.com/?q={{}}&pad={}", "a".repeat(500_000));
+        let engine = resolve_search_engine(None, Some(&huge_name), Some(&huge_template));
+        assert_eq!(engine.name, huge_name);
+        assert_eq!(engine.query_template, huge_template);
+
+        // A template with no placeholder, however large, is still rejected
+        // the same way a short one is.
+        let huge_template_no_placeholder = "a".repeat(500_000);
+        assert_eq!(
+            resolve_search_engine(None, Some("name"), Some(&huge_template_no_placeholder)),
+            SearchEngine::duckduckgo()
+        );
+    }
 }

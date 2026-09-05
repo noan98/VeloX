@@ -691,7 +691,11 @@ fn handle_user_event(
     match event {
         UserEvent::ToolbarMessage(body) => match toolbar::parse_command(&body) {
             Ok(command) => handle_toolbar_command(window, state, config, homepage, command),
-            Err(err) => eprintln!("velox: ignoring malformed toolbar message {body:?}: {err}"),
+            Err(err) => eprintln!(
+                "velox: ignoring malformed toolbar message ({} bytes, preview {:?}): {err}",
+                body.len(),
+                log_preview(&body)
+            ),
         },
         UserEvent::NavigationStarted(id, url) | UserEvent::LoadStarted(id, url) => {
             if let Some(tab) = state.tabs.get_mut(id) {
@@ -1745,6 +1749,27 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Maximum number of `char`s of a malformed/oversized IPC body ever printed
+/// to stderr by [`handle_user_event`]'s `ToolbarMessage` arm.
+const LOG_PREVIEW_MAX_CHARS: usize = 200;
+
+/// Truncate `text` to at most [`LOG_PREVIEW_MAX_CHARS`] characters for a log
+/// line, appending `…` when something was cut (Issue #35: a malformed IPC
+/// message can legitimately be many megabytes — e.g. a giant clipboard
+/// paste rejected by `toolbar::MAX_IPC_PAYLOAD_BYTES` — and dumping the
+/// whole thing into stderr on every rejection would itself be an unbounded
+/// sink, working against the very size cap that rejected it). Truncates on
+/// a `char` boundary (via `chars()`), never a byte boundary, so this can
+/// never panic on multi-byte UTF-8 input.
+fn log_preview(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut preview: String = chars.by_ref().take(LOG_PREVIEW_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
 /// A failed UI call (e.g. a script that could not be evaluated) should not
 /// crash the browser; surface it on stderr instead.
 fn log_failure(action: &str, result: wry::Result<()>) {
@@ -1774,6 +1799,42 @@ fn log_spawn_failure(action: &str, result: std::io::Result<std::process::Child>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- log_preview (Issue #35): a malformed/oversized IPC body must
+    // never be dumped to stderr in full. ---
+
+    #[test]
+    fn log_preview_leaves_short_text_unchanged() {
+        assert_eq!(log_preview(""), "");
+        assert_eq!(log_preview("short message"), "short message");
+    }
+
+    #[test]
+    fn log_preview_truncates_long_text_with_an_ellipsis() {
+        let huge = "a".repeat(5_000_000);
+        let preview = log_preview(&huge);
+        assert_eq!(preview.chars().count(), LOG_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn log_preview_does_not_panic_on_multibyte_utf8_near_the_cut_point() {
+        // Every character here is multi-byte; truncation must happen on a
+        // `char` boundary, never mid-codepoint (which would panic on a
+        // naive byte-index slice).
+        let text = "あ".repeat(LOG_PREVIEW_MAX_CHARS + 50);
+        let preview = log_preview(&text);
+        assert_eq!(preview.chars().count(), LOG_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        // Re-parsing as UTF-8 must succeed (proves no boundary was cut).
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn log_preview_of_exactly_the_cap_has_no_ellipsis() {
+        let text = "a".repeat(LOG_PREVIEW_MAX_CHARS);
+        assert_eq!(log_preview(&text), text);
+    }
 
     /// Build an `AppState` the way `run()` would for a fresh tab, with a
     /// given `history_enabled` (what `Config::private` drives at startup —
