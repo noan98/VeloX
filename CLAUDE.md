@@ -109,6 +109,29 @@ fmt → clippy → test → build を Linux 上で実行します。
 使えないための代替。docs/decisions.md D55 を参照)。自動マージさせたくない
 PR には `no-automerge` ラベルを付けるか、Draft のままにしてください。
 
+## 対応 OS の優先度
+
+VeloX が対象とする 3 つの OS は同列ではありません。**開発リソースを Windows に
+集中させ、他 OS は品質が固まってから整備する**という方針です。
+
+- **Windows (WebView2) を最優先とします。** 新機能・不具合対応・性能改善は、
+  まず Windows で動作し、日常利用に耐える品質になっていることを目標にします。
+  仕様や実装方針で OS 間のトレードオフが生じたときは、Windows を優先して
+  判断してください。
+- **macOS (WKWebView) / Linux (WebKitGTK) は当面「最低限の整備」に留めます。**
+  ビルドが通り、既存機能を壊していない状態を維持できていれば十分とし、OS 固有の
+  作り込みや検証コストの大きい対応は後回しにします。なお Linux は CI
+  (`.github/workflows/ci.yml`) と性能計測 (`.github/workflows/perf-gate.yml`、
+  `docs/performance-targets.md`) の実行環境として引き続き使います。
+- **macOS / Linux の本格対応は、製品としての品質が担保できた段階で着手します。**
+  その時点で 3 OS のリリースビルドを検証・配布できるよう整備します (Issue #33)。
+  それまでは「3 OS 同時対応」を完了条件に据えないでください。
+- OS 別の分岐を書くときは **Windows の実装を先に用意**し、macOS / Linux は
+  「動作する」ことを優先した最小実装で構いません。この方針で意図的に見送った
+  OS 固有の差異は、後から拾えるよう `docs/decisions.md` に記録してください。
+- 性能の数値は OS ごとに分けて記録する原則 (Epic #57) を維持します。Linux 上の
+  計測結果を Windows の実力値として扱わないでください。
+
 ## Rust コード品質
 
 - stable Rust を基本とし、`unsafe` は原則使用しません (使用する場合は理由を
