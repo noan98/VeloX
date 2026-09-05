@@ -101,7 +101,10 @@ sudo apt install libwebkit2gtk-4.1-dev   # Debian/Ubuntu
 macOS (WKWebView) / Windows (WebView2) は追加のシステム依存なしでビルドできます。
 
 CI は `.github/workflows/ci.yml` が PR と `main` push で
-fmt → clippy → test → build を Linux 上で実行します。
+fmt → clippy → test → build を Linux 上で実行します。加えて Windows
+(windows-latest) ジョブが build → test (`--lib` のみ、統合テストは対象外)
+を実行します (Issue #33、docs/decisions.md D61)。macOS ジョブは方針上
+追加していません。
 
 `.github/workflows/auto-merge.yml` は、`main` 向けの open な PR のうち
 「Auto Merge 自身を除くすべてのチェックが success / skipped になった」ものを

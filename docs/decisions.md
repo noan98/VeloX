@@ -4494,3 +4494,76 @@ D57 と同じく、Epic #57 のルール 1 の裏返しとして、測って効�
 いる状態なので影響は小さいが、実機で再測定する価値はある。(3) 音声再生中の
 タブ (#63 で保護対象にした) が本当にバックグラウンドでも再生を続けるかは、
 この環境に音声デバイスが無いため未検証。
+
+## D61: CI に Windows ジョブを追加する — macOS は対象外、統合テストは実行しない
+
+**対象**: Issue #33 (Epic #53)。当初の受け入れ条件「3 OS でビルド可能な状態を
+検証できる」は、Epic #53 のスコープ見直し (CLAUDE.md「対応 OS の優先度」) に
+より外れている。本 Issue でやるのは「Windows の CI 品質ゲートを整える」こと。
+
+**判断**:
+
+- **`ci.yml` に `check-windows` (windows-latest) ジョブを追加する。** 既存の
+  `check` (Linux) ジョブは変更しない — `VELOX_INTEGRATION_REQUIRE_GUI` +
+  `xvfb-run` + `dbus-run-session` の組み合わせは Issue #34/#72 の再発防止策
+  そのものなので、触らない。追加ジョブは同じ `CI` workflow 内の別ジョブに
+  するため、`auto-merge.yml` の `workflow_run.workflows` リスト
+  (`CI` / `Performance Regression Gate` / `Release (Windows)`) は変更不要
+  (workflow 単位のトリガであり、ジョブ追加では変わらない)。一方で
+  auto-merge 自体は PR の head commit の check-runs を全件見て
+  success/skipped/neutral を要求するため、`check-windows` の追加によって
+  「Windows のビルド/テストが通らない PR は自動マージされない」が新たに
+  効くようになる — これは本 Issue の目的 (Windows の品質ゲート) と合致する
+  望ましい副作用であり、`auto-merge.yml` 側の追加対応は不要と判断した。
+- **macOS ジョブは追加しない。** CLAUDE.md の「macOS / Linux は当面
+  『最低限の整備』に留める」方針に明記されている通りで、macOS ランナーは
+  Linux より高コスト (課金上の重み) なうえ、CI 時間とメンテコストが増える
+  だけで Windows 優先方針には寄与しない。Linux は既存 CI と性能計測の
+  実行環境として引き続き必要だが、macOS には今のところそのどちらの役割も
+  無い。macOS の本格対応は Issue #33 の完了を待たず、3 OS の品質が
+  「担保できた段階」(CLAUDE.md 該当節) で改めて着手する。
+- **Windows ジョブは `cargo build` + `cargo test --lib` のみで、統合テスト
+  (`tests/integration.rs`) は実行しない。** `tests/integration.rs` の
+  `gui_skip_reason()` は Linux でのみ `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`
+  を見てスキップ判定をし、macOS/Windows では常に `None` (スキップしない)
+  を返す設計になっている — 「デスクトップ OS なら追加の下準備なしに GUI が
+  起動できるはず」という前提のためだが、GitHub Actions の `windows-latest`
+  ホストランナー (対話セッションはあるが CI 専用の仮想環境) で実際に
+  `velox` (WebView2) のウィンドウ起動・イベントループが安定して成立するかは
+  未検証・不確実。これを確かめずに `cargo test` (引数なし) をそのまま
+  Windows ジョブで動かすと、(a) 実際に統合テストが GUI 起動に失敗して
+  ジョブが赤くなり続ける、または (b) 何らかの理由で当たり障りなく通って
+  しまい「Windows で検証できた」と誤認する、のどちらに転んでも本 Issue の
+  目的に反する。特に (b) は Issue #34 がまさに防ごうとした「見かけ上は緑だが
+  何も検証できていない」形そのものなので避けたい。そこで **確実に成立する
+  範囲 (`src/browser/` 配下の純粋ロジックに対する `--lib` 単体テスト) だけを
+  Windows ジョブの対象にし、GUI を要する統合テストは対象外であることを
+  ワークフローのコメントに明記する**、という安全側の設計にした。
+  「動いたことにする」のではなく「まだ検証していない」ことを明示している。
+- **`cargo build --release` は通常の PR 向け CI には追加しない。**
+  `release-windows.yml` が `workflow_dispatch` / `v*` タグ push で thin LTO
+  付きの release ビルドをすでに検証しており (WebView2 のセットアップ含めて
+  前例がある)、それを PR ごとに複製すると thin LTO のぶん CI 時間が伸びる
+  だけで得るものが少ない。PR ゲートでは debug ビルドの `cargo build` で
+  「ビルドが壊れていないか」だけを見れば十分と判断した。
+- **fmt / clippy は Windows ジョブに複製しない。** どちらもソースコードの
+  静的な整形・lint であり OS 依存の結果差が無いため、Linux ジョブで 1 回
+  実行すれば足りる。Windows ジョブは「Windows 固有の懸念 (ビルド・実行時の
+  単体テスト)」に絞った。
+- **依存キャッシュは Linux ジョブと同じ `Swatinem/rust-cache@v2` を使う。**
+  ランナー OS ごとにキーが分かれるため、Linux 用キャッシュと衝突しない。
+
+**検証の限界 (正直な記録)**: 本 Issue の実装は Linux 環境で行っており、
+`check-windows` ジョブが実際に GitHub Actions の `windows-latest` 上で
+グリーンになるかどうかは実機で確認できていない。YAML 構文の妥当性
+(`yaml.safe_load`) と、既存 Linux ジョブのコマンドがローカルで通ることは
+確認したが、Windows ジョブ自体の動作確認は本 PR のマージ後、実際の CI 実行
+結果を見て行う必要がある。
+
+**Revisit condition**: (1) `windows-latest` 上で `tests/integration.rs` の
+GUI 起動 (WebView2) が安定して動くことを実際の CI 実行で確認できたら、
+`check-windows` にも統合テスト (`cargo test` 全体、あるいは
+`VELOX_INTEGRATION_REQUIRE_GUI` 相当の仕組み) を追加する。(2) 3 OS の
+品質が担保できた段階 (CLAUDE.md「対応 OS の優先度」) で macOS ジョブの
+追加を再検討する。(3) Windows ジョブが実際に赤くなるようなら、原因が
+CI 環境固有の問題なのか実コードの Windows 対応不足なのかを切り分ける。
