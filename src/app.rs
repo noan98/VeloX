@@ -461,6 +461,15 @@ fn record_perf_event(
                 metrics::StartupTimestamps::mark_first_load_finished,
             );
         }
+        // The `mark` command (Issue #60) is the one automation command
+        // that *is* a perf event of its own: it writes the `measure_start`
+        // marker `benchmark::aggregate_trials` cuts each trial at. Listed
+        // before the catch-all arm below, which still covers every other
+        // `Automation` variant.
+        UserEvent::Automation(AutomationCommand::Mark) => {
+            let elapsed = Instant::now().saturating_duration_since(process_start);
+            perf_log.write(&metrics::PerfRecord::measure_start(), elapsed);
+        }
         UserEvent::LoadStarted(..)
         | UserEvent::NavigationBlocked(..)
         | UserEvent::PageTitleResolved { .. }
@@ -1392,6 +1401,10 @@ fn handle_automation_command(
             }
             None => eprintln!("velox: automation: suspend {index} は範囲外です"),
         },
+        // The marker is a perf-log record only (`record_perf_event` has
+        // already written it by the time dispatch gets here); there is no
+        // browser state to change.
+        AutomationCommand::Mark => {}
         AutomationCommand::Wait { .. } | AutomationCommand::Quit => {}
     }
 }

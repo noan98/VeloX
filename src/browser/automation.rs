@@ -29,6 +29,7 @@
 //! switch <index>    # activate the tab at position <index> (0-based)
 //! close <index>     # close the tab at position <index> (0-based)
 //! suspend <index>   # suspend the tab at position <index> (0-based; never the active tab)
+//! mark              # mark the start of the measured phase (drops everything logged before it)
 //! navigate <url>    # navigate the active tab
 //! wait <ms>         # sleep before the next command (<= MAX_WAIT_MS)
 //! quit              # exit the application
@@ -79,6 +80,13 @@ pub enum AutomationCommand {
     /// `navigate <url>` — navigate the active tab to `url` (already
     /// normalized).
     Navigate { url: String },
+    /// `mark` — everything logged before this point is warm-up (Issue #60).
+    /// Emits a `measure_start` perf record, which
+    /// `benchmark::aggregate_trials` uses as a cut: only events after the
+    /// last marker are aggregated. Lets a scenario open N tabs as setup and
+    /// then measure an operation *at* N tabs, without the setup's own
+    /// `tab_create`/`page_load` events dragging the numbers around.
+    Mark,
     /// `wait <ms>` — sleep for `ms` milliseconds before the next command.
     /// Never exceeds [`MAX_WAIT_MS`] (enforced at parse time).
     Wait { ms: u64 },
@@ -149,6 +157,13 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
         "wait" => Ok(AutomationCommand::Wait {
             ms: parse_wait(line, rest)?,
         }),
+        "mark" => {
+            if rest.is_empty() {
+                Ok(AutomationCommand::Mark)
+            } else {
+                Err(err(line, format!("mark は引数を取りません: {rest:?}")))
+            }
+        }
         "quit" => {
             if rest.is_empty() {
                 Ok(AutomationCommand::Quit)
@@ -233,6 +248,15 @@ const TAB_RESUME_EXTRA_TABS: usize = TAB_SWITCH_EXTRA_TABS;
 /// How many suspend-then-switch rounds `Scenario::TabResume` runs, one
 /// `tab_resume` latency sample (and one reload `page_load`) each.
 const TAB_RESUME_REPEATS: usize = TAB_SWITCH_REPEATS;
+/// How many `open`+`close` rounds `Scenario::TabCreateAt` runs after its
+/// `mark` — one `tab_create` sample each, all taken with exactly the
+/// scenario's tab count already open (the tab each round opens is closed
+/// again before the next one, so the count never drifts).
+const TAB_CREATE_AT_ROUNDS: usize = 8;
+/// How many `switch` commands `Scenario::TabSwitchAt` issues after its
+/// `mark`, cycling through the tabs it set up — one `tab_switch` sample
+/// each.
+const TAB_SWITCH_AT_REPEATS: usize = 8;
 /// Pause after a resumed tab is switched to, so its reload finishes (and
 /// its `page_load` is logged) before the next round suspends a different
 /// tab — a tab that is still loading is never suspended
@@ -318,6 +342,37 @@ pub fn generate_bench_script(
             }
             lines
         }
+        Scenario::TabCreateAt(tab_count) => {
+            // Setup: reach `tab_count` live tabs, each settled so the next
+            // `open` is a steady-state one (D54 never joins a web process
+            // that is still loading). Then `mark`, and repeatedly open one
+            // more tab and close it again — every measured `tab_create`
+            // therefore happens with exactly `tab_count` tabs already open.
+            let mut lines: Vec<String> = (1..tab_count)
+                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+                .collect();
+            lines.push("mark".to_owned());
+            for _ in 0..TAB_CREATE_AT_ROUNDS {
+                lines.push(format!("open {url}"));
+                lines.push(format!("wait {STEP_SETTLE_MS}"));
+                // The tab just opened sits at index `tab_count` (0-based),
+                // after the `tab_count` tabs the setup left in place.
+                lines.push(format!("close {tab_count}"));
+                lines.push(format!("wait {SWITCH_SETTLE_MS}"));
+            }
+            lines
+        }
+        Scenario::TabSwitchAt(tab_count) => {
+            let mut lines: Vec<String> = (1..tab_count)
+                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+                .collect();
+            lines.push("mark".to_owned());
+            for i in 0..TAB_SWITCH_AT_REPEATS {
+                lines.push(format!("switch {}", i % tab_count as usize));
+                lines.push(format!("wait {SWITCH_SETTLE_MS}"));
+            }
+            lines
+        }
         Scenario::TabCountMemory(tab_count) => {
             let extra_tabs = tab_count.saturating_sub(1);
             let mut lines: Vec<String> = (0..extra_tabs).map(|_| format!("open {url}")).collect();
@@ -382,6 +437,17 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             let round_ms = 2 * PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS + RESUME_SETTLE_MS;
             open_ms + TAB_RESUME_REPEATS as u64 * round_ms
         }
+        Scenario::TabCreateAt(tab_count) => {
+            let setup_ms =
+                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            let round_ms = 2 * PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS + SWITCH_SETTLE_MS;
+            setup_ms + TAB_CREATE_AT_ROUNDS as u64 * round_ms
+        }
+        Scenario::TabSwitchAt(tab_count) => {
+            let setup_ms =
+                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            setup_ms + TAB_SWITCH_AT_REPEATS as u64 * (PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS)
+        }
         Scenario::TabCountMemory(tab_count) => {
             let open_ms = u64::from(tab_count.saturating_sub(1)) * PER_STEP_OVERHEAD_MS;
             open_ms + MEMORY_STABILIZE_MS
@@ -438,7 +504,9 @@ pub fn recommended_rss_interval_ms(
         | Scenario::Navigation
         | Scenario::TabCreate
         | Scenario::TabSwitch
-        | Scenario::TabResume => None,
+        | Scenario::TabResume
+        | Scenario::TabCreateAt(_)
+        | Scenario::TabSwitchAt(_) => None,
     }
 }
 
@@ -475,6 +543,123 @@ mod tests {
                 AutomationCommand::Quit,
             ]
         );
+    }
+
+    #[test]
+    fn parses_mark_and_rejects_arguments_on_it() {
+        assert_eq!(
+            parse_script("mark\n").unwrap(),
+            vec![AutomationCommand::Mark]
+        );
+        let err = parse_script("mark 3\n").unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("mark"), "{}", err.message);
+    }
+
+    #[test]
+    fn tab_create_at_measures_every_sample_at_the_same_tab_count() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        for tab_count in [1u32, 5, 20] {
+            let script = generate_bench_script(Scenario::TabCreateAt(tab_count), url).unwrap();
+            let commands = parse_script(&script).unwrap();
+            let marker = commands
+                .iter()
+                .position(|c| *c == AutomationCommand::Mark)
+                .unwrap_or_else(|| panic!("tab_count {tab_count}: no mark"));
+
+            // Setup leaves exactly `tab_count` tabs open (the initial tab
+            // plus one per `open`).
+            let setup_opens = commands[..marker]
+                .iter()
+                .filter(|c| matches!(c, AutomationCommand::Open { .. }))
+                .count();
+            assert_eq!(setup_opens + 1, tab_count as usize);
+
+            // Replay the measured phase against a real `Tabs`: every round
+            // must create its tab with exactly `tab_count` already open,
+            // and put the count back afterwards.
+            let mut tabs = crate::browser::tabs::Tabs::new(url);
+            for _ in 0..setup_opens {
+                tabs.open(url);
+            }
+            let mut rounds = 0;
+            for command in &commands[marker + 1..] {
+                match command {
+                    AutomationCommand::Open { url } => {
+                        assert_eq!(
+                            tabs.len(),
+                            tab_count as usize,
+                            "tab_count {tab_count}: measured open at the wrong count"
+                        );
+                        tabs.open(url.clone());
+                        rounds += 1;
+                    }
+                    AutomationCommand::Close { index } => {
+                        let id = tabs.iter().nth(*index).expect("close index in range").id();
+                        assert!(tabs.close(id).is_some(), "close was refused");
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(rounds, TAB_CREATE_AT_ROUNDS);
+            assert_eq!(tabs.len(), tab_count as usize);
+            assert_eq!(commands.last(), Some(&AutomationCommand::Quit));
+        }
+    }
+
+    #[test]
+    fn tab_switch_at_switches_only_among_the_tabs_it_opened() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        for tab_count in [1u32, 5, 20] {
+            let script = generate_bench_script(Scenario::TabSwitchAt(tab_count), url).unwrap();
+            let commands = parse_script(&script).unwrap();
+            let marker = commands
+                .iter()
+                .position(|c| *c == AutomationCommand::Mark)
+                .unwrap();
+            let setup_opens = commands[..marker]
+                .iter()
+                .filter(|c| matches!(c, AutomationCommand::Open { .. }))
+                .count();
+            assert_eq!(setup_opens + 1, tab_count as usize);
+
+            let switches: Vec<usize> = commands[marker + 1..]
+                .iter()
+                .filter_map(|c| match c {
+                    AutomationCommand::Switch { index } => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(switches.len(), TAB_SWITCH_AT_REPEATS);
+            assert!(
+                switches.iter().all(|i| *i < tab_count as usize),
+                "tab_count {tab_count}: switch index out of range: {switches:?}"
+            );
+            // Nothing after the marker may change how many tabs are open —
+            // every sample must be taken at `tab_count`.
+            assert!(commands[marker + 1..].iter().all(|c| !matches!(
+                c,
+                AutomationCommand::Open { .. } | AutomationCommand::Close { .. }
+            )));
+        }
+    }
+
+    #[test]
+    fn only_the_parameterized_scenarios_emit_a_marker() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        for scenario in Scenario::all() {
+            let Some(script) = generate_bench_script(scenario, url) else {
+                continue;
+            };
+            let has_mark = parse_script(&script)
+                .unwrap()
+                .contains(&AutomationCommand::Mark);
+            let expected = matches!(
+                scenario,
+                Scenario::TabCreateAt(_) | Scenario::TabSwitchAt(_)
+            );
+            assert_eq!(has_mark, expected, "{scenario:?}");
+        }
     }
 
     #[test]

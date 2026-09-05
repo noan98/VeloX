@@ -337,10 +337,11 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
 /// 実行できる" + "中央値またはp95等の代表値を算出できる" acceptance
 /// criteria together.
 pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
+    let measured: Vec<&[Value]> = trials.iter().map(|trial| measured_phase(trial)).collect();
     let mut out = BTreeMap::new();
     for key in MetricKey::ALL {
         let mut values = Vec::new();
-        for trial in trials {
+        for trial in &measured {
             values.extend(key.extract(trial));
         }
         if let Some(stats) = compute_stats(&values) {
@@ -348,6 +349,31 @@ pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
         }
     }
     out
+}
+
+/// The part of one trial's events that counts as measurement: everything
+/// after the **last** `measure_start` marker (the `mark` automation
+/// command, Issue #60), or the whole trial when there is none.
+///
+/// This is what lets a scenario have a warm-up phase. `tab_create_20`, for
+/// instance, opens 20 tabs before it measures anything; without the cut,
+/// those 20 setup `tab_create` events — taken at 1, 2, 3 … tabs — would be
+/// pooled with the 8 samples actually taken at 20 tabs, and the median
+/// would describe neither. Scenarios that emit no marker (every scenario
+/// before this one) are unaffected, which is why the fallback is "keep
+/// everything" rather than "keep nothing".
+///
+/// The *last* marker wins, so a script may mark more than once (each one
+/// discarding what came before) without the aggregate silently keeping the
+/// earliest phase.
+fn measured_phase(trial: &[Value]) -> &[Value] {
+    match trial
+        .iter()
+        .rposition(|event| event.get("event").and_then(Value::as_str) == Some("measure_start"))
+    {
+        Some(index) => &trial[index + 1..],
+        None => trial,
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -1460,6 +1486,15 @@ pub mod scenario {
         Navigation,
         TabCreate,
         TabSwitch,
+        /// Cost of creating one more tab with `tab_count` tabs already
+        /// open (Issue #60). Every sample is taken at that exact tab
+        /// count: the scenario opens `tab_count` tabs as setup, `mark`s
+        /// the measured phase, then repeatedly opens one tab and closes it
+        /// again. `tab_count` is one of [`Scenario::TAB_COUNTS`].
+        TabCreateAt(u32),
+        /// Cost of switching between `tab_count` already-open tabs (Issue
+        /// #60), measured the same way: setup, `mark`, then switches.
+        TabSwitchAt(u32),
         /// Restore cost of tab suspension (Issue #63): open a few tabs,
         /// then repeatedly suspend one (`suspend <index>`) and switch back
         /// to it, one `tab_resume` latency sample (plus the page reload's
@@ -1494,6 +1529,8 @@ pub mod scenario {
                     .iter()
                     .map(|&n| Scenario::TabCountMemory(n)),
             );
+            scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabCreateAt(n)));
+            scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabSwitchAt(n)));
             scenarios
         }
 
@@ -1508,6 +1545,8 @@ pub mod scenario {
                 Scenario::TabCreate => "tab_create".to_owned(),
                 Scenario::TabSwitch => "tab_switch".to_owned(),
                 Scenario::TabResume => "tab_resume".to_owned(),
+                Scenario::TabCreateAt(n) => format!("tab_create_{n}"),
+                Scenario::TabSwitchAt(n) => format!("tab_switch_{n}"),
                 Scenario::TabCountMemory(n) => format!("tabs_{n}"),
             }
         }
@@ -1523,12 +1562,31 @@ pub mod scenario {
                 "tab_create" => Some(Scenario::TabCreate),
                 "tab_switch" => Some(Scenario::TabSwitch),
                 "tab_resume" => Some(Scenario::TabResume),
-                other => other
-                    .strip_prefix("tabs_")
-                    .and_then(|rest| rest.parse::<u32>().ok())
-                    .filter(|n| Self::TAB_COUNTS.contains(n))
-                    .map(Scenario::TabCountMemory),
+                // Parameterized ids, checked after the exact matches above
+                // so `tab_create`/`tab_switch` keep their own meaning.
+                other => Self::parse_parameterized(other),
             }
+        }
+
+        /// The `<prefix>_<tab count>` half of [`Self::parse`], split out so
+        /// the three parameterized families read as one table instead of a
+        /// chain of `or_else`s. `None` for an unknown prefix or a tab count
+        /// outside [`Self::TAB_COUNTS`].
+        fn parse_parameterized(id: &str) -> Option<Scenario> {
+            for (prefix, build) in [
+                ("tabs_", Scenario::TabCountMemory as fn(u32) -> Scenario),
+                ("tab_create_", Scenario::TabCreateAt as fn(u32) -> Scenario),
+                ("tab_switch_", Scenario::TabSwitchAt as fn(u32) -> Scenario),
+            ] {
+                if let Some(rest) = id.strip_prefix(prefix) {
+                    return rest
+                        .parse::<u32>()
+                        .ok()
+                        .filter(|n| Self::TAB_COUNTS.contains(n))
+                        .map(build);
+                }
+            }
+            None
         }
 
         /// Whether `velox-bench run` can drive this scenario unattended
@@ -1555,6 +1613,8 @@ pub mod scenario {
                 | Scenario::TabCreate
                 | Scenario::TabSwitch
                 | Scenario::TabResume
+                | Scenario::TabCreateAt(_)
+                | Scenario::TabSwitchAt(_)
                 | Scenario::TabCountMemory(_) => true,
             }
         }
@@ -1577,11 +1637,30 @@ pub mod scenario {
             assert_eq!(Scenario::parse("tabs_7"), None);
             assert_eq!(Scenario::parse("tabs_"), None);
             assert_eq!(Scenario::parse("not_a_scenario"), None);
+            assert_eq!(Scenario::parse("tab_create_7"), None);
+            assert_eq!(Scenario::parse("tab_switch_"), None);
         }
 
         #[test]
-        fn all_covers_seven_fixed_plus_five_tab_count_scenarios() {
-            assert_eq!(Scenario::all().len(), 7 + Scenario::TAB_COUNTS.len());
+        fn unparameterized_and_parameterized_ids_stay_distinct() {
+            // `tab_create` must not be read as a `tab_create_<n>` with an
+            // empty count, and the parameterized ids must not collide with
+            // the fixed ones they are named after.
+            assert_eq!(Scenario::parse("tab_create"), Some(Scenario::TabCreate));
+            assert_eq!(Scenario::parse("tab_switch"), Some(Scenario::TabSwitch));
+            assert_eq!(
+                Scenario::parse("tab_create_5"),
+                Some(Scenario::TabCreateAt(5))
+            );
+            assert_eq!(
+                Scenario::parse("tab_switch_20"),
+                Some(Scenario::TabSwitchAt(20))
+            );
+        }
+
+        #[test]
+        fn all_covers_seven_fixed_plus_three_parameterized_families() {
+            assert_eq!(Scenario::all().len(), 7 + 3 * Scenario::TAB_COUNTS.len());
         }
 
         #[test]
@@ -1636,6 +1715,62 @@ mod tests {
     }
 
     // -- MetricKey::extract -------------------------------------------------
+
+    // -- measured_phase / warm-up cut (Issue #60) --------------------------
+
+    #[test]
+    fn aggregate_ignores_events_before_the_last_measure_start() {
+        let trial = vec![
+            // Warm-up: two creations at low tab counts.
+            event(r#"{"event":"tab_create","tab_id":1,"duration_ms":50.0}"#),
+            event(r#"{"event":"tab_create","tab_id":2,"duration_ms":60.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+            // Measured phase.
+            event(r#"{"event":"tab_create","tab_id":3,"duration_ms":10.0}"#),
+            event(r#"{"event":"tab_create","tab_id":4,"duration_ms":12.0}"#),
+        ];
+        let aggregated = aggregate_trials(&[trial]);
+        let stats = aggregated.get("tab_create_ms").unwrap();
+        assert_eq!(stats.count, 2, "warm-up samples must not be pooled in");
+        assert_eq!(stats.median, 11.0);
+    }
+
+    #[test]
+    fn the_last_measure_start_is_the_one_that_cuts() {
+        let trial = vec![
+            event(r#"{"event":"measure_start","ts_ms":1.0}"#),
+            event(r#"{"event":"tab_switch","tab_id":1,"duration_ms":99.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":2.0}"#),
+            event(r#"{"event":"tab_switch","tab_id":2,"duration_ms":3.0}"#),
+        ];
+        let aggregated = aggregate_trials(&[trial]);
+        let stats = aggregated.get("tab_switch_ms").unwrap();
+        assert_eq!(stats.count, 1);
+        assert_eq!(stats.median, 3.0);
+    }
+
+    #[test]
+    fn a_trial_without_a_marker_keeps_every_event() {
+        // Every pre-#60 scenario emits no marker; their aggregation must
+        // be byte-for-byte what it always was.
+        let trial = vec![
+            event(r#"{"event":"tab_create","tab_id":1,"duration_ms":10.0}"#),
+            event(r#"{"event":"tab_create","tab_id":2,"duration_ms":20.0}"#),
+        ];
+        let stats = aggregate_trials(&[trial]);
+        assert_eq!(stats.get("tab_create_ms").unwrap().count, 2);
+    }
+
+    #[test]
+    fn a_marker_with_nothing_after_it_yields_no_samples() {
+        let trial = vec![
+            event(r#"{"event":"tab_create","tab_id":1,"duration_ms":10.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":5.0}"#),
+        ];
+        // Not a panic and not a silent fallback to the warm-up numbers:
+        // the metric is simply absent.
+        assert!(!aggregate_trials(&[trial]).contains_key("tab_create_ms"));
+    }
 
     #[test]
     fn extract_reads_matching_events_only() {
