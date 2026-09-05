@@ -713,13 +713,21 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     let page_a = fixture_url("text.html");
     let page_b = fixture_url("dom_heavy.html");
 
+    // `VELOX_MAX_TABS_PER_PROCESS=1` below is what makes the *choice* of
+    // victim deterministic, and it is load-bearing rather than incidental.
+    // D56 reclaims whole process groups before individual tabs, and D54
+    // decides grouping by whether the previous tab was still loading when
+    // the next one opened — so with the default cap the grouping, and
+    // therefore which tab the policy picks, depends on how fast this
+    // machine loads a local file. (That is not hypothetical: this test
+    // first shipped without it and passed here while failing on the
+    // slower CI runner, which grouped the tabs differently.) One tab per
+    // process makes every group a single tab, so group order collapses to
+    // plain least-recently-used and the assertions below hold at any
+    // speed. The live-tab cap and the resume path — what this test is
+    // actually about — are unaffected by the process layout.
+    //
     // Tab strip after each step (cap = 2 live tabs):
-    //   wait                   home finishes loading first, so every tab
-    //                          below joins home's web process (D54 never
-    //                          joins a process with a loading tab): one
-    //                          group, pinned by the active tab, so the
-    //                          policy's reclaim order is plain per-tab
-    //                          LRU here (docs/decisions.md D56).
     //   [home]                 home active, 1 live
     //   open a -> [home, a]    a active, 2 live — at the cap, nothing to do
     //   open b -> [home, a, b] b active, 3 live -> `home` (idle longest)
@@ -744,14 +752,16 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     );
     let script_path = write_script(&dir, &script);
 
-    let max_live_tabs = Path::new("2");
     let launch = launch_and_wait_with(
         &perf_output,
         &data_dir,
         &homepage,
         &script_path,
         Duration::from_secs(30),
-        &[("VELOX_MAX_LIVE_TABS", max_live_tabs)],
+        &[
+            ("VELOX_MAX_LIVE_TABS", Path::new("2")),
+            ("VELOX_MAX_TABS_PER_PROCESS", Path::new("1")),
+        ],
         Some(&stderr_path),
     );
     let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
