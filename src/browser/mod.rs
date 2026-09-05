@@ -23,6 +23,7 @@ pub mod omnibox_candidates;
 pub mod perf_log;
 pub mod persistence;
 pub mod ranking;
+pub mod subresource;
 pub mod suspension;
 pub mod tab;
 pub mod tabs;
@@ -39,6 +40,7 @@ pub use history::{
 pub use input_history::{InputHistoryEntry, InputHistoryStore};
 pub use omnibox::{Candidate, CandidateKind, CandidateSource};
 pub use omnibox_candidates::{HistoryBookmarkSource, InputHistorySource};
+pub use subresource::{is_blocked_resource, ResourceType, SiteExceptions};
 pub use suspension::{SuspendReason, SuspensionPolicy};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};

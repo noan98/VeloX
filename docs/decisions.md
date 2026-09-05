@@ -4494,3 +4494,171 @@ D57 と同じく、Epic #57 のルール 1 の裏返しとして、測って効�
 いる状態なので影響は小さいが、実機で再測定する価値はある。(3) 音声再生中の
 タブ (#63 で保護対象にした) が本当にバックグラウンドでも再生を続けるかは、
 この環境に音声デバイスが無いため未検証。
+
+## D59: サブリソースブロック — D17 の再検証、Windows (WebView2) のみ実装できることが判明
+
+**対象**: Issue #22 (依存する #21 は D17 で main-frame navigation blocking として
+実装済み)。CLAUDE.md「対応 OS の優先度」により Windows を最優先して再検証した。
+
+### D17 との差分（先に結論）
+
+**D17 の結論のうち「wry 0.56 にサブリソースのリクエスト横取り API が無い」自体は
+正しい。ただし D17 は `wry::WebViewBuilder` の `with_*` 系ビルダーメソッドしか
+調べておらず、`WebView` を組み立てた**後**に呼べる拡張トレイト
+(`WebViewExtWindows`) を見落としていた。** この拡張トレイトの
+`webview()` メソッドは、wry が内部で保持している生の `ICoreWebView2`
+COM オブジェクトをそのまま返す — 安定版・公開 API・`unsafe` 不要。ここから先、
+`ICoreWebView2::AddWebResourceRequestedFilter` /
+`add_WebResourceRequested` という WebView2 ネイティブのリクエスト横取り
+フックを **wry の外から** 直接呼び出せることが分かった。D17 が「(b) `wry::WebView`
+の先にある生プラットフォームオブジェクトに手を伸ばす」を「3 プラットフォーム
+それぞれ `unsafe` 隣接の別実装が要る」と評価していたのに対し、少なくとも
+Windows についてはその「手を伸ばす」経路が wry 自身によって公開 API として
+既に用意されていたことになる。macOS (`WKContentRuleList`) / Linux
+(`WebKitUserContentFilter`) に同等の拡張トレイトは無く、D17 の結論はこの 2
+プラットフォームでは変わらない。
+
+### 何を確認したか（根拠）
+
+`~/.cargo/registry/src/*/wry-0.56.1/src/lib.rs` を実際に読んだ:
+
+- `pub(crate) struct InnerWebView` ( `src/webview2/mod.rs` 61-63 行目)
+  が `pub controller: ICoreWebView2Controller` / `pub webview: ICoreWebView2`
+  / `pub env: ICoreWebView2Environment` を保持している。構造体自体は
+  `pub(crate)` なのでフィールドはクレート外から直接は見えない。
+- しかし `lib.rs` 2340-2348 行目に **`#[cfg(target_os = "windows")] pub trait
+  WebViewExtWindows`** があり、`fn webview(&self) -> ICoreWebView2` /
+  `fn controller(&self) -> ICoreWebView2Controller` / `fn environment(&self)
+  -> ICoreWebView2Environment` を公開している。実装 (2378-2394 行目) は
+  単に `self.webview.webview.clone()` — 上記の内部フィールドをクローンして
+  返すだけ。
+- wry 自身、`src/webview2/mod.rs` の `attach_custom_protocol_handler`
+  (992-1110 行目) で `webview.AddWebResourceRequestedFilter(...)` /
+  `webview.add_WebResourceRequested(...)` を呼んでいる — ただし
+  `with_custom_protocol` 用のカスタム URI スキームだけにフィルタを絞っており
+  (`work_around_uri_prefix` でスキーム名をパスに埋め込む回避策越し)、通常の
+  `http`/`https` サブリソースには発火しない。D17 の「wry は
+  webview2-com のイベントを内部で配線しているが `WebResourceRequested` は
+  配線していない」という記述はこの内部利用に限れば正しいが、**外部から
+  `WebViewExtWindows::webview()` 経由で同じ COM オブジェクトに自分の
+  リスナーを登録するのを妨げるものではない** — wry のリスナーと VeloX の
+  リスナーは独立に共存できる（WebView2 は 1 つの `ICoreWebView2` に対して
+  複数の `WebResourceRequested` ハンドラを登録できる）。
+- `webview2-com` 0.38.2 (wry が `Cargo.toml` で要求するのと同じバージョン)
+  は `WebResourceRequestedEventHandler::create(Box<dyn FnMut(...) ->
+  windows::core::Result<()>>)` という COM イベントハンドラ実装ヘルパーと
+  `take_pwstr` (COM が返す `PWSTR` を `String` に変換しつつ
+  `CoTaskMemFree` する) を `pub use` で公開している (`src/callback.rs`
+  342-347 行目、`src/pwstr.rs`)。VeloX 側で改めて COM の vtable を
+  組み立てる必要はない。
+- `webview2-com-sys` 0.38.2 の生成バインディング (`src/bindings.rs`) で
+  `ICoreWebView2WebResourceRequestedEventArgs::{Request, Response,
+  SetResponse, GetDeferral, ResourceContext}` (37812-37905 行目)、
+  `COREWEBVIEW2_WEB_RESOURCE_CONTEXT_{DOCUMENT,IMAGE,SCRIPT,STYLESHEET,
+  FONT,MEDIA,XML_HTTP_REQUEST,FETCH,WEBSOCKET,...}` の全列挙値
+  (928-961 行目)、`ICoreWebView2Environment::CreateWebResourceResponse`
+  (14019-14043 行目) の存在を確認した — issue が求める「画像・スクリプト・
+  XHR/fetch」の resource-type 判定と、ブロック応答 (空ボディ + 403) の生成に
+  必要な API が揃っている。
+
+### 実装したもの
+
+- **`browser::subresource`** (`src/browser/subresource.rs`) — 純粋・
+  エンジン非依存のロジック。`ResourceType` (Document/Stylesheet/Image/
+  Font/Script/XhrOrFetch/Media/WebSocket/Other)、`SiteExceptions`
+  (issue の「サイト単位の例外」— 完全一致ホスト名の許可リスト、
+  `FilterList` のドメインサフィックス方式とは別軸)、そして
+  `is_blocked_resource(list, exceptions, page_host, resource_type, url)`。
+  `ResourceType::Document` は常にブロック対象外 — WebView2 の
+  `WebResourceRequested` はメインフレームのナビゲーションでも発火するが、
+  その判定は D17 の `with_navigation_handler` が既に行っており、ここで
+  二重に判定すると「誤って表示中のページ自体をブロックする」事故になり
+  得るため。`<iframe>` 自身のドキュメント読み込みも同じ理由 (トップ
+  フレームか iframe かを確実に見分ける手段が `ResourceContext` 単体には
+  無い) で意図的に対象外にした — 詳しくは「残っている制約」を参照。
+  14 件のユニットテストがある (`cargo test subresource`)。
+- **`ui::webview2_blocking`** (`src/ui/webview2_blocking.rs`,
+  `#[cfg(windows)]`) — 上記の COM 呼び出し。`AddWebResourceRequestedFilter`
+  で `"*"` (全リクエスト) にフィルタを登録し、`add_WebResourceRequested`
+  ハンドラの中で `ResourceContext` → `ResourceType` に変換、
+  `ICoreWebView2::Source` (現在表示中のページの URL、サイト例外の判定に
+  使う) を取得し、`is_blocked_resource` の結果に従って
+  `SetResponse` に空ボディ・403 の `ICoreWebView2WebResourceResponse` を
+  差し込む。登録失敗は (D17/D18 と同じ流儀で) stderr にログして継続、
+  ブラウザは落とさない。`BrowserWindow::new` と `open_tab` の両方 —
+  つまり最初のタブ・新規タブ・休止からの復帰タブすべて — で
+  `attach()` を呼ぶことで、content webview がいつどう生成されても
+  同じブロック挙動になる (D17 の `content_webview_builder` と同じ設計原則)。
+- **ブロック数集計**: `Tab::on_subresource_blocked` を追加し、既存の
+  `Tab::blocked_count` (ツールバーのバッジ) を main-frame ブロックと共有する
+  — ユーザ視点では「このタブでコンテンツブロックが何回働いたか」の 1 個の
+  数字で十分なため。`UserEvent::SubresourceBlocked(TabId, String)` を追加し、
+  `app.rs` で `UserEvent::NavigationBlocked` とほぼ同じ扱い方をするが、
+  stderr へのログ出力だけは意図的に付けていない (busy なページでは 1 秒間に
+  何十件もブロックが起こり得るため、`log_failure` 系の診断ログを埋もれさせる)。
+- **サイト単位の例外**: `Config::content_blocking_site_exceptions`
+  (`VELOX_CONTENT_BLOCKING_ALLOW`、カンマ区切りホスト名) →
+  `browser::SiteExceptions` → `BrowserWindow` → `ui::webview2_blocking`。
+  トグル用のツールバー UI (ボタン一つで今開いているサイトを許可する、等) は
+  今回のスコープに含めていない — 環境変数での静的指定のみ。UI 化は follow-up。
+- **依存クレート追加** (`Cargo.toml`, `[target.'cfg(windows)'.dependencies]`):
+  `windows = "0.61"` (`Win32_System_Com` フィーチャのみ — `IStream` の
+  `Option<&IStream>` 引数に必要) と `webview2-com = "0.38"`。**バージョンは
+  wry 0.56.1 が要求するものと完全に一致させている** (wry の `Cargo.toml`
+  参照) — ここがずれると `webview()` が返す `ICoreWebView2` と VeloX が
+  import する `ICoreWebView2` が型として別物になり、コンパイルは通っても
+  値を渡せない (あるいは cargo が 2 系統の `windows`/`webview2-com` を
+  依存グラフに持ち込んで型が合わなくなる) 事故になり得るため。実際 `cargo
+  tree` で見ると `tao` が独自に `windows 0.62.2` を使っており (VeloX の
+  Windows ビルドの既存の依存)、VeloX 自身の `windows = "0.61"` はそれとは
+  別系統として wry/webview2-com の 0.61.3 に解決される — Rust は同名クレートの
+  複数バージョン共存を許すので問題にならないが、意図せず `windows 0.62` 系に
+  解決されていないかは今後の `cargo update` のたびに確認が要る。
+
+### 検証できたこと・できなかったこと（正直な記録）
+
+**この開発環境は Linux のみで、Windows 実機は無い。** 確認できた範囲:
+
+- `rustup target add x86_64-pc-windows-msvc` でターゲットを追加し、
+  `cargo check --target x86_64-pc-windows-msvc --lib` および
+  `cargo clippy --target x86_64-pc-windows-msvc --lib -- -D warnings` が
+  **エラー・警告 0 件で通る**ことを確認した (型チェックのみ、リンクや実行は
+  していない)。`--all-targets` (テストを含む) は `src/browser/downloads.rs`
+  の既存のテストコード (`resolve_unix_download_dir` という存在しない関数名を
+  参照している、本 Issue と無関係の pre-existing なバグ) で落ちる —
+  `git stash` して確認したところ、この PR の変更を一切含まない `main` でも
+  同じエラーで落ちることを確認済み。本 PR が原因ではないため直していない
+  (別 Issue で扱うべき)。
+- **実行時の動作 (実際にリクエストがブロックされるか、`SetResponse` が
+  期待通り機能するか、`ICoreWebView2::Source` が想定したタイミングで
+  正しい値を返すか) は一切確認できていない。** WebView2 ランタイムも
+  Windows も無いため。
+
+### 残っている制約 (revisit condition)
+
+1. **iframe のドキュメント読み込みはブロック対象外**: `ResourceContext ==
+   Document` を一律で除外しているため、広告 iframe そのもの (よくある
+   `<iframe src="https://ads.example/...">` パターン) は現状素通りする。
+   WebView2 にはトップフレームと iframe の文書リクエストを確実に見分ける
+   単純な手段が `ICoreWebView2WebResourceRequestedEventArgs` 単体には無く
+   (`AddWebResourceRequestedFilterWithRequestSourceKinds` の
+   `RequestSourceKinds` は Document/ServiceWorker/SharedWorker/
+   DedicatedWorker の区別であって top-level/iframe の区別ではない)、誤って
+   トップフレームの表示中ページをブロックする事故のリスクを取ってまで
+   実装する価値が今回のスコープでは無いと判断した。iframe 内の広告 URL が
+   `FilterList` に載っていれば、その iframe が読み込む画像/スクリプトは
+   別途ブロックされるため、影響は「iframe の空箱が残る」程度に留まる。
+2. **実機未検証**: 上記の通り型チェックのみ。次に Windows 実機 (または
+   Windows CI ランナー) が使えるようになったら、実際に広告ページで
+   ブロック件数バッジが増えること、通常サイトが壊れないことを確認する。
+3. **macOS/Linux は変更なし**: D17 の結論のまま。`WKContentRuleList` /
+   `WebKitUserContentFilter` に相当する `*ExtWindows` 的な拡張トレイトが
+   wry に無いかは今回改めて `wkwebview`/`webkitgtk` バックエンドの
+   `lib.rs` 該当箇所も確認したが、`WebViewExtWindows` に相当するものは
+   無かった (macOS 向けの拡張は `WebViewBuilderExtWebview2` のような
+   ビルダー系のみで、ビルド後の `WebView` から `WKWebView` 本体を取り出す
+   公開 API は無い)。CLAUDE.md の OS 優先度方針どおり、この 2 プラット
+   フォームは「動作する (= 何もしない、壊さない)」最小実装のままで良いと
+   判断し、今回は追わなかった。
+4. **サイト例外は静的設定のみ**: `VELOX_CONTENT_BLOCKING_ALLOW` による
+   起動時指定のみで、ツールバーからのトグル UI は無い。UI 化は follow-up。

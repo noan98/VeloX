@@ -44,7 +44,9 @@ use wry::{PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
 
 use crate::app::UserEvent;
 use crate::browser::downloads;
-use crate::browser::{group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, TabId};
+use crate::browser::{
+    group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, SiteExceptions, TabId,
+};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -610,6 +612,19 @@ pub struct BrowserWindow {
     /// Whether content blocking is currently active; threaded into every
     /// [`content_webview_builder`] call alongside `blocklist`.
     content_blocking_enabled: bool,
+    /// Per-site content-blocking exceptions (Issue #22, D59). Kept
+    /// alongside `blocklist` for the same reason: every tab's content
+    /// webview, however and whenever it comes into existence, must see the
+    /// same exception list. Consulted only by the Windows/WebView2
+    /// subresource-blocking hook today (`ui::webview2_blocking`); main-frame
+    /// navigation blocking does not use it yet (D17's `with_navigation_handler`
+    /// predates this field). Kept unconditionally (not `#[cfg(windows)]`,
+    /// unlike `host`) so `BrowserWindow::new`'s signature — and therefore
+    /// `app.rs`, which is otherwise OS-agnostic — does not need a
+    /// platform-specific branch just to build this struct; `#[allow(dead_code)]`
+    /// on macOS/Linux is the cheaper cost of the two.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    site_exceptions: Arc<SiteExceptions>,
 }
 
 impl BrowserWindow {
@@ -626,6 +641,7 @@ impl BrowserWindow {
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
         blocklist: Arc<FilterList>,
+        site_exceptions: Arc<SiteExceptions>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // A window-title suffix is a second, independent tell for private
         // mode (docs/decisions.md D14): unlike the toolbar badge it survives
@@ -756,6 +772,21 @@ impl BrowserWindow {
             content_blocking_enabled,
         );
         let content = attach(content_builder)?;
+        // Windows-only subresource blocking (Issue #22, D59): a no-op on
+        // every other platform (`attach` compiles away entirely there — see
+        // its doc comment). Attached after `attach()` because it needs the
+        // *built* `wry::WebView` (specifically `WebViewExtWindows::webview`)
+        // to reach the raw `ICoreWebView2`, which does not exist yet on a
+        // bare `WebViewBuilder`.
+        #[cfg(windows)]
+        crate::ui::webview2_blocking::attach(
+            &content,
+            initial_tab,
+            Arc::clone(&blocklist),
+            Arc::clone(&site_exceptions),
+            content_blocking_enabled,
+            proxy.clone(),
+        );
 
         let mut contents = HashMap::new();
         contents.insert(
@@ -791,6 +822,7 @@ impl BrowserWindow {
             private: config.private,
             blocklist,
             content_blocking_enabled,
+            site_exceptions,
         })
     }
 
@@ -915,6 +947,20 @@ impl BrowserWindow {
             target_os = "netbsd",
         )))]
         let webview = Self::attach_webview(&self.window, builder)?;
+        // Same Windows-only hook as `BrowserWindow::new` — see its call
+        // site's doc comment. Covers every tab opened after startup and
+        // every tab rebuilt on resume from suspension (`resume_tab` reuses
+        // this function), so a resumed tab does not silently lose
+        // subresource blocking.
+        #[cfg(windows)]
+        crate::ui::webview2_blocking::attach(
+            &webview,
+            id,
+            Arc::clone(&self.blocklist),
+            Arc::clone(&self.site_exceptions),
+            self.content_blocking_enabled,
+            self.proxy.clone(),
+        );
         if std::env::var_os("VELOX_DEBUG").is_some() {
             // Which `WebKitWebProcess` group this tab landed in (D54) —
             // the one piece of placement state nothing else surfaces, and
