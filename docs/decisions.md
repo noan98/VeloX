@@ -4600,3 +4600,132 @@ GUI 起動 (WebView2) が安定して動くことを実際の CI 実行で確認
 追加を再検討する。(3) Windows ジョブが赤くなったときは、原因が CI 環境
 固有の問題なのか実コードの Windows 対応不足なのかを切り分ける — 初回の
 `resolve_unix_download_dir` は後者だった。
+
+## D63: 依存関係・セキュリティ監査を CI 化 (#37) — cargo-deny 単体を採用し、PR は依存グラフを触った時だけブロッカーにする
+
+**対象**: Issue #37。Rust 依存クレートの脆弱性・ライセンス・更新状況を CI で
+継続監視する。実装前に `cargo install cargo-audit` / `cargo install
+cargo-deny` を実際にこの環境で行い、VeloX の依存ツリー (Cargo.lock 286
+クレート、`gtk = "0.18"` を含む Linux ターゲット cfg 依存も含む) に対して
+両方を実際に走らせた結果に基づいて判断した (机上の一般論やよくある
+allow-list のコピペではない)。
+
+**判断**:
+
+- **`cargo-audit` と `cargo-deny` の両方をローカルで実行して比較し、
+  最終的に CI には `cargo-deny` だけを採用した。** `cargo audit` の結果は
+  「既知脆弱性 (vulnerability) 0 件、warning 12 件」。12 件の内訳は
+  `Cargo.toml` の `[target.'cfg(any(target_os = "linux", ...))'.dependencies]`
+  にある `gtk = "0.18"` (wry の gtk バックエンドが Linux ビルドに必要と
+  する gtk-rs GTK3 バインディング) が引き込む transitive 依存
+  (`atk`/`atk-sys`/`gdk`/`gdk-sys`/`gdkwayland-sys`/`gdkx11`/
+  `gdkx11-sys`/`gtk`/`gtk-sys`/`gtk3-macros` の unmaintained
+  advisory 10 件、`proc-macro-error` の unmaintained 1 件、`glib` の
+  unsound 1 件、RUSTSEC ID は deny.toml の `[advisories].ignore` に
+  列挙) だけで、VeloX 自身のコードに起因するものは無い。`cargo deny
+  check advisories` は同じ RustSec DB を使うため検知内容は同一だが、
+  advisories に加えて licenses/bans/sources もカバーする上位互換であり、
+  Issue の受け入れ条件にある「ライセンス監査」を別ツールで賄う必要が
+  無くなる。CLAUDE.md / D6 の「依存クレートは必要最小限に保つ」は
+  Rust クレートの話だが、CI ツールについても「同じ RustSec DB を見る
+  ツールを 2 本併走させて設定ファイルを 2 つメンテする」意味は無いと
+  判断し、`cargo-audit` は本 Issue の調査目的にのみ使い、CI には積まない。
+- **ライセンス監査は実データに基づく allow-list にした。**
+  `cargo deny init` の空 allow-list で `cargo deny check licenses` を
+  走らせ、実際に拒否された全エントリの SPDX 式 (286 クレート分) を
+  集計した結果、VeloX の依存ツリーに現れる atomic license は
+  `0BSD` / `Apache-2.0` / `Apache-2.0 WITH LLVM-exception` /
+  `BSD-3-Clause` / `CC0-1.0` / `MIT` / `MIT-0` / `MPL-2.0` /
+  `Unicode-3.0` / `Unlicense` / `Zlib` の 11 種類のみで、GPL 系の
+  copyleft ライセンスは一切無かった。`deny.toml` の `[licenses].allow`
+  にはこの 11 種類だけを列挙している (「よくある allow-list」のコピペ
+  ではなく実測値)。唯一の非パーミッシブ枠は `MPL-2.0` (wry →
+  `dom_query` → `cssparser`/`cssparser-macros`/`selectors` 経由) で、
+  ファイル単位の弱いコペレフト (バイナリ配布・リンクは制限しない) の
+  ため許可した。VeloX 自身は MIT (Cargo.toml の `license = "MIT"`) で、
+  MPL-2.0 のファイルを改変して再配布する予定は無い。
+- **advisories の `unsound` スコープを既定の `"workspace"` から
+  `"all"` に上書きした。** `unmaintained` の既定は `"all"` (transitive
+  依存も検査) だが `unsound` の既定は `"workspace"` (自クレート自身が
+  unsound advisory を持つ場合のみ) で、そのままだと `glib 0.18.5`
+  (RUSTSEC-2024-0429, `glib::VariantStrIter` の Iterator 実装の
+  unsound) のような transitive advisory を検査対象から外してしまう。
+  見落としを防ぐため明示的に `"all"` にした。
+- **例外ルールは `deny.toml` の `[advisories].ignore` に RUSTSEC ID +
+  理由を 1 件ずつ書く運用にした。** 一括で `unmaintained = "allow"` に
+  するような包括的な緩和はせず、個別 ID を列挙する。個別に列挙する
+  ことで、将来 VeloX 自身が直接依存する別のクレートが新たに
+  unmaintained/unsound になったときはちゃんと検知され (`ignore` に
+  無い ID なので `advisories FAILED` になる)、今回把握済みの 12 件
+  だけが素通りする。誤検知や「対応版が無い」既知の警告を握りつぶす
+  のではなく、1 件ごとに `docs/decisions.md` (本項) への参照込みで
+  記録した。
+- **CI は新しい workflow `.github/workflows/dependency-audit.yml` を
+  追加し、既存の `ci.yml` (#33 の成果物、`check-windows` を含む) には
+  一切手を入れていない。** ジョブは `EmbarkStudios/cargo-deny-action@v2`
+  (ビルド済みバイナリを取得して実行するため、ソースからの
+  `cargo install cargo-deny` (ローカル検証で約 3 分) を CI 毎回走らせ
+  ずに済む) で `cargo deny check` (advisories/bans/licenses/sources
+  すべて) を実行する。
+- **CI failure policy: `continue-on-error` は使わず、代わりに
+  トリガーの `paths` フィルタでブロッカーの範囲を絞った。** 2 系統の
+  トリガーを用意している。
+  1. `pull_request` (`paths: ["Cargo.toml", "Cargo.lock", "deny.toml",
+     ".github/workflows/dependency-audit.yml"]` に限定): 依存グラフ
+     そのものを変更する PR に対してだけ、通常どおり (継続不可の)
+     マージブロッカーとして働く。依存を一切触らない大多数の PR では
+     `paths` に一致するファイルが無いためジョブそのものが起動せず、
+     check-run も生成されない。
+  2. `schedule` (毎日 1 回、`cron: "0 18 * * *"` = JST 03:00): 依存を
+     まったく動かしていない期間に後から公表される advisory を拾う
+     ための定期監視。PR の head commit に紐付かないので、失敗しても
+     `auto-merge.yml` の判定には影響しない。
+  この設計により「VeloX 側に非がなく突然公表される advisory で、依存を
+  何も動かしていない無関係な PR まで巻き込んで開発が止まる」という
+  Issue 本文の懸念を、`continue-on-error` で失敗を握りつぶすのではなく
+  「そもそもその PR では検査が走らない/走っても PR 自身の変更が原因」
+  という形で構造的に避けた。
+- **`auto-merge.yml` への影響**: 上記の `paths` フィルタにより、依存を
+  触らない PR ではこのジョブの check-run 自体が存在しないため、
+  `auto-merge.yml` の「head commit の全 check-runs が success/skipped」
+  判定には最初から数えられない (影響ゼロ)。依存を触った PR では
+  他のジョブと同様に 1 つの check-run として扱われ、失敗すれば
+  (継続不可なので) 従来どおりマージが止まる — これは意図した挙動
+  (依存グラフを変えた張本人に対応してもらう)。`workflow_run.workflows`
+  リストにも `Dependency Audit` を追加した (D55 のコメント「新しい
+  workflow を追加したら追加する」に従う。追加漏れがあっても 30 分毎の
+  `schedule` フォールバックがあるため誤動作にはならない)。
+- **lockfile 監視・依存更新チェックは Dependabot (`.github/dependabot.yml`)
+  を新規導入した。** `cargo` エコシステムと `github-actions` エコシステム
+  の両方を対象にし、週次 (月曜) + `groups` で minor/patch 更新を 1 本の
+  PR にまとめる (major はグルーピング対象外で個別 PR のまま — wry/tao/gtk
+  のような描画スタック本体の major bump は挙動が変わりうるため一括
+  マージしたくない)。Dependabot が作る PR には `no-automerge` ラベルを
+  付与し、`auto-merge.yml` の対象から明示的に外した。理由は、
+  `cargo fmt`/`clippy`/`cargo test` が通っても依存更新が WebView の
+  実際の描画・IPC 挙動まで検証できるわけではなく、人間のレビューを
+  必ず挟みたいため。
+
+**検証の限界 (正直な記録)**: (1) `EmbarkStudios/cargo-deny-action@v2` を
+実際に GitHub Actions 上で実行して確認したわけではない (この環境では
+`cargo deny` をソースからインストールしてローカルで直接走らせて検証した)。
+action 自体の配布バイナリ取得やキャッシュ挙動は、本 PR マージ後の実際の
+CI 実行で確認する必要がある。(2) `deny.toml` の advisories ignore
+(RUSTSEC-2024-0411/0412/0413/0414/0415/0416/0417/0418/0419/0420/0370/0429)
+はすべて `gtk = "0.18"` (Linux 専用ターゲット依存) 由来で、CLAUDE.md の
+「対応 OS の優先度」(Windows 最優先、Linux は最低限の整備) と整合する
+判断だが、上流の gtk-rs が GTK4 版に移行しない限り、あるいは wry が
+gtk4-rs 対応の新しい gtk backend を出さない限り解消しない — VeloX 単独
+では直せない。(3) `dependabot.yml` の実際の PR 生成・grouping の挙動も
+マージ後の初回実行を待って確認する必要がある。
+
+**Revisit condition**: (1) wry が GTK4 (gtk4-rs) ベースの gtk backend を
+リリースし、`gtk = "0.18"` を上げられるようになったら、`deny.toml` の
+gtk-rs 関連の `ignore` エントリを削除する。(2) `EmbarkStudios/cargo-deny-action`
+が実際の CI 実行で想定通り動くか (プラットフォーム互換のバイナリ取得・
+キャッシュ) を確認し、問題があれば `cargo install cargo-deny --locked`
+方式に切り替える。(3) Dependabot の週次 PR 頻度・grouping が実際に
+運用してみて多すぎる/少なすぎると分かったら `interval`/`groups` を
+調整する。(4) 新しい直接依存の追加で MPL-2.0 以外の copyleft ライセンス
+(GPL 系など) が入りそうになったら、`deny.toml` の allow ではなく
+依存追加自体を見直す。
