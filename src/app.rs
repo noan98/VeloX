@@ -22,7 +22,8 @@ use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPo
 use crate::browser::{
     input_history, metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
-    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, TabId, Tabs,
+    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, TabId,
+    Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -214,8 +215,51 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
 
     let blocklist = Arc::new(build_blocklist(&config));
 
-    let tabs = Tabs::new(config.homepage.clone());
-    let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id(), blocklist)?;
+    // Resolved before `Tabs`/`BrowserWindow` are built (unlike the
+    // history/bookmarks/input-history loads below, which only need it once
+    // `AppState` exists) because session restore (Issue #25, see
+    // docs/decisions.md D65) decides what the *first* `Tabs` looks like.
+    let data_dir = persistence::default_data_dir();
+    if data_dir.is_none() {
+        eprintln!(
+            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
+             history, bookmarks, and session restore will not be saved this session"
+        );
+    }
+
+    // Issue #25 (D65): restore the previous session's tabs when the setting
+    // is on and a usable snapshot exists; otherwise (setting off, no data
+    // directory, no file yet, or a corrupt/empty one —
+    // `SessionSnapshot::sanitize` returns `None` for both) fall back to the
+    // pre-#25 behavior of a single tab at the homepage. A corrupt or
+    // truncated `session.json` must never stop VeloX from starting, so
+    // every step here degrades to `None` instead of propagating an error.
+    // Private mode never restores, matching D14's "a private launch leaves
+    // no trace of — and inherits no trace from — any session" rule.
+    let restored_session = if config.restore_previous_session && !config.private {
+        data_dir
+            .as_deref()
+            .and_then(persistence::load_session)
+            .and_then(SessionSnapshot::sanitize)
+    } else {
+        None
+    };
+    let tabs = match restored_session {
+        Some(snapshot) => Tabs::restore(&snapshot.tabs, snapshot.active_index),
+        None => Tabs::new(config.homepage.clone()),
+    };
+    // Issue #25/D65: the active tab's own `current_url` — not necessarily
+    // `config.homepage` once session restore is in play — is what the
+    // first real webview must load.
+    let initial_url = tabs.active().current_url().to_owned();
+    let mut window = BrowserWindow::new(
+        &event_loop,
+        &config,
+        proxy,
+        tabs.active_id(),
+        &initial_url,
+        blocklist,
+    )?;
     if let Some(startup) = startup.as_mut() {
         startup.mark_window_created(Instant::now());
     }
@@ -246,13 +290,6 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     // other's start times.
     let mut page_load_timers: HashMap<TabId, metrics::PageLoadTimer> = HashMap::new();
 
-    let data_dir = persistence::default_data_dir();
-    if data_dir.is_none() {
-        eprintln!(
-            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
-             history and bookmarks will not be saved this session"
-        );
-    }
     let history = data_dir
         .as_deref()
         .map(persistence::load_history)
@@ -646,7 +683,7 @@ fn sweep_tabs(
                 record_tab_suspend(state, id, reason);
             }
         }
-        sync_tab_strip(window, &state.tabs);
+        sync_tab_strip(window, state);
     }
     policy
         .idle_after
@@ -702,7 +739,7 @@ fn handle_user_event(
                 log_failure("show loading state", window.set_loading(true));
                 sync_bookmark_star(window, state, &url);
             }
-            sync_tab_strip(window, &state.tabs);
+            sync_tab_strip(window, state);
         }
         UserEvent::NavigationBlocked(id, url) => {
             eprintln!("velox: blocked navigation to {url} in tab {id:?}");
@@ -760,7 +797,7 @@ fn handle_user_event(
                 }
                 log_failure("hide loading state", window.set_loading(false));
             }
-            sync_tab_strip(window, &state.tabs);
+            sync_tab_strip(window, state);
         }
         UserEvent::PageTitleResolved {
             tab_id,
@@ -772,6 +809,11 @@ fn handle_user_event(
             // gets its title.
             if let Some(tab) = state.tabs.get_mut(tab_id) {
                 tab.set_title(title.clone());
+                // Unlike `FaviconResolved` below, nothing else here already
+                // calls `sync_tab_strip` (which would also cover this) —
+                // persist explicitly so a title that arrives just before a
+                // crash is not lost from the next restore (Issue #25/D65).
+                persist_session(state);
             }
             if state.history.update_title(history_id, title) {
                 persist_history(state);
@@ -788,7 +830,7 @@ fn handle_user_event(
             // flight) is a safe no-op — mirrors `PageTitleResolved` above.
             if let Some(tab) = state.tabs.get_mut(tab_id) {
                 tab.set_favicon_url(url.clone());
-                sync_tab_strip(window, &state.tabs);
+                sync_tab_strip(window, state);
             }
             if state.history.update_favicon(history_id, url.clone()) {
                 persist_history(state);
@@ -939,7 +981,7 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::SuspendTab { id } => {
             if suspend_tab(window, state, TabId::from(id)) {
-                sync_tab_strip(window, &state.tabs);
+                sync_tab_strip(window, state);
             }
             // Otherwise: unknown id, the active tab (never suspended), or
             // already suspended — a no-op, mirroring `CloseTab`'s guards.
@@ -967,7 +1009,7 @@ fn handle_toolbar_command(
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
             refresh_downloads_panel(window, state);
-            sync_tab_strip(window, &state.tabs);
+            sync_tab_strip(window, state);
         }
         ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, state),
         ToolbarCommand::TogglePanel { panel } => {
@@ -1413,7 +1455,7 @@ fn handle_automation_command(
         AutomationCommand::Suspend { index } => match tab_id_at(state, index) {
             Some(id) => {
                 if suspend_tab(window, state, id) {
-                    sync_tab_strip(window, &state.tabs);
+                    sync_tab_strip(window, state);
                 }
                 // Otherwise the active or an already-suspended tab: a
                 // no-op, exactly like `ToolbarCommand::SuspendTab`.
@@ -1510,11 +1552,18 @@ fn activate_and_refresh(
         sync_bookmark_star(window, state, &url);
     }
     sync_block_count(window, &state.tabs);
-    sync_tab_strip(window, &state.tabs);
+    sync_tab_strip(window, state);
 }
 
-/// Push the full tab list to the toolbar's tab strip.
-fn sync_tab_strip(window: &BrowserWindow, tabs: &Tabs) {
+/// Push the full tab list to the toolbar's tab strip, and persist a fresh
+/// session snapshot (Issue #25, D65) — piggybacking on this function rather
+/// than adding a parallel call at each of its call sites, since every
+/// tab-affecting change already routes through here to keep the tab strip
+/// current. `sync_tab_strip` runs unconditionally (`window.set_tabs` doesn't
+/// care about private mode); `persist_session` below is what actually gates
+/// writing to disk on `history_enabled`/`data_dir`.
+fn sync_tab_strip(window: &BrowserWindow, state: &AppState) {
+    let tabs = &state.tabs;
     let active_id = tabs.active_id();
     let summaries: Vec<toolbar::TabSummary> = tabs
         .iter()
@@ -1532,6 +1581,7 @@ fn sync_tab_strip(window: &BrowserWindow, tabs: &Tabs) {
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));
+    persist_session(state);
 }
 
 /// Push the active tab's blocked-navigation count to the toolbar badge.
@@ -1732,6 +1782,32 @@ fn persist_input_history(state: &AppState) {
             "save input history",
             persistence::save_input_history(dir, &state.input_history),
         );
+    }
+}
+
+/// Persist the current tab session (Issue #25 — see docs/decisions.md D65).
+///
+/// Called from [`sync_tab_strip`] — the one place nearly every
+/// tab-affecting change already routes through — rather than only at exit:
+/// an exit-only save would never run for exactly the case session restore
+/// is meant to help with (a crash, `kill -9`, a power loss), so this saves
+/// eagerly, the same "every mutation writes back to disk" pattern
+/// `persist_history`/`persist_bookmarks` already follow.
+///
+/// Gated by `history_enabled` — the same whole-app private-browsing choke
+/// point `record_visit_if_enabled` uses (docs/decisions.md D13/D14) — so a
+/// private session never writes what tabs it had open to disk, regardless
+/// of whether `Config::restore_previous_session` is even on; saving is
+/// unconditional otherwise, so turning the setting on later always has a
+/// recent session to restore from. A missing `data_dir` is a silent no-op,
+/// like every other `persist_*` function here.
+fn persist_session(state: &AppState) {
+    if !state.history_enabled {
+        return;
+    }
+    if let Some(dir) = &state.data_dir {
+        let snapshot = SessionSnapshot::from_tabs(&state.tabs);
+        log_io_failure("save session", persistence::save_session(dir, &snapshot));
     }
 }
 

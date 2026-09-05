@@ -536,11 +536,11 @@ quick-reference summary.
   already-suspended tab" special cases — `TabState::suspend` only accepts
   `Background`, so both are simply invalid transitions now, caught in the
   one place every other invalid transition is.
-- **`Restoring` is real, not a synonym for `Active`**, so a future
-  asynchronous session restore (#25) has a state for "selected, but nothing
-  is showing yet" instead of needing to add one later. Every current caller
-  still collapses `Suspended -> Restoring -> Active` into one call
-  (`Tab::resume`), because today's webview rebuild
+- **`Restoring` is real, not a synonym for `Active`**, which is exactly the
+  seam session restore (#25, see "Session restore" below) needed: no new
+  state had to be added for "selected, but nothing is showing yet". Every
+  current caller still collapses `Suspended -> Restoring -> Active` into one
+  call (`Tab::resume`), because today's webview rebuild
   (`ui::window::BrowserWindow::resume_tab`) is synchronous — there is no
   observable gap between the two edges yet, just the seam for one.
 - **`ActivationEffect`**: `Tabs::activate`/`activate_at`/`close` return
@@ -557,9 +557,9 @@ quick-reference summary.
   `UserEvent::PageTitleResolved` (which already carries a `tab_id` for
   exactly this); *rendering* either in the tab strip is left to #11. These,
   plus the pre-existing `last_active`/`last_active_at` (D9) and
-  `current_url`, are the state a future #25 session-restore feature is
-  expected to read from — persistence format/schema is #25's own decision,
-  not defined here.
+  `current_url`, are the state session restore (#25, see "Session restore"
+  below) reads from — `url`/`title`/`favicon` only; `last_active` stays
+  per-process and is not persisted (see D65).
 
 ## Tab suspension
 
@@ -666,6 +666,75 @@ above, and D56 for the adaptive policy and its measured effect.
   stamp but still run the state transition correctly). The currently active
   tab's timestamp is never read, since the active tab is always excluded
   from suspension candidates regardless of its value.
+
+## Session restore
+
+Status: session persistence and startup restore are implemented and
+opt-in (default off, Issue #25); WebView/renderer crash *detection* is not
+— wry 0.56 exposes no hook for it on the two OSes VeloX ships broadly on.
+See docs/decisions.md D65 for the full investigation and rationale; this
+section is the quick-reference summary.
+
+- **What is saved, and when**: `browser::session::SessionSnapshot` (one
+  `SavedTab { url, title, favicon }` per open tab, in display order, plus
+  which one was active) is the persisted shape — deliberately the same
+  three fields the tab strip itself renders from
+  (`app::sync_tab_strip`'s `TabSummary`), never scroll position, form
+  input, or session history (none of that survives a webview being
+  dropped at all — suspension already accepts the same loss, D9).
+  `app::persist_session` writes it via
+  `browser::persistence::{load,save}_session` (`session.json`, the same
+  per-platform data directory as `history.json`/`bookmarks.json`, D10) from
+  inside `app::sync_tab_strip` — the one function nearly every
+  tab-affecting change already calls to keep the tab strip current — rather
+  than only at process exit, so a crash or `kill -9` still leaves a recent
+  session to restore from. Gated by the same `history_enabled` choke point
+  private browsing already uses (D13/D14): a private session never writes
+  what tabs it had open to disk.
+- **What is restored, and how**: at startup, `app::run` loads
+  `session.json` and runs it through
+  `browser::session::SessionSnapshot::sanitize` (every URL re-validated
+  through `navigation::normalize_input`, the same address-bar gate;
+  `active_index` re-resolved rather than trusted) before trusting it at
+  all. Only when `Config::restore_previous_session` is on (opt-in,
+  `VELOX_RESTORE_SESSION`, off by default like every other auto-behavior
+  toggle — D9's rule) and a usable snapshot survives sanitization does
+  `browser::tabs::Tabs::restore` build the initial `Tabs` from it instead
+  of `Tabs::new(homepage)`.
+- **Reuses tab suspension instead of a second "webview regeneration"
+  path**: `Tabs::restore` puts every tab *except* the active one directly
+  into `TabState::Suspended` (`Tab::new_suspended`) rather than building a
+  webview for each up front. `ui::window::BrowserWindow::new` already only
+  ever builds a webview for the one tab id it is given, so a restored
+  session's other tabs simply have no `ContentTab` entry until the user
+  actually activates one — at which point `Tabs::activate` reports
+  `ActivationEffect::Resume` exactly as it would for a tab suspended during
+  the session, and the ordinary `BrowserWindow::resume_tab` rebuilds its
+  webview — no second, restore-specific webview-build path was added:
+  restoring 10 tabs costs one real webview at startup, not ten. The one
+  actual `ui::window` change was a pre-existing latent bug this surfaced:
+  `BrowserWindow::new` always loaded `config.homepage` into the first
+  webview regardless of what `Tabs` said that tab's `current_url` was; it
+  now takes an explicit `initial_url` (`app::run` passes
+  `tabs.active().current_url()`), which is `config.homepage` unchanged in
+  the non-restore case.
+- **Corruption tolerance**: a missing, truncated, wrong-shape, or
+  wrong-typed `session.json` fails to deserialize
+  (`browser::persistence::load_session` returns `None`, matching
+  `load_history`/`load_bookmarks`'s existing contract) and VeloX falls back
+  to a fresh single tab at the homepage — never a failed startup. A
+  well-formed file whose *content* is bad (a rejected URL scheme, an
+  out-of-range `active_index`) is repaired or dropped entry-by-entry by
+  `SessionSnapshot::sanitize` rather than discarding the whole session.
+- **Crash detection was investigated, not implemented**: see D65. wry 0.56
+  exposes `WebViewBuilderExtDarwin::with_on_web_content_process_terminate_handler`
+  for a renderer crash, but only on macOS/iOS; there is no equivalent for
+  WebKitGTK or WebView2 in this wry version. Given CLAUDE.md's OS priority
+  (Windows first), a macOS-only hook was not wired up. "1 タブの WebView
+  障害でブラウザ全体が終了しない" is not actively *tested* as a result, but
+  holds structurally: each tab's `WebView` is an independent object behind
+  `ui::window`'s per-`TabId` map, and no code path treats one tab's engine
+  callbacks as able to reach another tab or the event loop itself.
 
 ## Startup URL
 

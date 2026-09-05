@@ -244,6 +244,31 @@ impl Tab {
         }
     }
 
+    /// Construct a tab directly in [`TabState::Suspended`], skipping the
+    /// normal `Active -> Background -> Suspended` path entirely.
+    ///
+    /// Only ever used by session restore (`super::tabs::Tabs::restore`,
+    /// Issue #25 — see docs/decisions.md D65): a tab rebuilt from a previous
+    /// session's snapshot has no webview to suspend in the first place, so
+    /// there is nothing to transition *from*. `loading` starts `false`
+    /// (nothing is loading — there is no webview yet, exactly like an
+    /// ordinary suspended tab) and `last_active` starts at the moment of
+    /// restore, since the real "last active" instant belongs to a process
+    /// that no longer exists — `Instant` cannot be persisted across a
+    /// restart.
+    pub(super) fn new_suspended(id: TabId, initial_url: impl Into<String>) -> Self {
+        Self {
+            id,
+            current_url: initial_url.into(),
+            title: None,
+            favicon: Favicon::default(),
+            loading: false,
+            blocked_count: 0,
+            state: TabState::Suspended,
+            last_active: Instant::now(),
+        }
+    }
+
     /// This tab's stable identifier.
     pub fn id(&self) -> TabId {
         self.id
@@ -669,5 +694,26 @@ mod tests {
         let err = tab.resume().unwrap_err();
         assert_eq!(err.from, TabState::Active);
         assert_eq!(err.to, TabState::Restoring);
+    }
+
+    // --- Session restore (Issue #25, D65): Tab::new_suspended -------------
+
+    #[test]
+    fn new_suspended_starts_suspended_and_not_loading() {
+        let tab = Tab::new_suspended(TabId::from(0), "https://example.com/");
+        assert_eq!(tab.state(), TabState::Suspended);
+        assert!(tab.is_suspended());
+        assert!(!tab.is_loading());
+        assert_eq!(tab.current_url(), "https://example.com/");
+        assert_eq!(tab.title(), None);
+        assert_eq!(tab.favicon(), &Favicon::Unknown);
+    }
+
+    #[test]
+    fn new_suspended_tab_can_be_resumed_like_any_other_suspended_tab() {
+        let mut tab = Tab::new_suspended(TabId::from(0), "https://example.com/");
+        tab.resume().unwrap();
+        assert_eq!(tab.state(), TabState::Active);
+        assert!(tab.is_loading());
     }
 }

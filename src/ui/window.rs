@@ -614,7 +614,16 @@ pub struct BrowserWindow {
 
 impl BrowserWindow {
     /// Create the window, the toolbar webview, and the first tab's content
-    /// webview (bound to `initial_tab`, loading `config.homepage`).
+    /// webview (bound to `initial_tab`, loading `initial_url`).
+    ///
+    /// `initial_url` is *not* always `config.homepage`: session restore
+    /// (Issue #25, see docs/decisions.md D65) builds `Tabs` with the
+    /// previously active tab's own `current_url` before `BrowserWindow` is
+    /// ever constructed, and that — not the configured homepage — is what
+    /// the first real webview must load. The ordinary (non-restored) case
+    /// still passes `config.homepage` here, since that is exactly what
+    /// `Tabs::new(config.homepage.clone())` set as the same tab's
+    /// `current_url` too.
     ///
     /// `blocklist` is the ad/tracker filter list content blocking matches
     /// against (see docs/decisions.md D17); it is stored on `self` so every
@@ -625,6 +634,7 @@ impl BrowserWindow {
         config: &Config,
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
+        initial_url: &str,
         blocklist: Arc<FilterList>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         // A window-title suffix is a second, independent tell for private
@@ -741,7 +751,7 @@ impl BrowserWindow {
         let content_blocking_enabled = config.content_blocking_enabled;
         let content_builder = content_webview_builder(
             initial_tab,
-            &config.homepage,
+            initial_url,
             content_rect,
             &proxy,
             WebviewIsolation {

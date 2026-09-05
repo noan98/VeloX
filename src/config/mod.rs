@@ -181,6 +181,20 @@ pub struct Config {
     /// `VELOX_SEARCH_ENGINE_NAME`/`VELOX_SEARCH_ENGINE_URL` (a fully custom
     /// engine) — see [`Config::from_env_and_args`].
     pub search_engine: SearchEngine,
+    /// "前回のタブを復元" (Issue #25, see docs/decisions.md D65): when `true`,
+    /// `app::run` loads the last-saved tab session
+    /// (`browser::persistence::load_session`) instead of starting a single
+    /// tab at `homepage`, provided a usable one exists (see
+    /// `browser::session::SessionSnapshot::sanitize`). Off by default —
+    /// same conservative-default rule as `suspension`/`private`: a fresh
+    /// checkout, or a launch with this never turned on, must behave exactly
+    /// as it did before this feature existed. Session data is still saved
+    /// unconditionally (outside private mode) regardless of this flag, so
+    /// turning it on later immediately has something to restore from.
+    /// Selectable via `VELOX_RESTORE_SESSION` (presence, like
+    /// `VELOX_PRIVATE`/`VELOX_PERF_METRICS`) — see
+    /// [`Config::from_env_and_args`].
+    pub restore_previous_session: bool,
 }
 
 impl Default for Config {
@@ -210,6 +224,7 @@ impl Default for Config {
             perf_rss_interval: None,
             perf_format: PerfFormat::Text,
             perf_output_path: None,
+            restore_previous_session: false,
         }
     }
 }
@@ -269,6 +284,9 @@ impl Config {
     ///   *both* are set to a non-empty value and the URL contains the `{}`
     ///   placeholder; otherwise this pair is ignored and `VELOX_SEARCH_ENGINE`
     ///   (or the default) applies instead.
+    /// - `VELOX_RESTORE_SESSION` — presence (like `VELOX_PRIVATE`) turns on
+    ///   restoring the previous session's tabs at startup (Issue #25, see
+    ///   docs/decisions.md D65). Unset means off.
     ///
     /// No CLI-parsing crate is introduced for this (see docs/decisions.md
     /// D6); `args` is expected to be the process arguments with argv\[0\]
@@ -314,6 +332,7 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        let restore_previous_session = std::env::var_os("VELOX_RESTORE_SESSION").is_some();
         Self {
             homepage,
             private,
@@ -324,6 +343,7 @@ impl Config {
             perf_rss_interval,
             perf_format,
             perf_output_path,
+            restore_previous_session,
             ..defaults
         }
     }
@@ -516,6 +536,10 @@ mod tests {
         assert_eq!(config.perf_format, PerfFormat::Text);
         assert_eq!(config.perf_output_path, None);
         assert_eq!(config.search_engine, SearchEngine::duckduckgo());
+        // Issue #25 (D65): a fresh checkout must never restore a session
+        // the user did not ask for, mirroring the same conservative
+        // default `suspension` and `private` already follow.
+        assert!(!config.restore_previous_session);
     }
 
     #[test]
