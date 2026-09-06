@@ -100,6 +100,34 @@ cargo build
 The zip contains the two executables plus README/LICENSE. WebView2 Runtime
 must be present on the target machine (it is on Windows 11).
 
+#### Code signing
+
+`velox.exe` / `velox-bench.exe` are **currently unsigned** — this project
+does not (yet) hold a code-signing certificate, so Windows SmartScreen may
+warn on first run. `release-windows.yml` has an opt-in Authenticode signing
+step (via Azure Trusted Signing) that activates automatically once the
+required repository secrets/variables are configured; see
+[docs/windows-code-signing.md](docs/windows-code-signing.md) for what's
+needed, what was investigated, and why macOS signing/notarization is out of
+scope for now (Issue #42 / docs/decisions.md D73).
+
+#### Verifying a release download
+
+Every release asset (Windows zip, Linux tar.gz) ships with a `.sha256` file
+next to it. Until signing is enabled (see above), this is the only way to
+confirm a downloaded archive matches what CI built. Compare the computed
+hash against the value in the `.sha256` file:
+
+```powershell
+# Windows (PowerShell)
+Get-FileHash .\velox-<version>-windows-x86_64.zip -Algorithm SHA256
+```
+
+```sh
+# Linux / macOS
+sha256sum -c velox-<version>-linux-x86_64.tar.gz.sha256
+```
+
 ## Run
 
 ```sh

@@ -16,6 +16,20 @@ name: Release (Windows)
 # tarball のみ、AppImage/deb 等のネイティブパッケージ化は対象外)。
 # macOS は対象外 (Issue #41 / docs/decisions.md D70 参照 — CLAUDE.md の
 # OS 優先度方針に従い、本格対応は品質担保後に着手する)。
+#
+# コード署名 (Issue #42 / docs/decisions.md D73): 下記 6 つの Secrets /
+# Variables が揃っている場合のみ、Azure Trusted Signing (現行の製品名は
+# Artifact Signing) で実行ファイルに Authenticode 署名を行う。
+#   - secrets.WINDOWS_CODESIGN_AZURE_CLIENT_ID
+#   - secrets.WINDOWS_CODESIGN_AZURE_TENANT_ID
+#   - secrets.WINDOWS_CODESIGN_AZURE_SUBSCRIPTION_ID
+#   - vars.WINDOWS_CODESIGN_ENDPOINT
+#   - vars.WINDOWS_CODESIGN_ACCOUNT_NAME
+#   - vars.WINDOWS_CODESIGN_CERT_PROFILE_NAME
+# いずれか 1 つでも未設定なら署名ステップ一式をスキップし、これまでどおり
+# 無署名の zip を作る (このリポジトリには証明書が無いため、現状は常に
+# スキップされる)。証明書取得後の設定手順は docs/windows-code-signing.md
+# を参照。
 on:
   workflow_dispatch: {}
   push:
@@ -33,6 +47,9 @@ env:
 
 permissions:
   contents: write # タグ push 時に GitHub Release を作成するため
+  id-token: write # Azure Trusted Signing への OIDC 認証用 (azure/login)。
+  # 署名用 Secrets/Variables が未設定なら azure/login 自体が動かないため、
+  # このトークンが実際に要求されることはない。
 
 # 同じタグに対して release-windows.yml と release-linux.yml が同時に走ると、
 # 両方が `softprops/action-gh-release` で同じ Release を作りに行って競合する
@@ -98,6 +115,80 @@ jobs:
             "$exe : $size bytes"
           }
 
+      # 署名用の Secrets/Variables (下記 6 つ) が全て揃っている場合のみ、
+      # このあとの Azure ログイン・署名ステップを実行する。1 つでも
+      # 欠けていれば `enabled=false` にして無署名のままビルドを続ける
+      # (このリポジトリには証明書が無いため、現状は常に false になる)。
+      # `if:` で `secrets.*` を直接比較する書き方は job 単位の条件では
+      # 使えず、step 単位でもツール/バージョンによって扱いが揺れるため
+      # (実際に skip されず秘密文字列が空のまま次段に渡る事故が起こり得る)、
+      # ここでは Secrets/Variables を一度 env 経由でシェル変数に落として
+      # から判定する、より確実な方法を採る。
+      - name: Check Windows code signing configuration
+        id: signing
+        shell: bash
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.WINDOWS_CODESIGN_AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.WINDOWS_CODESIGN_AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.WINDOWS_CODESIGN_AZURE_SUBSCRIPTION_ID }}
+          CODESIGN_ENDPOINT: ${{ vars.WINDOWS_CODESIGN_ENDPOINT }}
+          CODESIGN_ACCOUNT_NAME: ${{ vars.WINDOWS_CODESIGN_ACCOUNT_NAME }}
+          CODESIGN_CERT_PROFILE_NAME: ${{ vars.WINDOWS_CODESIGN_CERT_PROFILE_NAME }}
+        run: |
+          set -euo pipefail
+          if [ -n "$AZURE_CLIENT_ID" ] && [ -n "$AZURE_TENANT_ID" ] && [ -n "$AZURE_SUBSCRIPTION_ID" ] \
+             && [ -n "$CODESIGN_ENDPOINT" ] && [ -n "$CODESIGN_ACCOUNT_NAME" ] && [ -n "$CODESIGN_CERT_PROFILE_NAME" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Windows code signing is configured - binaries will be signed."
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Windows code signing secrets/variables are not fully configured - shipping an unsigned build. See docs/windows-code-signing.md."
+          fi
+
+      - name: Azure login (code signing)
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.WINDOWS_CODESIGN_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.WINDOWS_CODESIGN_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.WINDOWS_CODESIGN_AZURE_SUBSCRIPTION_ID }}
+
+      # Azure Trusted Signing (製品名は Artifact Signing に改称済みだが、
+      # 公式 Action は本記事執筆時点でも azure/trusted-signing-action の
+      # 系譜と azure/artifact-signing-action の両方が公開されている。ここ
+      # では現行の公式 README が例示している azure/artifact-signing-action
+      # を使う (docs/windows-code-signing.md 参照)。private key はサービス
+      # 側の HSM に置かれたままで、CI 側には一切渡らない。
+      - name: Sign Windows binaries (Azure Trusted Signing)
+        if: steps.signing.outputs.enabled == 'true'
+        uses: azure/artifact-signing-action@v2
+        with:
+          endpoint: ${{ vars.WINDOWS_CODESIGN_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.WINDOWS_CODESIGN_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.WINDOWS_CODESIGN_CERT_PROFILE_NAME }}
+          files-folder: ${{ github.workspace }}\target\release
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
+
+      # signtool.exe の場所探索に頼らず、PowerShell 組み込みの
+      # Get-AuthenticodeSignature で署名結果を確認する。証明書が無い現状の
+      # CI では `enabled=false` のため実行されず未検証 — 実際に証明書を
+      # 設定した初回リリースで必ず確認すること (docs/windows-code-signing.md)。
+      - name: Verify Authenticode signature
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          foreach ($exe in "velox.exe", "velox-bench.exe") {
+            $path = "target\release\$exe"
+            $sig = Get-AuthenticodeSignature -FilePath $path
+            if ($sig.Status -ne "Valid") {
+              throw "Authenticode signature is not valid for $path (status: $($sig.Status))"
+            }
+            "$exe : signed by $($sig.SignerCertificate.Subject)"
+          }
+
       - name: Package
         id: package
         shell: pwsh
@@ -133,3 +224,7 @@ jobs:
             dist/${{ steps.package.outputs.name }}.zip
             dist/${{ steps.package.outputs.name }}.zip.sha256
           generate_release_notes: true
+          body: |
+            ${{ steps.signing.outputs.enabled == 'true' && '**Windows**: velox.exe / velox-bench.exe are Authenticode-signed.' || '**Windows**: this build is unsigned (no code-signing certificate configured yet) — verify the SHA-256 checksum below before running it.' }}
+
+            Verifying the SHA-256 checksum: see the "Build > Windows / Linux > Release build via GitHub Actions" section of README.md.
