@@ -100,8 +100,24 @@ sudo apt install libwebkit2gtk-4.1-dev   # Debian/Ubuntu
 
 macOS (WKWebView) / Windows (WebView2) は追加のシステム依存なしでビルドできます。
 
+**Windows 固有コードや `cfg` 分岐を触ったら、Linux 上でも型チェックできます。**
+CI を一往復させる前に手元で確認してください:
+
+```sh
+rustup target add x86_64-pc-windows-msvc          # 初回のみ
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+リンクを伴わない型チェックのみなので MSVC ツールチェーンは不要です
+(`webview2-com` / `tao` の Windows 版まで検査されます)。ただしリンクと実行は
+しないため、これが通っても Windows で `cargo build` / `cargo test` が通る
+保証にはなりません (docs/decisions.md D61)。
+
 CI は `.github/workflows/ci.yml` が PR と `main` push で
-fmt → clippy → test → build を Linux 上で実行します。
+fmt → clippy → test → build を Linux 上で実行します。加えて Windows
+(windows-latest) ジョブが build → test (`--lib` のみ、統合テストは対象外)
+を実行します (Issue #33、docs/decisions.md D61)。macOS ジョブは方針上
+追加していません。
 
 `.github/workflows/auto-merge.yml` は、`main` 向けの open な PR のうち
 「Auto Merge 自身を除くすべてのチェックが success / skipped になった」ものを

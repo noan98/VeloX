@@ -479,6 +479,74 @@ mod tests {
         assert_eq!(store.entries()[0].visit_count, 1);
     }
 
+    // --- Robustness against extreme/hostile field values (Issue #35) ---
+
+    #[test]
+    fn record_visit_does_not_panic_with_an_extremely_long_url_or_title() {
+        let mut store = HistoryStore::new();
+        let huge_url = format!("https://example.com/{}", "a".repeat(1_000_000));
+        let huge_title = "た".repeat(200_000);
+        let id = store.record_visit(&huge_url, Some(huge_title.clone()), 1, 0);
+        assert_eq!(store.entries()[0].id, id);
+        assert_eq!(
+            store.entries()[0].title.as_deref(),
+            Some(huge_title.as_str())
+        );
+    }
+
+    #[test]
+    fn record_visit_handles_unicode_and_control_characters_in_the_url_and_title() {
+        let mut store = HistoryStore::new();
+        let id = store.record_visit(
+            "https://example.com/\u{0}\u{202e}\n\t",
+            Some("title with \"quotes\" and </script> and 🚀".to_owned()),
+            1,
+            0,
+        );
+        assert_eq!(store.entries()[0].id, id);
+    }
+
+    #[test]
+    fn visit_count_saturates_instead_of_overflowing() {
+        // `record_visit`'s `saturating_add` must stay at `u32::MAX`, never
+        // wrap around to `0` from repeated reloads.
+        let mut store = HistoryStore::new();
+        store.record_visit("https://example.com/", None, 1, 0);
+        store.entries[0].visit_count = u32::MAX;
+        store.record_visit("https://example.com/", None, 2, 0);
+        assert_eq!(store.entries()[0].visit_count, u32::MAX);
+    }
+
+    #[test]
+    fn max_entries_cap_does_not_panic_with_a_cap_of_one() {
+        let mut store = HistoryStore::new();
+        for i in 0..50u64 {
+            store.record_visit(&format!("https://{i}.example/"), None, i, 1);
+        }
+        assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn search_does_not_panic_on_an_extremely_long_or_unicode_query() {
+        let mut store = HistoryStore::new();
+        store.record_visit("https://example.com/", Some("Example".to_owned()), 1, 0);
+        let huge_query = "a".repeat(1_000_000);
+        assert!(store.search(&huge_query).is_empty());
+        assert!(store.search("🚀日本語クエリ").is_empty());
+    }
+
+    #[test]
+    fn pre_issue_18_history_json_with_a_huge_visit_count_field_still_loads() {
+        // A `visit_count` at the very top of its type's range must
+        // deserialize cleanly, not panic or silently wrap.
+        let json = format!(
+            r#"{{"entries":[{{"id":1,"url":"https://example.com/","title":null,"visited_at":100,"visit_count":{}}}],"next_id":2}}"#,
+            u32::MAX
+        );
+        let store: HistoryStore = serde_json::from_str(&json).expect("valid JSON should parse");
+        assert_eq!(store.entries()[0].visit_count, u32::MAX);
+    }
+
     #[test]
     fn search_matches_url_or_title_case_insensitively() {
         let mut store = HistoryStore::new();

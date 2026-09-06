@@ -192,4 +192,53 @@ mod tests {
         store.clear();
         assert!(store.entries().is_empty());
     }
+
+    // --- Robustness against extreme/hostile field values (Issue #35) ---
+
+    #[test]
+    fn record_does_not_panic_with_an_extremely_long_query() {
+        let mut store = InputHistoryStore::new();
+        let huge = "検索語".repeat(200_000);
+        store.record(&huge, 1, 0);
+        assert_eq!(store.entries()[0].text, huge);
+    }
+
+    #[test]
+    fn record_handles_unicode_and_control_characters() {
+        let mut store = InputHistoryStore::new();
+        store.record("query\0with\u{202e}control\nchars🚀", 1, 0);
+        assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn use_count_saturates_instead_of_overflowing() {
+        let mut store = InputHistoryStore::new();
+        store.record("rust", 1, 0);
+        store.entries[0].use_count = u32::MAX;
+        store.record("rust", 2, 0);
+        assert_eq!(store.entries()[0].use_count, u32::MAX);
+    }
+
+    #[test]
+    fn many_distinct_queries_with_a_tight_cap_does_not_panic() {
+        let mut store = InputHistoryStore::new();
+        for i in 0..5_000u64 {
+            store.record(&format!("query {i}"), i, 50);
+        }
+        assert_eq!(store.entries().len(), 50);
+    }
+
+    #[test]
+    fn malformed_json_falls_back_via_persistence_not_a_panic_here() {
+        // `InputHistoryStore` itself has no bespoke `Deserialize` impl (it
+        // is `#[derive(Deserialize)]`), so malformed-JSON robustness for it
+        // is exercised at the `browser::persistence::load_input_history`
+        // boundary — this just documents that a directly-malformed
+        // deserialize attempt errors cleanly rather than panicking, mirror-
+        // ing `history`/`bookmarks`' own direct-deserialize tests.
+        assert!(serde_json::from_str::<InputHistoryStore>("not json").is_err());
+        assert!(
+            serde_json::from_str::<InputHistoryStore>(r#"{"entries":"not an array"}"#).is_err()
+        );
+    }
 }

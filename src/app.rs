@@ -23,7 +23,7 @@ use crate::browser::{
     input_history, metrics, navigation, omnibox, persistence, site_data, ActivationEffect,
     BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList,
     HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore,
-    TabId, Tabs,
+    SiteExceptions, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -40,6 +40,11 @@ pub enum UserEvent {
     /// Content blocking refused a main-frame navigation in tab `.0` to this
     /// URL.
     NavigationBlocked(TabId, String),
+    /// Content blocking refused a subresource request (image/script/
+    /// XHR/fetch/...) in tab `.0` to this URL. Windows/WebView2 only for now
+    /// — see docs/decisions.md D59 — sent from
+    /// `ui::webview2_blocking::attach`'s `WebResourceRequested` handler.
+    SubresourceBlocked(TabId, String),
     /// Tab `.0`'s content webview started loading this URL.
     LoadStarted(TabId, String),
     /// Tab `.0`'s content webview finished loading this URL.
@@ -214,9 +219,39 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         .then(|| metrics::StartupTimestamps::new(process_start));
 
     let blocklist = Arc::new(build_blocklist(&config));
+    let site_exceptions = Arc::new(build_site_exceptions(&config));
+
+    // Resolved here (rather than down with `history`/`bookmarks`/
+    // `input_history` below) because `site_permissions` — unlike those
+    // three — must exist before `BrowserWindow::new` builds the first
+    // tab's content webview: its `with_permission_handler` wiring
+    // (docs/decisions.md D60) needs the store from the very first
+    // permission request, not just from whenever `AppState` gets around to
+    // loading it.
+    let data_dir = persistence::default_data_dir();
+    if data_dir.is_none() {
+        eprintln!(
+            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
+             history, bookmarks, and site permissions will not be saved this session"
+        );
+    }
+    let site_permissions = Arc::new(
+        data_dir
+            .as_deref()
+            .map(persistence::load_site_permissions)
+            .unwrap_or_default(),
+    );
 
     let tabs = Tabs::new(config.homepage.clone());
-    let mut window = BrowserWindow::new(&event_loop, &config, proxy, tabs.active_id(), blocklist)?;
+    let mut window = BrowserWindow::new(
+        &event_loop,
+        &config,
+        proxy,
+        tabs.active_id(),
+        blocklist,
+        site_exceptions,
+        site_permissions,
+    )?;
     if let Some(startup) = startup.as_mut() {
         startup.mark_window_created(Instant::now());
     }
@@ -247,13 +282,6 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     // other's start times.
     let mut page_load_timers: HashMap<TabId, metrics::PageLoadTimer> = HashMap::new();
 
-    let data_dir = persistence::default_data_dir();
-    if data_dir.is_none() {
-        eprintln!(
-            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
-             history and bookmarks will not be saved this session"
-        );
-    }
     let history = data_dir
         .as_deref()
         .map(persistence::load_history)
@@ -383,6 +411,12 @@ fn build_blocklist(config: &Config) -> FilterList {
     list
 }
 
+/// Build the per-site content-blocking exception set (Issue #22) from
+/// `Config::content_blocking_site_exceptions`.
+fn build_site_exceptions(config: &Config) -> SiteExceptions {
+    SiteExceptions::from_hosts(&config.content_blocking_site_exceptions)
+}
+
 /// Build the [`PerfLog`] performance events are written through: a file at
 /// `config.perf_output_path` if one was requested and could be opened,
 /// stderr otherwise. Only called when `config.perf_metrics` is on.
@@ -473,6 +507,7 @@ fn record_perf_event(
         }
         UserEvent::LoadStarted(..)
         | UserEvent::NavigationBlocked(..)
+        | UserEvent::SubresourceBlocked(..)
         | UserEvent::PageTitleResolved { .. }
         | UserEvent::FaviconResolved { .. }
         | UserEvent::OpenDevtoolsRequested
@@ -692,7 +727,11 @@ fn handle_user_event(
     match event {
         UserEvent::ToolbarMessage(body) => match toolbar::parse_command(&body) {
             Ok(command) => handle_toolbar_command(window, state, config, homepage, command),
-            Err(err) => eprintln!("velox: ignoring malformed toolbar message {body:?}: {err}"),
+            Err(err) => eprintln!(
+                "velox: ignoring malformed toolbar message ({} bytes, preview {:?}): {err}",
+                body.len(),
+                log_preview(&body)
+            ),
         },
         UserEvent::NavigationStarted(id, url) | UserEvent::LoadStarted(id, url) => {
             if let Some(tab) = state.tabs.get_mut(id) {
@@ -714,6 +753,20 @@ fn handle_user_event(
             // navigation in a background tab still updates its own
             // `Tab::blocked_count` above and is picked up the moment that
             // tab becomes active (see `activate_and_refresh`).
+            if id == state.tabs.active_id() {
+                sync_block_count(window, &state.tabs);
+            }
+        }
+        UserEvent::SubresourceBlocked(id, url) => {
+            // Deliberately no `eprintln!` here unlike `NavigationBlocked`
+            // above: a busy page can trigger this dozens of times per
+            // second (every blocked ad/tracker image, script, XHR...), and
+            // spamming stderr at that rate would drown out every other
+            // `log_failure` line this file relies on for diagnostics.
+            if let Some(tab) = state.tabs.get_mut(id) {
+                tab.on_subresource_blocked(&url);
+            }
+            // Same badge-visibility reasoning as `NavigationBlocked` above.
             if id == state.tabs.active_id() {
                 sync_block_count(window, &state.tabs);
             }
@@ -1780,6 +1833,27 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Maximum number of `char`s of a malformed/oversized IPC body ever printed
+/// to stderr by [`handle_user_event`]'s `ToolbarMessage` arm.
+const LOG_PREVIEW_MAX_CHARS: usize = 200;
+
+/// Truncate `text` to at most [`LOG_PREVIEW_MAX_CHARS`] characters for a log
+/// line, appending `…` when something was cut (Issue #35: a malformed IPC
+/// message can legitimately be many megabytes — e.g. a giant clipboard
+/// paste rejected by `toolbar::MAX_IPC_PAYLOAD_BYTES` — and dumping the
+/// whole thing into stderr on every rejection would itself be an unbounded
+/// sink, working against the very size cap that rejected it). Truncates on
+/// a `char` boundary (via `chars()`), never a byte boundary, so this can
+/// never panic on multi-byte UTF-8 input.
+fn log_preview(text: &str) -> String {
+    let mut chars = text.chars();
+    let mut preview: String = chars.by_ref().take(LOG_PREVIEW_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
 /// A failed UI call (e.g. a script that could not be evaluated) should not
 /// crash the browser; surface it on stderr instead.
 fn log_failure(action: &str, result: wry::Result<()>) {
@@ -1809,6 +1883,42 @@ fn log_spawn_failure(action: &str, result: std::io::Result<std::process::Child>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- log_preview (Issue #35): a malformed/oversized IPC body must
+    // never be dumped to stderr in full. ---
+
+    #[test]
+    fn log_preview_leaves_short_text_unchanged() {
+        assert_eq!(log_preview(""), "");
+        assert_eq!(log_preview("short message"), "short message");
+    }
+
+    #[test]
+    fn log_preview_truncates_long_text_with_an_ellipsis() {
+        let huge = "a".repeat(5_000_000);
+        let preview = log_preview(&huge);
+        assert_eq!(preview.chars().count(), LOG_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+    }
+
+    #[test]
+    fn log_preview_does_not_panic_on_multibyte_utf8_near_the_cut_point() {
+        // Every character here is multi-byte; truncation must happen on a
+        // `char` boundary, never mid-codepoint (which would panic on a
+        // naive byte-index slice).
+        let text = "あ".repeat(LOG_PREVIEW_MAX_CHARS + 50);
+        let preview = log_preview(&text);
+        assert_eq!(preview.chars().count(), LOG_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        // Re-parsing as UTF-8 must succeed (proves no boundary was cut).
+        assert!(std::str::from_utf8(preview.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn log_preview_of_exactly_the_cap_has_no_ellipsis() {
+        let text = "a".repeat(LOG_PREVIEW_MAX_CHARS);
+        assert_eq!(log_preview(&text), text);
+    }
 
     /// Build an `AppState` the way `run()` would for a fresh tab, with a
     /// given `history_enabled` (what `Config::private` drives at startup —

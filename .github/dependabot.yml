@@ -1,0 +1,52 @@
+version: 2
+
+# Issue #37: 依存クレート/GitHub Actions の更新チェックを Dependabot に任せる。
+# 設計判断 (頻度・grouping・auto-merge との関係) は docs/decisions.md D63 を参照。
+#
+# 要点:
+#   - 週次 (月曜) にまとめて 1 本の PR にする (`groups`)。バージョンごとに
+#     個別 PR を乱発すると、対応コストが更新頻度に比例して増えてしまい
+#     "依存クレートは必要最小限に保つ" 方針 (CLAUDE.md / D6) のメンテ
+#     コスト意識と噛み合わない。
+#   - major 更新は grouping の対象外にして個別 PR にする (wry/tao/gtk の
+#     ような画面描画スタック本体の major bump は挙動が変わりうるため、
+#     minor/patch と同列に一括マージしたくない)。
+#   - `no-automerge` ラベルを付け、`.github/workflows/auto-merge.yml` の
+#     自動マージ対象から外す。cargo test/clippy が通っても、依存更新は
+#     ブラウザの実利用シナリオ (WebView の実際の描画・IPC) までは
+#     検証できないため、人が中身を見てからマージする運用にする。
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "no-automerge"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+    commit-message:
+      prefix: "chore"
+
+  # workflow 内で使う actions/checkout などの action バージョンも
+  # 同じ理由 (週次・grouping・no-automerge) で追随させる。
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "no-automerge"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"

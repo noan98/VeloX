@@ -101,6 +101,13 @@ pub struct Config {
     /// `browser::FilterList`), merged on top of VeloX's built-in list.
     /// `None` uses only the built-in list.
     pub extra_blocklist_path: Option<String>,
+    /// Hostnames exempt from content blocking — the "サイト単位の例外"
+    /// (per-site exception) Issue #22 asks for, applied to both main-frame
+    /// navigation blocking (D17) and subresource blocking (D59, currently
+    /// Windows/WebView2 only). Exact-host match, no subdomain expansion (see
+    /// `browser::SiteExceptions`). Empty by default. Set via
+    /// `VELOX_CONTENT_BLOCKING_ALLOW` (comma-separated hostnames).
+    pub content_blocking_site_exceptions: Vec<String>,
     /// Enable performance metrics logging to stderr: the four startup
     /// checkpoints, per-page-load duration, and (if
     /// [`Config::perf_rss_interval`] is set) periodic process-tree RSS
@@ -195,6 +202,7 @@ impl Default for Config {
             toolbar_height: 82,
             content_blocking_enabled: true,
             extra_blocklist_path: None,
+            content_blocking_site_exceptions: Vec::new(),
             panel_height: 320,
             // A single row, roughly the height of a tab-strip row (see
             // ui/toolbar.html's #bookmark-bar rule) — enough for one line of
@@ -269,6 +277,10 @@ impl Config {
     ///   *both* are set to a non-empty value and the URL contains the `{}`
     ///   placeholder; otherwise this pair is ignored and `VELOX_SEARCH_ENGINE`
     ///   (or the default) applies instead.
+    /// - `VELOX_CONTENT_BLOCKING_ALLOW` — comma-separated hostnames exempt
+    ///   from content blocking (Issue #22's per-site exception). Blank
+    ///   entries and surrounding whitespace are dropped; unset means no
+    ///   exceptions.
     ///
     /// No CLI-parsing crate is introduced for this (see docs/decisions.md
     /// D6); `args` is expected to be the process arguments with argv\[0\]
@@ -314,6 +326,11 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        let content_blocking_site_exceptions = resolve_content_blocking_site_exceptions(
+            std::env::var("VELOX_CONTENT_BLOCKING_ALLOW")
+                .ok()
+                .as_deref(),
+        );
         Self {
             homepage,
             private,
@@ -324,6 +341,7 @@ impl Config {
             perf_rss_interval,
             perf_format,
             perf_output_path,
+            content_blocking_site_exceptions,
             ..defaults
         }
     }
@@ -489,6 +507,21 @@ fn resolve_suspension(
     }
 }
 
+/// Pure decision logic behind [`Config::from_env_and_args`]'s
+/// `content_blocking_site_exceptions` (Issue #22), factored out for the same
+/// testability reason as [`resolve_suspension`]. Splits on `,`, trims each
+/// entry, and drops blanks — unset or empty input yields no exceptions
+/// (content blocking stays fully active), matching every other knob here:
+/// absence of the variable must never silently change behavior.
+fn resolve_content_blocking_site_exceptions(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -516,6 +549,41 @@ mod tests {
         assert_eq!(config.perf_format, PerfFormat::Text);
         assert_eq!(config.perf_output_path, None);
         assert_eq!(config.search_engine, SearchEngine::duckduckgo());
+        assert!(config.content_blocking_site_exceptions.is_empty());
+    }
+
+    // -- resolve_content_blocking_site_exceptions (Issue #22) -------------
+
+    #[test]
+    fn content_blocking_allow_unset_yields_no_exceptions() {
+        assert_eq!(
+            resolve_content_blocking_site_exceptions(None),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn content_blocking_allow_parses_comma_separated_hosts() {
+        assert_eq!(
+            resolve_content_blocking_site_exceptions(Some("example.com,news.example")),
+            vec!["example.com".to_owned(), "news.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn content_blocking_allow_trims_whitespace_and_drops_blank_entries() {
+        assert_eq!(
+            resolve_content_blocking_site_exceptions(Some(" example.com , , news.example ")),
+            vec!["example.com".to_owned(), "news.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn content_blocking_allow_empty_string_yields_no_exceptions() {
+        assert_eq!(
+            resolve_content_blocking_site_exceptions(Some("")),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -873,5 +941,75 @@ mod tests {
         let policy = resolve_suspension(None, None, None, Some("100"));
         assert!(!policy.is_enabled());
         assert_eq!(policy.memory_check_interval, Duration::from_millis(100));
+    }
+
+    // --- Robustness against hostile/malformed env values (Issue #35): a
+    // config knob is external input the same way a URL or an IPC message
+    // is — a broken/adversarial environment must never panic the browser
+    // at startup, only ever fall back to a safe default. ---
+
+    #[test]
+    fn numeric_env_knobs_do_not_panic_on_a_value_that_overflows_its_integer_type() {
+        // One digit past u64::MAX — `str::parse` must return `Err`, not
+        // panic, and every resolver here already treats a parse failure as
+        // "use the default".
+        let overflowing = format!("{}0", u64::MAX);
+        assert_eq!(
+            resolve_max_tabs_per_web_process(Some(&overflowing)),
+            DEFAULT_MAX_TABS_PER_WEB_PROCESS
+        );
+        let policy = resolve_suspension(
+            Some(&overflowing),
+            Some(&overflowing),
+            Some(&overflowing),
+            Some(&overflowing),
+        );
+        assert_eq!(policy, SuspensionPolicy::default());
+        // `resolve_perf_env` treats an unparseable value the same as an
+        // absent one (falls back to the default interval, not "off" — see
+        // `unparseable_interval_falls_back_to_default` above), so an
+        // overflowing value follows that same documented rule.
+        assert_eq!(
+            resolve_perf_env(true, Some(&overflowing)).1,
+            Some(DEFAULT_PERF_RSS_INTERVAL)
+        );
+    }
+
+    #[test]
+    fn resolve_homepage_does_not_panic_on_an_extremely_long_or_hostile_value() {
+        let huge = format!("https://example.com/{}", "a".repeat(2_000_000));
+        assert_eq!(
+            resolve_homepage(None, &args(&["--homepage", &huge]), DEFAULT_HOME),
+            huge
+        );
+
+        for hostile in [
+            "javascript:alert(document.cookie)",
+            "\0\0\0",
+            "   \n\t  ",
+            &"a".repeat(2_000_000), // not URL-shaped at all once huge
+        ] {
+            // Must not panic; a rejected/unparseable value always falls
+            // back to the compiled-in default (see
+            // `homepage_rejects_dangerous_schemes_and_falls_back` above).
+            let _ = resolve_homepage(None, &args(&["--homepage", hostile]), DEFAULT_HOME);
+        }
+    }
+
+    #[test]
+    fn search_engine_env_values_do_not_panic_on_extreme_or_unicode_input() {
+        let huge_name = "エ".repeat(500_000);
+        let huge_template = format!("https://example.com/?q={{}}&pad={}", "a".repeat(500_000));
+        let engine = resolve_search_engine(None, Some(&huge_name), Some(&huge_template));
+        assert_eq!(engine.name, huge_name);
+        assert_eq!(engine.query_template, huge_template);
+
+        // A template with no placeholder, however large, is still rejected
+        // the same way a short one is.
+        let huge_template_no_placeholder = "a".repeat(500_000);
+        assert_eq!(
+            resolve_search_engine(None, Some("name"), Some(&huge_template_no_placeholder)),
+            SearchEngine::duckduckgo()
+        );
     }
 }
