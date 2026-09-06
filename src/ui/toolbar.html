@@ -1258,6 +1258,9 @@
       } else if (event.key === "b" || event.key === "B") {
         // Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar.
         message = { cmd: "toggle_bookmark_bar" };
+      } else if (event.key === "n" || event.key === "N") {
+        // Ctrl/Cmd+Shift+N (Issue #27): open a new private window.
+        message = { cmd: "new_private_window" };
       }
     }
     if (message === null) {
