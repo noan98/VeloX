@@ -232,6 +232,39 @@ pub enum ToolbarCommand {
     /// toolbar button) — distinct from `TogglePanel`, since the bar is a
     /// permanent strip, not a dropdown panel (see docs/decisions.md D35).
     ToggleBookmarkBar,
+
+    // --- In-page find (Issue #43, Ctrl/Cmd+F), see docs/decisions.md D69 ---
+    /// Open the find bar for the active tab. Sent by the toolbar's own
+    /// keydown listener (Ctrl/Cmd+F while toolbar UI has focus); the
+    /// content-webview equivalent is `ui::window::ContentShortcut::OpenFindBar`
+    /// (same page has focus). Both funnel into the same `app::open_find_bar`.
+    /// Deliberately its own dedicated command rather than a `TogglePanel`
+    /// variant: unlike the History/Bookmarks/Downloads panels, opening find
+    /// again while it is already open must still refocus/reselect the input
+    /// (mirrors why Omnibox also bypassed `TogglePanel` — see
+    /// docs/decisions.md D11/D26).
+    OpenFindBar,
+    /// The find bar's input changed (every keystroke), or its case-sensitive
+    /// toggle was flipped (re-sent with the current text so a toggle re-runs
+    /// the search immediately). `query` is the raw, not-yet-normalized text;
+    /// an empty/whitespace-only value means "search cleared" —
+    /// `browser::find::normalize_query` is the single place that decides
+    /// this, mirroring how `SearchHistory`'s empty-query case defers to
+    /// `browser::history::search` (D30).
+    FindQuery {
+        query: String,
+        case_sensitive: bool,
+    },
+    /// "▼" button, or Enter in the find input: move to the next match,
+    /// wrapping around. A no-op while there are no matches
+    /// (`browser::find::FindState::next_match`).
+    FindNext,
+    /// "▲" button, or Shift+Enter in the find input: move to the previous
+    /// match, wrapping around.
+    FindPrevious,
+    /// "✕" button, or Esc while the find input has focus: close the find
+    /// bar and clear any highlight left in the page.
+    FindClose,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -369,7 +402,12 @@ pub fn parse_command(body: &str) -> Result<ToolbarCommand, ParseCommandError> {
 /// whole serialized JSON document (an object/array, not just one string),
 /// since `\u{2028}`/`\u{2029}` can only occur inside a JSON string value to
 /// begin with, never as JSON structural syntax.
-fn escape_js_line_terminators(json: &str) -> String {
+///
+/// `pub(crate)` (rather than private) so `ui::window` can apply the same
+/// hardening to the query text it splices into the *content* webview's
+/// find-in-page scripts (Issue #43, docs/decisions.md D69) instead of
+/// duplicating this logic.
+pub(crate) fn escape_js_line_terminators(json: &str) -> String {
     if !json.contains('\u{2028}') && !json.contains('\u{2029}') {
         return json.to_owned();
     }
@@ -493,6 +531,25 @@ pub fn set_bookmark_bar_script(view: &BookmarksView<'_>) -> String {
 /// docs/decisions.md D35).
 pub fn set_bookmark_bar_visible_script(visible: bool) -> String {
     format!("veloxSetBookmarkBarVisible({visible});")
+}
+
+/// JS snippet that shows or hides the find bar (Issue #43). No dynamic text
+/// is embedded here — only a `bool` — so unlike `set_find_status_script`'s
+/// neighbors above, no JSON/escaping step is needed.
+pub fn set_find_bar_visible_script(visible: bool) -> String {
+    format!("veloxSetFindBarVisible({visible});")
+}
+
+/// JS snippet that updates the find bar's "N/M" match counter. `active` is
+/// the 0-based index [`crate::browser::find::FindState::active`] reports;
+/// the toolbar's own JS adds 1 for display. Both arguments are plain
+/// numbers (never user-controlled text), so — like `set_find_bar_visible_script`
+/// and `set_block_count_script` — this needs no JSON-embedding/escaping step.
+pub fn set_find_status_script(total: usize, active: Option<usize>) -> String {
+    match active {
+        Some(index) => format!("veloxSetFindStatus({total}, {index});"),
+        None => format!("veloxSetFindStatus({total}, null);"),
+    }
 }
 
 /// JS snippet that replaces the downloads panel's contents. `DownloadEntry`
@@ -1216,6 +1273,64 @@ mod tests {
             ToolbarCommand::TogglePanel {
                 panel: Panel::Downloads
             }
+        );
+    }
+
+    #[test]
+    fn parses_find_commands() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"open_find_bar"}"#).unwrap(),
+            ToolbarCommand::OpenFindBar
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"find_query","query":"foo","case_sensitive":false}"#).unwrap(),
+            ToolbarCommand::FindQuery {
+                query: "foo".to_owned(),
+                case_sensitive: false,
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"find_query","query":"","case_sensitive":true}"#).unwrap(),
+            ToolbarCommand::FindQuery {
+                query: String::new(),
+                case_sensitive: true,
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"find_next"}"#).unwrap(),
+            ToolbarCommand::FindNext
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"find_previous"}"#).unwrap(),
+            ToolbarCommand::FindPrevious
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"find_close"}"#).unwrap(),
+            ToolbarCommand::FindClose
+        );
+    }
+
+    #[test]
+    fn find_bar_visible_script_embeds_bool_only() {
+        assert_eq!(
+            set_find_bar_visible_script(true),
+            "veloxSetFindBarVisible(true);"
+        );
+        assert_eq!(
+            set_find_bar_visible_script(false),
+            "veloxSetFindBarVisible(false);"
+        );
+    }
+
+    #[test]
+    fn find_status_script_embeds_numbers_and_null() {
+        assert_eq!(
+            set_find_status_script(5, Some(2)),
+            "veloxSetFindStatus(5, 2);"
+        );
+        assert_eq!(
+            set_find_status_script(0, None),
+            "veloxSetFindStatus(0, null);"
         );
     }
 
