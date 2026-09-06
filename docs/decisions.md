@@ -5425,6 +5425,7 @@ crates.io/docs.rs (docs.rs 自体はプロキシで `EGRESS_BLOCKED`) を実際�
 4. **自動更新の UI/機構は無い** — `extra_blocklist_path` の手動再配置 +
    再起動のみ。ホットリロードや定期フェッチは follow-up。
 
+
 ## D65: タブセッション復元 (#25) — 保存は `sync_tab_strip` に相乗り、復元は休止/復帰機構をそのまま再利用、クラッシュ検知フックは wry 0.56 に存在しない
 
 **対象**: Issue #25 (依存: #12)。起動時セッション読み込み・終了時タブ情報
@@ -5634,4 +5635,288 @@ D65 を更新した上でそちらに乗り換える。(3) 「復旧不能なペ
 は CLAUDE.md の方針どおり「動作すれば十分」の最小実装 (`Tabs::restore`/
 `persistence` は 3 OS 共通の純粋 Rust なので実質差分は無いが、実機検証は
 Windows を優先し、macOS/Linux は未検証のまま)。
+
+## D66: サイトデータ管理 (#26) — `wry::WebView::clear_all_browsing_data()` で全消去、origin 単位はエンジンごとに非対称で見送り
+
+**対象**: Issue #26 (関連 #7 — プライベートブラウジング、D14/D15/D49 で
+実装済み)。CLAUDE.md「対応 OS の優先度」により Windows を最優先して調査した
+上で、Linux (CI・性能計測環境) で実装・実測している。
+
+### 既存のデータ境界 (D14/D15/D49) — この Issue はその上に「削除」を足すだけ
+
+この Issue に着手する前提として、通常モード/プライベートモードのデータ境界
+は既に D14/D15/D49 で実装済みであることを確認した。新しい境界は導入して
+いない:
+
+- **通常モード**: `ui::window::BrowserWindow::context: Option<WebContext>`
+  が `Some(WebContext::new(None))` — toolbar と全タブの content webview が
+  この 1 つを共有する (D49)。永続ストアで、下記の実測どおり
+  `$XDG_DATA_HOME/velox`/`$XDG_CACHE_HOME/velox` (Linux) 相当の場所に
+  Cookie 以外のサイトデータが残る。
+- **プライベートモード**: `context` は最初から `None`。toolbar・各タブの
+  content webview はそれぞれ `.with_incognito(true)` で個別に
+  `WebContext::new_ephemeral()` (WebKitGTK) /
+  `nonPersistentDataStore()` (WKWebView) /
+  `SetIsInPrivateModeEnabled(true)` (WebView2) を持ち、**互いに共有せず、
+  ディスクにも残らない** (D15)。`ui/window.rs` 1361 行目以降の
+  `WebviewIsolation` のドキュメントコメントが「private なら related view
+  も張らない」ことまで含めて既にこの境界を明文化している。
+- 両モードは同一プロセス内で排他 (D14: プロセス全体に効くフラグ、共存しない)
+  なので、本 Issue の削除処理がモードを跨いでデータへ触れる経路はコード上
+  存在しない。`clear_all_site_data`(下記) はこの前提の上に実装した。
+
+### エンジンごとの永続化方式 (受け入れ条件「エンジンごとの永続化方式をdocsに
+記録」の本体)
+
+`~/.cargo/registry/src/*/wry-0.56.1` を実際に読み、`data_directory: None`
+(VeloX が今使っている呼び出し方 — 上記) のときに何が起きるかを確認した:
+
+- **WebKitGTK (Linux/BSD)** — `src/webkitgtk/web_context.rs` 30-49 行目:
+  `data_directory` が `None` のときは `WebContext::builder()` に何も足さず
+  `.build()` するだけで、`webkit2gtk::WebsiteDataManager` を明示的に作らない
+  ため、**WebKitGTK 自身のデフォルト `WebsiteDataManager` が使われる**。
+  `create_context` (65-74 行目) が `ApplicationInfo::set_name(env!(
+  "CARGO_PKG_NAME"))` = `"velox"` を設定しており、これがデフォルトの保存先
+  ディレクトリ名に使われる。実機で確認した実際の値は次項。**Cookie の永続化
+  だけは `Some(data_directory)` 分岐 (37-43 行目) でしか
+  `cookie_manager.set_persistent_storage(...)` を呼んでいない** — VeloX は
+  常に `None` を渡しているため、今の実装では Cookie はメモリ内のみで
+  **プロセスを再起動すると失われる** (下記「副次的発見」)。
+- **WKWebView (macOS)** — D15 が既に確認済み: `WKWebsiteDataStore` の既定
+  (persistent) ストアが `Library/WebKit/<bundle id>/WebsiteData/` 相当の
+  場所に Cookie・キャッシュ・各種ストレージをまとめて持つ。ここは Cookie も
+  含め既定で永続化される (WebKitGTK と異なり明示設定不要)。
+- **WebView2 (Windows)** — `src/webview2/mod.rs` 288-296 行目:
+  `data_directory` が `None` のときは空の `HSTRING` を
+  `CreateCoreWebView2EnvironmentWithOptions` の `userDataFolder` 引数に渡す
+  。WebView2 はこれを「既定値を使う」の意味に扱い、実行ファイルのパス由来で
+  自動的に `<実行ファイルの場所>/<実行ファイル名>.exe.WebView2/` 相当を
+  導出する (Microsoft のドキュメント記載の既定挙動) — **WebKitGTKと違い、
+  何も指定しなくても実行ファイルごとに自然に分離される**ため、他アプリの
+  データと混在するリスクは WebKitGTK より低い。Cookie を含め既定で永続化
+  される。
+
+### 実機で確認した Linux のディレクトリ配置 (推測ではなく実測)
+
+`WebContext::builder().build()` の実際の保存先はライブラリのドキュメント
+コメントだけでは確定できない (libwebkit2gtk C 実装依存) ため、`xvfb-run` +
+独立した `HOME`/`XDG_*` の下で実際に VeloX (デバッグビルド) を起動し、
+Cookie と `localStorage` をセットする自作ページを読み込ませて、起動前後の
+ファイル差分を取った:
+
+```
+$XDG_CACHE_HOME/velox/CacheStorage/salt
+$XDG_CACHE_HOME/velox/WebKitCache/Version 17/Records/<hash>/Resource/<hash>
+$XDG_CACHE_HOME/velox/WebKitCache/Version 17/salt
+$XDG_DATA_HOME/velox/history.json                      ← 既存 (D10)
+$XDG_DATA_HOME/velox/hsts-storage.sqlite
+$XDG_DATA_HOME/velox/localstorage/http_<host>_<port>.localstorage(-wal/-shm)
+$XDG_DATA_HOME/velox/mediakeys/v1/salt
+$XDG_DATA_HOME/velox/storage/salt
+```
+
+**わかったこと 3 点**:
+
+1. `WebContext::new(None)` は「エンジンの共有デフォルト」ではなく、
+   `ApplicationInfo` の `"velox"` という名前のおかげで **既に VeloX 専用の
+   ディレクトリ**(`persistence::default_data_dir()` が history/bookmarks に
+   使っているのと同じ `$XDG_DATA_HOME/velox`)に事実上分離されている。他
+   アプリとの混在は無い — 当初懸念していた「WebKitGTK 全体の共有デフォルト
+   を誤って触る」リスクは実測で否定された。
+2. **サイトデータと VeloX 自身の永続化ファイル (`history.json` 等) が同じ
+   ディレクトリに同居している。** ファイルシステムを直接 `rm -rf` する方式
+   だと、`history.json`/`bookmarks.json`/`input_history.json` を巻き込んで
+   消してしまう事故が起きうる — 「安全な削除」を素朴なディレクトリ削除で
+   実装しなかった理由の実測的な裏付けである。
+3. **内部レイアウトはバージョン依存で非公開**(`WebKitCache/Version 17/...`
+   のように libwebkit2gtk のキャッシュフォーマットバージョンがパスに焼き
+   込まれている)。ファイルシステムを直接操作する実装は将来の libwebkit2gtk
+   更新で静かに壊れる — エンジン自身の API を使うべき理由がここにもある。
+4. 前述のとおり Cookie 用のファイルは一切現れなかった — 実測でも
+   「Cookie は永続化されていない」という上記のソース読解を裏付けた。
+
+### 削除の実装: `wry::WebView::clear_all_browsing_data()` — 3 エンジンとも
+public かつ安全な API が既にあった
+
+Issue の指示 (Issue #22/D59 が Windows 側拡張トレイトの見落としで結論を
+覆した前例) に倣い、`WebViewBuilder` の `with_*` 系だけでなく `WebView`
+構築後に呼べるメソッド・拡張トレイトの双方を確認した。その結果、**`unsafe`
+な COM/objc 呼び出しを VeloX 側で書く必要は無かった** — wry 0.56.1 自身が
+`wry::WebView::clear_all_browsing_data(&self) -> Result<()>` という public
+メソッドを、VeloX が対象とする 3 エンジン全てに実装済みで公開している:
+
+- `src/lib.rs` 2251-2253 行目: `WebView::clear_all_browsing_data` は
+  `self.webview.clear_all_browsing_data()` に委譲するだけの薄いラッパ。
+- `src/webkitgtk/mod.rs` 920-931 行目: `context.website_data_manager()` を
+  取り、`WebsiteDataManagerExtManual::clear(WebsiteDataTypes::ALL,
+  TimeSpan::from_seconds(0), None, |_| {})` を呼ぶ。`unsafe` はこの関数の
+  中に一切現れない (`webkit2gtk` クレート側が `unsafe` を内包している)。
+- `src/wkwebview/mod.rs` 832-841 行目:
+  `configuration().websiteDataStore()` から
+  `removeDataOfTypes_modifiedSince_completionHandler(allWebsiteDataTypes,
+  epoch, handler)` を呼ぶ。こちらは objc 呼び出しのため関数全体が
+  `unsafe` ブロックだが、**wry 側の実装**であり VeloX 側で書く unsafe では
+  ない。
+- `src/webview2/mod.rs` 1808-1817 行目:
+  `self.webview.cast::<ICoreWebView2_13>()?.Profile()?
+  .cast::<ICoreWebView2Profile2>()?.ClearBrowsingDataAll(&
+  ClearBrowsingDataCompletedHandler::create(Box::new(move |_| Ok(()))))` —
+  Issue #22/D59 が発見した `WebViewExtWindows`/`ICoreWebView2_13::Profile()`
+  と全く同じ経路を、**wry 自身が既にこの用途向けに実装済み**だった。ここも
+  `unsafe` は wry 内部にあり、VeloX 側のコードには一切現れない。
+
+いずれの実装も「全消去」(Cookie・キャッシュ・
+local/session storage・IndexedDB・Service Worker 等をまとめて) であり、
+`WebContext`/`WKWebsiteDataStore`/`ICoreWebView2Profile` という**共有ストア
+単位**で効く。個々の `WebView` に対して呼んでも、その `WebView` が属する
+ストアそのものを消すため、D49 で共有した `WebContext` を使う通常モードでは
+どの webview から呼んでも同じ範囲が消える。
+
+**実装**: `ui::window::BrowserWindow::clear_all_site_data(&self) ->
+SiteDataClearResult` が toolbar の webview と全タブ (`ContentTab::webview`
+が `Some` のもの全て) それぞれに対して `clear_all_browsing_data()` を呼び、
+成功数・失敗数・最初のエラーを集計して返す。`ToolbarCommand::ClearSiteData`
+(`clear_site_data` IPC) → `app.rs` の `clear_all_site_data` ヘルパー →
+`browser::site_data::summarize(attempted, failed)` が結果を
+`ClearOutcome::{Success, Partial, AllFailed, Nothing}` に判定し、`Partial`/
+`AllFailed` のときだけ stderr にログする (完全成功時は無言 — 既存の
+`persist_*`/`log_io_failure` と同じ流儀)。UI は履歴パネルに「サイトデータを
+削除」ボタンを追加しただけ (`ui/toolbar.html`) — 履歴とは独立した操作で、
+`ClearHistory` のように VeloX 自身の状態を触ることはない。
+
+**通常/プライベート両モードで同じコードが正しく動く理由**: toolbar +
+全タブへ「毎回」試みる設計にしたことで、`self.private` によるモード分岐を
+一切書かずに済んでいる。通常モードでは全 webview が同じ `WebContext` を
+共有しているため冗長 (無害) だが、休止中タブしか無くても常に生きている
+toolbar 経由で必ず 1 回は成功する。プライベートモードでは toolbar と各タブ
+がそれぞれ独立した ephemeral ストアを持つ (D15) ため、生きている webview
+**全部**に対して個別に呼ばないと一部のタブの Cookie/ストレージが消し
+残る — 全 webview を毎回試みる設計はこの両立を自動的に満たす。
+
+### 安全性: 実行中ロックの危険性をどう避けたか
+
+Issue が名指しした「実行中の WebView が掴んでいるファイルを消す危険性」は、
+**ファイルシステムを直接操作する設計を採らなかったことで、そもそも発生し
+ない**。`clear_all_browsing_data()` はエンジン自身の API 呼び出しであり、
+ファイルのオープン・クローズ・ロック解放はすべてエンジン (WebKitGTK/
+WKWebView/WebView2) 内部が担う — VeloX のコードはファイルパスを一切
+知らない・触らない。加えて:
+
+- 失敗しても呼び出し元 (`clear_all_site_data`) がパニックすることはない —
+  `wry::Result<()>` を集計するだけで、`unwrap`/`expect` は使っていない。
+- 1 つの webview の呼び出しが失敗しても残りへの試行は止めない (受け入れ
+  条件「削除失敗時に安全にエラー処理される」) — `attempt` クロージャは
+  エラーをカウントするだけで早期リターンしない。
+- WebKitGTK 実装 (`clear`) はコールバックの結果を無視する
+  (`|_| {}`/`move |_| Ok(())`) 非同期発火型で、呼び出し自体は即座に返る —
+  VeloX 側で完了を待ち合わせるロジックを書いていないぶん、待機中に UI が
+  固まる心配もない (ただし裏を返すと「呼び出しが返った時点でまだ消去が
+  完了していない」余地はある。実測では `wait 500ms` 後には
+  `localstorage`/キャッシュのレコードファイルは既に消えていたので実用上は
+  問題ないが、「呼び出しが返った瞬間に完全に消えている」保証はしていない
+  ことを明記しておく)。
+- 実測 (`xvfb-run` 経由、自作の Cookie/localStorage セットページ → `wait
+  1500ms` → 削除呼び出し → `wait 500ms` → 終了) で、`localstorage/*.
+  localstorage` と `WebKitCache/.../Records/...` のレコードファイルが
+  消え、同じディレクトリに同居する `history.json` はそのまま残ることを
+  確認した — 「サイトデータだけを消し、VeloX 自身の履歴/ブックマークは
+  巻き込まない」という設計目標を実測で裏付けた。
+
+### 見送ったもの: origin 単位の削除
+
+Issue の実装内容が挙げる「origin 単位のデータ管理」は、**危険な実装を避け
+るため今回は見送り、設計だけ記録する**。3 エンジンの調査結果が非対称
+だったことが理由:
+
+- **WebKitGTK (Linux)**: `webkit2gtk::WebsiteDataManagerExtManual::fetch`/
+  `remove` (`webkit2gtk-2.0.2/src/website_data_manager.rs` 14-116 行目) は
+  `unsafe` を要求しない安全な Rust API で、`WebsiteData::name()`
+  (`auto/website_data.rs` 19-35 行目) がレコードのドメイン名を返す —
+  `fetch` して名前でフィルタし `remove` すれば origin 単位の削除ができる。
+  到達経路は `wry::WebViewExtUnix::webview()` (`src/lib.rs` 2426-2427 行目)
+  → `webkit2gtk::WebView` → (`webkit2gtk::WebViewExt` の)
+  `website_data_manager()`。`v2_16` フィーチャが必要だが、VeloX (`wry`) は
+  `webkit2gtk/v2_40` を要求しており `v2_16` を包含するので使える
+  (`webkit2gtk-2.0.2/Cargo.toml` 55-70 行目、`v2_18`→…→`v2_16` の
+  カスケード)。
+- **WebView2 (Windows)**: `ICoreWebView2Profile2::ClearBrowsingData` /
+  `ClearBrowsingDataInTimeRange` (`webview2-com-sys-0.38.2/src/bindings.rs`
+  31371-31421 行目) は `COREWEBVIEW2_BROWSING_DATA_KINDS` というデータ種別
+  でのフィルタしか持たず、**origin/ドメインでのフィルタは無い**。唯一
+  ドメイン単位が効くのは Cookie だけ — `ICoreWebView2CookieManager::
+  DeleteCookiesWithDomainAndPath` (同ファイル 11390-11409 行目)。つまり
+  Windows では「origin 単位の全消去」は Cookie 以外 (localStorage/
+  IndexedDB/キャッシュ) には存在しない。到達経路自体は #22/D59 と同じ
+  `WebViewExtWindows::webview()` → `ICoreWebView2_13::Profile()` で問題
+  ないが、`unsafe` な COM 呼び出しをこの実機テストができない環境で書いて
+  「Windows 最優先」の看板の下に出すには、カバレッジが Cookie だけの
+  中途半端な機能になってしまう。
+- **WKWebView (macOS)**: `WKWebsiteDataStore` にも
+  `fetchDataRecordsOfTypes:completionHandler:`/
+  `removeDataOfTypes:forDataRecords:completionHandler:` という同種の
+  record 単位 API がある (Apple のドキュメント記載) が、wry はこれを
+  `WebViewExtMacOS` のような形で公開しておらず、VeloX 側で新たに objc
+  呼び出しを書く必要がある。macOS は CLAUDE.md の方針上「最低限の整備」
+  対象であり、動作確認もできない。
+
+**結論**: 3 エンジンのうち安全に (`unsafe` を書かずに) origin 単位を実装
+できるのは WebKitGTK だけで、しかも Linux は優先度の低い OS。Windows は
+実装できても Cookie だけの部分的な機能になり、しかも実機で検証できない。
+「消す対象が明確でないなら範囲を狭める」の原則に従い、**今回は全消去のみを
+実装し、origin 単位はこの設計を土台にした将来の Issue に回す**。次に着手
+する際の実装ポイントは上記の到達経路 (Linux: `WebViewExtUnix::webview()` +
+`WebsiteDataManagerExtManual`、Windows: `WebViewExtWindows::webview()` +
+`ICoreWebView2CookieManager` で Cookie のみ) としてそのまま使える。
+
+### 副次的発見: 通常モードの Cookie は現状ディスクに永続化されていない (Linux)
+
+本 Issue の対象ではないが安全性検討の過程で見つけたため記録する。上記の
+とおり `wry` は `WebContext::new(None)` (VeloX が常に使う呼び方) のとき
+`cookie_manager.set_persistent_storage(...)` を一切呼ばない
+(`webkitgtk/web_context.rs` の `Some(data_directory)` 分岐にしか無い) ため、
+**通常モードであっても Linux (WebKitGTK) では Cookie はメモリ内のみで
+保持され、プロセスを再起動すると失われる**。実機実測でも `$XDG_DATA_HOME/
+velox`/`$XDG_CACHE_HOME/velox` の下に Cookie ファイルは一度も現れなかった。
+プライベートモードと違い「意図した」非永続化ではなく、`WebContext::new`
+に `data_directory` を渡していないことの副作用と見られる。ログイン状態が
+再起動のたびに失われるのは製品として望ましくない可能性が高いが、Cookie
+永続化を有効にする変更 (`WebContext::new(Some(dir))` への切り替え) は本
+Issue のスコープ (削除・データ境界) を超え、别のトレードオフ (どの
+ディレクトリを使うか、既存の `persistence::default_data_dir()` と衝突しな
+いか等) の検討を要するため、ここでは変更せず新規 Issue 化を推奨する
+記録に留める。
+
+### テスト・検証
+
+- `browser::site_data::summarize` の判定ロジックはエンジン非依存の純粋
+  関数として `src/browser/site_data.rs` に実装し、4 パターン
+  (0 件/全成功/一部失敗/全失敗) を単体テストした。
+- `ToolbarCommand::ClearSiteData` の IPC パース・`toolbar.html` に対応する
+  ボタン/ハンドラが存在することを、既存の `ClearHistory` 系テストと同じ
+  形で追加した。
+- `BrowserWindow::clear_all_site_data` 自体 (wry 呼び出し) は自動テストの
+  対象にしていない — この項目が使う `wry::WebView::clear_all_browsing_data`
+  は wry 自身が実装・提供する API であり、`evaluate_script`/`load_url`
+  など他の wry 呼び出しと同様、VeloX の統合テスト (`tests/integration.rs`)
+  も個々の wry API の効果までは検証しない方針 (同ファイル冒頭のコメント)
+  に合わせた。代わりに、`xvfb-run` 上で実際に VeloX を起動し Cookie/
+  localStorage をセットしたページを読み込ませ、`clear_all_browsing_data`
+  相当の呼び出し (一時的に `AutomationCommand::Mark` へ差し替えて確認し、
+  検証後に元へ戻した — この差し替えはコミットに含めていない) 後に該当
+  ファイルが消え `history.json` は残ることを手動で確認した。
+- Windows 側は `cargo check --target x86_64-pc-windows-msvc --lib` で型
+  レベルの整合は確認したが、実機での動作確認はできていない
+  (`wry::WebView::clear_all_browsing_data` の WebView2 実装自体は wry 側の
+  既存コードであり、VeloX が新規に書いた unsafe コードは無い)。
+
+**Revisit condition**: (1) origin 単位の削除 (上記見送り分)。(2) Cookie の
+永続化 (副次的発見、別 Issue 候補)。(3) `clear_all_browsing_data` の
+WebKitGTK 実装が完了を待たない非同期発火型であることの影響 — 呼び出し
+直後に webview を破棄する・ページを再読み込みする等のタイミングでは消去
+の完了前に別の書き込みが走る余地が理論上ある。VeloX の現在の呼び出し方
+(ボタン契機、その後は特に何もしない) では実害が無いと判断したが、将来
+「削除 → 即座に別処理」のような使い方を足す場合は要再検討。(4) Windows/
+macOS の実機検証 (`clear_all_browsing_data` が実際にファイルを消すこと)
+は今回の環境では不可能だった。
+
 

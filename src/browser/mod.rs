@@ -25,6 +25,7 @@ pub mod perf_log;
 pub mod persistence;
 pub mod ranking;
 pub mod session;
+pub mod site_data;
 pub mod site_permissions;
 pub mod subresource;
 pub mod suspension;
@@ -44,6 +45,7 @@ pub use input_history::{InputHistoryEntry, InputHistoryStore};
 pub use omnibox::{Candidate, CandidateKind, CandidateSource};
 pub use omnibox_candidates::{HistoryBookmarkSource, InputHistorySource};
 pub use session::{SavedTab, SessionSnapshot};
+pub use site_data::ClearOutcome;
 pub use site_permissions::{
     origin_of, PermissionDecision, PermissionKind, PermissionRecord, Resolution,
     SitePermissionStore,
