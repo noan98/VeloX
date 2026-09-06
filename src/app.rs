@@ -22,7 +22,7 @@ use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPo
 use crate::browser::{
     input_history, metrics, navigation, omnibox, persistence, ActivationEffect, BookmarkStore,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
-    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, TabId, Tabs,
+    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SiteExceptions, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -39,6 +39,11 @@ pub enum UserEvent {
     /// Content blocking refused a main-frame navigation in tab `.0` to this
     /// URL.
     NavigationBlocked(TabId, String),
+    /// Content blocking refused a subresource request (image/script/
+    /// XHR/fetch/...) in tab `.0` to this URL. Windows/WebView2 only for now
+    /// — see docs/decisions.md D59 — sent from
+    /// `ui::webview2_blocking::attach`'s `WebResourceRequested` handler.
+    SubresourceBlocked(TabId, String),
     /// Tab `.0`'s content webview started loading this URL.
     LoadStarted(TabId, String),
     /// Tab `.0`'s content webview finished loading this URL.
@@ -213,6 +218,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         .then(|| metrics::StartupTimestamps::new(process_start));
 
     let blocklist = Arc::new(build_blocklist(&config));
+    let site_exceptions = Arc::new(build_site_exceptions(&config));
 
     // Resolved here (rather than down with `history`/`bookmarks`/
     // `input_history` below) because `site_permissions` — unlike those
@@ -242,6 +248,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         proxy,
         tabs.active_id(),
         blocklist,
+        site_exceptions,
         site_permissions,
     )?;
     if let Some(startup) = startup.as_mut() {
@@ -403,6 +410,12 @@ fn build_blocklist(config: &Config) -> FilterList {
     list
 }
 
+/// Build the per-site content-blocking exception set (Issue #22) from
+/// `Config::content_blocking_site_exceptions`.
+fn build_site_exceptions(config: &Config) -> SiteExceptions {
+    SiteExceptions::from_hosts(&config.content_blocking_site_exceptions)
+}
+
 /// Build the [`PerfLog`] performance events are written through: a file at
 /// `config.perf_output_path` if one was requested and could be opened,
 /// stderr otherwise. Only called when `config.perf_metrics` is on.
@@ -493,6 +506,7 @@ fn record_perf_event(
         }
         UserEvent::LoadStarted(..)
         | UserEvent::NavigationBlocked(..)
+        | UserEvent::SubresourceBlocked(..)
         | UserEvent::PageTitleResolved { .. }
         | UserEvent::FaviconResolved { .. }
         | UserEvent::OpenDevtoolsRequested
@@ -734,6 +748,20 @@ fn handle_user_event(
             // navigation in a background tab still updates its own
             // `Tab::blocked_count` above and is picked up the moment that
             // tab becomes active (see `activate_and_refresh`).
+            if id == state.tabs.active_id() {
+                sync_block_count(window, &state.tabs);
+            }
+        }
+        UserEvent::SubresourceBlocked(id, url) => {
+            // Deliberately no `eprintln!` here unlike `NavigationBlocked`
+            // above: a busy page can trigger this dozens of times per
+            // second (every blocked ad/tracker image, script, XHR...), and
+            // spamming stderr at that rate would drown out every other
+            // `log_failure` line this file relies on for diagnostics.
+            if let Some(tab) = state.tabs.get_mut(id) {
+                tab.on_subresource_blocked(&url);
+            }
+            // Same badge-visibility reasoning as `NavigationBlocked` above.
             if id == state.tabs.active_id() {
                 sync_block_count(window, &state.tabs);
             }

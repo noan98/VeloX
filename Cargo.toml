@@ -48,6 +48,23 @@ gtk = "0.18"
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
 
+# Windows-only subresource content blocking (Issue #22, docs/decisions.md
+# D59). `wry::WebViewExtWindows::webview()` (stable, safe, public API) hands
+# back the raw `ICoreWebView2` COM object wry's webview2 backend already
+# holds internally; these two crates are what let us actually call methods
+# on it (`AddWebResourceRequestedFilter` / `add_WebResourceRequested`) —
+# `windows` for the COM interface types themselves, `webview2-com` for the
+# `WebResourceRequestedEventHandler` helper that implements the COM event
+# handler vtable so we don't have to. Versions are pinned to exactly what
+# wry 0.56.1 depends on (see its Cargo.toml) so the `ICoreWebView2` value
+# `webview()` returns is the *same type* our code imports — a version
+# mismatch here would not fail to compile with a helpful error, it would
+# just mean two distinct `ICoreWebView2` types that cannot be used
+# interchangeably.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+windows = { version = "0.61", features = ["Win32_System_Com"] }
+
 [profile.release]
 lto = "thin"
 strip = true
