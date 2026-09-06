@@ -6,8 +6,9 @@ name: Auto Merge
 # 自前で用意する。設計判断は docs/decisions.md D55 を参照。
 #
 # 動作の流れ:
-#   1. 他の workflow (CI / perf-gate / release-windows) が完了するたびに起動
-#      (workflow_run)。取りこぼし防止のため 30 分ごとの定期実行と手動実行も可。
+#   1. 他の workflow (CI / perf-gate / release-windows / dependency-audit)
+#      が完了するたびに起動 (workflow_run)。取りこぼし防止のため 30 分
+#      ごとの定期実行と手動実行も可。
 #   2. `main` 向けの open な PR を全件走査し、PR ごとに head commit の
 #      check-runs と commit status を集める (この workflow 自身は除外)。
 #   3. 1 つでも未完了があれば待つ (何もしない)。1 つでも失敗があれば
@@ -25,6 +26,12 @@ on:
       - CI
       - Performance Regression Gate
       - Release (Windows)
+      # Issue #37: Dependency Audit (deny.toml) を追加。PR 向けには
+      # Cargo.toml/Cargo.lock/deny.toml の変更時のみ走るので、対象外の
+      # PR ではこの workflow_run が発火せず check-runs にも現れない
+      # (schedule 定期実行の fallback で最大 30 分遅れる程度)。
+      # docs/decisions.md D63 参照。
+      - Dependency Audit
     types: [completed]
   schedule:
     - cron: "*/30 * * * *"

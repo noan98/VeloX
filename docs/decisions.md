@@ -4663,6 +4663,546 @@ Windows についてはその「手を伸ばす」経路が wry 自身によっ�
 4. **サイト例外は静的設定のみ**: `VELOX_CONTENT_BLOCKING_ALLOW` による
    起動時指定のみで、ツールバーからのトグル UI は無い。UI 化は follow-up。
 
+
+## D60: サイト権限 — wry 0.56 の `with_permission_handler` は存在するが origin もカスタム UI も渡せない、origin 単位ストア + 安全側デフォルトの組み合わせで対応する
+
+**対象**: Issue #24 (「サイト権限と権限要求UI」)。
+
+**先に結論**: D17 (Issue #22、サブリソースブロック) と同様、まず「wry に
+権限要求をフックする API があるか」を憶測せずに調べた。**今回は D17 と違い、
+該当 API は実在する** (`WebViewBuilder::with_permission_handler`)。ただし
+実装を進める中で、この API には設計上の制約が 2 つあり、それが Issue の
+「Allow / Block UI」をそのままの形では実装させない — その制約と、代わりに
+採った設計を記録する。
+
+### 調査: wry 0.56.1 の `with_permission_handler`
+
+ベンダー済みソース (`~/.cargo/registry/src/index.crates.io-*/wry-0.56.1/`)
+を実際に読んだ。
+
+- **API 定義**: `src/lib.rs` の
+  `WebViewBuilder::with_permission_handler<F>(self, handler: F) -> Self`
+  (`F: Fn(PermissionKind) -> PermissionResponse + Send + Sync + 'static`)。
+  `src/permissions.rs` に `PermissionKind` (`#[non_exhaustive]`。
+  `Camera`/`Microphone`/`Geolocation`/`Notifications`/`ClipboardRead`/
+  `DisplayCapture`/`Midi`/`Sensors`/`MediaKeySystemAccess`/`LocalFonts`/
+  `WindowManagement`/`PointerLock`/`AutomaticDownloads`/
+  `FileSystemAccess`/`Autoplay`/`Other`) と `PermissionResponse`
+  (`Allow`/`Deny`/`Default`) が定義されている。
+- **Windows (WebView2)** — `src/webview2/mod.rs`: `attributes.permission_handler`
+  が設定されていれば `ICoreWebView2::add_PermissionRequested` に登録。
+  `COREWEBVIEW2_PERMISSION_KIND_*` を `PermissionKind` に変換してハンドラを
+  呼び、`Allow`→`args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)`、
+  `Deny`→`...STATE_DENY`、`Default`→ 何もしない (ソースコメント: "Do
+  nothing, let WebView2 show default prompt")。doc コメントは「Windows:
+  Fully supported via WebView2's PermissionRequested event」。
+- **Linux (WebKitGTK)** — `src/webkitgtk/mod.rs`: `WebView::connect_permission_request`
+  に登録。`UserMediaPermissionRequest` (カメラ/マイク/画面共有の複合要求) と
+  `GeolocationPermissionRequest`/`NotificationPermissionRequest`/
+  `PointerLockPermissionRequest` を型で判別してハンドラを呼ぶ。`Default` は
+  そのシグナルハンドラが `false` (未処理) を返すことで WebKitGTK 自身の
+  既定動作に委ねる — `with_permission_handler` の doc コメント
+  (`src/lib.rs`) はこれを明記して「Linux: The default behavior is
+  `Self::Deny`」としている。
+- **macOS/iOS (WKWebView)** — doc コメントは「Fully supported via
+  WKUIDelegate's requestMediaCapturePermission」だが、これは
+  Camera/Microphone のみ。`PermissionKind` 各バリアントの doc コメントを
+  読むと Geolocation/Notifications/ClipboardRead/Midi/Sensors/…はいずれも
+  「macOS / iOS: Not yet supported by platform backends」と明記されており、
+  実質サポートされるのはカメラ・マイクだけ。
+
+### この API がもたらす 2 つの制約
+
+1. **origin/URL がハンドラに渡されない**。`Fn(PermissionKind) ->
+   PermissionResponse` の引数は `PermissionKind` のみで、どのフレーム・
+   どの URL からの要求かという情報が一切無い。origin 単位の許可/拒否
+   (受け入れ条件「許可/拒否がサイト単位で適用される」) を実現するには、
+   呼び出し側 (VeloX) が別途「このタブは今どの origin を表示している
+   か」を追跡し、ハンドラ呼び出し時にそれを引ければならない。
+2. **同期・即時決定のみ、非同期のカスタム UI を挟めない**。
+   `Fn(PermissionKind) -> PermissionResponse` は同期関数で、`wry`/
+   プラットフォームは戻り値を待ってその場で許可/拒否を確定する
+   (`PermissionResponse::Default` を返した場合のみプラットフォーム側が
+   独自にネイティブプロンプトを出す)。VeloX 独自の「このサイトがカメラ
+   へのアクセスを求めています。許可 / ブロック」という画面を表示して
+   ユーザ操作を待ってから答える、という非同期フローはこの関数シグネ
+   チャでは表現できない (`app.rs`「全状態変更はメインスレッドの
+   `UserEvent` ディスパッチに集約」というイベントループ駆動の設計とも
+   相性が悪い — 応答を待つ間イベントループを止めるわけにはいかない)。
+
+### 採った設計
+
+1. **`src/browser/site_permissions.rs`** — `wry`/UI に一切依存しない純粋
+   ロジックとして origin 単位の権限ストア `SitePermissionStore` を実装
+   (`bookmarks.rs`/`history.rs` と同じ形: プレーンな `Vec<PermissionRecord>`
+   + 単体テスト)。永続化は `src/browser/persistence.rs` に既存パターン
+   通りに追加 (`site_permissions.json`。壊れたファイル・欠けたフィール
+   ドはいずれも空ストアへフォールバックし、起動不能にはならない)。
+   - 扱う種類は issue の列挙どおり `Camera` / `Microphone` /
+     `Geolocation` / `Notifications` / `ClipboardRead` の 5 つ。それ以外
+     は `PermissionKind::Other` に丸められ、**レコードの有無に関わらず
+     常に拒否** (`SitePermissionStore::resolve` が最初に弾く)。将来
+     `wry` が新しい種類を追加しても自動的に安全側に倒れる
+     (`#[serde(other)]` により、将来のバージョンが書いた
+     `site_permissions.json` の未知の kind 文字列も `Other` として読め、
+     ファイル全体のパース失敗にはならない)。
+   - 「今後も許可」「今後も拒否」だけが `PermissionDecision::Allow`/
+     `Block` としてディスクに残る唯一の状態。「一度だけ許可」は
+     `PermissionDecision` のバリアントとしては存在させず、「`set` を
+     一切呼ばない」こと自体として扱う (モジュール doc コメント参照) —
+     ストアを 3 状態に増やすより、「保存しない」がそのまま「一度だけ」
+     の意味になる方が安全側に倒しやすい。
+2. **`src/ui/window.rs` の実配線** — `content_webview_builder` に
+   `.with_permission_handler` を追加し、実際に本物の `wry::PermissionKind`
+   を受け取って応答する。制約 1 (origin が来ない) への対処として、各
+   タブの content webview ごとに `Arc<Mutex<Option<String>>>` で「直近の
+   ナビゲーション成功時点の origin」(`site_permissions::origin_of`) を
+   保持し、既存の `with_navigation_handler` (ブロックリスト判定のすぐ
+   後、ブロックされなかった場合のみ) で更新する。`Mutex` を使うのは
+   `with_permission_handler` のクロージャが `Send + Sync` を要求する
+   ため — アプリの他の状態が守っている「メインスレッドの `UserEvent`
+   ディスパッチに集約 (ロックなし)」の原則の例外だが、範囲はこの
+   1 個の `String` キャッシュだけに閉じている (アプリの実データである
+   `SitePermissionStore` 自体は起動時に読み込んだきり不変な
+   `Arc` で共有しており、可変状態としての「ロック」はここには無い)。
+   制約 2 (同期決定のみ、非同期カスタム UI 不可) への対処として:
+   - ストアに明示的な `Allow`/`Block` が既にあれば、それをそのまま
+     `PermissionResponse::Allow`/`Deny` として返す — カスタム UI 無し
+     でも即答できる。
+   - 記録が無い場合 (「未設定」) は `PermissionResponse::Default` を
+     返す。前節の調査どおり、これは **Windows (WebView2) / macOS
+     (WKWebView, カメラ・マイクのみ) ではプラットフォーム純正の
+     Allow/Block プロンプトに処理を委ねる** — つまり VeloX が何も
+     描画しなくても、CLAUDE.md の OS 優先度で最優先とする Windows では
+     ユーザは明示的な許可 UI を見られる (受け入れ条件「権限要求を
+     ユーザーに明示できる」を、Windows についてはネイティブ UI が
+     満たす)。Linux (WebKitGTK) では `Default` は拒否に落ちる — これが
+     そのまま受け入れ条件「不明な権限要求を安全側で処理する」の安全側
+     デフォルトになる。
+   - origin が取得できない要求 (まだ http(s) にナビゲートしていない、
+     あるいは `file:`/`about:`/`data:` など — `origin_of` が `None` を
+     返すケース) は `PermissionKind::Other` と同様、常に拒否
+     (`resolve_permission`)。「サイト単位で保存された何か」を紐付ける
+     先が無い以上、許可しようがないという判断。
+   - マッピング関数 `map_permission_kind`/`resolve_permission` は純粋
+     関数として切り出し、実際の webview を起動せずに単体テストしている
+     (`src/ui/window.rs` の `tests` モジュール)。
+3. **今回やらなかったこと (フォローアップ)**: プラットフォーム純正
+   プロンプトでユーザが実際に何を選んだかを `wry` から観測する手段が
+   無い (`with_permission_handler` の doc コメント自身も「一度永続的に
+   許可/拒否されると、次回以降はこのハンドラ自体が呼ばれずプラット
+   フォームの保存済み設定が使われる」と明記している) ため、その結果を
+   `SitePermissionStore` に書き戻すことはできない。したがって受け入れ
+   条件の「設定から権限変更」「現在サイトの権限状態表示」に対応する
+   VeloX 独自の UI (ツールバーへの新しいパネル、`ToolbarCommand`/
+   `UserEvent` の追加) は本 PR にはまだ無い。`SitePermissionStore` 自体
+   は読み書き両方の API (`set`/`clear`/`clear_origin`/`records_for`) を
+   備えているので、そうした UI を足す土台として設計してある。
+
+### Revisit condition
+
+(1) macOS/Windows 実機での動作は未検証 (この環境は Linux/WebKitGTK の
+CI のみ) — 特に WebView2/WKWebView のネイティブプロンプトが実際に
+origin 単位で永続化されるか、VeloX を再起動しても維持されるかは実機で
+確認が要る (CLAUDE.md の OS 優先度どおり、確認するなら Windows が先)。
+(2) `wry` が将来 origin 付き・非同期対応の権限 API を追加すれば、
+VeloX 独自の Allow/Block プロンプト UI に切り替える価値が生まれる
+(`wry` の CHANGELOG を継続的に見る — D17 の revisit condition と同じ
+運用)。(3) 設定画面/ツールバーへの「現在サイトの権限」表示・変更 UI は
+別途 Issue 化して積み残す。
+
+## D61: CI に Windows ジョブを追加する — macOS は対象外、統合テストは実行しない
+
+**対象**: Issue #33 (Epic #53)。当初の受け入れ条件「3 OS でビルド可能な状態を
+検証できる」は、Epic #53 のスコープ見直し (CLAUDE.md「対応 OS の優先度」) に
+より外れている。本 Issue でやるのは「Windows の CI 品質ゲートを整える」こと。
+
+**判断**:
+
+- **`ci.yml` に `check-windows` (windows-latest) ジョブを追加する。** 既存の
+  `check` (Linux) ジョブは変更しない — `VELOX_INTEGRATION_REQUIRE_GUI` +
+  `xvfb-run` + `dbus-run-session` の組み合わせは Issue #34/#72 の再発防止策
+  そのものなので、触らない。追加ジョブは同じ `CI` workflow 内の別ジョブに
+  するため、`auto-merge.yml` の `workflow_run.workflows` リスト
+  (`CI` / `Performance Regression Gate` / `Release (Windows)`) は変更不要
+  (workflow 単位のトリガであり、ジョブ追加では変わらない)。一方で
+  auto-merge 自体は PR の head commit の check-runs を全件見て
+  success/skipped/neutral を要求するため、`check-windows` の追加によって
+  「Windows のビルド/テストが通らない PR は自動マージされない」が新たに
+  効くようになる — これは本 Issue の目的 (Windows の品質ゲート) と合致する
+  望ましい副作用であり、`auto-merge.yml` 側の追加対応は不要と判断した。
+- **macOS ジョブは追加しない。** CLAUDE.md の「macOS / Linux は当面
+  『最低限の整備』に留める」方針に明記されている通りで、macOS ランナーは
+  Linux より高コスト (課金上の重み) なうえ、CI 時間とメンテコストが増える
+  だけで Windows 優先方針には寄与しない。Linux は既存 CI と性能計測の
+  実行環境として引き続き必要だが、macOS には今のところそのどちらの役割も
+  無い。macOS の本格対応は Issue #33 の完了を待たず、3 OS の品質が
+  「担保できた段階」(CLAUDE.md 該当節) で改めて着手する。
+- **Windows ジョブは `cargo build` + `cargo test --lib` のみで、統合テスト
+  (`tests/integration.rs`) は実行しない。** `tests/integration.rs` の
+  `gui_skip_reason()` は Linux でのみ `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`
+  を見てスキップ判定をし、macOS/Windows では常に `None` (スキップしない)
+  を返す設計になっている — 「デスクトップ OS なら追加の下準備なしに GUI が
+  起動できるはず」という前提のためだが、GitHub Actions の `windows-latest`
+  ホストランナー (対話セッションはあるが CI 専用の仮想環境) で実際に
+  `velox` (WebView2) のウィンドウ起動・イベントループが安定して成立するかは
+  未検証・不確実。これを確かめずに `cargo test` (引数なし) をそのまま
+  Windows ジョブで動かすと、(a) 実際に統合テストが GUI 起動に失敗して
+  ジョブが赤くなり続ける、または (b) 何らかの理由で当たり障りなく通って
+  しまい「Windows で検証できた」と誤認する、のどちらに転んでも本 Issue の
+  目的に反する。特に (b) は Issue #34 がまさに防ごうとした「見かけ上は緑だが
+  何も検証できていない」形そのものなので避けたい。そこで **確実に成立する
+  範囲 (`src/browser/` 配下の純粋ロジックに対する `--lib` 単体テスト) だけを
+  Windows ジョブの対象にし、GUI を要する統合テストは対象外であることを
+  ワークフローのコメントに明記する**、という安全側の設計にした。
+  「動いたことにする」のではなく「まだ検証していない」ことを明示している。
+- **`cargo build --release` は通常の PR 向け CI には追加しない。**
+  `release-windows.yml` が `workflow_dispatch` / `v*` タグ push で thin LTO
+  付きの release ビルドをすでに検証しており (WebView2 のセットアップ含めて
+  前例がある)、それを PR ごとに複製すると thin LTO のぶん CI 時間が伸びる
+  だけで得るものが少ない。PR ゲートでは debug ビルドの `cargo build` で
+  「ビルドが壊れていないか」だけを見れば十分と判断した。
+- **fmt / clippy は Windows ジョブに複製しない。** どちらもソースコードの
+  静的な整形・lint であり OS 依存の結果差が無いため、Linux ジョブで 1 回
+  実行すれば足りる。Windows ジョブは「Windows 固有の懸念 (ビルド・実行時の
+  単体テスト)」に絞った。
+- **依存キャッシュは Linux ジョブと同じ `Swatinem/rust-cache@v2` を使う。**
+  ランナー OS ごとにキーが分かれるため、Linux 用キャッシュと衝突しない。
+
+**追加したジョブが初回実行で既存バグを 1 件検出した**: `check-windows` を
+入れた最初の CI 実行で `cargo test --lib` が**コンパイルエラー**で落ちた。
+`src/browser/downloads.rs` の `resolve_unix_download_dir` は
+`#[cfg(not(any(target_os = "macos", target_os = "windows")))]` でガードされて
+いるのに、それを呼ぶ 3 つのテスト (`unix_dir_*`) には同じ cfg が付いておらず、
+Windows/macOS では「存在しない関数を呼ぶテスト」が残ってしまう、という
+書き漏れである。同ファイルの `open_path_command_*` テストは最初から同じ cfg
+を持っており、そこと不揃いだった。**この不整合は main に元からあったもので、
+CI が Linux 専用だったために誰も気づけなかった** — Windows ジョブを足す価値が
+そのまま出た形なので、本 PR のスコープ内 (追加したジョブを緑にする) として
+同じ PR で修正した。テストを削除・スキップしたのではなく、テスト対象の関数と
+同じ cfg をテスト側にも付けて対象プラットフォームを揃えただけであり、Linux
+では従来通り 3 件とも実行される。
+
+**Linux から Windows のコンパイルを事前検証できる**: 上記の切り分けの過程で、
+`rustup target add x86_64-pc-windows-msvc` を入れれば Linux 上でも
+
+```sh
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+が通ることを確認した。リンクを伴わない型チェックのみなので MSVC ツール
+チェーンは不要で、`webview2-com` / `tao` の Windows 版まで検査される。実際、
+修正前はこのコマンドが CI と同一の 3 エラーを再現し、修正後は解消した。
+Windows 固有コードや cfg 分岐を触るときは、CI を一往復させる前にこれで
+確認できる。ただし**リンクと実行を伴わないため、これが通っても
+`cargo build` / `cargo test` が Windows で通る保証にはならない** — 実行時の
+挙動を見るのは引き続き `check-windows` ジョブの役割である。この事情から、
+このコマンドを CI に足すことはしない (Windows ジョブが上位互換であり、
+Linux ジョブに足しても検査が重複するだけ)。開発者の手元での事前確認手段と
+して CLAUDE.md に記載するに留める。
+
+**検証の限界 (正直な記録)**: 本 Issue の実装は Linux 環境で行っており、
+`check-windows` ジョブが `windows-latest` 上で最終的にグリーンになるかは
+本 PR の CI 実行結果で確認する。上記の Windows ターゲット型チェック、YAML
+構文の妥当性 (`yaml.safe_load`)、既存 Linux ジョブのコマンドがローカルで
+通ることは確認済みだが、Windows ランナー上での実行時の挙動 (WebView2 を
+含む) はこの環境では確かめられない。
+
+**Revisit condition**: (1) `windows-latest` 上で `tests/integration.rs` の
+GUI 起動 (WebView2) が安定して動くことを実際の CI 実行で確認できたら、
+`check-windows` にも統合テスト (`cargo test` 全体、あるいは
+`VELOX_INTEGRATION_REQUIRE_GUI` 相当の仕組み) を追加する。(2) 3 OS の
+品質が担保できた段階 (CLAUDE.md「対応 OS の優先度」) で macOS ジョブの
+追加を再検討する。(3) Windows ジョブが赤くなったときは、原因が CI 環境
+固有の問題なのか実コードの Windows 対応不足なのかを切り分ける — 初回の
+`resolve_unix_download_dir` は後者だった。
+
+## D62: セキュリティ・入力値堅牢性 (#35) — スキーム許可リストは維持、IPC に
+サイズ上限、JS 埋め込みに追加エスケープ、ブックマークの壊れた `folder_id` を
+ロード時に自己修復
+
+**対象**: Issue #35。外部入力の境界 (URL 正規化、トールバー IPC、Rust→JS の
+文字列埋め込み、`history.json`/`bookmarks.json`/`input_history.json` の永続化
+読み込み、`VELOX_AUTOMATION_SCRIPT`) を総点検し、攻撃パターンをテストで固定
+化した。テストは 100 件以上追加 (`src/browser/navigation.rs`,
+`src/ui/toolbar.rs`, `src/ui/window.rs`, `src/browser/persistence.rs`,
+`src/browser/history.rs`, `src/browser/bookmarks.rs`,
+`src/browser/input_history.rs`, `src/config/mod.rs`, `src/app.rs`)。
+
+### 見つかったもの・直したもの
+
+**クラッシュ (パニック) は見つからなかった。** `url`/`serde_json` はどちらも
+不正入力に対して `Err` を返す設計で、本体コードもその `Err` を
+`unwrap()`/`expect()` せず `Option`/`Result` で素通りさせる既存の書き方が
+既に徹底されていた (`normalize_input`, `parse_command`,
+`persistence::read_json` はいずれも失敗を吸収して `None`/`Err`/デフォルト値
+に倒す)。`serde_json` 自体もパース時の再帰深度に上限を持つため、数万階層の
+配列/オブジェクトのネスト ("JSON 爆弾") を IPC・永続化ファイルの双方に流し
+込んでもスタックオーバーフローせず `Err` になることをテストで確認した
+(`toolbar::tests::does_not_panic_or_hang_on_deeply_nested_json`,
+`persistence::tests::deeply_nested_json_does_not_panic`)。
+
+見つかった実際の問題は次の 3 点、いずれも修正済み:
+
+1. **ブックマークの `folder_id` が壊れたまま読み込まれる。**
+   `BookmarkEntry::folder_id` の「`None` か実在する folder id のどちらか」
+   という不変条件は `BookmarkStore::edit`/`remove_folder` が能動的に守って
+   いるだけで、`#[derive(Deserialize)]` によるファイル読み込みはこの不変条件
+   を一切検証しない。手編集や部分的に壊れた `bookmarks.json` が存在しない
+   `folder_id` を指すエントリを持っていた場合、そのブックマークは
+   `entries_in(None)` (root) にも `entries_in(Some(壊れたid))` にも現れず、
+   パネル/ブックマークバーのどちらからも永久に見えなくなる ("消えた"よう
+   に見えるブックマーク)。`BookmarkStore::repair_dangling_folder_ids` を
+   追加し、`persistence::load_bookmarks` がロード直後に必ず呼ぶようにした。
+   壊れた `folder_id` は root に付け替えられ、次に保存されれば
+   ファイル自体も修復される。
+2. **不正/巨大な IPC メッセージをそのまま stderr に全文出力していた。**
+   `app::handle_user_event` の `ToolbarMessage` 分岐は、パースに失敗した
+   `body` を `{body:?}` でそのまま `eprintln!` していた。IPC にサイズ上限が
+   無かった当時の設計では、数百万文字のアドレスバー貼り付けが弾かれた場合、
+   その全文がそのままログに落ちる — クラッシュはしないが、ログを肥大化させ
+   る/機微情報を丸ごと残すという別種の「サイズに比例したコスト」の穴だった。
+   `app::log_preview` (最大 200 文字、`char` 境界で切り詰め) を追加し、常に
+   これ経由でログに出すようにした。
+3. **U+2028/U+2029 (LINE/PARAGRAPH SEPARATOR) が JS 文字列リテラルの終端に
+   なり得る。** `ui::toolbar` の `set_*_script` 関数群は、以前から
+   `serde_json` の文字列シリアライズ (`"`/`\`/制御文字のエスケープ) だけで
+   `evaluate_script` に渡す JS を組み立てていた。RFC 8259 は U+2028/U+2029 を
+   JSON 文字列中でエスケープ不要としているが、これらは ES2019 より前の
+   ECMAScript 文法では文字列リテラルの内部でも行終端子として扱われていた
+   — つまりエンジンによっては、タイトルや URL にこの 2 文字が混じるだけで
+   文字列が意図せず終端し、後続の生 JS が別の文としてそのまま実行されかね
+   ない。`escape_js_line_terminators` を追加し、`evaluate_script` に渡す
+   すべての JSON 埋め込み (`set_url_script`, `set_focus_address_bar_script`,
+   `set_tabs_script`, `set_candidates_script`, `set_history_script`,
+   `set_bookmarks_script`, `set_bookmark_bar_script`,
+   `set_downloads_script`) がこれを通るようにした。
+
+### スキーム許可リストは変更しなかった
+
+`ALLOWED_SCHEMES = ["http", "https", "file", "about", "data"]`
+(`browser::navigation`、命名決定前からの既存コード) はそのまま維持した。
+`javascript:`/`vbscript:`/`livescript:` などスクリプト実行系スキームは元々
+拒否されており、大文字小文字・前後の空白・`javascript:alert(1)//`のような
+コメント付与では回避できないことをテストで固定化した
+(`rejects_dangerous_schemes_regardless_of_case_or_whitespace_tricks`)。
+`data:`/`file:` は Issue #35 の対象ではなく、ダウンロード機能のテスト
+(D28 関連) や `about:blank` 的な用途で既に前提にされている既存動作のため、
+「危険そうだから」で新たに絞り込むことはしなかった — 制限を強めることが
+今回のスコープではなく、CLAUDE.md の「正常系を壊さない」方針にも反する。
+
+### IPC ペイロード上限をどう決めたか
+
+`ui::toolbar::MAX_IPC_PAYLOAD_BYTES = 1 MiB`。トールバー Webview は VeloX
+自身がバンドルする信頼済み HTML (`TOOLBAR_HTML`) であり、任意の外部 Web
+コンテンツではないため、これは「攻撃者からの入力を弾く」ためというより
+**多層防御**として入れた: 上限が無いと、アドレスバーへの巨大なクリップ
+ボード貼り付けや (トールバー Webview 自体に将来何らかの脆弱性が入った場合
+の) 悪意ある巨大メッセージが、`ToolbarCommand` のフィールド型チェックに
+たどり着く前に `serde_json::from_str` へそのまま渡り、無制限に時間/メモリ
+を消費し得る。1 MiB は「実用上あり得る最大の正当な入力 (アドレスバーへの
+非常に長い URL や検索クエリ) に対して十分な余裕を残しつつ、明らかに
+病的なサイズは弾く」という基準で選んだ — Chromium の URL 長上限が概ね
+2MB 程度であることも参考にしたが、厳密にそれへ揃える理由はないため、
+JSON のオーバーヘッドを差し引いても十分な余裕を持つ 1 MiB とした。
+上限超過はパースを試みる前に `ParseCommandError::TooLarge` を返し、
+`serde_json` には一切渡さない。
+
+一方、**コンテンツ Webview → Rust のショートカット IPC
+(`ui::window::parse_content_shortcut`)** はそもそも JSON を解釈しない —
+固定の合言葉文字列 (`velox:new-tab` 等) との完全一致比較のみで、一致しな
+ければ即座に無視する (D18/D23)。この経路は任意の Web ページ (信頼できない
+入力) から届くため、こちらにこそサイズ上限が要ると思われるかもしれないが、
+文字列の完全一致比較はサイズに比例したコストしかかからず (パース木を作ら
+ない)、巨大な文字列を送っても最初のバイト不一致で早期に `None` へ落ちる
+ため、明示的な上限を追加する必要はないと判断した。実際に 500 万文字の
+入力でパニックしないことをテストで確認した
+(`parse_content_shortcut_does_not_panic_on_hostile_content_webview_input`)。
+
+### JS エスケープの方針
+
+Rust → JS の文字列埋め込みは今後も **`serde_json` の文字列/値シリアライズ
+を経由するのが唯一の方法** とする — 独自のエスケープ関数を書き足さない。
+`"`/`\`/制御文字は `serde_json` が RFC 8259 通りにエスケープするため、URL
+やタイトルにこれらがいくら含まれても JS 文字列リテラルの外へ抜け出すことは
+ない (`url_script_escapes_quotes_and_backslashes` 等で既存)。今回追加した
+`escape_js_line_terminators` は、その `serde_json` の出力に対する**後処理**
+として U+2028/U+2029 だけを追加でエスケープするもので、JSON のパース結果を
+変えない (エスケープ後の文字列も同じ JSON として解釈できる) ため、
+`serde_json` を経由する既存の安全性の議論をそのまま維持できる。
+
+`</script>` 等の HTML 的な文字列 (`url_script_neutralizes_script_closing_and_html_sequences`)
+は `evaluate_script` が HTML パーサではなく JS エンジンへ文字列をそのまま
+渡す API であるため、そもそも特別扱いする理由がない — これは今回のテストで
+挙動を確認しただけで、コード変更はしていない。
+
+### 永続化ファイルの壊れ方への方針
+
+`browser::persistence::read_json` は元々「読めない/パースできない/型が
+合わない」の区別をせず、すべて `None` (呼び出し側でデフォルト値) に丸めて
+いた。この方針は変更していない — 部分的に読めたフィールドだけ救おうとする
+部分復旧は複雑さの割に価値が低く (`#[serde(default)]` で吸収できる
+フィールド追加は D27/D32 で既にその形になっている)、壊れたファイル全体を
+安全に空として扱う方が事故が少ない。今回追加したのは
+`BookmarkStore::repair_dangling_folder_ids` (上記) のみで、これは
+「パース自体は成功するが、パースだけでは守れない構造的不変条件」という
+別種の問題に対する追加のポスト処理であり、`read_json` 自体の方針変更では
+ない。
+
+### 対応しなかったもの (アドレス表示の見た目に関わる既知の限界)
+
+以下はいずれも「クラッシュしない」ことは確認したが、意図的に**未対応**の
+まま残した — URL 自体の解析/読み込みは正しく行われるが、アドレスバーに
+表示される見た目が本来のホストと異なって見えうるという、実在するブラウザ
+共通の課題であり、今回のスコープ (堅牢性テストの整備) を超える表示層の
+設計判断が要るため:
+
+- **userinfo によるホスト偽装** (`https://google.com@evil.com/` は
+  `evil.com` が実ホストで `google.com` は捨てられる userinfo) —
+  `userinfo_before_the_host_does_not_change_the_actual_host` で挙動を固定化
+  したのみ。
+- **Bidi override 文字によるパス偽装** (`\u{202E}` でファイル名の見た目を
+  反転させる) — `does_not_panic_on_bidi_override_characters_in_a_url` で
+  パニックしないことのみ固定化。
+- **IDN ホモグラフ攻撃** (punycode 変換自体は `url`/`idna` クレートに委譲
+  済みで正しく動くが、見た目が似た文字を使ったなりすましドメインをどう
+  警告表示するかは対象外)。
+
+**Revisit condition**: アドレスバーの表示ロジック自体に手を入れる Issue が
+立ったら、上記 3 点をまとめて検討する。userinfo は本来「表示前に取り除く」
+判断がしやすい (URL としての意味を変えずに済む) ので着手コストが低く、
+bidi override / IDN ホモグラフは表示ポリシーの設計判断 (どこまで punycode
+表示に倒すか) が要るため、着手コストが相対的に高い。
+
+## D63: 依存関係・セキュリティ監査を CI 化 (#37) — cargo-deny 単体を採用し、PR は依存グラフを触った時だけブロッカーにする
+
+**対象**: Issue #37。Rust 依存クレートの脆弱性・ライセンス・更新状況を CI で
+継続監視する。実装前に `cargo install cargo-audit` / `cargo install
+cargo-deny` を実際にこの環境で行い、VeloX の依存ツリー (Cargo.lock 286
+クレート、`gtk = "0.18"` を含む Linux ターゲット cfg 依存も含む) に対して
+両方を実際に走らせた結果に基づいて判断した (机上の一般論やよくある
+allow-list のコピペではない)。
+
+**判断**:
+
+- **`cargo-audit` と `cargo-deny` の両方をローカルで実行して比較し、
+  最終的に CI には `cargo-deny` だけを採用した。** `cargo audit` の結果は
+  「既知脆弱性 (vulnerability) 0 件、warning 12 件」。12 件の内訳は
+  `Cargo.toml` の `[target.'cfg(any(target_os = "linux", ...))'.dependencies]`
+  にある `gtk = "0.18"` (wry の gtk バックエンドが Linux ビルドに必要と
+  する gtk-rs GTK3 バインディング) が引き込む transitive 依存
+  (`atk`/`atk-sys`/`gdk`/`gdk-sys`/`gdkwayland-sys`/`gdkx11`/
+  `gdkx11-sys`/`gtk`/`gtk-sys`/`gtk3-macros` の unmaintained
+  advisory 10 件、`proc-macro-error` の unmaintained 1 件、`glib` の
+  unsound 1 件、RUSTSEC ID は deny.toml の `[advisories].ignore` に
+  列挙) だけで、VeloX 自身のコードに起因するものは無い。`cargo deny
+  check advisories` は同じ RustSec DB を使うため検知内容は同一だが、
+  advisories に加えて licenses/bans/sources もカバーする上位互換であり、
+  Issue の受け入れ条件にある「ライセンス監査」を別ツールで賄う必要が
+  無くなる。CLAUDE.md / D6 の「依存クレートは必要最小限に保つ」は
+  Rust クレートの話だが、CI ツールについても「同じ RustSec DB を見る
+  ツールを 2 本併走させて設定ファイルを 2 つメンテする」意味は無いと
+  判断し、`cargo-audit` は本 Issue の調査目的にのみ使い、CI には積まない。
+- **ライセンス監査は実データに基づく allow-list にした。**
+  `cargo deny init` の空 allow-list で `cargo deny check licenses` を
+  走らせ、実際に拒否された全エントリの SPDX 式 (286 クレート分) を
+  集計した結果、VeloX の依存ツリーに現れる atomic license は
+  `0BSD` / `Apache-2.0` / `Apache-2.0 WITH LLVM-exception` /
+  `BSD-3-Clause` / `CC0-1.0` / `MIT` / `MIT-0` / `MPL-2.0` /
+  `Unicode-3.0` / `Unlicense` / `Zlib` の 11 種類のみで、GPL 系の
+  copyleft ライセンスは一切無かった。`deny.toml` の `[licenses].allow`
+  にはこの 11 種類だけを列挙している (「よくある allow-list」のコピペ
+  ではなく実測値)。唯一の非パーミッシブ枠は `MPL-2.0` (wry →
+  `dom_query` → `cssparser`/`cssparser-macros`/`selectors` 経由) で、
+  ファイル単位の弱いコペレフト (バイナリ配布・リンクは制限しない) の
+  ため許可した。VeloX 自身は MIT (Cargo.toml の `license = "MIT"`) で、
+  MPL-2.0 のファイルを改変して再配布する予定は無い。
+- **advisories の `unsound` スコープを既定の `"workspace"` から
+  `"all"` に上書きした。** `unmaintained` の既定は `"all"` (transitive
+  依存も検査) だが `unsound` の既定は `"workspace"` (自クレート自身が
+  unsound advisory を持つ場合のみ) で、そのままだと `glib 0.18.5`
+  (RUSTSEC-2024-0429, `glib::VariantStrIter` の Iterator 実装の
+  unsound) のような transitive advisory を検査対象から外してしまう。
+  見落としを防ぐため明示的に `"all"` にした。
+- **例外ルールは `deny.toml` の `[advisories].ignore` に RUSTSEC ID +
+  理由を 1 件ずつ書く運用にした。** 一括で `unmaintained = "allow"` に
+  するような包括的な緩和はせず、個別 ID を列挙する。個別に列挙する
+  ことで、将来 VeloX 自身が直接依存する別のクレートが新たに
+  unmaintained/unsound になったときはちゃんと検知され (`ignore` に
+  無い ID なので `advisories FAILED` になる)、今回把握済みの 12 件
+  だけが素通りする。誤検知や「対応版が無い」既知の警告を握りつぶす
+  のではなく、1 件ごとに `docs/decisions.md` (本項) への参照込みで
+  記録した。
+- **CI は新しい workflow `.github/workflows/dependency-audit.yml` を
+  追加し、既存の `ci.yml` (#33 の成果物、`check-windows` を含む) には
+  一切手を入れていない。** ジョブは `EmbarkStudios/cargo-deny-action@v2`
+  (ビルド済みバイナリを取得して実行するため、ソースからの
+  `cargo install cargo-deny` (ローカル検証で約 3 分) を CI 毎回走らせ
+  ずに済む) で `cargo deny check` (advisories/bans/licenses/sources
+  すべて) を実行する。
+- **CI failure policy: `continue-on-error` は使わず、代わりに
+  トリガーの `paths` フィルタでブロッカーの範囲を絞った。** 2 系統の
+  トリガーを用意している。
+  1. `pull_request` (`paths: ["Cargo.toml", "Cargo.lock", "deny.toml",
+     ".github/workflows/dependency-audit.yml"]` に限定): 依存グラフ
+     そのものを変更する PR に対してだけ、通常どおり (継続不可の)
+     マージブロッカーとして働く。依存を一切触らない大多数の PR では
+     `paths` に一致するファイルが無いためジョブそのものが起動せず、
+     check-run も生成されない。
+  2. `schedule` (毎日 1 回、`cron: "0 18 * * *"` = JST 03:00): 依存を
+     まったく動かしていない期間に後から公表される advisory を拾う
+     ための定期監視。PR の head commit に紐付かないので、失敗しても
+     `auto-merge.yml` の判定には影響しない。
+  この設計により「VeloX 側に非がなく突然公表される advisory で、依存を
+  何も動かしていない無関係な PR まで巻き込んで開発が止まる」という
+  Issue 本文の懸念を、`continue-on-error` で失敗を握りつぶすのではなく
+  「そもそもその PR では検査が走らない/走っても PR 自身の変更が原因」
+  という形で構造的に避けた。
+- **`auto-merge.yml` への影響**: 上記の `paths` フィルタにより、依存を
+  触らない PR ではこのジョブの check-run 自体が存在しないため、
+  `auto-merge.yml` の「head commit の全 check-runs が success/skipped」
+  判定には最初から数えられない (影響ゼロ)。依存を触った PR では
+  他のジョブと同様に 1 つの check-run として扱われ、失敗すれば
+  (継続不可なので) 従来どおりマージが止まる — これは意図した挙動
+  (依存グラフを変えた張本人に対応してもらう)。`workflow_run.workflows`
+  リストにも `Dependency Audit` を追加した (D55 のコメント「新しい
+  workflow を追加したら追加する」に従う。追加漏れがあっても 30 分毎の
+  `schedule` フォールバックがあるため誤動作にはならない)。
+- **lockfile 監視・依存更新チェックは Dependabot (`.github/dependabot.yml`)
+  を新規導入した。** `cargo` エコシステムと `github-actions` エコシステム
+  の両方を対象にし、週次 (月曜) + `groups` で minor/patch 更新を 1 本の
+  PR にまとめる (major はグルーピング対象外で個別 PR のまま — wry/tao/gtk
+  のような描画スタック本体の major bump は挙動が変わりうるため一括
+  マージしたくない)。Dependabot が作る PR には `no-automerge` ラベルを
+  付与し、`auto-merge.yml` の対象から明示的に外した。理由は、
+  `cargo fmt`/`clippy`/`cargo test` が通っても依存更新が WebView の
+  実際の描画・IPC 挙動まで検証できるわけではなく、人間のレビューを
+  必ず挟みたいため。
+
+**検証の限界 (正直な記録)**: (1) `EmbarkStudios/cargo-deny-action@v2` を
+実際に GitHub Actions 上で実行して確認したわけではない (この環境では
+`cargo deny` をソースからインストールしてローカルで直接走らせて検証した)。
+action 自体の配布バイナリ取得やキャッシュ挙動は、本 PR マージ後の実際の
+CI 実行で確認する必要がある。(2) `deny.toml` の advisories ignore
+(RUSTSEC-2024-0411/0412/0413/0414/0415/0416/0417/0418/0419/0420/0370/0429)
+はすべて `gtk = "0.18"` (Linux 専用ターゲット依存) 由来で、CLAUDE.md の
+「対応 OS の優先度」(Windows 最優先、Linux は最低限の整備) と整合する
+判断だが、上流の gtk-rs が GTK4 版に移行しない限り、あるいは wry が
+gtk4-rs 対応の新しい gtk backend を出さない限り解消しない — VeloX 単独
+では直せない。(3) `dependabot.yml` の実際の PR 生成・grouping の挙動も
+マージ後の初回実行を待って確認する必要がある。
+
+**Revisit condition**: (1) wry が GTK4 (gtk4-rs) ベースの gtk backend を
+リリースし、`gtk = "0.18"` を上げられるようになったら、`deny.toml` の
+gtk-rs 関連の `ignore` エントリを削除する。(2) `EmbarkStudios/cargo-deny-action`
+が実際の CI 実行で想定通り動くか (プラットフォーム互換のバイナリ取得・
+キャッシュ) を確認し、問題があれば `cargo install cargo-deny --locked`
+方式に切り替える。(3) Dependabot の週次 PR 頻度・grouping が実際に
+運用してみて多すぎる/少なすぎると分かったら `interval`/`groups` を
+調整する。(4) 新しい直接依存の追加で MPL-2.0 以外の copyleft ライセンス
+(GPL 系など) が入りそうになったら、`deny.toml` の allow ではなく
+依存追加自体を見直す。
+
 ## D64: EasyList/EasyPrivacy 対応 (#23) — 自前パーサを拡張、実データは同梱もダウンロードもしない
 
 **対象**: Issue #23 (依存する #22 は D59 で Windows 限定のサブリソースブロックとして
@@ -4883,3 +5423,4 @@ crates.io/docs.rs (docs.rs 自体はプロキシで `EGRESS_BLOCKED`) を実際�
 3. **実データの動作確認が Windows 実機でしかできない** — 上記のとおり。
 4. **自動更新の UI/機構は無い** — `extra_blocklist_path` の手動再配置 +
    再起動のみ。ホットリロードや定期フェッチは follow-up。
+
