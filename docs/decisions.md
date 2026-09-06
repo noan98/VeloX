@@ -7470,3 +7470,283 @@ Secrets/Variables を設定するだけで `release-windows.yml` の署名が有
 着手するとき、合わせて Developer ID 署名 + notarization を実装する。
 (3) Azure Trusted Signing の適格性要件 (地域・事業年数) が緩和されたとき。
 (4) 他ベンダーのクラウド署名サービスへの切り替えを検討するとき。
+
+## D74: プライベートブラウジング、残りスコープ (#27) — Private Window を別ウィンドウとして開けるようにする。分離は D14/D15 の既存メカニズムのまま、per-window 化だけを行う
+
+**対象**: Issue #27。Epic #53 の言葉を借りれば「大半は #7 (D14) で実装済み。
+残りは『Private Window を別に開く』のみで、#29 (D68, PR #150) が前提」。
+その #29 は本 Issue 着手時点で既に `main` にマージ済みで、D68 の末尾
+「Issue #27 が実装すべきこと」の節に (a)(b)(c) の 3 点として実装方針が
+具体的に書き残されていた。本項はその棚卸しの確認と、実際の実装・検証の
+記録である。
+
+### 棚卸し: #7 (D14/D15) と #29 (D68) で既に何ができていたか
+
+着手前に `docs/decisions.md` の D14/D15/D68/D71、`src/config/mod.rs`
+(`Config::private`)、`src/ui/window.rs`、`src/browser/windows.rs`、
+`src/app.rs` の `open_new_window`/`AppState` を読んだ。Issue #27 の受け入れ
+条件 4 点のうち、**ゼロから作る必要があったのは 1 点目だけ**だった:
+
+- **「Private Windowを通常ウィンドウとは別に開ける」— 未実装だった。** 本 PR
+  の主題。詳細は後述。
+- **「閲覧履歴がアプリ側に残らない」— D14 のロジック (`record_visit_if_enabled`
+  などの `history_enabled` ゲート) はそのまま使えたが、`history_enabled` が
+  プロセス全体で 1 個の `bool` だったため、複数ウィンドウが混在する状況
+  (通常ウィンドウ + Private Window が同一プロセス内に共存) では**そのまま
+  では正しく動かない**ことが分かった。D68 が既に予告していた通り、
+  per-window 化が必要だった (後述)。
+- **「通常セッションのCookie/Storageを共有しない」— D14/D15 の
+  `.with_incognito(true)` + `context: None` の分離メカニズムは
+  `ui::window::BrowserWindow::new` 内で完結しており、ウィンドウが複数に
+  増えても仕組み自体は無改修で使い回せることを D68 が確認済み
+  (「D14 が既に書いていた『複数ウィンドウが実現したときの拡張路線』が
+  そのまま使える形で残っている」)。今回の実装で実際にその通りだったことを
+  確認した (後述の「データストア分離の検証」)。
+- **「Private状態を明確に識別できる」— `--private-badge`・ウィンドウ
+  タイトルの `— プライベート` 接尾辞・D71 で修正済みの `--private-*` CSS
+  変数のテーマ追従は、いずれも「1 個の `bool` を `BrowserWindow::new`
+  構築時に渡す」形で既に実装されており、その `bool` の出どころを
+  `config.private` からウィンドウごとの値に差し替えるだけで済んだ。
+
+### 実装したもの: D68 が示した (a)(b)(c) をそのまま実装
+
+D68 の該当節がほぼ実装レシピそのものだったので、方針を変える理由は
+見当たらず、そのまま採用した:
+
+1. **(a) `browser::windows::WindowEntry` にウィンドウごとの `private: bool`
+   を追加**。`Windows::new`/`open_window` は互換維持のため据え置き (常に
+   `private: false` に委譲)、新たに `Windows::new_with_privacy`/
+   `Windows::open_window_with_privacy` を追加して呼び分ける形にした
+   (`Windows` 自身のテストを 1 件も壊さずに済む形を優先した)。新設の
+   `Windows::is_private(id) -> Option<bool>` が `app.rs` 側の唯一の参照点。
+2. **(b) `app::open_new_window` が `Config::private` の代わりにそのフラグを
+   見て `BrowserWindow::new` を呼ぶ**。実際には「新しい
+   `open_private_window`」を別関数として作るのではなく、`open_new_window`
+   自体に `private: bool` 引数を 1 つ追加する形にした — 呼び出し元が
+   `config.private`(既存の Ctrl/Cmd+N 系 3 経路) か `true`(新設の
+   Ctrl/Cmd+Shift+N 系 3 経路) のどちらを渡すかだけが違い、実装は 1 箇所の
+   ままで済む。`ui::window::BrowserWindow::new` にも同じ `private: bool`
+   引数を追加し、関数内部の 7 箇所の `config.private` 参照をすべて
+   この引数に差し替えた — `config: &Config` はプロセス全体で 1 個の
+   共有参照のため、これを直接見ている限り「通常ウィンドウとプライベート
+   ウィンドウが同一プロセスに共存する」ことは原理的に表現できなかった。
+3. **(c) Ctrl/Cmd+Shift+N を、#29 が作った 3 経路と同じパターンで追加**。
+   `ToolbarCommand::NewPrivateWindow`(`{"cmd":"new_private_window"}`)/
+   `ContentShortcut::NewPrivateWindow`(センチネル `velox:new-private-window`)/
+   `AutomationCommand::NewPrivateWindow`(`new_private_window` コマンド、
+   引数なし) の 3 つを、既存の `NewWindow` 系と完全に同じ場所・同じ理由
+   (「`ui_windows` 全体への `&mut` が要る = `handle_toolbar_command`/
+   `handle_content_shortcut` の中では処理できず `handle_user_event` で
+   横取りする」という D68 の借用上の制約) で追加した。`toolbar.html`/
+   `tab_shortcut_script`(content webview 側) の両方の keydown リスナに
+   Ctrl/Cmd+Shift+N を追加している。
+
+`AppState::history_enabled`(プロセス全体で 1 個の `bool`) は完全に廃止し、
+`record_visit_if_enabled`/`record_input_history_if_enabled`/
+`persist_session` はすべて新設のヘルパー `window_is_private(state,
+window_id)`(`state.windows.is_private(window_id).unwrap_or(true)` —
+不明なウィンドウは安全側の `true` = 記録しない扱い) を通す形に書き換えた。
+`ToolbarCommand::Ready` が押していた `window.set_private(config.private)`
+も `window.set_private(window.is_private())`(ウィンドウ自身が構築時に
+覚えている自分の `private` フラグ — 新設の `BrowserWindow::is_private()`)
+に差し替えた。`config.private` を直接見ていたこの 1 箇所を放置すると、
+通常ウィンドウの Ready ハンドラがプロセス起動時の `config.private`(= 常に
+`false`、通常起動の場合) をそのまま押してしまい、逆に `--private` 起動中に
+開いた「通常」の 2 枚目のウィンドウ (Ctrl+N, 後述) のバッジも常に
+`config.private` の値になってしまうところだった。
+
+**`--private`/`VELOX_PRIVATE` 起動フラグ (D14) 自体は変更していない**:
+`app::run` は最初のウィンドウを `Windows::new_with_privacy(homepage,
+config.private)` で開き、`BrowserWindow::new` にも `config.private` を渡す
+— プロセス全体を Private にして起動する挙動は従来どおり。**Ctrl/Cmd+N
+(無印) は今回も `config.private` を渡す**ようにした — つまり
+`--private` で起動したプロセスで Ctrl+N を押すと、今までどおり
+新しいウィンドウも Private になる (D68 が「今回は変更していない」と
+書いていた挙動をそのまま維持)。Ctrl/Cmd+Shift+N だけが常に `true` を渡す
+新経路で、`--private` 起動でも通常起動でも「明示的に Private Window を
+1 枚追加する」という一貫した意味を持つ。
+
+### データストア分離の検証: wry 0.56.1 の実ソースを 3 プラットフォームぶん確認した
+
+指示の通り、「分離されているつもりで実は分離されていない」を最も警戒す
+べき点として、`~/.cargo/registry/src/.../wry-0.56.1/src/` を実際に読んで
+確認した (以下、確認した具体的なコード箇所を引用する)。
+
+- **WebKitGTK (Linux, CI 環境)** — `src/webkitgtk/mod.rs` の
+  `new_gtk`:
+  ```rust
+  let web_context = if attributes.incognito {
+    default_context = WebContext::new_ephemeral();
+    &mut default_context
+  } else { /* ... 共有 WebContext ... */ };
+  ```
+  `.with_incognito(true)` を付けた `WebViewBuilder::build_*` 呼び出しは
+  **呼ばれるたびに** `WebContext::new_ephemeral()`(インメモリ、非永続) を
+  新規に作る。VeloX 側は toolbar/content 双方の webview 構築に
+  `.with_incognito(private)` を渡しており (`ui::window::BrowserWindow::new`)、
+  Private Window とは別に開いた通常ウィンドウの `WebContext::new(None)`
+  (D66 の実測どおりアプリ名ベースの永続ディレクトリを指す) とは完全に別の
+  オブジェクトになる。**確認できたこと**: Private Window の webview が
+  通常ウィンドウの永続ストアに触れることはない。**同時に判明した限界
+  (D15 が既に書いていた事実の再確認)**: `.with_incognito(true)` は呼ぶ
+  たびに新しい ephemeral context を作るため、同じ Private Window 内の
+  toolbar と各タブ、さらに複数の Private Window どうしも、互いに
+  Cookie を共有しない (実ブラウザの「同一シークレットセッション内の
+  タブはセッションを共有する」という一般的な期待からは外れる)。これは
+  #7/D15 の時点から存在する制約で、本 Issue が新たに悪化させたものでは
+  ない — 通常ウィンドウとの分離という本質的な要件は満たしている。
+- **WKWebView (macOS)** — `src/wkwebview/mod.rs`:
+  `(true, _, _) => WKWebsiteDataStore::nonPersistentDataStore(mtm)` —
+  Apple のドキュメント上 `nonPersistentDataStore()` は呼び出すたびに新しい
+  非永続ストアのインスタンスを返す (`.default()` が返す永続シングルトンとは
+  対照的)。WebKitGTK と同じ「呼ぶたびに新規・非永続」という構造。
+- **WebView2 (Windows, 最優先 OS)** — `src/webview2/mod.rs`:
+  `controller_opts.SetIsInPrivateModeEnabled(incognito)` は
+  `ICoreWebView2ControllerOptions3` 経由で個々の `Controller` に対して
+  設定される。ここで **1 点、実機検証できていない構造上の懸念**を記録して
+  おく: `env`(`ICoreWebView2Environment`) 自体は `create_environment` が
+  `attributes.context.as_deref().and_then(|c| c.data_directory())` から
+  導いた `data_directory` で作られ、VeloX は Private Window 用に
+  `context: None` を渡す (`ui::window.rs` の `context` 変数) ため、
+  Private Window の `env` は `data_directory` 未指定 (空文字列、
+  `CreateCoreWebView2EnvironmentWithOptions` の既定 = 実行ファイル隣接の
+  既定フォルダ) で作られる。これは Microsoft の公開ドキュメントが述べる
+  「`IsInPrivateModeEnabled` の Controller はインメモリの非永続プロファイル
+  を使う (基になる `Environment`/`data_directory` が何であれ、書き込みは
+  ディスクに永続化されない)」という仕様に依拠しており、wry のソース自体
+  からは「Private Window どうし・通常ウィンドウとの間でディスク上の
+  `data_directory` が数値として同じ既定値に揃いうる」ことまでしか確認
+  できない (＝ディスクに何か書かれるかどうかの最終防御線は WebView2 側の
+  InPrivate 実装そのものに委ねている)。**この開発環境は Linux 専用
+  (D61) で WebView2 を実行できないため、Windows 実機でこの分離を目視/
+  ファイルシステム上で検証することはできていない** — CLAUDE.md の
+  「Windows 最優先」の判断基準に従い、実装 (`.with_incognito(private)` を
+  toolbar/content 双方に渡す、D15 の時点から変更なし) はそのまま維持しつつ、
+  この限界を正直に記録する。
+
+**アプリ自身のデータ (履歴/入力履歴/セッション) の分離は、統合テストで
+実際に検証した** (wry/webview2 のようなブラックボックスに頼らない、
+VeloX 自身が書き込むファイルでの検証): `tests/integration.rs` に新設した
+`a_private_windows_page_visit_never_reaches_history_json` が、実際に
+`velox` プロセスを起動し、通常ウィンドウで 1 ページ訪問した後
+`new_private_window` で Private Window を開いて別の 1 ページを訪問し、
+`quit` 後の `history.json` を `persistence::load_history` で読み返して
+「通常ウィンドウの 2 件だけが記録され、Private Window の訪問は一切
+含まれない」ことをアサートしている。ユニットテストの
+`record_visit_if_enabled` 単体の正しさに加えて、`app::open_new_window`
+(`private: true` での `BrowserWindow` 構築) → 実際のページ読み込み →
+`UserEvent::LoadFinished` → `record_visit_if_enabled` という配線全体が
+実機 (Xvfb 上の WebKitGTK) で意図通り動くことを確認できた、数少ない
+「見送っていない」実地検証である。
+
+### 見つけた/見送った既知のギャップ
+
+- **オムニボックスの候補が通常ウィンドウの履歴を Private Window に
+  漏らす**: `ToolbarCommand::OmniboxInput` は `state.history`/
+  `state.bookmarks`/`state.input_history` をウィンドウの private 状態に
+  関わらず読む (D39 の「書き込みは止めるが読み込みは妨げない」という
+  既存方針をそのまま踏襲)。D14 の「プロセス全体が Private」という前提
+  では、同時に走っている通常ウィンドウが存在しえないためこれは無害
+  だったが、本 Issue で通常ウィンドウと Private Window が同一プロセスに
+  共存できるようになった結果、**Private Window のアドレスバーに、
+  同じセッション中に通常ウィンドウで実際に訪問した URL や打った検索語が
+  候補として出うる**、という新しいギャップが生まれた。これは履歴が
+  「ディスクに残る」問題ではなく「同一プロセス内の別ウィンドウに一時的に
+  見える」問題であり、Issue #27 の 4 つの受け入れ条件には直接該当しない
+  が、実ブラウザの Private/incognito モードの直感 (通常ウィンドウの閲覧を
+  Private Window から見えなくする) には反する。修正には
+  `omnibox::build_candidates` 系に `window_id`(または呼び出し元の
+  private フラグ) を通す設計変更が必要で、かつ「Private Window の候補は
+  ブックマークだけ見せるべきか、何も見せないべきか」という仕様判断も
+  要るため、本 Issue のスコープでは修正せず、ここに明示的に残す。
+- **`DownloadStore` はプロセス全体で 1 個の共有ストアのまま
+  (D28/D68 変更なし)**: Private Window でのダウンロードも同じダウンロード
+  パネル一覧に載る。ダウンロードしたファイル自体は (実ブラウザでも同様)
+  ディスクに残る操作なので Private モードでも隠しようがないが、
+  「そのダウンロードが Private Window で行われた」という一覧上の記録は
+  通常ウィンドウのパネルからも見えてしまう。D68 が既に「頻度の低いパス」
+  として見送っていたスコープで、本 Issue でも同様に見送った。
+- **`SitePermissionStore`/`FilterList`/`SiteExceptions` は D68 の設計通り
+  全ウィンドウ共有のまま**: Private Window で許可したサイト権限
+  (カメラ/位置情報など) は通常ウィンドウにも残る。実ブラウザでも
+  Private/incognito のサイト権限は「そのセッションの間だけ」揮発する
+  実装が多いが、VeloX は元々 D60 の設計で「サイト権限はアプリ全体で
+  1 つ」となっており、本 Issue はこれを変更していない — 変更するには
+  `SitePermissionStore` 自体をウィンドウ (または private/non-private)
+  スコープに分割する設計が必要で、スコープ超過と判断した。
+
+### テスト・検証
+
+- `browser::windows`: 7 件追加 (`a_window_opened_by_new_is_not_private`、
+  `new_with_privacy_marks_the_first_window_private`、
+  `open_window_marks_the_new_window_non_private`、
+  `open_window_with_privacy_marks_the_new_window_private`、
+  `is_private_returns_none_for_an_unknown_window`、
+  `open_restored_window_is_never_private`、そして本題の
+  `a_normal_and_a_private_window_sharing_the_same_tab_id_keep_independent_privacy`
+  — #29 統合時に実際に 3 件のバグが見つかった「同じ `TabId` を持つ 2 つの
+  ウィンドウが干渉しないか」という指示を、`private` フラグについて検証)。
+- `browser::automation`: `new_private_window` のパース
+  (`parses_new_private_window_and_rejects_arguments_on_it`) を追加。
+- `ui::toolbar`: `{"cmd":"new_private_window"}` のパース、
+  `toolbar_html_declares_expected_hooks` に `new_private_window` の
+  存在確認を追加。
+- `ui::window`: `tab_shortcut_script_captures_expected_combos_in_capture_phase`/
+  `parse_content_shortcut_matches_every_sentinel_exactly` に新センチネル
+  `velox:new-private-window`/`ContentShortcut::NewPrivateWindow` を追加。
+- `app`: 2 件追加。
+  `a_private_window_records_no_visit_while_a_normal_window_with_the_same_tab_id_still_does`
+  (本題 — 同じ `TabId` を共有する通常/Private ウィンドウで
+  `record_visit_if_enabled`/`record_input_history_if_enabled` が
+  正しく独立して動くことの単体テスト) と
+  `persist_session_skips_a_private_primary_window_but_writes_a_normal_one`
+  (セッション永続化側の同型テスト、実ファイルシステムに対して)。
+- `tests/integration.rs`(新規 1 件):
+  `a_private_windows_page_visit_never_reaches_history_json` — 上述の
+  「データストア分離の検証」参照。実際に `velox` を起動し、Private Window
+  経由の訪問が `history.json` に一切現れないことを確認する、本 Issue の
+  最も重要な受け入れ条件に対する実地証拠。
+- テスト件数: `cargo test --lib` は着手前 800 件 → 着手後 810 件 (+10)。
+  `xvfb-run` + `dbus-run-session` 経由の `cargo test --test integration`
+  は着手前 9 件 → 着手後 10 件 (+1)。既存テストの削除・スキップ化は
+  行っていない。
+- `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` は
+  警告ゼロ (`ui::window::BrowserWindow::new` の引数が 8 個になった分は
+  `#[allow(clippy::too_many_arguments)]` を明示的に付与 — `app.rs` の
+  `handle_user_event` 等、既存の同種関数と同じパターン)。
+  `cargo check --target x86_64-pc-windows-msvc --all-targets` も型検査の
+  みだが通過を確認した — CLAUDE.md D61 の通りリンク・実行はしておらず、
+  上記「データストア分離の検証」の WebView2 に関する懸念は Windows 実機
+  でのみ最終確認できる。
+
+### 満たせなかった/検証できていない点 (正直な棚卸し)
+
+- **Windows (WebView2) 実機でのデータストア分離の目視/ファイル検証は
+  行っていない** — 開発環境が Linux 専用のため。上記のとおり、
+  wry のソースと Microsoft の公開仕様からの推論に留まる。CLAUDE.md の
+  「Windows 最優先」の判断基準は、実装の設計判断 (D15 から変更なしの
+  `.with_incognito` 呼び出し) には反映したが、実機検証そのものは今回も
+  できていない。
+- **macOS 実機でのデータストア分離の検証も同様に未実施**(D71 と同じ理由)。
+- **オムニボックス候補の cross-window リーク**(上記) は既知のまま未修正。
+- **`DownloadStore`/`SitePermissionStore`/`FilterList`/`SiteExceptions`
+  の全ウィンドウ共有は D68/D60/D28 の設計を維持したまま**、Private
+  Window 導入後の具体的な意味合い (上記) を記録したのみで、分割は
+  行っていない。
+- **Private Window 内の複数タブ/複数 Private Window 間で Cookie が
+  共有されない**(WebKitGTK/WKWebView の `.with_incognito(true)` が
+  呼び出しごとに新規ストアを作る構造上の制約、D15 由来) — 実ブラウザの
+  一般的な incognito 挙動 (同一シークレットセッション内では共有) との
+  差異だが、#7 の時点からの既存の制約であり本 Issue のスコープでは
+  修正していない。
+
+**Revisit condition**: (1) Windows/macOS 実機でデータストア分離を検証
+できる環境が整ったとき (D61/D71 と同じ制約)。(2) オムニボックス候補の
+cross-window リークを修正する Issue に着手するとき — `window_id` を
+`omnibox::build_candidates` 系まで通す設計と、「Private Window の候補に
+何を出すか」という仕様判断が必要になる。(3) ダウンロード/サイト権限/
+フィルタ設定をウィンドウ (または private/non-private) スコープに分割する
+価値が実際に求められたとき (D68 の「見送ったもの」と同じ優先度判断)。
+(4) WebKitGTK/WKWebView 側で「Private Window 内はタブ間で共有し、通常
+ウィンドウとは分離する」ような、呼び出し単位でない共有 ephemeral
+context を wry が公開するようになったとき。
