@@ -48,6 +48,7 @@ use wry::{
 
 use crate::app::UserEvent;
 use crate::browser::downloads;
+use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
 use crate::browser::{
     group_by_date, parse_sentinel, Candidate, DownloadEntry, FilterList, HistoryEntry, ShortcutId,
@@ -146,6 +147,11 @@ pub enum ContentShortcut {
     /// both are handled by the same shared function in `app.rs`. See
     /// docs/decisions.md D69.
     OpenFindBar,
+    /// Ctrl/Cmd+S (Issue #46): save the current page ("名前を付けて保存").
+    /// The content-webview half of `ui::toolbar::ToolbarCommand::SavePage` —
+    /// both are handled by the same shared function in `app.rs`. See
+    /// docs/decisions.md D76.
+    SavePage,
     /// Ctrl/Cmd+P (Issue #40): print the active tab's page. The
     /// content-webview half of `ui::toolbar::ToolbarCommand::Print` — both
     /// are handled by the same shared function in `app.rs`. See
@@ -216,6 +222,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         ShortcutId::OpenFindBar => Some(ContentShortcut::OpenFindBar),
         ShortcutId::ViewSource => Some(ContentShortcut::ViewSource),
         ShortcutId::Print => Some(ContentShortcut::Print),
+        ShortcutId::SavePage => Some(ContentShortcut::SavePage),
         ShortcutId::OpenDevtools => None,
     }
 }
@@ -1969,6 +1976,186 @@ impl BrowserWindow {
         })
     }
 
+    /// Ctrl/Cmd+S / `ToolbarCommand::SavePage` / `ContentShortcut::SavePage`
+    /// (Issue #46, "名前を付けて保存"): save tab `tab_id`'s current page to
+    /// disk. `url`/`title` are the values `app.rs` already has for that tab
+    /// (`Tab::current_url`/`Tab::title`) at the moment the request was made
+    /// — passed in rather than re-read here so this method never needs to
+    /// know about `browser::Tabs` at all, the same boundary
+    /// [`Self::fetch_page_title`]/[`Self::fetch_favicon`] already keep.
+    /// `download_dir_override` is the settings screen's Downloads-tab
+    /// override (Issue #30/D67) — only consulted on the non-Windows
+    /// fallback path below; see this method's `#[cfg]`'d bodies.
+    ///
+    /// Every outcome — success, a user-facing failure, or the user
+    /// cancelling the Windows save dialog — is reported by sending
+    /// [`UserEvent::SavePageStarted`]/[`UserEvent::SavePageFinished`] itself
+    /// (this method has no return value): unlike a title/favicon refresh, a
+    /// user-initiated "save" that silently did nothing on failure would look
+    /// like a bug, not a harmless no-op (Issue #46's "エラー時に原因を
+    /// 表示できる" acceptance criterion) — see docs/decisions.md D76 for why
+    /// the save flow itself (and format: MHTML vs. a plain HTML snapshot)
+    /// differs by platform, and `app.rs`'s handling of both events for why
+    /// this reuses the Downloads panel/`DownloadStore` rather than adding a
+    /// separate UI.
+    #[cfg(target_os = "windows")]
+    pub fn request_save_page(
+        &self,
+        tab_id: TabId,
+        url: String,
+        title: Option<String>,
+        _download_dir_override: Option<String>,
+    ) {
+        let window_id = self.id;
+        let proxy = self.proxy.clone();
+        let suggested =
+            save_page::suggested_file_name(title.as_deref(), &url, save_page::MHTML_EXTENSION);
+        let Some(webview) = self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        else {
+            report_save_page_failure(
+                &proxy,
+                window_id,
+                url,
+                suggested,
+                "ページが表示されていないため保存できません".to_owned(),
+            );
+            return;
+        };
+
+        let destination = match crate::ui::save_dialog_windows::show_save_dialog(&suggested) {
+            Ok(Some(path)) => path,
+            // The user cancelled the dialog - not an error, and not a save
+            // that ever started, so no `DownloadEntry` should appear for it
+            // either.
+            Ok(None) => return,
+            Err(err) => {
+                report_save_page_failure(&proxy, window_id, url, suggested, err);
+                return;
+            }
+        };
+
+        let file_name = destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or(suggested);
+        let _ = proxy.send_event(UserEvent::SavePageStarted {
+            window_id,
+            url: url.clone(),
+            file_name,
+            destination: destination.clone(),
+            started_at: unix_now(),
+        });
+
+        crate::ui::save_dialog_windows::capture_and_write_mhtml(
+            webview,
+            proxy,
+            window_id,
+            url,
+            destination,
+        );
+    }
+
+    /// [`Self::request_save_page`]'s non-Windows fallback (see
+    /// docs/decisions.md D76): no native Save-As dialog on these platforms
+    /// (see the module-level "OS 優先度" policy in CLAUDE.md — macOS/Linux
+    /// stay at a minimal, always-builds implementation) — the page is saved
+    /// straight to the resolved downloads directory
+    /// (`browser::downloads::resolve_download_dir_with_override`), with the
+    /// same suggested-name-then-collision-avoided-if-taken handling a real
+    /// download already gets (`browser::downloads::prepare_destination`),
+    /// as a plain `document.documentElement.outerHTML` snapshot — **images,
+    /// external CSS, and other subresources are not fetched or embedded**,
+    /// unlike the Windows/MHTML path.
+    #[cfg(not(target_os = "windows"))]
+    pub fn request_save_page(
+        &self,
+        tab_id: TabId,
+        url: String,
+        title: Option<String>,
+        download_dir_override: Option<String>,
+    ) {
+        let window_id = self.id;
+        let proxy = self.proxy.clone();
+        let suggested =
+            save_page::suggested_file_name(title.as_deref(), &url, save_page::HTML_EXTENSION);
+        let Some(webview) = self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        else {
+            report_save_page_failure(
+                &proxy,
+                window_id,
+                url,
+                suggested,
+                "ページが表示されていないため保存できません".to_owned(),
+            );
+            return;
+        };
+
+        let dir = downloads::resolve_download_dir_with_override(download_dir_override.as_deref())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let destination = match downloads::prepare_destination(&dir, &suggested) {
+            Ok(path) => path,
+            Err(err) => {
+                report_save_page_failure(
+                    &proxy,
+                    window_id,
+                    url,
+                    suggested,
+                    format!("保存先フォルダを準備できませんでした: {err}"),
+                );
+                return;
+            }
+        };
+        let file_name = destination
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or(suggested);
+        let _ = proxy.send_event(UserEvent::SavePageStarted {
+            window_id,
+            url: url.clone(),
+            file_name,
+            destination: destination.clone(),
+            started_at: unix_now(),
+        });
+
+        let finish_proxy = proxy.clone();
+        let finish_destination = destination.clone();
+        let finish_url = url.clone();
+        let start_result = webview.evaluate_script_with_callback(
+            "document.documentElement.outerHTML",
+            move |raw| {
+                let error = match extract_js_string_result(&raw) {
+                    Some(html) => {
+                        let document = save_page::wrap_outer_html_as_document(&html);
+                        std::fs::write(&finish_destination, document.as_bytes())
+                            .err()
+                            .map(|err| format!("ファイルの書き込みに失敗しました: {err}"))
+                    }
+                    None => Some("ページのソースを取得できませんでした".to_owned()),
+                };
+                let _ = finish_proxy.send_event(UserEvent::SavePageFinished {
+                    window_id,
+                    url: finish_url.clone(),
+                    destination: finish_destination.clone(),
+                    error,
+                });
+            },
+        );
+        if let Err(err) = start_result {
+            let _ = proxy.send_event(UserEvent::SavePageFinished {
+                window_id,
+                url,
+                destination,
+                error: Some(format!("ページのソース取得を開始できませんでした: {err}")),
+            });
+        }
+    }
+
     /// Asynchronously read tab `tab_id`'s full page markup
     /// (`document.documentElement.outerHTML`) and report it back as
     /// [`UserEvent::ViewSourceReady`] for View Source (Issue #45, see
@@ -2702,6 +2889,44 @@ fn unix_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Report a "名前を付けて保存" (Issue #46) failure that happened *before* a
+/// real destination could ever be chosen (no live webview for the tab, the
+/// native Save-As dialog itself failing, or the fallback download directory
+/// being unwritable) — every such case in
+/// [`BrowserWindow::request_save_page`]'s two `#[cfg]`'d bodies above.
+///
+/// Sends both [`UserEvent::SavePageStarted`] and
+/// [`UserEvent::SavePageFinished`] back to back (with a shared, matching
+/// `PathBuf::new()` placeholder destination — `DownloadStore::resolve_completion`'s
+/// exact-destination-match branch is what pairs them back up) rather than
+/// only `SavePageFinished`: this is the difference between the failure
+/// showing up as a `DownloadState::Failed` row in the Downloads panel (with
+/// `reason` visible, satisfying the issue's "エラー時に原因を表示できる"
+/// acceptance criterion) and it silently having no `DownloadEntry` at all,
+/// since `SavePageFinished` alone has nothing to resolve against.
+fn report_save_page_failure(
+    proxy: &EventLoopProxy<UserEvent>,
+    window_id: WindowId,
+    url: String,
+    file_name: String,
+    reason: String,
+) {
+    let now = unix_now();
+    let _ = proxy.send_event(UserEvent::SavePageStarted {
+        window_id,
+        url: url.clone(),
+        file_name,
+        destination: PathBuf::new(),
+        started_at: now,
+    });
+    let _ = proxy.send_event(UserEvent::SavePageFinished {
+        window_id,
+        url,
+        destination: PathBuf::new(),
+        error: Some(reason),
+    });
 }
 
 #[cfg(any(

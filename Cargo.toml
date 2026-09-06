@@ -61,9 +61,23 @@ winresource = "0.1"
 # mismatch here would not fail to compile with a helpful error, it would
 # just mean two distinct `ICoreWebView2` types that cannot be used
 # interchangeably.
+# Issue #46 (名前を付けて保存, docs/decisions.md D76) adds two more Windows
+# Shell/COM features on top of the D59 set above:
+# - `Win32_UI_Shell` / `Win32_UI_Shell_Common`: the native "Save As" file
+#   picker (`IFileSaveDialog`/`IShellItem`, the `FileSaveDialog` CLSID,
+#   `COMDLG_FILTERSPEC`/`SIGDN_FILESYSPATH`/`FOS_*`), used by
+#   `ui::save_dialog_windows` to satisfy the issue's "保存先を選択できる"
+#   acceptance criterion. This is the same classic Shell Common Item Dialog
+#   API every native Windows app uses for Open/Save dialogs — not a
+#   WebView2-specific type — so it needs no generation gate the way
+#   `ICoreWebView2_NN` does.
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
-windows = { version = "0.61", features = ["Win32_System_Com"] }
+windows = { version = "0.61", features = [
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
 
 [profile.release]
 lto = "thin"

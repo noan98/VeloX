@@ -1291,6 +1291,10 @@
         // Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
         // docs/decisions.md D69.
         message = { cmd: "open_find_bar" };
+      } else if (event.key === "s" || event.key === "S") {
+        // Ctrl/Cmd+S (Issue #46): save the current page. See
+        // docs/decisions.md D76.
+        message = { cmd: "save_page" };
       } else if (event.key === "p" || event.key === "P") {
         // Ctrl/Cmd+P (Issue #40): print the active tab. See
         // docs/decisions.md D75.
