@@ -569,7 +569,18 @@ fn visiting_pages_persists_history_json() {
     // Wait for the homepage's own load to finish and be recorded before
     // navigating away, so both visits land as separate history entries in
     // a deterministic order.
-    let script = format!("wait 1000\nnavigate {second_page}\nwait 700\nquit\n");
+    //
+    // The second wait was 700ms and went red on a CI runner while this test
+    // still passed locally: only `minimal.html` reached history.json, so the
+    // navigation to `text.html` had not finished loading (and been recorded
+    // by the `LoadFinished` handler) before `quit` ran. `AutomationCommand`
+    // has no "wait until the load completes" primitive — only a wall-clock
+    // `wait <ms>` — so the only lever here is the margin, and 700ms left too
+    // little of it for a loaded runner. Raised to match the first wait
+    // rather than reduced to a value that merely happens to pass: this test
+    // asserts *what* lands in history.json, and its timing constants should
+    // never be the thing that decides whether the assertion is reached.
+    let script = format!("wait 1000\nnavigate {second_page}\nwait 1500\nquit\n");
     let script_path = write_script(&dir, &script);
 
     let launch = launch_and_wait(
