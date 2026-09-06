@@ -103,6 +103,9 @@ const ACTIVATE_TAB_MESSAGE_PREFIX: &str = "velox:activate-tab-";
 /// Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
 /// `ContentShortcut::OpenFindBar` and docs/decisions.md D69.
 const OPEN_FIND_BAR_MESSAGE: &str = "velox:open-find-bar";
+/// Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
+/// `ContentShortcut::ViewSource` and docs/decisions.md D72.
+const VIEW_SOURCE_MESSAGE: &str = "velox:view-source";
 
 /// A tab-management keyboard shortcut reported by the content webview's
 /// shortcut IPC channel (see [`parse_content_shortcut`]).
@@ -157,6 +160,11 @@ pub enum ContentShortcut {
     /// both are handled by the same shared function in `app.rs`. See
     /// docs/decisions.md D69.
     OpenFindBar,
+    /// Ctrl/Cmd+U (Issue #45): view the active tab's page source. The
+    /// content-webview half of `ui::toolbar::ToolbarCommand::ViewSource` —
+    /// both are handled by the same shared function in `app.rs`. See
+    /// docs/decisions.md D72.
+    ViewSource,
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
@@ -177,6 +185,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         TOGGLE_BOOKMARK_BAR_MESSAGE => Some(ContentShortcut::ToggleBookmarkBar),
         NEW_WINDOW_MESSAGE => Some(ContentShortcut::NewWindow),
         OPEN_FIND_BAR_MESSAGE => Some(ContentShortcut::OpenFindBar),
+        VIEW_SOURCE_MESSAGE => Some(ContentShortcut::ViewSource),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
         "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
@@ -257,6 +266,8 @@ fn tab_shortcut_script() -> String {
         message = "{NEW_WINDOW_MESSAGE}";
       }} else if (event.key === "f" || event.key === "F") {{
         message = "{OPEN_FIND_BAR_MESSAGE}";
+      }} else if (event.key === "u" || event.key === "U") {{
+        message = "{VIEW_SOURCE_MESSAGE}";
       }}
     }} else if (event.shiftKey && !event.altKey) {{
       if (event.key === "t" || event.key === "T") {{
@@ -1771,6 +1782,49 @@ impl BrowserWindow {
         })
     }
 
+    /// Asynchronously read tab `tab_id`'s full page markup
+    /// (`document.documentElement.outerHTML`) and report it back as
+    /// [`UserEvent::ViewSourceReady`] for View Source (Issue #45, see
+    /// docs/decisions.md D72). `page_url` is the page this source belongs
+    /// to, captured by the caller *before* the async round trip — same
+    /// reasoning as [`Self::fetch_favicon`]'s `page_url` parameter: if
+    /// `tab_id` has already navigated elsewhere by the time this resolves,
+    /// the result is attributed to the page it was actually requested for,
+    /// not whatever loaded next (an accepted raciness, same class as every
+    /// other `evaluate_script_with_callback` fetch here — see
+    /// docs/decisions.md D12). All escaping/truncation of the returned
+    /// markup happens afterwards, in pure Rust (`browser::view_source`) —
+    /// this method only ever hands back the page's raw, **unescaped**
+    /// source; nothing here renders it.
+    ///
+    /// A no-op — not an error — for an unknown or currently suspended
+    /// `tab_id` (no webview to read from), the same contract every other
+    /// `fetch_*`/`search_in_page` method above uses.
+    pub fn fetch_page_source(&self, tab_id: TabId, page_url: String) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        let proxy = self.proxy.clone();
+        // Issue #29/D68: carry this window's id so the resulting View Source
+        // tab opens in the window the request came from — a `tab_id` alone
+        // cannot say which window, since two windows can share the same
+        // `TabId` value. Same reason `search_in_page` above captures it.
+        let window_id = self.id;
+        webview.evaluate_script_with_callback(VIEW_SOURCE_FETCH_SCRIPT, move |raw| {
+            let html = extract_js_string_result(&raw).unwrap_or_default();
+            let _ = proxy.send_event(UserEvent::ViewSourceReady {
+                window_id,
+                page_url: page_url.clone(),
+                html,
+            });
+        })
+    }
+
     /// This window's own id (Issue #29). Stable for the window's whole
     /// lifetime — see the `id` field's doc comment.
     pub fn id(&self) -> WindowId {
@@ -1787,6 +1841,29 @@ impl BrowserWindow {
         self.window.id()
     }
 }
+
+/// Reads the current page's full markup for View Source (Issue #45, see
+/// docs/decisions.md D72): `document.documentElement.outerHTML`, the same
+/// value a page's own devtools "View Page Source" reproduces. Wrapped in
+/// try/catch like [`RESOLVE_FAVICON_SCRIPT`]: a document in a state this
+/// cannot be read from (should not normally happen) yields an empty string
+/// rather than propagating a JS exception into the
+/// `evaluate_script_with_callback` result.
+///
+/// Deliberately a *live-DOM* snapshot, not a second network fetch of the
+/// original response bytes — see docs/decisions.md D72 for the alternatives
+/// considered (a raw HTTP re-fetch would need a whole separate networking
+/// path wry does not expose, and would show different markup for JS-authored
+/// pages than what is actually on screen) and its accepted trade-off (a page
+/// that mutated its own DOM after load shows the *current* DOM, not the
+/// bytes the server originally sent).
+const VIEW_SOURCE_FETCH_SCRIPT: &str = r#"(() => {
+  try {
+    return document.documentElement.outerHTML;
+  } catch (err) {
+    return "";
+  }
+})();"#;
 
 /// `WebView::evaluate_script_with_callback` hands back the JS result
 /// serialized as a JSON string (see wry's `eval`); unwrap that one layer to
@@ -2830,6 +2907,7 @@ mod tests {
             TOGGLE_BOOKMARK_BAR_MESSAGE,
             NEW_WINDOW_MESSAGE,
             OPEN_FIND_BAR_MESSAGE,
+            VIEW_SOURCE_MESSAGE,
         ] {
             assert!(
                 script.contains(message),
@@ -2886,6 +2964,10 @@ mod tests {
         assert_eq!(
             parse_content_shortcut(OPEN_FIND_BAR_MESSAGE),
             Some(ContentShortcut::OpenFindBar)
+        );
+        assert_eq!(
+            parse_content_shortcut(VIEW_SOURCE_MESSAGE),
+            Some(ContentShortcut::ViewSource)
         );
         for n in 1u8..=8 {
             assert_eq!(
@@ -3009,6 +3091,18 @@ mod tests {
     fn favicon_script_falls_back_to_a_same_origin_guess() {
         assert!(RESOLVE_FAVICON_SCRIPT.contains("link[rel~=\"icon\"]"));
         assert!(RESOLVE_FAVICON_SCRIPT.contains("/favicon.ico"));
+    }
+
+    // --- View Source (Issue #45), see docs/decisions.md D72 ---
+
+    #[test]
+    fn view_source_fetch_script_reads_outer_html_and_is_exception_safe() {
+        assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("document.documentElement.outerHTML"));
+        // Wrapped in try/catch, like RESOLVE_FAVICON_SCRIPT, so a page whose
+        // DOM cannot be read from yields "" instead of propagating a JS
+        // exception through `evaluate_script_with_callback`.
+        assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("try {"));
+        assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("catch"));
     }
 
     /// The embedded logo must stay decodable into the 8-bit RGBA layout the
