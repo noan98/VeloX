@@ -170,12 +170,15 @@ impl GeneralSettings {
     }
 }
 
-/// Chrome theme: only affects VeloX's own toolbar/tab-strip UI
-/// (`ui/toolbar.html`), never web page content — a page's own
-/// `prefers-color-scheme` is entirely up to the OS/engine, which wry 0.56
-/// exposes no per-webview override for. `System` (the default) keeps
-/// today's behavior (the toolbar's existing `@media (prefers-color-scheme:
-/// dark)` rule) unchanged for anyone who never opens the settings screen.
+/// Chrome theme: only affects VeloX's own UI (`ui/toolbar.html`'s
+/// toolbar/tab-strip/bookmark-bar/panels, and — since Issue #31, see
+/// docs/decisions.md D71 — the native window decorations `tao` draws around
+/// it), never web page content — a page's own `prefers-color-scheme` is
+/// entirely up to the OS/engine, which wry 0.56 exposes no per-webview
+/// override for. `System` (the default) keeps today's behavior (the
+/// toolbar's existing `@media (prefers-color-scheme: dark)` rule, and
+/// `tao`'s own default of auto-tracking the OS theme for the window frame)
+/// unchanged for anyone who never opens the settings screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Theme {
@@ -195,6 +198,48 @@ impl Theme {
             Theme::Light => "light",
             Theme::Dark => "dark",
         }
+    }
+}
+
+/// A concrete (never "follow the OS") light/dark theme — what
+/// [`native_window_theme`] resolves a [`Theme`] setting to when a surface
+/// needs an actual answer rather than a further layer of "system" deferral.
+/// A small mirror of `tao::window::Theme`'s two variants: `browser::` must
+/// not depend on `tao` (see docs/architecture.md's four-layer split), so
+/// `ui::window` is what converts this to the real `tao::window::Theme` at
+/// the one call site that needs it
+/// (`ui::window::BrowserWindow::set_theme`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedTheme {
+    Light,
+    Dark,
+}
+
+/// What a UI surface that can only be told "explicit light/dark, or defer to
+/// the OS yourself" — exactly the shape of `tao::window::Window::
+/// set_theme(Option<tao::window::Theme>)` — should be given for a
+/// [`Theme`] setting (Issue #31, see docs/decisions.md D71).
+///
+/// `None` for [`Theme::System`] is deliberate, not a missing case: `tao`'s
+/// `WindowBuilder` already defaults every window's `preferred_theme` to
+/// `None`, which makes it auto-track the OS theme for the whole lifetime of
+/// the window (reacting to a live OS theme change with no polling needed —
+/// see `docs/decisions.md` D71 for the `tao` 0.37 source references this
+/// claim is based on). VeloX does not need to *resolve* "what is the OS
+/// theme right now" itself to keep that behavior; it only needs to get out
+/// of the way by passing `None` through whenever the user has not
+/// overridden it. [`Theme::Light`]/[`Theme::Dark`] map straight across as an
+/// explicit override — the same two states [`Theme::as_str`] already
+/// pushes into the toolbar's own `data-velox-theme` attribute, now also
+/// applied to the window frame itself so the two never disagree (previously
+/// an explicit Light/Dark choice only ever reached the in-page toolbar,
+/// leaving the OS-drawn title bar tracking the OS regardless — the concrete
+/// gap this function closes).
+pub fn native_window_theme(theme: Theme) -> Option<ResolvedTheme> {
+    match theme {
+        Theme::System => None,
+        Theme::Light => Some(ResolvedTheme::Light),
+        Theme::Dark => Some(ResolvedTheme::Dark),
     }
 }
 
@@ -854,6 +899,32 @@ mod tests {
             assert_eq!(json, format!("\"{}\"", theme.as_str()));
             let parsed: Theme = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, theme);
+        }
+    }
+
+    // --- native_window_theme (Issue #31, D71) ---
+
+    #[test]
+    fn native_window_theme_defers_to_the_os_for_system() {
+        // `None` here is what tells `tao::window::Window::set_theme` to keep
+        // auto-tracking the OS theme itself — see the doc comment.
+        assert_eq!(native_window_theme(Theme::System), None);
+    }
+
+    #[test]
+    fn native_window_theme_maps_light_and_dark_straight_across() {
+        assert_eq!(
+            native_window_theme(Theme::Light),
+            Some(ResolvedTheme::Light)
+        );
+        assert_eq!(native_window_theme(Theme::Dark), Some(ResolvedTheme::Dark));
+    }
+
+    #[test]
+    fn native_window_theme_is_a_pure_function_of_its_input() {
+        // Same input, same output, every time — no hidden clock/OS query.
+        for theme in [Theme::System, Theme::Light, Theme::Dark] {
+            assert_eq!(native_window_theme(theme), native_window_theme(theme));
         }
     }
 }

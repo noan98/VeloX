@@ -43,7 +43,18 @@
      `@media` rules above decide, unchanged from before this setting
      existed. An attribute selector always outranks the plain `:root`
      `@media` rule above by specificity, regardless of source order, so
-     this works the same whichever the OS preference is. */
+     this works the same whichever the OS preference is.
+
+     Includes the `--private-*` variables (Issue #31, see docs/decisions.md
+     D71): before this issue only the plain `:root`/`@media` rules above
+     defined them, so an explicit Light/Dark override left a Private Window
+     always showing the *OS's* private colors instead of the theme the user
+     actually picked — the "an explicit choice must reach every surface,
+     not just the non-private ones" bug this issue's "UI全体でテーマが統一
+     される" acceptance criterion calls out. `--private-badge-*` is
+     intentionally absent from both blocks below: its values are identical
+     between light and dark in the rules above, so there is nothing to
+     override. */
   :root[data-velox-theme="light"] {
     --bg: #f3f3f5;
     --fg: #1c1c1e;
@@ -52,6 +63,10 @@
     --row-hover: rgba(128, 128, 128, 0.12);
     --border: #d0d0d5;
     --tab-bg: #e3e3e8;
+    --private-bg: #2d1b4e;
+    --private-fg: #ece6fb;
+    --private-field-bg: #241542;
+    --private-border: #5c3f94;
   }
   :root[data-velox-theme="dark"] {
     --bg: #2b2b2e;
@@ -61,6 +76,10 @@
     --row-hover: rgba(255, 255, 255, 0.08);
     --border: #47474c;
     --tab-bg: #38383c;
+    --private-bg: #1f1338;
+    --private-fg: #ece6fb;
+    --private-field-bg: #170e29;
+    --private-border: #4a3470;
   }
   html, body {
     margin: 0;
