@@ -858,7 +858,147 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
 }
 
 // ---------------------------------------------------------------------
-// 7. The `mark` command cuts warm-up out of the aggregated numbers
+// 7. Session restore (Issue #25): a saved session survives a real second
+//    launch of the binary, and a restored background tab is genuinely
+//    suspended (rebuilds its webview through the ordinary resume path).
+// ---------------------------------------------------------------------
+
+/// Guarantees, across two real, separate launches of `velox` sharing the
+/// same `VELOX_DATA_DIR`:
+///
+/// - The first launch's `session.json` (`browser::persistence::
+///   load_session`) records both open tabs, in order, with the correct
+///   `active_index` — not just that *a* file was written (already covered
+///   for `history.json`/`bookmarks.json` by
+///   `visiting_pages_persists_history_json`), but that its content matches
+///   what was actually open.
+/// - The second launch, with `VELOX_RESTORE_SESSION=1` and a *different*
+///   `VELOX_HOMEPAGE` than anything in the saved session, loads the
+///   previously active tab's own URL instead of the configured homepage
+///   (`page_load` for it, never for the homepage) — this is the
+///   `ui::window::BrowserWindow::new` fix this issue made (the initial
+///   webview used to always load `config.homepage`, ignoring a restored
+///   tab's real URL).
+/// - The other restored tab starts genuinely suspended, not merely
+///   "not yet opened": switching to it is reported as `tab_resume` (via
+///   the exact same automatic-suspension resume path D56 already uses),
+///   and it reloads *its own* URL, not the homepage either.
+#[test]
+fn restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch() {
+    skip_without_gui!("restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("session-restore");
+    let data_dir = dir.join("data");
+    let home = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+    // Deliberately unrelated to anything in the saved session: if this
+    // shows up as a `page_load` in the second launch, restore did not
+    // actually take priority over `VELOX_HOMEPAGE`.
+    let unused_homepage = fixture_url("dom_heavy.html");
+
+    // --- Launch 1: open a second tab, then quit — no `restore` setting
+    //     needed here (there is nothing to restore from yet). ---
+    let perf_output_1 = dir.join("perf1.jsonl");
+    let script_1 = format!("wait 800\nopen {page_a}\nwait 600\nquit\n");
+    let script_path_1 = write_script(&dir, &script_1);
+    let launch_1 = launch_and_wait(
+        &perf_output_1,
+        &data_dir,
+        &home,
+        &script_path_1,
+        Duration::from_secs(30),
+    );
+    let Some(status_1) = launch_1.exit_status else {
+        panic!(
+            "velox (launch 1) did not exit on its own within 30s: {:?}",
+            launch_1.perf_records
+        );
+    };
+    assert!(
+        status_1.success(),
+        "launch 1 exited abnormally: {status_1:?}"
+    );
+
+    let snapshot = persistence::load_session(&data_dir)
+        .expect("session.json should have been written and parse after launch 1");
+    assert_eq!(
+        snapshot
+            .tabs
+            .iter()
+            .map(|t| t.url.as_str())
+            .collect::<Vec<_>>(),
+        vec![home.as_str(), page_a.as_str()],
+        "the saved session should list both tabs in the order they were opened"
+    );
+    assert_eq!(
+        snapshot.active_index, 1,
+        "`page_a` (opened last) should be the active tab in the saved session"
+    );
+
+    // --- Launch 2: restore is on, and the homepage is a third, unrelated
+    //     page that must never actually load. ---
+    let perf_output_2 = dir.join("perf2.jsonl");
+    // `switch 0` targets the restored `home` tab, which must start
+    // suspended for this to exercise a resume rather than a plain switch.
+    let script_2 = "wait 800\nswitch 0\nwait 800\nquit\n";
+    let script_path_2 = write_script(&dir, script_2);
+    // `write_script` always writes to the same `script.txt` inside `dir`;
+    // launch 1 already consumed its own copy, so this just overwrites it
+    // with the second script before launch 2 reads it.
+    let launch_2 = launch_and_wait_with(
+        &perf_output_2,
+        &data_dir,
+        &unused_homepage,
+        &script_path_2,
+        Duration::from_secs(30),
+        &[("VELOX_RESTORE_SESSION", Path::new("1"))],
+        None,
+    );
+    let Some(status_2) = launch_2.exit_status else {
+        panic!(
+            "velox (launch 2) did not exit on its own within 30s: {:?}",
+            launch_2.perf_records
+        );
+    };
+    assert!(
+        status_2.success(),
+        "launch 2 exited abnormally: {status_2:?}"
+    );
+
+    let records_2 = &launch_2.perf_records;
+    assert!(
+        events_named(records_2, "page_load")
+            .all(|r| r["url"].as_str() != Some(unused_homepage.as_str())),
+        "the configured homepage must never load once a session was restored: {records_2:?}"
+    );
+    assert!(
+        events_named(records_2, "page_load").any(|r| r["url"].as_str() == Some(page_a.as_str())),
+        "the restored active tab (page_a) should reload on startup: {records_2:?}"
+    );
+
+    let resumes: Vec<_> = events_named(records_2, "tab_resume").collect();
+    assert_eq!(
+        resumes.len(),
+        1,
+        "`switch 0` onto the restored, suspended `home` tab must be reported as \
+         `tab_resume`, proving it started genuinely suspended: {records_2:?}"
+    );
+    let resume_ts = resumes[0]["ts_ms"].as_f64().unwrap_or(0.0);
+    assert!(
+        events_named(records_2, "page_load").any(|r| {
+            r["url"].as_str() == Some(home.as_str())
+                && r["ts_ms"].as_f64().unwrap_or(0.0) > resume_ts
+        }),
+        "resuming the restored `home` tab should reload its own (correct) URL \
+         after ts={resume_ts}: {records_2:?}"
+    );
+}
+
+// ---------------------------------------------------------------------
+// 8. The `mark` command cuts warm-up out of the aggregated numbers
 //    (Issue #60).
 // ---------------------------------------------------------------------
 

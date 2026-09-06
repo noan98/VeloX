@@ -15,6 +15,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::session::SavedTab;
 use super::suspension::Candidate;
 use super::tab::{Tab, TabId, TabState};
 
@@ -108,6 +109,70 @@ impl Tabs {
         let id = TabId::from(*next_id);
         *next_id += 1;
         id
+    }
+
+    /// Rebuild a `Tabs` collection from a previous session's snapshot
+    /// (Issue #25 — see docs/decisions.md D65 for the full design). Every
+    /// tab except the one at `active_index` is created directly in
+    /// [`TabState::Suspended`] via [`Tab::new_suspended`] — it never had a
+    /// live webview to suspend from, and starting it suspended means
+    /// `ui::window::BrowserWindow` never builds more than the one webview a
+    /// fresh launch always builds (for the active tab); every other
+    /// restored tab gets its webview lazily, the first time it is
+    /// activated, through the exact same [`Self::activate`]/`resume_tab`
+    /// path an ordinary suspended tab already uses. There is no separate
+    /// "webview regeneration" mechanism for restored tabs — this is the
+    /// point of building `Tabs::restore` on top of `TabState` rather than
+    /// beside it.
+    ///
+    /// Ids are freshly assigned in `saved` order, exactly like [`Self::new`]
+    /// — a restored session's tab ids never try to match whatever the
+    /// previous process happened to assign, which were never part of the
+    /// persisted snapshot in the first place (see `browser::session`).
+    ///
+    /// `saved` is expected to be non-empty with `active_index` in range —
+    /// both already guaranteed by
+    /// `browser::session::SessionSnapshot::sanitize`, the only intended
+    /// caller (`app::run`). Neither is trusted blindly here regardless: an
+    /// out-of-range `active_index` falls back to `0`, and an empty `saved`
+    /// falls back to a single fresh tab at `about:blank` — `Tabs` is never
+    /// empty (see the module doc comment), so this can never construct one
+    /// that is.
+    pub fn restore(saved: &[SavedTab], active_index: usize) -> Self {
+        if saved.is_empty() {
+            return Self::new("about:blank");
+        }
+        let active_index = if active_index < saved.len() {
+            active_index
+        } else {
+            0
+        };
+        let mut next_id = 0;
+        let tabs = saved
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let id = Self::take_id(&mut next_id);
+                let mut tab = if index == active_index {
+                    Tab::new(id, entry.url.clone())
+                } else {
+                    Tab::new_suspended(id, entry.url.clone())
+                };
+                if let Some(title) = &entry.title {
+                    tab.set_title(title.clone());
+                }
+                if let Some(favicon) = &entry.favicon {
+                    tab.set_favicon_url(favicon.clone());
+                }
+                tab
+            })
+            .collect();
+        Tabs {
+            tabs,
+            active: active_index,
+            next_id,
+            closed: ClosedTabs::default(),
+        }
     }
 
     /// Number of open tabs.
@@ -1168,5 +1233,106 @@ mod tests {
         assert_eq!(candidates[0].id, b);
         assert_eq!(candidates[0].process_group, None);
         assert!(candidates[1].active);
+    }
+
+    // -- Issue #25 (D65): Tabs::restore --------------------------------
+
+    fn saved_tab(url: &str) -> SavedTab {
+        SavedTab {
+            url: url.to_owned(),
+            title: None,
+            favicon: None,
+        }
+    }
+
+    #[test]
+    fn restore_makes_only_the_active_tab_live_the_rest_start_suspended() {
+        let saved = vec![
+            saved_tab("https://a.example/"),
+            saved_tab("https://b.example/"),
+            saved_tab("https://c.example/"),
+        ];
+        let tabs = Tabs::restore(&saved, 1);
+
+        assert_eq!(tabs.len(), 3);
+        assert_eq!(tabs.active().current_url(), "https://b.example/");
+        assert_eq!(tabs.active().state(), TabState::Active);
+
+        let states: Vec<TabState> = tabs.iter().map(Tab::state).collect();
+        assert_eq!(
+            states,
+            vec![TabState::Suspended, TabState::Active, TabState::Suspended]
+        );
+    }
+
+    #[test]
+    fn restore_preserves_title_and_favicon() {
+        let saved = vec![SavedTab {
+            url: "https://a.example/".to_owned(),
+            title: Some("A".to_owned()),
+            favicon: Some("https://a.example/favicon.ico".to_owned()),
+        }];
+        let tabs = Tabs::restore(&saved, 0);
+        let tab = tabs.active();
+        assert_eq!(tab.title(), Some("A"));
+        assert_eq!(
+            tab.favicon(),
+            &Favicon::Url("https://a.example/favicon.ico".to_owned())
+        );
+    }
+
+    #[test]
+    fn restore_assigns_fresh_sequential_ids_never_reused_afterwards() {
+        let saved = vec![
+            saved_tab("https://a.example/"),
+            saved_tab("https://b.example/"),
+        ];
+        let mut tabs = Tabs::restore(&saved, 0);
+        let ids = ids(&tabs);
+        assert_eq!(ids[0].get(), 0);
+        assert_eq!(ids[1].get(), 1);
+
+        // Ids keep incrementing normally afterwards.
+        let c = tabs.open("https://c.example/");
+        assert_eq!(c.get(), 2);
+    }
+
+    #[test]
+    fn restore_clamps_an_out_of_range_active_index_to_the_first_tab() {
+        let saved = vec![
+            saved_tab("https://a.example/"),
+            saved_tab("https://b.example/"),
+        ];
+        let tabs = Tabs::restore(&saved, 99);
+        assert_eq!(tabs.active().current_url(), "https://a.example/");
+        assert_eq!(tabs.active().state(), TabState::Active);
+    }
+
+    #[test]
+    fn restore_of_an_empty_list_falls_back_to_a_single_active_tab() {
+        // Should not happen in practice (the caller,
+        // `browser::session::SessionSnapshot::sanitize`, never returns an
+        // empty snapshot), but `Tabs` must never end up empty regardless.
+        let tabs = Tabs::restore(&[], 0);
+        assert_eq!(tabs.len(), 1);
+        assert_eq!(tabs.active().state(), TabState::Active);
+    }
+
+    #[test]
+    fn restored_suspended_tab_resumes_through_the_normal_activation_path() {
+        let saved = vec![
+            saved_tab("https://a.example/"),
+            saved_tab("https://b.example/"),
+        ];
+        let mut tabs = Tabs::restore(&saved, 0);
+        let b = tabs.iter().nth(1).unwrap().id();
+        assert!(tabs.get(b).unwrap().is_suspended());
+
+        let effect = tabs.activate(b);
+
+        assert_eq!(effect, Some(ActivationEffect::Resume));
+        assert_eq!(tabs.active_id(), b);
+        assert!(!tabs.get(b).unwrap().is_suspended());
+        assert!(tabs.get(b).unwrap().is_loading());
     }
 }

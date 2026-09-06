@@ -549,6 +549,29 @@ fn pick_process_group(
         .map(|(group, _)| group)
 }
 
+/// The site-scoped stores [`BrowserWindow::new`] needs, bundled into one
+/// argument.
+///
+/// These three arrived from three separate issues (#17/#21 の `blocklist`、
+/// #22 の `site_exceptions`、#24 の `site_permissions`) and were originally
+/// three separate parameters. Together with `initial_url` (#25) that pushed
+/// `new` past clippy's `too_many_arguments` limit, and the three are always
+/// passed together anyway — every one of them is a policy that must apply
+/// identically to every tab, whenever and however its webview comes into
+/// existence. Bundling them is the same move [`ContentPolicy`] makes one
+/// layer down for [`content_webview_builder`]; this type is the public,
+/// `app.rs`-facing half of it (it deliberately does *not* carry
+/// `content_blocking_enabled`, which `new` derives from `Config` itself).
+pub struct SitePolicies {
+    /// Ad/tracker filter rules content blocking matches against
+    /// (docs/decisions.md D17).
+    pub blocklist: Arc<FilterList>,
+    /// Per-site content-blocking exceptions (Issue #22, D59).
+    pub site_exceptions: Arc<SiteExceptions>,
+    /// Per-origin permission decisions (Issue #24, D60).
+    pub site_permissions: Arc<SitePermissionStore>,
+}
+
 /// The main browser window: the toolbar webview and one content webview per
 /// tab.
 pub struct BrowserWindow {
@@ -651,23 +674,35 @@ pub struct SiteDataClearResult {
 
 impl BrowserWindow {
     /// Create the window, the toolbar webview, and the first tab's content
-    /// webview (bound to `initial_tab`, loading `config.homepage`).
+    /// webview (bound to `initial_tab`, loading `initial_url`).
     ///
-    /// `blocklist` is the ad/tracker filter list content blocking matches
-    /// against (see docs/decisions.md D17); `site_permissions` is the
-    /// per-origin permission store (docs/decisions.md D60). Both are stored
-    /// on `self` so every tab opened later — or rebuilt on resume from
-    /// suspension — is built through the same [`content_webview_builder`]
-    /// with the same policies as the first tab.
+    /// `initial_url` is *not* always `config.homepage`: session restore
+    /// (Issue #25, see docs/decisions.md D65) builds `Tabs` with the
+    /// previously active tab's own `current_url` before `BrowserWindow` is
+    /// ever constructed, and that — not the configured homepage — is what
+    /// the first real webview must load. The ordinary (non-restored) case
+    /// still passes `config.homepage` here, since that is exactly what
+    /// `Tabs::new(config.homepage.clone())` set as the same tab's
+    /// `current_url` too.
+    ///
+    /// `policies` carries the site-scoped stores every tab must share (see
+    /// [`SitePolicies`]). They are stored on `self` so every tab opened
+    /// later — or rebuilt on resume from suspension — is built through the
+    /// same [`content_webview_builder`] with the same policies as the first
+    /// tab.
     pub fn new(
         event_loop: &EventLoopWindowTarget<UserEvent>,
         config: &Config,
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
-        blocklist: Arc<FilterList>,
-        site_exceptions: Arc<SiteExceptions>,
-        site_permissions: Arc<SitePermissionStore>,
+        initial_url: &str,
+        policies: SitePolicies,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let SitePolicies {
+            blocklist,
+            site_exceptions,
+            site_permissions,
+        } = policies;
         // A window-title suffix is a second, independent tell for private
         // mode (docs/decisions.md D14): unlike the toolbar badge it survives
         // being covered by another window in a taskbar/alt-tab switcher.
@@ -782,7 +817,7 @@ impl BrowserWindow {
         let content_blocking_enabled = config.content_blocking_enabled;
         let content_builder = content_webview_builder(
             initial_tab,
-            &config.homepage,
+            initial_url,
             content_rect,
             &proxy,
             WebviewIsolation {

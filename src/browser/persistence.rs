@@ -20,11 +20,13 @@ use serde::Serialize;
 use super::bookmarks::BookmarkStore;
 use super::history::HistoryStore;
 use super::input_history::InputHistoryStore;
+use super::session::SessionSnapshot;
 use super::site_permissions::SitePermissionStore;
 
 const HISTORY_FILE: &str = "history.json";
 const BOOKMARKS_FILE: &str = "bookmarks.json";
 const INPUT_HISTORY_FILE: &str = "input_history.json";
+const SESSION_FILE: &str = "session.json";
 const SITE_PERMISSIONS_FILE: &str = "site_permissions.json";
 
 /// Resolve the directory VeloX stores its history/bookmarks files in.
@@ -119,6 +121,31 @@ pub fn save_site_permissions(dir: &Path, store: &SitePermissionStore) -> std::io
     write_json(dir, &dir.join(SITE_PERMISSIONS_FILE), store)
 }
 
+/// Load the last-saved tab session from `dir` (Issue #25 — see
+/// docs/decisions.md D65). `None` for anything that does not parse into a
+/// well-formed [`SessionSnapshot`]: a missing file (first run, or the
+/// feature was just turned on), an unreadable one, truncated/corrupt JSON,
+/// or JSON of the wrong shape entirely (e.g. a bare array or a number where
+/// an object is expected) — `serde_json` simply fails to deserialize and
+/// [`read_json`] turns that into `None`, same as every other store here.
+/// The caller (`app::run`) still runs this through
+/// [`SessionSnapshot::sanitize`] before trusting it further; this function
+/// only answers "did a session file parse at all".
+pub fn load_session(dir: &Path) -> Option<SessionSnapshot> {
+    read_json(&dir.join(SESSION_FILE))
+}
+
+/// Persist the current tab session to `dir`, creating the directory if
+/// needed. Called after essentially every tab-affecting change (see
+/// `app::persist_session`'s call sites) rather than only at exit, so a
+/// session started before an unclean shutdown (a crash, `kill -9`, a power
+/// loss) still has something recent to restore from next launch — an exit
+/// hook alone would never run in exactly the cases session restore is
+/// supposed to help with.
+pub fn save_session(dir: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
+    write_json(dir, &dir.join(SESSION_FILE), snapshot)
+}
+
 fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
     let data = fs::read_to_string(path).ok()?;
     serde_json::from_str(&data).ok()
@@ -132,6 +159,7 @@ fn write_json<T: Serialize>(dir: &Path, path: &Path, value: &T) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
+    use super::super::session::SavedTab;
     use super::*;
 
     #[test]
@@ -377,6 +405,130 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(SITE_PERMISSIONS_FILE), "not json").unwrap();
         assert_eq!(load_site_permissions(&dir), SitePermissionStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Session (Issue #25, D65) ---
+
+    #[test]
+    fn missing_session_file_loads_as_none() {
+        let dir = unique_temp_dir("velox-persist-session-missing");
+        assert_eq!(load_session(&dir), None);
+    }
+
+    #[test]
+    fn session_round_trips_through_disk() {
+        let dir = unique_temp_dir("velox-persist-session");
+        let snapshot = SessionSnapshot {
+            tabs: vec![
+                SavedTab {
+                    url: "https://a.example/".to_owned(),
+                    title: Some("A".to_owned()),
+                    favicon: None,
+                },
+                SavedTab {
+                    url: "https://b.example/".to_owned(),
+                    title: None,
+                    favicon: Some("https://b.example/favicon.ico".to_owned()),
+                },
+            ],
+            active_index: 1,
+        };
+
+        save_session(&dir, &snapshot).expect("save_session should succeed");
+        let loaded = load_session(&dir);
+        assert_eq!(loaded, Some(snapshot));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_session_file_loads_as_none_not_a_panic() {
+        let dir = unique_temp_dir("velox-persist-session-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(SESSION_FILE), "not json").unwrap();
+        assert_eq!(load_session(&dir), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncated_session_file_loads_as_none() {
+        let dir = unique_temp_dir("velox-persist-session-truncated");
+        fs::create_dir_all(&dir).unwrap();
+        // A well-formed session, chopped off mid-object — simulates a write
+        // interrupted by a crash or power loss.
+        let full = serde_json::to_string(&SessionSnapshot {
+            tabs: vec![SavedTab {
+                url: "https://a.example/".to_owned(),
+                title: Some("A very very very long title indeed".to_owned()),
+                favicon: None,
+            }],
+            active_index: 0,
+        })
+        .unwrap();
+        let truncated = &full[..full.len() / 2];
+        fs::write(dir.join(SESSION_FILE), truncated).unwrap();
+        assert_eq!(load_session(&dir), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_file_of_the_wrong_json_shape_loads_as_none() {
+        let dir = unique_temp_dir("velox-persist-session-wrong-shape");
+        fs::create_dir_all(&dir).unwrap();
+        // A bare array/number/string instead of the expected object.
+        for wrong in ["[1,2,3]", "42", "\"hello\"", "null"] {
+            fs::write(dir.join(SESSION_FILE), wrong).unwrap();
+            assert_eq!(load_session(&dir), None, "input was {wrong:?}");
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_file_with_wrong_field_types_loads_as_none() {
+        let dir = unique_temp_dir("velox-persist-session-wrong-types");
+        fs::create_dir_all(&dir).unwrap();
+        // `active_index` as a string, `tabs` as an object instead of an
+        // array — both should fail to deserialize rather than panicking or
+        // silently coercing into something unintended.
+        fs::write(
+            dir.join(SESSION_FILE),
+            r#"{"tabs":"not-an-array","active_index":"zero"}"#,
+        )
+        .unwrap();
+        assert_eq!(load_session(&dir), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn very_large_session_file_still_round_trips() {
+        // "巨大なファイル" from the issue's acceptance criteria — a session
+        // with many tabs must not fail to load or blow up memory unusually;
+        // `serde_json` streams through `fs::read_to_string` just like every
+        // other store here, so this exercises that path at a size no real
+        // user session would ever reach.
+        let dir = unique_temp_dir("velox-persist-session-large");
+        let tabs: Vec<SavedTab> = (0..20_000)
+            .map(|i| SavedTab {
+                url: format!("https://{i}.example/"),
+                title: Some(format!("Tab {i}")),
+                favicon: None,
+            })
+            .collect();
+        let snapshot = SessionSnapshot {
+            tabs,
+            active_index: 10_000,
+        };
+
+        save_session(&dir, &snapshot).expect("save_session should succeed");
+        let loaded = load_session(&dir).expect("a large well-formed file should still load");
+        assert_eq!(loaded.tabs.len(), 20_000);
+        assert_eq!(loaded.active_index, 10_000);
 
         fs::remove_dir_all(&dir).ok();
     }
