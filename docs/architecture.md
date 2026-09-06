@@ -930,6 +930,42 @@ This exists mainly so `velox-bench run --url <URL>` can point a benchmark
 trial at a fixed local fixture instead of a network-dependent page; see
 docs/benchmarking.md.
 
+## Print / PDF export
+
+Status: implemented (Issue #40, see docs/decisions.md D75 for the full
+investigation). Ctrl/Cmd+P (`ui::window::BrowserWindow::print_tab`) calls
+`wry::WebView::print()` — a stable, safe, public method the base `WebView`
+type exposes on every platform, needing no `unsafe` and no new dependency —
+which opens each OS's own native print UI: a GTK print dialog on Linux, an
+`NSPrintOperation` modal on macOS, and Chromium's own print preview
+(`window.print()`) on Windows. All three include a "save as PDF"
+destination of their own, which is how "PDFとして保存" is satisfied on every
+platform without VeloX writing any file itself.
+
+**Windows also gets a second, headless path**: the toolbar's "PDFとして
+保存" button skips the dialog entirely and writes straight to a file via
+`ICoreWebView2_7::PrintToPdf` (`ui::webview2_print`, `#[cfg(windows)]`),
+reached the same way D59/D66/D69 reach WebView2 internals
+(`wry::WebViewExtWindows::webview()`/`environment()`). `browser::print`
+holds the pure, UI/engine-independent settings shape
+(`PdfExportSettings`: paper size/orientation/margins/scale/backgrounds,
+each with a `sanitize()` clamping step) and `suggest_pdf_filename`; the
+destination directory and final filename reuse `browser::downloads`'
+existing `resolve_download_dir_with_override`/`prepare_destination`
+wholesale rather than re-deriving either. macOS/Linux have no equivalent
+headless API reachable through wry's safe surface (confirmed, not merely
+unimplemented — see D75), so `BrowserWindow::export_tab_as_pdf` answers
+`PdfExportRequest::UnsupportedPlatform` there and the caller points the
+user at the print dialog instead — the CLAUDE.md "Windows first, other OSes
+minimal" policy applied to this issue.
+
+A shared print-status banner (`#print-status` in the toolbar, pushed via
+`BrowserWindow::set_print_status`) surfaces both a `print_tab` dispatch
+failure and the PDF export's async result
+(`UserEvent::PdfExportFinished`) — see D75 for the honest caveat that only
+the PDF-export path can report a *real* print failure; `wry::WebView::
+print()` gives no completion signal on any of the three platforms.
+
 ## Performance extension points
 
 Implemented in `browser::metrics` (see D16/D19 in `docs/decisions.md`),
