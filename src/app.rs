@@ -220,6 +220,27 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     let blocklist = Arc::new(build_blocklist(&config));
     let site_exceptions = Arc::new(build_site_exceptions(&config));
 
+    // Resolved here (rather than down with `history`/`bookmarks`/
+    // `input_history` below) because `site_permissions` — unlike those
+    // three — must exist before `BrowserWindow::new` builds the first
+    // tab's content webview: its `with_permission_handler` wiring
+    // (docs/decisions.md D60) needs the store from the very first
+    // permission request, not just from whenever `AppState` gets around to
+    // loading it.
+    let data_dir = persistence::default_data_dir();
+    if data_dir.is_none() {
+        eprintln!(
+            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
+             history, bookmarks, and site permissions will not be saved this session"
+        );
+    }
+    let site_permissions = Arc::new(
+        data_dir
+            .as_deref()
+            .map(persistence::load_site_permissions)
+            .unwrap_or_default(),
+    );
+
     let tabs = Tabs::new(config.homepage.clone());
     let mut window = BrowserWindow::new(
         &event_loop,
@@ -228,6 +249,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         tabs.active_id(),
         blocklist,
         site_exceptions,
+        site_permissions,
     )?;
     if let Some(startup) = startup.as_mut() {
         startup.mark_window_created(Instant::now());
@@ -259,13 +281,6 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     // other's start times.
     let mut page_load_timers: HashMap<TabId, metrics::PageLoadTimer> = HashMap::new();
 
-    let data_dir = persistence::default_data_dir();
-    if data_dir.is_none() {
-        eprintln!(
-            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
-             history and bookmarks will not be saved this session"
-        );
-    }
     let history = data_dir
         .as_deref()
         .map(persistence::load_history)
