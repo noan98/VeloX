@@ -1,0 +1,121 @@
+name: Release (Linux)
+
+# Linux 向けの最小限のリリースビルド。`release-windows.yml` と同じ 2 つの
+# 起動方法:
+#
+# 1. workflow_dispatch — GitHub の Actions タブから「Run workflow」を押す
+#    (どのブランチでも可)。成果物は Actions の実行ページの Artifacts
+#    (`velox-linux-x86_64`) からダウンロードする。
+# 2. `v*` タグの push (例: `git tag v0.1.0 && git push origin v0.1.0`)。
+#    上記に加えて GitHub Release に tar.gz を添付する (release-windows.yml
+#    と同じタグで動くため、同じ Release に Windows の zip と並んで追加
+#    される)。
+#
+# スコープはあえて狭くしてある (Issue #41 / docs/decisions.md D70):
+# AppImage・deb 等のネイティブパッケージ化は行わず、実行ファイル一式を
+# 固めた tar.gz のみを作る。CLAUDE.md の OS 優先度方針 (Windows 最優先、
+# Linux/macOS は「ビルドが通り既存機能を壊さない」最低限の整備) に従い、
+# ネイティブパッケージ形式の検討・実装はここでは行わない。
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - "v*"
+  # この workflow 自身を変更する PR では実際にビルドして検証する
+  # (release-windows.yml と同じ理由 — workflow_dispatch は main に
+  # マージされるまで Actions タブに現れない)。
+  pull_request:
+    paths:
+      - ".github/workflows/release-linux.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write # タグ push 時に GitHub Release へ添付するため
+
+jobs:
+  build-linux:
+    name: Build release (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install WebKitGTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # release-windows.yml と同じ理由: タグと Cargo.toml の version が
+      # ずれたまま Release を作らないようにする。
+      - name: Verify tag matches Cargo.toml version (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          cargo_version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          if [ "$tag_version" != "$cargo_version" ]; then
+            echo "::error::tag v$tag_version does not match Cargo.toml version $cargo_version"
+            exit 1
+          fi
+          echo "tag v$tag_version matches Cargo.toml version $cargo_version"
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      # velox には `--help` のような「ウィンドウを開かずに終了する」引数が
+      # 無いため、ここではビルド成果物の存在とサイズだけを確認する
+      # (release-windows.yml と同じ方針)。
+      - name: Verify build outputs
+        run: |
+          set -euo pipefail
+          for exe in velox velox-bench; do
+            path="target/release/$exe"
+            if [ ! -f "$path" ]; then
+              echo "::error::missing: $path"
+              exit 1
+            fi
+            size=$(stat -c%s "$path")
+            if [ "$size" -lt 102400 ]; then
+              echo "::error::suspiciously small: $path ($size bytes)"
+              exit 1
+            fi
+            echo "$exe : $size bytes"
+          done
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
+          name="velox-$version-linux-x86_64"
+          mkdir -p "dist/$name"
+          cp target/release/velox target/release/velox-bench README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: velox-linux-x86_64
+          path: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Create GitHub Release (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/${{ steps.package.outputs.name }}.tar.gz
+            dist/${{ steps.package.outputs.name }}.tar.gz.sha256
+          generate_release_notes: true

@@ -11,6 +11,11 @@ name: Release (Windows)
 # Linux 用の CI (`ci.yml`) と違い、Windows は追加のシステム依存が無い
 # (WebView2 は Windows 11 / 近年の Windows 10 に同梱)。ビルドは
 # `Cargo.toml` の `[profile.release]` (thin LTO + strip) をそのまま使う。
+#
+# Linux 向けの同種の workflow は `release-linux.yml` (最小限のビルド済み
+# tarball のみ、AppImage/deb 等のネイティブパッケージ化は対象外)。
+# macOS は対象外 (Issue #41 / docs/decisions.md D70 参照 — CLAUDE.md の
+# OS 優先度方針に従い、本格対応は品質担保後に着手する)。
 on:
   workflow_dispatch: {}
   push:
@@ -40,6 +45,22 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # タグ push 時、`Cargo.toml` の version と一致しないタグで release を
+      # 作ってしまうと、GitHub Release のタグ名と zip 内のファイル名/
+      # `Cargo.toml` の version 表示がずれる (タグを打つ前に version を
+      # 上げ忘れた場合に起こりうる)。ここで早期に失敗させ、
+      # 「タグから再現可能なビルド」の一貫性を保証する。
+      - name: Verify tag matches Cargo.toml version (tag push only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          $cargoVersion = (cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages[0].version
+          if ($tagVersion -ne $cargoVersion) {
+            throw "tag v$tagVersion does not match Cargo.toml version $cargoVersion"
+          }
+          "tag v$tagVersion matches Cargo.toml version $cargoVersion"
 
       - name: Build (release)
         run: cargo build --release --locked
