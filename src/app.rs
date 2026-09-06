@@ -229,10 +229,11 @@ pub enum UserEvent {
 ///
 /// **Multi-window (Issue #29, D68)**: `windows` replaces what used to be a
 /// single `tabs: Tabs` field — every other field here (`history`,
-/// `bookmarks`, `input_history`, `downloads`, `history_enabled`, `perf`)
-/// stays whole-process/shared across every window, matching D14's "private
-/// browsing is a whole-app mode" decision; see D68 for the extension path
-/// once #27 (private windows) needs any of these to become per-window.
+/// `bookmarks`, `input_history`, `downloads`, `perf`) stays whole-process/
+/// shared across every window; only whether a given window's activity is
+/// *recorded* into them is now per-window (Issue #27, D74 — see
+/// [`window_is_private`], which replaced a single whole-process
+/// `history_enabled` bool once two windows could disagree on privacy).
 struct AppState {
     windows: Windows,
     /// The first window opened at startup (Issue #29/D68). Session
@@ -261,23 +262,16 @@ struct AppState {
     history: HistoryStore,
     bookmarks: BookmarkStore,
     /// Previously-submitted search queries (Issue #20) — see
-    /// docs/decisions.md D38. Gated by `history_enabled` for recording the
-    /// same way `history`/`bookmarks` are, but — like `history` — still
-    /// read from for candidates in private mode; see
-    /// `record_input_history_if_enabled` and D39.
+    /// docs/decisions.md D38. Gated by [`window_is_private`] for recording
+    /// the same way `history`/`bookmarks` are, but — like `history` — still
+    /// read from for candidates regardless of privacy; see
+    /// `record_input_history_if_enabled` and D39/D74.
     input_history: InputHistoryStore,
     /// Where `history`/`bookmarks`/`input_history` are persisted; `None`
     /// when no data directory could be resolved (see
     /// `persistence::default_data_dir`), in which case all three stores
     /// stay in-memory only for this run.
     data_dir: Option<PathBuf>,
-    /// Single choke point for whether page visits are written to
-    /// `history`. Mirrors `Config::private` for the life of the process
-    /// (whole-app private browsing, see docs/decisions.md D14); a
-    /// per-window/per-tab notion can set it dynamically once that concept
-    /// exists — see `record_visit_if_enabled` below and docs/decisions.md
-    /// D13.
-    history_enabled: bool,
     /// Tab-create/switch latency logging (Issue #13). `None` when
     /// `config.perf_metrics` is off, in which case `record_tab_latency`
     /// below is a single `Option::is_none` check — no extra `Instant::now()`
@@ -300,8 +294,8 @@ struct AppState {
     /// startup (`Config::apply_settings`, in `run` below, before
     /// `BrowserWindow::new`); this copy is what the settings screen itself
     /// reads from and writes back to (`refresh_settings_panel`,
-    /// `apply_updated_settings`). Whole-process, like `history_enabled`
-    /// (D14) — every window's settings screen shows and edits the same
+    /// `apply_updated_settings`). Whole-process, unlike per-window privacy
+    /// (D74) — every window's settings screen shows and edits the same
     /// value; see D68's multi-window/#30 integration for why appearance
     /// changes are pushed to every open window, not just the one whose
     /// settings screen made the change.
@@ -468,7 +462,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // tab at the homepage otherwise. Every window opened later (Ctrl/Cmd+N)
     // always starts fresh at the homepage; multi-window session restore is
     // out of this issue's scope (see D68).
-    let mut windows = Windows::new(config.homepage.clone());
+    let mut windows = Windows::new_with_privacy(config.homepage.clone(), config.private);
     let primary_id = match restored_session {
         Some(snapshot) => {
             // Replace the placeholder window `Windows::new` just made above
@@ -506,6 +500,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         initial_tab,
         &initial_url,
         site_policies.clone(),
+        config.private,
     )?;
     // Every open native window, keyed by the same `browser::WindowId`
     // `windows: Windows` above uses for its logical (tab-owning) half — see
@@ -591,7 +586,6 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         bookmarks,
         input_history,
         data_dir,
-        history_enabled: !config.private,
         perf: perf_log
             .clone()
             .map(|log| PerfContext { process_start, log }),
@@ -1161,6 +1155,22 @@ fn handle_user_event(
                     state,
                     config,
                     homepage,
+                    config.private,
+                );
+            }
+            // Issue #27/D74: same interception as `NewWindow` above, `true`
+            // instead of `config.private` — a private window is opened
+            // regardless of whether the process itself was launched
+            // private.
+            Ok(ToolbarCommand::NewPrivateWindow) => {
+                open_new_window(
+                    target,
+                    window_event_proxy,
+                    ui_windows,
+                    state,
+                    config,
+                    homepage,
+                    true,
                 );
             }
             // See this function's doc comment, and `apply_updated_settings`'s:
@@ -1291,10 +1301,13 @@ fn handle_user_event(
                 // synthetic, address-bar-unfriendly base64 blob with no real
                 // "site" behind it to revisit; recording it would only
                 // pollute history/the omnibox with a huge unreadable string.
+                //
+                // `record_visit_if_enabled` itself skips a private window
+                // (Issue #27, D74), so both exclusions compose here.
                 let history_id = if url.starts_with("data:") {
                     None
                 } else {
-                    record_visit_if_enabled(state, &url, config.history_max_entries)
+                    record_visit_if_enabled(state, window_id, &url, config.history_max_entries)
                 };
                 if history_id.is_some() {
                     persist_history(state);
@@ -1403,6 +1416,21 @@ fn handle_user_event(
                 state,
                 config,
                 homepage,
+                config.private,
+            );
+            let _ = window_id; // Unused: opening a window needs no source tab.
+        }
+        // Issue #27/D74: same interception as `NewWindow` above, `true`
+        // instead of `config.private`.
+        UserEvent::ContentShortcut(window_id, ContentShortcut::NewPrivateWindow) => {
+            open_new_window(
+                target,
+                window_event_proxy,
+                ui_windows,
+                state,
+                config,
+                homepage,
+                true,
             );
             let _ = window_id; // Unused: opening a window needs no source tab.
         }
@@ -1465,6 +1493,23 @@ fn handle_user_event(
                 state,
                 config,
                 homepage,
+                config.private,
+            ) {
+                *automation_window = new_id;
+            }
+        }
+        // Issue #27/D74: same interception as `NewWindow` above, `true`
+        // instead of `config.private` — lets an automation script (and this
+        // crate's integration tests) drive the private-window path.
+        UserEvent::Automation(AutomationCommand::NewPrivateWindow) => {
+            if let Some(new_id) = open_new_window(
+                target,
+                window_event_proxy,
+                ui_windows,
+                state,
+                config,
+                homepage,
+                true,
             ) {
                 *automation_window = new_id;
             }
@@ -1560,6 +1605,19 @@ fn handle_user_event(
 /// (the `Windows` entry `open_window` just created is removed again) rather
 /// than taking the whole process down or leaving an orphaned logical window
 /// with no `BrowserWindow` behind it.
+///
+/// `private` decides the new window's own privacy (Issue #27, D74) —
+/// `ToolbarCommand::NewWindow`/`ContentShortcut::NewWindow`/
+/// `AutomationCommand::NewWindow` (Ctrl/Cmd+N) pass `config.private` through
+/// unchanged (so a `--private`-launched process keeps opening private
+/// windows, exactly as before this issue), while their
+/// `NewPrivateWindow`/`new_private_window` counterparts (Ctrl/Cmd+Shift+N)
+/// always pass `true` regardless of `config.private`. Threaded into both
+/// `browser::Windows::open_window_with_privacy` (the logical half —
+/// gates history/input-history recording and session persistence, see
+/// `window_is_private`) and `ui::window::BrowserWindow::new` (the engine
+/// half — `.with_incognito`/ephemeral `WebContext`, see docs/decisions.md
+/// D15) with the same value, since the two must always agree.
 fn open_new_window(
     target: &EventLoopWindowTarget<UserEvent>,
     window_event_proxy: &EventLoopProxy<UserEvent>,
@@ -1567,8 +1625,11 @@ fn open_new_window(
     state: &mut AppState,
     config: &Config,
     url: &str,
+    private: bool,
 ) -> Option<WindowId> {
-    let window_id = state.windows.open_window(url.to_owned());
+    let window_id = state
+        .windows
+        .open_window_with_privacy(url.to_owned(), private);
     let tab_id = state
         .windows
         .tabs(window_id)
@@ -1582,6 +1643,7 @@ fn open_new_window(
         tab_id,
         url,
         state.site_policies.clone(),
+        private,
     ) {
         Ok(window) => {
             // Issue #30/D67, integrated with multi-window in D68: settings
@@ -1637,7 +1699,12 @@ fn handle_toolbar_command(
             // docs/decisions.md D38).
             let intent = navigation::classify_input(&input);
             if let Some(Intent::Search(query)) = &intent {
-                record_input_history_if_enabled(state, query, input_history::DEFAULT_MAX_ENTRIES);
+                record_input_history_if_enabled(
+                    state,
+                    window_id,
+                    query,
+                    input_history::DEFAULT_MAX_ENTRIES,
+                );
                 persist_input_history(state);
             }
             match resolve_intent(config, intent) {
@@ -1717,7 +1784,15 @@ fn handle_toolbar_command(
                 "initialize loading state",
                 window.set_loading(tabs_of(state, window_id).active().is_loading()),
             );
-            log_failure("show private indicator", window.set_private(config.private));
+            // `window.is_private()` — this window's own flag (D74) — not
+            // `config.private`: the latter is process-wide and would show
+            // every window's badge according to whichever window happened
+            // to launch the process, wrong the moment a private and a
+            // normal window coexist.
+            log_failure(
+                "show private indicator",
+                window.set_private(window.is_private()),
+            );
             log_failure(
                 "initialize bookmark bar visibility",
                 window.set_bookmark_bar_visible(window.bookmark_bar_visible()),
@@ -1818,10 +1893,27 @@ fn handle_toolbar_command(
             // search queries, ranked by `browser::ranking` — see
             // docs/decisions.md D36-D39. Both sources read `state.history`/
             // `state.bookmarks`/`state.input_history` as they stand right
-            // now regardless of `state.history_enabled` (private mode
+            // now regardless of this window's own privacy (private mode
             // blocks new *writes* to these stores, not reads of what was
             // already recorded before it started — see D39), so this needs
             // no extra gating of its own.
+            //
+            // **Known gap, Issue #27/D74**: these stores are shared by every
+            // window in the process (unchanged by this issue — see
+            // `AppState`'s doc comment), so a *private* window's omnibox can
+            // surface a history/bookmark/search-query entry a *normal*
+            // window in the same running process recorded moments earlier.
+            // D39's premise ("reads of what was recorded before private mode
+            // started are fine") held when private browsing was whole-app —
+            // there was no concurrently running normal window to leak from —
+            // and no longer fully holds now that the two can coexist. Left
+            // unfixed here: filtering candidates by the querying window's
+            // own privacy would need `window_id` threaded into
+            // `omnibox::build_candidates`/`HistoryBookmarkSource`/
+            // `InputHistorySource`, and a decision on what a private
+            // window's candidates should look like at all (real browsers
+            // typically still show bookmarks in an incognito omnibox, so
+            // this is not simply "read nothing"). See the PR description.
             let now = now_unix();
             let history_bookmark_source = HistoryBookmarkSource {
                 history: &state.history,
@@ -1934,7 +2026,7 @@ fn handle_toolbar_command(
         // here). Listed explicitly, not folded into a wildcard, so a future
         // `ToolbarCommand` variant still fails to compile here instead of
         // silently doing nothing.
-        ToolbarCommand::NewWindow => {}
+        ToolbarCommand::NewWindow | ToolbarCommand::NewPrivateWindow => {}
         ToolbarCommand::UpdateSettings { .. } | ToolbarCommand::ResetSettings => {}
 
         // --- In-page find (Issue #43), see docs/decisions.md D69, and D68's
@@ -2468,7 +2560,7 @@ fn handle_content_shortcut(
         // Intercepted in `handle_user_event` before it ever reaches here —
         // see that function's doc comment (same reason as
         // `ToolbarCommand::NewWindow` in `handle_toolbar_command`).
-        ContentShortcut::NewWindow => {}
+        ContentShortcut::NewWindow | ContentShortcut::NewPrivateWindow => {}
         ContentShortcut::OpenFindBar => open_find_bar(window, window_id, state),
         ContentShortcut::Print => print_active_tab(window, window_id, state),
         ContentShortcut::ViewSource => request_view_source(window, window_id, state),
@@ -2541,7 +2633,7 @@ fn handle_automation_command(
         // scoped to "the current window" in the first place, and changes
         // *which* window `automation_window` points at afterwards. See
         // `browser::AutomationCommand::NewWindow`'s doc comment.
-        AutomationCommand::NewWindow => {}
+        AutomationCommand::NewWindow | AutomationCommand::NewPrivateWindow => {}
     }
 }
 
@@ -2649,7 +2741,7 @@ fn activate_and_refresh(
 /// tab-affecting change already routes through here to keep the tab strip
 /// current. `sync_tab_strip` runs unconditionally (`window.set_tabs` doesn't
 /// care about private mode); `persist_session` below is what actually gates
-/// writing to disk on `history_enabled`/`data_dir`.
+/// writing to disk on this window's own privacy/`data_dir`.
 fn sync_tab_strip(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
     let tabs = tabs_of(state, window_id);
     let active_id = tabs.active_id();
@@ -2684,15 +2776,34 @@ fn sync_block_count(window: &BrowserWindow, tabs: &Tabs) {
     );
 }
 
-/// Record a page visit if history recording is currently enabled.
+/// Whether window `window_id` is private (Issue #27, D74) — the single
+/// choke point [`record_visit_if_enabled`]/[`record_input_history_if_enabled`]/
+/// [`persist_session`] all gate on, replacing what used to be one
+/// process-wide `AppState::history_enabled` bool (see docs/decisions.md
+/// D13/D14/D68). An unknown `window_id` (the window closed before this
+/// check ran, or was never opened — should not happen for a `window_id` a
+/// caller just resolved a live `BrowserWindow`/`Tabs` from, but there is no
+/// need to `expect` it here) defaults to `true` — the safe-by-default
+/// direction, matching `TabId`'s own "a stale id is a no-op" convention:
+/// treating a vanished window as private only ever means "record one fewer
+/// visit than strictly necessary", never the other, much worse way around.
+fn window_is_private(state: &AppState, window_id: WindowId) -> bool {
+    state.windows.is_private(window_id).unwrap_or(true)
+}
+
+/// Record a page visit in window `window_id` if that window's history
+/// recording is currently enabled (Issue #27, D74: private browsing is now
+/// per-window, not whole-app — see [`window_is_private`]).
 ///
 /// This is the single call site page loads flow through on their way into
-/// `state.history` — see the doc comment on [`AppState::history_enabled`].
-/// Adding private browsing later only needs to make `history_enabled`
-/// reflect the active tab/window's private state before this runs; nothing
-/// else in the recording path needs to change.
-fn record_visit_if_enabled(state: &mut AppState, url: &str, max_entries: usize) -> Option<u64> {
-    if !state.history_enabled {
+/// `state.history`.
+fn record_visit_if_enabled(
+    state: &mut AppState,
+    window_id: WindowId,
+    url: &str,
+    max_entries: usize,
+) -> Option<u64> {
+    if window_is_private(state, window_id) {
         return None;
     }
     Some(
@@ -2703,14 +2814,19 @@ fn record_visit_if_enabled(state: &mut AppState, url: &str, max_entries: usize) 
 }
 
 /// Record a submitted search query to `state.input_history`, gated by the
-/// exact same `history_enabled` choke point `record_visit_if_enabled` uses
-/// (Issue #20 — see docs/decisions.md D38/D39: input history is part of
-/// the same privacy surface as page-visit history, so it follows the same
-/// whole-app private-browsing rule — recording is skipped, but entries
-/// recorded before private mode was entered stay readable for candidates,
-/// same as `HistoryStore`).
-fn record_input_history_if_enabled(state: &mut AppState, text: &str, max_entries: usize) {
-    if !state.history_enabled {
+/// exact same per-window privacy check [`record_visit_if_enabled`] uses
+/// (Issue #20/#27 — see docs/decisions.md D38/D39/D74: input history is
+/// part of the same privacy surface as page-visit history, so it follows
+/// the same rule — recording is skipped for a private window, but entries
+/// recorded before that window opened (by any window) stay readable for
+/// candidates, same as `HistoryStore`).
+fn record_input_history_if_enabled(
+    state: &mut AppState,
+    window_id: WindowId,
+    text: &str,
+    max_entries: usize,
+) {
+    if window_is_private(state, window_id) {
         return;
     }
     state.input_history.record(text, now_unix(), max_entries);
@@ -2973,21 +3089,25 @@ fn clear_all_site_data(window: &BrowserWindow) {
 /// eagerly, the same "every mutation writes back to disk" pattern
 /// `persist_history`/`persist_bookmarks` already follow.
 ///
-/// Gated by `history_enabled` — the same whole-app private-browsing choke
-/// point `record_visit_if_enabled` uses (docs/decisions.md D13/D14) — so a
-/// private session never writes what tabs it had open to disk, regardless
-/// of whether `Config::restore_previous_session` is even on; saving is
+/// Gated by [`window_is_private`] — the same per-window choke point
+/// `record_visit_if_enabled` uses (docs/decisions.md D13/D14/D74) — so a
+/// private window never writes what tabs it had open to disk, regardless of
+/// whether `Config::restore_previous_session` is even on; saving is
 /// unconditional otherwise, so turning the setting on later always has a
 /// recent session to restore from. A missing `data_dir` is a silent no-op,
 /// like every other `persist_*` function here.
 ///
 /// **Multi-window (Issue #29/D68)**: only ever writes `window_id ==
-/// state.primary_window`'s tabs — a window opened later (Ctrl/Cmd+N) is
-/// never part of what the next launch restores. See the PR description for
-/// why multi-window session persistence/restore is a follow-up, not part of
-/// this issue.
+/// state.primary_window`'s tabs — a window opened later (Ctrl/Cmd+N or
+/// Ctrl/Cmd+Shift+N) is never part of what the next launch restores. See
+/// docs/decisions.md D68/D74 for why multi-window session persistence/
+/// restore is a follow-up, not part of either issue. In practice this means
+/// the `window_is_private` check below only ever matters when the *primary*
+/// window itself is private (`--private`/`VELOX_PRIVATE` at launch, D74) —
+/// a private window opened later already never reaches here at all, since
+/// it is never `state.primary_window`.
 fn persist_session(state: &AppState, window_id: WindowId) {
-    if window_id != state.primary_window || !state.history_enabled {
+    if window_id != state.primary_window || window_is_private(state, window_id) {
         return;
     }
     if let Some(dir) = &state.data_dir {
@@ -3104,15 +3224,17 @@ mod tests {
         WindowId::from(0)
     }
 
-    /// Build an `AppState` the way `run()` would for a fresh tab, with a
-    /// given `history_enabled` (what `Config::private` drives at startup —
-    /// see docs/decisions.md D13/D14). Single-window (Issue #29's
+    /// Build an `AppState` the way `run()` would for a fresh tab, with its
+    /// one window's history recording set to `history_enabled` (i.e. its
+    /// privacy is `!history_enabled` — what `Config::private` drove at
+    /// startup pre-#27, now a per-window flag on `Windows` itself, see
+    /// docs/decisions.md D13/D14/D74). Single-window (Issue #29's
     /// multi-window-specific behavior — `Windows`, `open_new_window` — is
     /// covered by `browser::windows`'s own unit tests instead; this helper
     /// only needs *a* window to exist for every pre-#29 test below to keep
     /// working unchanged).
     fn state_with_history_enabled(history_enabled: bool) -> AppState {
-        let windows = Windows::new("https://example.com/");
+        let windows = Windows::new_with_privacy("https://example.com/", !history_enabled);
         let primary_window = windows.ids().next().expect("Windows::new opens one window");
         AppState {
             windows,
@@ -3126,7 +3248,6 @@ mod tests {
             bookmarks: BookmarkStore::new(),
             input_history: InputHistoryStore::new(),
             data_dir: None,
-            history_enabled,
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
@@ -3138,7 +3259,7 @@ mod tests {
     #[test]
     fn records_a_visit_when_history_is_enabled() {
         let mut state = state_with_history_enabled(true);
-        let id = record_visit_if_enabled(&mut state, "https://example.com/", 0);
+        let id = record_visit_if_enabled(&mut state, test_window_id(), "https://example.com/", 0);
         assert!(id.is_some());
         assert_eq!(state.history.entries().len(), 1);
     }
@@ -3146,11 +3267,11 @@ mod tests {
     #[test]
     fn private_mode_records_no_visit() {
         // This is the private-browsing invariant from docs/decisions.md
-        // D13/D14: with history recording disabled (as it is for the whole
-        // app when `Config::private` is set), a page load must never reach
+        // D13/D14/D74: with history recording disabled (as it is for a
+        // private window), a page load must never reach
         // `HistoryStore::record_visit`.
         let mut state = state_with_history_enabled(false);
-        let id = record_visit_if_enabled(&mut state, "https://example.com/", 0);
+        let id = record_visit_if_enabled(&mut state, test_window_id(), "https://example.com/", 0);
         assert!(id.is_none());
         assert!(state.history.entries().is_empty());
     }
@@ -3163,24 +3284,160 @@ mod tests {
             "https://b.example/",
             "https://a.example/",
         ] {
-            assert!(record_visit_if_enabled(&mut state, url, 0).is_none());
+            assert!(record_visit_if_enabled(&mut state, test_window_id(), url, 0).is_none());
         }
         assert!(state.history.entries().is_empty());
+    }
+
+    #[test]
+    fn a_private_window_records_no_visit_while_a_normal_window_with_the_same_tab_id_still_does() {
+        // The critical multi-window scenario Issue #27/D74 exists to get
+        // right: a normal window and a private window opened side by side
+        // end up with the same `TabId` (see `browser::windows`'s
+        // `each_window_has_its_own_independent_tab_id_space`), so gating
+        // recording off anything keyed by `TabId` alone (instead of
+        // `WindowId`) would either leak a private visit into `state.history`
+        // or wrongly suppress the normal window's own recording. The #29
+        // PR description names three real bugs of exactly this shape found
+        // in search/settings — this test exists so this issue does not add
+        // a fourth for history/input-history recording.
+        let mut windows = Windows::new("https://normal.example/");
+        let normal_window = windows.ids().next().unwrap();
+        let private_window = windows.open_window_with_privacy("https://private.example/", true);
+        assert_eq!(
+            windows.tabs(normal_window).unwrap().active_id(),
+            windows.tabs(private_window).unwrap().active_id(),
+            "test assumes both windows share a TabId value"
+        );
+
+        let mut state = AppState {
+            windows,
+            primary_window: normal_window,
+            site_policies: SitePolicies {
+                blocklist: Arc::new(FilterList::built_in()),
+                site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
+                site_permissions: Arc::new(crate::browser::SitePermissionStore::new()),
+            },
+            history: HistoryStore::new(),
+            bookmarks: BookmarkStore::new(),
+            input_history: InputHistoryStore::new(),
+            data_dir: None,
+            perf: None,
+            downloads: DownloadStore::new(),
+            pending_memory_sample: None,
+            settings: Settings::default(),
+            site_permissions: Arc::new(SitePermissionStore::new()),
+        };
+
+        let private_id = record_visit_if_enabled(
+            &mut state,
+            private_window,
+            "https://private.example/visited",
+            0,
+        );
+        assert!(
+            private_id.is_none(),
+            "the private window must not record a visit"
+        );
+        let normal_id = record_visit_if_enabled(
+            &mut state,
+            normal_window,
+            "https://normal.example/visited",
+            0,
+        );
+        assert!(
+            normal_id.is_some(),
+            "the normal window sharing the same TabId must still record its visit"
+        );
+        assert_eq!(
+            state
+                .history
+                .entries()
+                .iter()
+                .map(|entry| entry.url.as_str())
+                .collect::<Vec<_>>(),
+            vec!["https://normal.example/visited"],
+            "only the normal window's visit should have reached HistoryStore"
+        );
+
+        // Same story for input history (Issue #20/#27): the private
+        // window's typed query must not reach `input_history`, and the
+        // normal window's must.
+        record_input_history_if_enabled(&mut state, private_window, "private query", 0);
+        record_input_history_if_enabled(&mut state, normal_window, "normal query", 0);
+        let recorded: Vec<&str> = state
+            .input_history
+            .entries()
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect();
+        assert_eq!(recorded, vec!["normal query"]);
     }
 
     #[test]
     fn persist_history_is_a_noop_without_a_data_dir() {
         // Exercises the same "no write happens" path a private session with
         // no data_dir override would take; a data_dir is only ever set from
-        // `persistence::default_data_dir()` in `run()`, unaffected by
-        // `history_enabled` itself, so the write-suppression for private
-        // mode has to come entirely from never producing history entries to
+        // `persistence::default_data_dir()` in `run()`, unaffected by a
+        // window's own privacy, so the write-suppression for private mode
+        // has to come entirely from never producing history entries to
         // persist in the first place (checked above) rather than from
         // `persist_history` deciding not to write.
         let state = state_with_history_enabled(false);
         assert!(state.data_dir.is_none());
         // Should not panic and should not touch the filesystem.
         persist_history(&state);
+    }
+
+    /// A fresh, unique temp directory for a `persist_session` test to write
+    /// into — mirrors `unique_temp_file` below (added for the download
+    /// tests) but for a directory `persistence::save_session` can create
+    /// `session.json` under.
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "velox-app-test-{label}-{:?}-{}",
+            std::thread::current().id(),
+            std::time::SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).expect("create a temp dir for a persist_session test");
+        dir
+    }
+
+    #[test]
+    fn persist_session_skips_a_private_primary_window_but_writes_a_normal_one() {
+        // Issue #27/D74's other acceptance criterion for session
+        // persistence: a process launched with `--private` (so its one and
+        // only, therefore primary, window is private — D68 already
+        // restricts session persistence to the primary window regardless)
+        // must never write `session.json`, exactly like `record_visit_if_enabled`
+        // must never write to `state.history`.
+        let dir = unique_temp_dir("private-session");
+        let mut state = state_with_history_enabled(false); // private == true
+        state.data_dir = Some(dir.clone());
+        let window_id = state.windows.ids().next().unwrap();
+        assert_eq!(window_id, state.primary_window);
+
+        persist_session(&state, window_id);
+        assert!(
+            !dir.join("session.json").exists(),
+            "a private primary window must never write session.json"
+        );
+
+        // Flipping the same window to non-private (a fresh, non-private
+        // `AppState`, same shape otherwise) must write it.
+        let mut normal_state = state_with_history_enabled(true);
+        normal_state.data_dir = Some(dir.clone());
+        let normal_window_id = normal_state.windows.ids().next().unwrap();
+        persist_session(&normal_state, normal_window_id);
+        assert!(
+            dir.join("session.json").exists(),
+            "a normal primary window must still write session.json"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

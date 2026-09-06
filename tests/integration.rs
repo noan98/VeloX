@@ -620,6 +620,102 @@ fn visiting_pages_persists_history_json() {
 }
 
 // ---------------------------------------------------------------------
+// 3b. Private windows (Issue #27, D74): a private window's page visits
+//     never reach history.json, even while a normal window in the same
+//     process keeps recording its own.
+// ---------------------------------------------------------------------
+
+/// Guarantees: `new_private_window` (`AutomationCommand::NewPrivateWindow`)
+/// drives the real private-window path end to end — a second, genuinely
+/// private `ui::window::BrowserWindow` gets built (`app::open_new_window`
+/// with `private: true`) — and, critically, a page visited in *that* window
+/// never reaches `history.json`, while a page visited beforehand in the
+/// first (normal) window still does. This is the concrete, externally
+/// observable version of the acceptance criterion "閲覧履歴がアプリ側に残らない"
+/// (Issue #27): `record_visit_if_enabled`'s own unit tests already
+/// cover the same logic against a bare `AppState` (see
+/// `a_private_window_records_no_visit_while_a_normal_window_with_the_same_tab_id_still_does`
+/// in `src/app.rs`), but only a real second `ui::window::BrowserWindow`
+/// actually built with `.with_incognito(true)` and a real page load through
+/// it proves the full path — construction, navigation, and
+/// `UserEvent::LoadFinished` — wires up the same way outside of a unit test.
+#[test]
+fn a_private_windows_page_visit_never_reaches_history_json() {
+    skip_without_gui!("a_private_windows_page_visit_never_reaches_history_json");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("private-window-history");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let homepage = fixture_url("minimal.html");
+    let normal_page = fixture_url("text.html");
+    let private_page = fixture_url("dom_heavy.html");
+
+    // Window 1 (normal) opens at `homepage`, then navigates to
+    // `normal_page` — both visits should land in history.json. Window 2,
+    // opened private by `new_private_window`, then navigates to
+    // `private_page` — that visit must never appear.
+    let script = format!(
+        "wait 1000\n\
+         navigate {normal_page}\n\
+         wait 700\n\
+         new_private_window\n\
+         wait 500\n\
+         navigate {private_page}\n\
+         wait 700\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+    );
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s with a private window open. Perf records \
+             observed before the forced kill: {:?}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally with a private window open: {status:?}"
+    );
+
+    let history_path = data_dir.join("history.json");
+    assert!(
+        history_path.is_file(),
+        "history.json was not written to {} (the normal window's visits should have created it)",
+        history_path.display()
+    );
+
+    let store = persistence::load_history(&data_dir);
+    let urls: Vec<&str> = store
+        .entries()
+        .iter()
+        .map(|entry| entry.url.as_str())
+        .collect();
+    assert_eq!(
+        urls,
+        vec![homepage.as_str(), normal_page.as_str()],
+        "history.json must contain only the normal window's two visits — the private window's \
+         visit to {private_page:?} must never appear: {:?}",
+        store.entries()
+    );
+    assert!(
+        !urls.contains(&private_page.as_str()),
+        "the private window's page visit leaked into history.json: {:?}",
+        store.entries()
+    );
+}
+
+// ---------------------------------------------------------------------
 // 4. Downloads: one download → one panel entry, saved where VeloX says.
 // ---------------------------------------------------------------------
 
