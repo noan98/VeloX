@@ -202,6 +202,15 @@ pub struct Config {
     /// `VELOX_PRIVATE`/`VELOX_PERF_METRICS`) — see
     /// [`Config::from_env_and_args`].
     pub restore_previous_session: bool,
+    /// Overrides `browser::downloads::resolve_download_dir`'s platform
+    /// default for every download this run (Issue #30's settings screen,
+    /// Downloads tab — see docs/decisions.md D67). `None` keeps today's
+    /// behavior (`VELOX_DOWNLOAD_DIR`, or the platform convention). Not
+    /// settable via an env var of its own — it exists purely as the target
+    /// [`Config::apply_settings`] writes into from a persisted
+    /// `browser::settings::Settings`, applied once at startup like every
+    /// other settings-screen field except Appearance (D67).
+    pub download_dir_override: Option<String>,
 }
 
 impl Default for Config {
@@ -233,6 +242,7 @@ impl Default for Config {
             perf_format: PerfFormat::Text,
             perf_output_path: None,
             restore_previous_session: false,
+            download_dir_override: None,
         }
     }
 }
@@ -365,6 +375,176 @@ impl Config {
             ..defaults
         }
     }
+
+    /// Merge a persisted, user-editable [`browser::settings::Settings`] (the
+    /// settings screen, Issue #30) onto `self`.
+    ///
+    /// Called in `app::run`, right after a *real, already-existing*
+    /// `settings.json` is loaded and [`browser::settings::Settings::sanitize`]d,
+    /// and *before* anything downstream (`BrowserWindow::new`, the
+    /// content-blocking filter list, the suspension policy) reads `self` —
+    /// so every field touched here takes effect starting from the very
+    /// first tab of this run, the same way an equivalent `VELOX_*`
+    /// environment variable already would. This is a one-shot merge, not a
+    /// live binding: a settings change made *during* a run through the
+    /// settings screen only reaches `Config` (and therefore most of what it
+    /// feeds) on the *next* restart — see docs/decisions.md D67 for exactly
+    /// which fields are the exception (`ui::window::BrowserWindow` applies
+    /// Appearance's `theme`/`show_bookmark_bar` immediately, without going
+    /// through `Config` at all).
+    ///
+    /// **Only call this when a `settings.json` actually exists on disk** —
+    /// never with a defaulted [`browser::settings::Settings`] a fresh
+    /// checkout never wrote. Doing so would silently discard every
+    /// `VELOX_*` environment variable/CLI flag [`Config::from_env_and_args`]
+    /// just resolved (they would all read back as "unset" from a
+    /// never-saved `Settings::default()`), which is exactly backwards from
+    /// this issue's "ConfigとUIが適切に分離される" acceptance criterion —
+    /// see [`Config::to_settings`] for the seam that keeps a fresh
+    /// checkout's env-driven `Config` visible to (and preserved by) the
+    /// settings screen instead.
+    ///
+    /// `Settings` already arrives sanitized (a rejected/malformed value
+    /// already repaired to a safe fallback), so this function does no
+    /// validation of its own — it is a plain field-by-field copy, using
+    /// [`resolve_search_engine`] (the same resolution
+    /// [`Config::from_env_and_args`] uses for `VELOX_SEARCH_ENGINE*`) so a
+    /// preset name or a custom name/template pair is turned into a
+    /// [`SearchEngine`] exactly one way, not two independently-maintained
+    /// ones.
+    pub fn apply_settings(&mut self, settings: &crate::browser::settings::Settings) {
+        self.homepage = settings.general.homepage.clone();
+        self.restore_previous_session = settings.general.restore_previous_session;
+        self.search_engine = resolve_search_engine(
+            Some(&settings.search.engine_preset),
+            Some(&settings.search.custom_engine_name),
+            Some(&settings.search.custom_engine_url),
+        );
+        self.content_blocking_enabled = settings.privacy.content_blocking_enabled;
+        self.content_blocking_site_exceptions =
+            settings.privacy.content_blocking_site_exceptions.clone();
+        self.max_tabs_per_web_process = settings.performance.max_tabs_per_web_process;
+        self.suspension = SuspensionPolicy {
+            idle_after: settings
+                .performance
+                .auto_suspend_after_ms
+                .map(Duration::from_millis),
+            max_live_tabs: settings.performance.max_live_tabs,
+            memory_budget_bytes: settings
+                .performance
+                .memory_budget_mb
+                .map(|mib| mib.saturating_mul(1024 * 1024)),
+            memory_check_interval: Duration::from_millis(
+                settings.performance.memory_check_interval_ms,
+            ),
+        };
+        self.download_dir_override = settings.downloads.download_dir_override.clone();
+        self.perf_metrics = settings.advanced.perf_metrics_enabled;
+        self.perf_format = if settings.advanced.perf_format == "json" {
+            PerfFormat::Json
+        } else {
+            PerfFormat::Text
+        };
+        self.perf_output_path = settings.advanced.perf_output_path.clone();
+        self.extra_blocklist_path = settings.advanced.extra_blocklist_path.clone();
+    }
+
+    /// The reverse of [`Config::apply_settings`]: build a
+    /// [`browser::settings::Settings`] that reflects `self`'s *current*
+    /// values, for `app::run` to seed the settings screen with the first
+    /// time it runs with no `settings.json` on disk yet.
+    ///
+    /// Without this, `app::AppState::settings` would start from
+    /// [`browser::settings::Settings::default`] regardless of any
+    /// `VELOX_*` environment variable/CLI flag already in effect for this
+    /// run — the settings screen would show (and, on the first "保存",
+    /// permanently persist) values the user never actually asked for,
+    /// silently discarding whatever got them here. Seeding from `self`
+    /// instead means: open the settings screen before ever saving, and it
+    /// shows exactly what is actually running; click "保存" without
+    /// changing anything, and nothing changes on the next restart either.
+    ///
+    /// `search_engine` is matched back against every built-in preset's own
+    /// value ([`SearchEngine::duckduckgo`] etc.); anything that does not
+    /// match exactly (a custom engine, or a preset this version does not
+    /// list) round-trips as `"custom"` plus its name/template — never lossy
+    /// in a way that would change what the omnibox actually sends a search
+    /// to. `appearance` has no `Config` equivalent (D67 — it never was a
+    /// `Config` field, only ever a settings-screen/`ui::window` one), so it
+    /// always starts at [`browser::settings::AppearanceSettings::default`].
+    pub fn to_settings(&self) -> crate::browser::settings::Settings {
+        use crate::browser::settings::{
+            AdvancedSettings, AppearanceSettings, DownloadsSettings, GeneralSettings,
+            PerformanceSettings, PrivacySettings, SearchSettings, Settings,
+            SETTINGS_SCHEMA_VERSION,
+        };
+
+        let (engine_preset, custom_engine_name, custom_engine_url) =
+            if self.search_engine == SearchEngine::duckduckgo() {
+                ("duckduckgo".to_owned(), String::new(), String::new())
+            } else if self.search_engine == SearchEngine::google() {
+                ("google".to_owned(), String::new(), String::new())
+            } else if self.search_engine == SearchEngine::bing() {
+                ("bing".to_owned(), String::new(), String::new())
+            } else if self.search_engine == SearchEngine::startpage() {
+                ("startpage".to_owned(), String::new(), String::new())
+            } else if self.search_engine == SearchEngine::ecosia() {
+                ("ecosia".to_owned(), String::new(), String::new())
+            } else {
+                (
+                    "custom".to_owned(),
+                    self.search_engine.name.clone(),
+                    self.search_engine.query_template.clone(),
+                )
+            };
+
+        Settings {
+            schema_version: SETTINGS_SCHEMA_VERSION,
+            general: GeneralSettings {
+                homepage: self.homepage.clone(),
+                restore_previous_session: self.restore_previous_session,
+            },
+            appearance: AppearanceSettings::default(),
+            search: SearchSettings {
+                engine_preset,
+                custom_engine_name,
+                custom_engine_url,
+            },
+            privacy: PrivacySettings {
+                content_blocking_enabled: self.content_blocking_enabled,
+                content_blocking_site_exceptions: self.content_blocking_site_exceptions.clone(),
+            },
+            performance: PerformanceSettings {
+                max_tabs_per_web_process: self.max_tabs_per_web_process,
+                auto_suspend_after_ms: self.suspension.idle_after.map(|d| d.as_millis() as u64),
+                max_live_tabs: self.suspension.max_live_tabs,
+                memory_budget_mb: self
+                    .suspension
+                    .memory_budget_bytes
+                    .map(|bytes| bytes / (1024 * 1024)),
+                memory_check_interval_ms: self.suspension.memory_check_interval.as_millis() as u64,
+            },
+            downloads: DownloadsSettings {
+                download_dir_override: self.download_dir_override.clone(),
+            },
+            advanced: AdvancedSettings {
+                perf_metrics_enabled: self.perf_metrics,
+                perf_format: match self.perf_format {
+                    PerfFormat::Json => "json",
+                    PerfFormat::Text => "text",
+                }
+                .to_owned(),
+                perf_output_path: self.perf_output_path.clone(),
+                extra_blocklist_path: self.extra_blocklist_path.clone(),
+            },
+        }
+        // Sanitized regardless: `self` is already a valid `Config`, so this
+        // is expected to be a no-op, but running it keeps the contract
+        // "every `Settings` this codebase hands to the UI/persistence layer
+        // has been through `sanitize`" exceptionless rather than carving
+        // out "except this one, which is already fine" as a special case.
+        .sanitize()
+    }
 }
 
 /// The startup URL, given the raw ingredients (`VELOX_HOMEPAGE`, the CLI
@@ -415,7 +595,7 @@ fn homepage_arg(args: &[String]) -> Option<String> {
 /// hard failure, falling back to the preset (or the default) instead — a
 /// typo'd `VELOX_SEARCH_ENGINE_URL` should never stop the browser from
 /// starting.
-fn resolve_search_engine(
+pub(crate) fn resolve_search_engine(
     preset_raw: Option<&str>,
     custom_name: Option<&str>,
     custom_url: Option<&str>,
@@ -545,6 +725,7 @@ fn resolve_content_blocking_site_exceptions(raw: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::settings::{AppearanceSettings, Settings};
 
     #[test]
     fn default_config_is_sane() {
@@ -1035,5 +1216,306 @@ mod tests {
             resolve_search_engine(None, Some("name"), Some(&huge_template_no_placeholder)),
             SearchEngine::duckduckgo()
         );
+    }
+
+    // --- Config::apply_settings (Issue #30, D67) ---
+
+    #[test]
+    fn apply_settings_with_default_settings_leaves_config_at_its_own_defaults() {
+        // The most important property: a fresh checkout with no
+        // settings.json yet must merge in `Settings::default()` (what
+        // `app::run` uses when nothing was persisted) and end up exactly
+        // where `Config::default()` already was — otherwise adding the
+        // settings screen would itself be a behavior change for everyone
+        // who never opens it.
+        let mut config = Config::default();
+        let before = config.clone();
+        config.apply_settings(&Settings::default());
+        assert_eq!(config.homepage, before.homepage);
+        assert_eq!(
+            config.restore_previous_session,
+            before.restore_previous_session
+        );
+        assert_eq!(config.search_engine, before.search_engine);
+        assert_eq!(
+            config.content_blocking_enabled,
+            before.content_blocking_enabled
+        );
+        assert_eq!(
+            config.content_blocking_site_exceptions,
+            before.content_blocking_site_exceptions
+        );
+        assert_eq!(
+            config.max_tabs_per_web_process,
+            before.max_tabs_per_web_process
+        );
+        assert_eq!(config.suspension, before.suspension);
+        assert_eq!(config.download_dir_override, before.download_dir_override);
+        assert_eq!(config.perf_metrics, before.perf_metrics);
+        assert_eq!(config.perf_format, before.perf_format);
+        assert_eq!(config.perf_output_path, before.perf_output_path);
+        assert_eq!(config.extra_blocklist_path, before.extra_blocklist_path);
+    }
+
+    #[test]
+    fn apply_settings_copies_general_and_search_fields() {
+        let mut config = Config::default();
+        let mut settings = Settings::default();
+        settings.general.homepage = "https://example.com/".to_owned();
+        settings.general.restore_previous_session = true;
+        settings.search.engine_preset = "google".to_owned();
+        config.apply_settings(&settings);
+        assert_eq!(config.homepage, "https://example.com/");
+        assert!(config.restore_previous_session);
+        assert_eq!(config.search_engine, SearchEngine::google());
+    }
+
+    #[test]
+    fn apply_settings_resolves_a_custom_search_engine() {
+        let mut config = Config::default();
+        let mut settings = Settings::default();
+        settings.search.engine_preset = "custom".to_owned();
+        settings.search.custom_engine_name = "My Engine".to_owned();
+        settings.search.custom_engine_url = "https://example.com/search?q={}".to_owned();
+        config.apply_settings(&settings);
+        assert_eq!(
+            config.search_engine,
+            SearchEngine {
+                name: "My Engine".to_owned(),
+                query_template: "https://example.com/search?q={}".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn apply_settings_copies_privacy_fields() {
+        let mut config = Config::default();
+        let mut settings = Settings::default();
+        settings.privacy.content_blocking_enabled = false;
+        settings.privacy.content_blocking_site_exceptions =
+            vec!["example.com".to_owned(), "news.example".to_owned()];
+        config.apply_settings(&settings);
+        assert!(!config.content_blocking_enabled);
+        assert_eq!(
+            config.content_blocking_site_exceptions,
+            vec!["example.com".to_owned(), "news.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn apply_settings_copies_performance_fields_into_the_suspension_policy() {
+        let mut config = Config::default();
+        let mut settings = Settings::default();
+        settings.performance.max_tabs_per_web_process = 8;
+        settings.performance.auto_suspend_after_ms = Some(30_000);
+        settings.performance.max_live_tabs = Some(6);
+        settings.performance.memory_budget_mb = Some(512);
+        settings.performance.memory_check_interval_ms = 5_000;
+        config.apply_settings(&settings);
+        assert_eq!(config.max_tabs_per_web_process, 8);
+        assert_eq!(config.suspension.idle_after, Some(Duration::from_secs(30)));
+        assert_eq!(config.suspension.max_live_tabs, Some(6));
+        assert_eq!(
+            config.suspension.memory_budget_bytes,
+            Some(512 * 1024 * 1024)
+        );
+        assert_eq!(
+            config.suspension.memory_check_interval,
+            Duration::from_secs(5)
+        );
+        assert!(config.suspension.is_enabled());
+    }
+
+    #[test]
+    fn apply_settings_none_performance_signals_disable_the_suspension_policy() {
+        // Start from a config where every signal was already on (e.g. from
+        // an earlier env-var-driven run), to prove `apply_settings`
+        // overwrites rather than merges — turning a signal off in the
+        // settings screen must actually turn it off.
+        let mut config = Config {
+            suspension: SuspensionPolicy {
+                idle_after: Some(Duration::from_secs(10)),
+                max_live_tabs: Some(3),
+                memory_budget_bytes: Some(100),
+                memory_check_interval: Duration::from_secs(1),
+            },
+            ..Config::default()
+        };
+        config.apply_settings(&Settings::default());
+        assert_eq!(config.suspension, SuspensionPolicy::default());
+        assert!(!config.suspension.is_enabled());
+    }
+
+    #[test]
+    fn apply_settings_copies_downloads_and_advanced_fields() {
+        let mut config = Config::default();
+        let mut settings = Settings::default();
+        settings.downloads.download_dir_override = Some("/custom/downloads".to_owned());
+        settings.advanced.perf_metrics_enabled = true;
+        settings.advanced.perf_format = "json".to_owned();
+        settings.advanced.perf_output_path = Some("/tmp/perf.jsonl".to_owned());
+        settings.advanced.extra_blocklist_path = Some("/etc/velox/extra.txt".to_owned());
+        config.apply_settings(&settings);
+        assert_eq!(
+            config.download_dir_override,
+            Some("/custom/downloads".to_owned())
+        );
+        assert!(config.perf_metrics);
+        assert_eq!(config.perf_format, PerfFormat::Json);
+        assert_eq!(config.perf_output_path, Some("/tmp/perf.jsonl".to_owned()));
+        assert_eq!(
+            config.extra_blocklist_path,
+            Some("/etc/velox/extra.txt".to_owned())
+        );
+    }
+
+    #[test]
+    fn apply_settings_text_perf_format_for_anything_other_than_json() {
+        let mut config = Config {
+            perf_format: PerfFormat::Json,
+            ..Config::default()
+        };
+        let mut settings = Settings::default();
+        settings.advanced.perf_format = "text".to_owned();
+        config.apply_settings(&settings);
+        assert_eq!(config.perf_format, PerfFormat::Text);
+    }
+
+    // --- Config::to_settings (Issue #30, D67) -----------------------------
+    //
+    // The bug these guard against: an env-var/CLI-driven `Config` must
+    // survive being round-tripped through the settings screen's seed step
+    // (`app::run` calls this only when no `settings.json` exists yet) —
+    // otherwise the very first "設定を開いて何も変えず保存" (open settings,
+    // change nothing, save) would silently reset every `VELOX_*` override
+    // on the next launch. This is exactly what broke this project's own
+    // integration test suite (env vars like `VELOX_RESTORE_SESSION`/
+    // `VELOX_MAX_LIVE_TABS`/`VELOX_PERF_METRICS` going inert) before
+    // `app::run` was fixed to call `to_settings` instead of
+    // `Settings::default()` when no settings.json exists.
+
+    #[test]
+    fn to_settings_on_a_default_config_matches_settings_default() {
+        // The other half of `apply_settings_with_default_settings_leaves_
+        // config_at_its_own_defaults` above: a fresh `Config` must seed a
+        // `Settings` indistinguishable from `Settings::default()` (modulo
+        // `appearance`, which has no `Config` equivalent and is asserted
+        // separately below), so opening the settings screen on a totally
+        // fresh checkout shows exactly what it always has.
+        let settings = Config::default().to_settings();
+        assert_eq!(settings.general, Settings::default().general);
+        assert_eq!(settings.search, Settings::default().search);
+        assert_eq!(settings.privacy, Settings::default().privacy);
+        assert_eq!(settings.performance, Settings::default().performance);
+        assert_eq!(settings.downloads, Settings::default().downloads);
+        assert_eq!(settings.advanced, Settings::default().advanced);
+        assert_eq!(settings.appearance, AppearanceSettings::default());
+    }
+
+    #[test]
+    fn to_settings_round_trips_back_through_apply_settings() {
+        // For every field `apply_settings` actually copies, `Config ->
+        // to_settings -> apply_settings` must be a no-op — the property
+        // that keeps "open settings, save without changing anything" safe
+        // for a `Config` built from arbitrary env vars/CLI flags, not just
+        // the default one.
+        let original = Config {
+            homepage: "https://example.com/".to_owned(),
+            restore_previous_session: true,
+            search_engine: SearchEngine::bing(),
+            content_blocking_enabled: false,
+            content_blocking_site_exceptions: vec!["a.example".to_owned(), "b.example".to_owned()],
+            max_tabs_per_web_process: 8,
+            suspension: SuspensionPolicy {
+                idle_after: Some(Duration::from_secs(45)),
+                max_live_tabs: Some(6),
+                memory_budget_bytes: Some(512 * 1024 * 1024),
+                memory_check_interval: Duration::from_secs(3),
+            },
+            download_dir_override: Some("/custom/downloads".to_owned()),
+            perf_metrics: true,
+            perf_format: PerfFormat::Json,
+            perf_output_path: Some("/tmp/perf.jsonl".to_owned()),
+            extra_blocklist_path: Some("/etc/velox/extra.txt".to_owned()),
+            ..Config::default()
+        };
+        let settings = original.to_settings();
+        let mut round_tripped = Config::default();
+        round_tripped.apply_settings(&settings);
+
+        assert_eq!(round_tripped.homepage, original.homepage);
+        assert_eq!(
+            round_tripped.restore_previous_session,
+            original.restore_previous_session
+        );
+        assert_eq!(round_tripped.search_engine, original.search_engine);
+        assert_eq!(
+            round_tripped.content_blocking_enabled,
+            original.content_blocking_enabled
+        );
+        assert_eq!(
+            round_tripped.content_blocking_site_exceptions,
+            original.content_blocking_site_exceptions
+        );
+        assert_eq!(
+            round_tripped.max_tabs_per_web_process,
+            original.max_tabs_per_web_process
+        );
+        assert_eq!(round_tripped.suspension, original.suspension);
+        assert_eq!(
+            round_tripped.download_dir_override,
+            original.download_dir_override
+        );
+        assert_eq!(round_tripped.perf_metrics, original.perf_metrics);
+        assert_eq!(round_tripped.perf_format, original.perf_format);
+        assert_eq!(round_tripped.perf_output_path, original.perf_output_path);
+        assert_eq!(
+            round_tripped.extra_blocklist_path,
+            original.extra_blocklist_path
+        );
+    }
+
+    #[test]
+    fn to_settings_detects_every_built_in_search_engine_preset() {
+        for (engine, preset) in [
+            (SearchEngine::duckduckgo(), "duckduckgo"),
+            (SearchEngine::google(), "google"),
+            (SearchEngine::bing(), "bing"),
+            (SearchEngine::startpage(), "startpage"),
+            (SearchEngine::ecosia(), "ecosia"),
+        ] {
+            let config = Config {
+                search_engine: engine,
+                ..Config::default()
+            };
+            let settings = config.to_settings();
+            assert_eq!(settings.search.engine_preset, preset, "preset was {preset}");
+            assert_eq!(settings.search.custom_engine_name, "");
+            assert_eq!(settings.search.custom_engine_url, "");
+        }
+    }
+
+    #[test]
+    fn to_settings_round_trips_a_custom_search_engine() {
+        let config = Config {
+            search_engine: SearchEngine {
+                name: "My Engine".to_owned(),
+                query_template: "https://example.com/search?q={}".to_owned(),
+            },
+            ..Config::default()
+        };
+        let settings = config.to_settings();
+        assert_eq!(settings.search.engine_preset, "custom");
+        assert_eq!(settings.search.custom_engine_name, "My Engine");
+        assert_eq!(
+            settings.search.custom_engine_url,
+            "https://example.com/search?q={}"
+        );
+    }
+
+    #[test]
+    fn to_settings_is_already_sanitized() {
+        let settings = Config::default().to_settings();
+        assert_eq!(settings.clone().sanitize(), settings);
     }
 }

@@ -34,6 +34,34 @@
       --private-border: #4a3470;
     }
   }
+  /* Chrome theme override (Issue #30's Appearance tab, see
+     docs/decisions.md D67): only this toolbar/tab-strip webview's own
+     colors — never web page content, which wry 0.56 exposes no per-webview
+     `prefers-color-scheme` override for. Set on <html> by
+     `veloxSetTheme`/`ToolbarCommand::UpdateSettings`; `"system"` (the
+     default) sets no matching attribute value, so the plain `:root`/
+     `@media` rules above decide, unchanged from before this setting
+     existed. An attribute selector always outranks the plain `:root`
+     `@media` rule above by specificity, regardless of source order, so
+     this works the same whichever the OS preference is. */
+  :root[data-velox-theme="light"] {
+    --bg: #f3f3f5;
+    --fg: #1c1c1e;
+    --dim-fg: #6b6b70;
+    --field-bg: #ffffff;
+    --row-hover: rgba(128, 128, 128, 0.12);
+    --border: #d0d0d5;
+    --tab-bg: #e3e3e8;
+  }
+  :root[data-velox-theme="dark"] {
+    --bg: #2b2b2e;
+    --fg: #ececf0;
+    --dim-fg: #9a9aa0;
+    --field-bg: #1c1c1e;
+    --row-hover: rgba(255, 255, 255, 0.08);
+    --border: #47474c;
+    --tab-bg: #38383c;
+  }
   html, body {
     margin: 0;
     height: 100%;
@@ -601,6 +629,110 @@
     font-size: 11px;
     color: var(--dim-fg);
   }
+
+  /* Settings screen (Issue #30, see docs/decisions.md D67). Shares #panel's
+     toolbar-resize mechanism (docs/decisions.md D11) like every other
+     panel; unlike them it has its own row of category tabs above a
+     scrollable body, since nine categories do not fit in the fixed panel
+     height at once. */
+  .settings-tabs {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px;
+    padding: 6px 12px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-tab-btn {
+    width: auto;
+    height: 24px;
+    padding: 0 10px;
+    border-radius: 6px 6px 0 0;
+    background: transparent;
+    color: var(--dim-fg);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .settings-tab-btn:hover { background: var(--row-hover); }
+  .settings-tab-btn.active { background: var(--field-bg); color: var(--fg); }
+  .settings-body {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px 12px;
+  }
+  .settings-tab-panel[hidden] { display: none; }
+  .settings-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    margin-bottom: 12px;
+  }
+  .settings-field label {
+    font-size: 12px;
+    color: var(--dim-fg);
+  }
+  .settings-field input[type="text"],
+  .settings-field input[type="number"],
+  .settings-field select,
+  .settings-field textarea {
+    box-sizing: border-box;
+    width: 100%;
+    padding: 4px 8px;
+    height: 26px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--field-bg);
+    color: var(--fg);
+    font-size: 12px;
+    font-family: inherit;
+  }
+  .settings-field textarea {
+    height: 60px;
+    resize: vertical;
+    padding: 6px 8px;
+  }
+  .settings-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    margin-bottom: 12px;
+  }
+  .settings-hint {
+    font-size: 11px;
+    color: var(--dim-fg);
+  }
+  .settings-actions-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .settings-actions-row button {
+    width: auto;
+    height: 26px;
+    padding: 0 10px;
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.15);
+    font-size: 12px;
+  }
+  .settings-readonly-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 6px 0;
+    font-size: 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  .settings-readonly-row:last-child { border-bottom: none; }
+  .settings-footer {
+    flex: none;
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--dim-fg);
+    border-top: 1px solid var(--border);
+  }
 </style>
 </head>
 <body>
@@ -625,6 +757,7 @@
   <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
   <button id="bookmark-bar-toggle" title="ブックマークバーの表示切替 (Ctrl/Cmd+Shift+B)">&#9644;</button>
   <button id="downloads-toggle" title="ダウンロード">&#11015;</button>
+  <button id="settings-toggle" title="設定">&#128295;</button>
 </div>
 <div id="bookmark-bar" hidden></div>
 <div id="panel" hidden>
@@ -664,6 +797,155 @@
   <div id="panel-omnibox" class="panel-list" hidden>
     <div id="omnibox-rows" class="panel-rows"></div>
   </div>
+  <div id="panel-settings" class="panel-list" hidden>
+    <div class="panel-header">
+      <span>設定</span>
+      <button id="settings-reset">初期設定に戻す</button>
+      <button id="settings-save">保存</button>
+    </div>
+    <div class="settings-tabs">
+      <button class="settings-tab-btn active" data-tab="general">General</button>
+      <button class="settings-tab-btn" data-tab="appearance">Appearance</button>
+      <button class="settings-tab-btn" data-tab="search">Search</button>
+      <button class="settings-tab-btn" data-tab="privacy">Privacy</button>
+      <button class="settings-tab-btn" data-tab="security">Security</button>
+      <button class="settings-tab-btn" data-tab="performance">Performance</button>
+      <button class="settings-tab-btn" data-tab="downloads">Downloads</button>
+      <button class="settings-tab-btn" data-tab="shortcuts">Shortcuts</button>
+      <button class="settings-tab-btn" data-tab="advanced">Advanced</button>
+    </div>
+    <div class="settings-body">
+      <div class="settings-tab-panel" data-tab="general">
+        <div class="settings-field">
+          <label for="set-homepage">ホームページ</label>
+          <input id="set-homepage" type="text" spellcheck="false" autocomplete="off" />
+        </div>
+        <label class="settings-checkbox-row">
+          <input id="set-restore-session" type="checkbox" />
+          前回終了時のタブを復元する
+        </label>
+      </div>
+      <div class="settings-tab-panel" data-tab="appearance" hidden>
+        <div class="settings-field">
+          <label for="set-theme">テーマ（ツールバーの外観のみ。Web ページの表示は OS の設定に従います）</label>
+          <select id="set-theme">
+            <option value="system">システムに合わせる</option>
+            <option value="light">ライト</option>
+            <option value="dark">ダーク</option>
+          </select>
+        </div>
+        <label class="settings-checkbox-row">
+          <input id="set-show-bookmark-bar" type="checkbox" />
+          ブックマークバーを表示する
+        </label>
+      </div>
+      <div class="settings-tab-panel" data-tab="search" hidden>
+        <div class="settings-field">
+          <label for="set-search-preset">検索エンジン</label>
+          <select id="set-search-preset">
+            <option value="duckduckgo">DuckDuckGo</option>
+            <option value="google">Google</option>
+            <option value="bing">Bing</option>
+            <option value="startpage">Startpage</option>
+            <option value="ecosia">Ecosia</option>
+            <option value="custom">カスタム</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label for="set-search-custom-name">カスタム検索エンジン名（「カスタム」選択時のみ使用）</label>
+          <input id="set-search-custom-name" type="text" spellcheck="false" autocomplete="off" />
+        </div>
+        <div class="settings-field">
+          <label for="set-search-custom-url">カスタム検索 URL（検索語を <code>{}</code> で表す）</label>
+          <input id="set-search-custom-url" type="text" spellcheck="false" autocomplete="off"
+                 placeholder="https://example.com/search?q={}" />
+        </div>
+      </div>
+      <div class="settings-tab-panel" data-tab="privacy" hidden>
+        <label class="settings-checkbox-row">
+          <input id="set-content-blocking-enabled" type="checkbox" />
+          広告・トラッカーのブロックを有効にする
+        </label>
+        <div class="settings-field">
+          <label for="set-content-blocking-exceptions">ブロックを無効化するサイト（1 行に 1 ホスト名）</label>
+          <textarea id="set-content-blocking-exceptions" spellcheck="false"
+                    placeholder="example.com"></textarea>
+        </div>
+        <div class="settings-actions-row">
+          <button id="settings-clear-history">履歴をすべて削除</button>
+          <button id="settings-clear-site-data">サイトデータを削除</button>
+        </div>
+      </div>
+      <div class="settings-tab-panel" data-tab="security" hidden>
+        <div class="settings-hint" style="margin-bottom: 8px;">
+          サイトごとに記録されているカメラ・マイク・位置情報・通知・クリップボードの許可/ブロック状態です（読み取り専用）。
+        </div>
+        <div id="settings-permissions-rows"></div>
+      </div>
+      <div class="settings-tab-panel" data-tab="performance" hidden>
+        <div class="settings-field">
+          <label for="set-max-tabs-per-process">1 プロセスあたりの最大タブ数</label>
+          <input id="set-max-tabs-per-process" type="number" min="1" />
+        </div>
+        <div class="settings-field">
+          <label for="set-auto-suspend-after">自動休止までのアイドル時間 (ミリ秒、空欄で無効)</label>
+          <input id="set-auto-suspend-after" type="number" min="0" />
+        </div>
+        <div class="settings-field">
+          <label for="set-max-live-tabs">同時に保持する最大タブ数 (空欄で無効)</label>
+          <input id="set-max-live-tabs" type="number" min="0" />
+        </div>
+        <div class="settings-field">
+          <label for="set-memory-budget-mb">メモリ予算 (MiB、空欄で無効)</label>
+          <input id="set-memory-budget-mb" type="number" min="0" />
+        </div>
+        <div class="settings-field">
+          <label for="set-memory-check-interval-ms">メモリ計測間隔 (ミリ秒)</label>
+          <input id="set-memory-check-interval-ms" type="number" min="1" />
+        </div>
+      </div>
+      <div class="settings-tab-panel" data-tab="downloads" hidden>
+        <div class="settings-field">
+          <label for="set-download-dir-override">ダウンロード先フォルダ (空欄で既定値)</label>
+          <input id="set-download-dir-override" type="text" spellcheck="false" autocomplete="off" />
+        </div>
+        <div class="settings-actions-row">
+          <button id="settings-open-downloads-folder">フォルダを開く</button>
+        </div>
+      </div>
+      <div class="settings-tab-panel" data-tab="shortcuts" hidden>
+        <div class="settings-hint" style="margin-bottom: 8px;">
+          キーボードショートカット一覧です（このバージョンでは変更できません）。
+        </div>
+        <div id="settings-shortcuts-rows"></div>
+      </div>
+      <div class="settings-tab-panel" data-tab="advanced" hidden>
+        <label class="settings-checkbox-row">
+          <input id="set-perf-metrics-enabled" type="checkbox" />
+          パフォーマンス計測ログを有効にする
+        </label>
+        <div class="settings-field">
+          <label for="set-perf-format">計測ログの形式</label>
+          <select id="set-perf-format">
+            <option value="text">text</option>
+            <option value="json">json</option>
+          </select>
+        </div>
+        <div class="settings-field">
+          <label for="set-perf-output-path">計測ログの出力先ファイル (空欄で標準エラー出力)</label>
+          <input id="set-perf-output-path" type="text" spellcheck="false" autocomplete="off" />
+        </div>
+        <div class="settings-field">
+          <label for="set-extra-blocklist-path">追加ブロックリストファイル (空欄でなし)</label>
+          <input id="set-extra-blocklist-path" type="text" spellcheck="false" autocomplete="off" />
+        </div>
+      </div>
+    </div>
+    <div class="settings-footer">
+      ※ General・Search・Privacy・Performance・Downloads・Advanced タブの変更は次回起動後に反映されます。
+      Appearance タブ（テーマ・ブックマークバー表示）は即座に反映されます。
+    </div>
+  </div>
 </div>
 <script>
   "use strict";
@@ -688,6 +970,9 @@
   const omniboxRowsEl = document.getElementById("omnibox-rows");
   const bookmarkBarEl = document.getElementById("bookmark-bar");
   const newFolderNameEl = document.getElementById("new-folder-name");
+  const settingsPanelEl = document.getElementById("panel-settings");
+  const settingsShortcutsRowsEl = document.getElementById("settings-shortcuts-rows");
+  const settingsPermissionsRowsEl = document.getElementById("settings-permissions-rows");
 
   /* Omnibox candidate dropdown state (Issue #15): the candidate list Rust
      last pushed via veloxSetCandidates, and which row (if any) Up/Down has
@@ -768,6 +1053,9 @@
   });
   document.getElementById("downloads-open-folder").addEventListener("click", () => {
     send({ cmd: "open_downloads_folder" });
+  });
+  document.getElementById("settings-toggle").addEventListener("click", () => {
+    send({ cmd: "toggle_panel", panel: "settings" });
   });
 
   /* Bookmark folders and the bookmark bar (Issue #19, see
@@ -878,6 +1166,7 @@
     bookmarksPanelEl.hidden = panel !== "bookmarks";
     downloadsPanelEl.hidden = panel !== "downloads";
     omniboxPanelEl.hidden = panel !== "omnibox";
+    settingsPanelEl.hidden = panel !== "settings";
   };
 
   /* Full re-render of the tab strip from the current tab list. Simpler and
@@ -1497,6 +1786,206 @@
     currentCandidates = candidates;
     selectedIndex = -1;
     renderCandidateRows();
+  };
+
+  /* Settings screen (Issue #30, see docs/decisions.md D67). Tab switching
+     is purely client-side (no round trip to Rust, same reasoning as the
+     bookmark/history panels' own client-side interactions); only
+     "保存"/"初期設定に戻す" and the read-only tabs' underlying data cross
+     the IPC boundary. */
+  const settingsTabButtons = document.querySelectorAll(".settings-tab-btn");
+  const settingsTabPanels = document.querySelectorAll(".settings-tab-panel");
+  settingsTabButtons.forEach((button) => {
+    button.addEventListener("click", () => {
+      settingsTabButtons.forEach((b) => b.classList.toggle("active", b === button));
+      settingsTabPanels.forEach((panel) => {
+        panel.hidden = panel.dataset.tab !== button.dataset.tab;
+      });
+    });
+  });
+
+  /* An empty/whitespace-only field means "unset" for every optional
+     string/number setting below — mirrors `browser::settings::Settings::
+     sanitize`'s own trim-and-treat-blank-as-unset rule, so the round trip
+     through Rust never turns a deliberately-cleared field back into a
+     non-empty one. */
+  function optionalText(id) {
+    const value = document.getElementById(id).value.trim();
+    return value.length > 0 ? value : null;
+  }
+  function optionalNumber(id) {
+    const value = document.getElementById(id).value.trim();
+    if (value.length === 0) {
+      return null;
+    }
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  function gatherSettingsFromForm() {
+    return {
+      general: {
+        homepage: document.getElementById("set-homepage").value,
+        restore_previous_session: document.getElementById("set-restore-session").checked,
+      },
+      appearance: {
+        theme: document.getElementById("set-theme").value,
+        show_bookmark_bar: document.getElementById("set-show-bookmark-bar").checked,
+      },
+      search: {
+        engine_preset: document.getElementById("set-search-preset").value,
+        custom_engine_name: document.getElementById("set-search-custom-name").value,
+        custom_engine_url: document.getElementById("set-search-custom-url").value,
+      },
+      privacy: {
+        content_blocking_enabled: document.getElementById("set-content-blocking-enabled").checked,
+        content_blocking_site_exceptions: document
+          .getElementById("set-content-blocking-exceptions")
+          .value.split("\n")
+          .map((host) => host.trim())
+          .filter((host) => host.length > 0),
+      },
+      performance: {
+        max_tabs_per_web_process:
+          Number(document.getElementById("set-max-tabs-per-process").value) || 0,
+        auto_suspend_after_ms: optionalNumber("set-auto-suspend-after"),
+        max_live_tabs: optionalNumber("set-max-live-tabs"),
+        memory_budget_mb: optionalNumber("set-memory-budget-mb"),
+        memory_check_interval_ms:
+          Number(document.getElementById("set-memory-check-interval-ms").value) || 0,
+      },
+      downloads: {
+        download_dir_override: optionalText("set-download-dir-override"),
+      },
+      advanced: {
+        perf_metrics_enabled: document.getElementById("set-perf-metrics-enabled").checked,
+        perf_format: document.getElementById("set-perf-format").value,
+        perf_output_path: optionalText("set-perf-output-path"),
+        extra_blocklist_path: optionalText("set-extra-blocklist-path"),
+      },
+    };
+  }
+
+  function populateSettingsForm(settings) {
+    document.getElementById("set-homepage").value = settings.general.homepage;
+    document.getElementById("set-restore-session").checked =
+      settings.general.restore_previous_session;
+    document.getElementById("set-theme").value = settings.appearance.theme;
+    document.getElementById("set-show-bookmark-bar").checked =
+      settings.appearance.show_bookmark_bar;
+    document.getElementById("set-search-preset").value = settings.search.engine_preset;
+    document.getElementById("set-search-custom-name").value = settings.search.custom_engine_name;
+    document.getElementById("set-search-custom-url").value = settings.search.custom_engine_url;
+    document.getElementById("set-content-blocking-enabled").checked =
+      settings.privacy.content_blocking_enabled;
+    document.getElementById("set-content-blocking-exceptions").value =
+      settings.privacy.content_blocking_site_exceptions.join("\n");
+    document.getElementById("set-max-tabs-per-process").value =
+      settings.performance.max_tabs_per_web_process;
+    document.getElementById("set-auto-suspend-after").value =
+      settings.performance.auto_suspend_after_ms ?? "";
+    document.getElementById("set-max-live-tabs").value =
+      settings.performance.max_live_tabs ?? "";
+    document.getElementById("set-memory-budget-mb").value =
+      settings.performance.memory_budget_mb ?? "";
+    document.getElementById("set-memory-check-interval-ms").value =
+      settings.performance.memory_check_interval_ms;
+    document.getElementById("set-download-dir-override").value =
+      settings.downloads.download_dir_override ?? "";
+    document.getElementById("set-perf-metrics-enabled").checked =
+      settings.advanced.perf_metrics_enabled;
+    document.getElementById("set-perf-format").value = settings.advanced.perf_format;
+    document.getElementById("set-perf-output-path").value =
+      settings.advanced.perf_output_path ?? "";
+    document.getElementById("set-extra-blocklist-path").value =
+      settings.advanced.extra_blocklist_path ?? "";
+  }
+
+  /* Shortcuts tab: a static, read-only reference table
+     (`browser::settings::shortcut_reference`) — not user-remappable in this
+     issue, see docs/decisions.md D67. */
+  function renderShortcuts(shortcuts) {
+    settingsShortcutsRowsEl.replaceChildren();
+    for (const shortcut of shortcuts) {
+      const row = document.createElement("div");
+      row.className = "settings-readonly-row";
+      const action = document.createElement("span");
+      action.textContent = shortcut.action;
+      const keys = document.createElement("span");
+      keys.className = "panel-row-meta";
+      keys.textContent = shortcut.keys;
+      row.append(action, keys);
+      settingsShortcutsRowsEl.appendChild(row);
+    }
+  }
+
+  /* Security tab: a read-only view of `browser::site_permissions::
+     SitePermissionStore` (Issue #24, D60) — this issue does not add a way
+     to change a decision from here, only to see it (see docs/decisions.md
+     D67 for why). */
+  const PERMISSION_KIND_LABELS = {
+    Camera: "カメラ",
+    Microphone: "マイク",
+    Geolocation: "位置情報",
+    Notifications: "通知",
+    ClipboardRead: "クリップボード",
+    Other: "その他",
+  };
+  function renderSitePermissions(records) {
+    settingsPermissionsRowsEl.replaceChildren();
+    if (records.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "panel-empty";
+      empty.textContent = "記録されているサイト権限はありません";
+      settingsPermissionsRowsEl.appendChild(empty);
+      return;
+    }
+    for (const record of records) {
+      const row = document.createElement("div");
+      row.className = "settings-readonly-row";
+      const label = document.createElement("span");
+      label.textContent =
+        record.origin + " — " + (PERMISSION_KIND_LABELS[record.kind] || record.kind);
+      const decision = document.createElement("span");
+      decision.className = "panel-row-meta";
+      decision.textContent = record.decision === "Allow" ? "許可" : "ブロック";
+      row.append(label, decision);
+      settingsPermissionsRowsEl.appendChild(row);
+    }
+  }
+
+  document.getElementById("settings-save").addEventListener("click", () => {
+    send({ cmd: "update_settings", settings: gatherSettingsFromForm() });
+  });
+  document.getElementById("settings-reset").addEventListener("click", () => {
+    send({ cmd: "reset_settings" });
+  });
+  document.getElementById("settings-open-downloads-folder").addEventListener("click", () => {
+    send({ cmd: "open_downloads_folder" });
+  });
+  document.getElementById("settings-clear-history").addEventListener("click", () => {
+    send({ cmd: "clear_history" });
+  });
+  document.getElementById("settings-clear-site-data").addEventListener("click", () => {
+    send({ cmd: "clear_site_data" });
+  });
+
+  /* Called from Rust on `ready` and after every `update_settings`/
+     `reset_settings` — the form always echoes back what was actually
+     persisted (post-`sanitize`), never just what was typed. */
+  window.veloxSetSettings = (view) => {
+    populateSettingsForm(view.settings);
+    renderShortcuts(view.shortcuts);
+    renderSitePermissions(view.site_permissions);
+  };
+
+  /* Chrome theme override (Issue #30's Appearance tab). Applied immediately
+     — see the `:root[data-velox-theme]` CSS rules — never a page's own
+     content. `"system"` sets an attribute value no CSS rule matches, so the
+     plain `:root`/`@media` rules decide, unchanged from before this setting
+     existed. */
+  window.veloxSetTheme = (theme) => {
+    document.documentElement.setAttribute("data-velox-theme", theme);
   };
 
   /* Ask Rust for the current state: the content page may have started

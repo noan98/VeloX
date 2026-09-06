@@ -516,6 +516,24 @@ pub fn resolve_download_dir() -> Option<PathBuf> {
     platform_download_dir()
 }
 
+/// [`resolve_download_dir`], but `override_dir` — when `Some` and non-blank
+/// once trimmed — always wins over both `VELOX_DOWNLOAD_DIR` and the
+/// platform default. This is the settings screen's Downloads tab
+/// (`browser::settings::DownloadsSettings::download_dir_override`, Issue
+/// #30, see docs/decisions.md D67), threaded in as
+/// `Config::download_dir_override` at the point every download-started
+/// handler is built (`ui::window::with_download_handlers`) and read again by
+/// `app::open_downloads_folder` — both baked in at startup/tab-build time,
+/// so a change here takes effect after the next restart, same as every
+/// other Performance/Privacy/Advanced setting (D67).
+pub fn resolve_download_dir_with_override(override_dir: Option<&str>) -> Option<PathBuf> {
+    let trimmed = override_dir.map(str::trim).filter(|dir| !dir.is_empty());
+    match trimmed {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => resolve_download_dir(),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn platform_download_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Downloads"))
@@ -1015,6 +1033,39 @@ mod tests {
     #[test]
     fn unix_dir_is_none_without_xdg_or_home() {
         assert_eq!(resolve_unix_download_dir(None, None), None);
+    }
+
+    // --- resolve_download_dir_with_override (Issue #30, D67) ---
+
+    #[test]
+    fn override_wins_when_set_and_non_blank() {
+        assert_eq!(
+            resolve_download_dir_with_override(Some("/custom/downloads")),
+            Some(PathBuf::from("/custom/downloads"))
+        );
+    }
+
+    #[test]
+    fn override_is_trimmed() {
+        assert_eq!(
+            resolve_download_dir_with_override(Some("  /custom/downloads  ")),
+            Some(PathBuf::from("/custom/downloads"))
+        );
+    }
+
+    #[test]
+    fn blank_or_absent_override_falls_back_to_resolve_download_dir() {
+        // Not asserting a specific path here (that depends on the real
+        // process environment, which this test must not touch — see the
+        // `resolve_unix_download_dir` tests above for why) — only that a
+        // blank/`None` override defers to the exact same function an
+        // unset Downloads-tab setting has always used.
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                resolve_download_dir_with_override(absent),
+                resolve_download_dir()
+            );
+        }
     }
 
     // --- open_path_command: pure command construction ---
