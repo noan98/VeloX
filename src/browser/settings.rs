@@ -6,7 +6,8 @@
 //! from the UI and that survive a restart. Security and Shortcuts are
 //! deliberately **not** part of this persisted shape — the settings screen
 //! still shows a tab for each, but as a read-only view over data that
-//! already exists elsewhere ([`shortcut_reference`]'s static table, and
+//! already exists elsewhere ([`shortcut_reference`], generated from
+//! `browser::shortcuts::SHORTCUT_TABLE` — Issue #38, D77 — and
 //! `browser::site_permissions::SitePermissionStore`, already loaded by
 //! `app::AppState`) rather than a new preference. See docs/decisions.md D67
 //! for the full reasoning behind that split, and for which fields below
@@ -526,78 +527,121 @@ fn sanitize_optional_path(raw: &Option<String>) -> Option<String> {
         .map(str::to_owned)
 }
 
-// --- Shortcuts tab: a static reference table, not a persisted setting ---
+// --- Shortcuts tab: a reference table generated from `browser::shortcuts`,
+//     not a persisted setting ---
 //
-// Every binding here already exists (`ui/toolbar.html`'s keydown listener,
-// `ui::window::ContentShortcut` — see docs/decisions.md D18/D23) and is not
-// user-remappable by this issue; the settings screen only displays it for
-// discoverability. See docs/decisions.md D67 for why remapping is out of
-// scope here.
+// Every binding here is defined once in `browser::shortcuts::SHORTCUT_TABLE`
+// (Issue #38, see docs/decisions.md D77) and is not user-remappable by this
+// issue; the settings screen only displays it for discoverability. See
+// docs/decisions.md D67 for why remapping the *toolbar*/*content-webview*
+// behavior itself is out of scope for the settings screen, and D77 for why
+// full UI remapping is out of scope for #38 too.
 
-/// One row of the Shortcuts tab's reference table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+use super::shortcuts::{Platform, ShortcutId, SHORTCUT_TABLE};
+
+/// One row of the Shortcuts tab's reference table. Owned `String`s (not
+/// `&'static str`, unlike most other static-ish data in this module) because
+/// [`shortcut_reference`] renders each key label for [`Platform::current`]
+/// at call time — the whole point of D77's `KeyChord::label`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ShortcutInfo {
-    pub action: &'static str,
-    pub keys: &'static str,
+    pub action: String,
+    pub keys: String,
+}
+
+/// Look up a single [`SHORTCUT_TABLE`] entry's chord label(s) for `platform`,
+/// joining more than one chord (only [`ShortcutId::OpenDevtools`] has more
+/// than one today) with `" / "`.
+fn chord_label(id: ShortcutId, platform: Platform) -> String {
+    SHORTCUT_TABLE
+        .iter()
+        .find(|def| def.id == id)
+        .map(|def| {
+            def.chords
+                .iter()
+                .map(|chord| chord.label(platform))
+                .collect::<Vec<_>>()
+                .join(" / ")
+        })
+        .unwrap_or_default()
 }
 
 /// Every keyboard shortcut VeloX currently wires up, in the order the
-/// Shortcuts tab lists them. `Ctrl` reads as `Cmd` on macOS throughout (both
-/// channels that implement these already accept either modifier — see
-/// docs/decisions.md D18).
-pub fn shortcut_reference() -> &'static [ShortcutInfo] {
-    &[
+/// Shortcuts tab lists them, with each row's key label rendered for
+/// [`Platform::current`] (Issue #38's "macOS/Windows/Linuxで適切な
+/// modifierになる" acceptance criterion — `Ctrl` on Windows/Linux, `Cmd`
+/// on macOS; the underlying key handling still accepts either modifier on
+/// every platform, see docs/decisions.md D23).
+///
+/// `ActivateTabAt(1..=8)` is rendered as one combined "1〜8番目のタブに
+/// 切り替え" row rather than eight separate ones, matching the pre-#38
+/// display; every other row is a 1:1 read of one
+/// `browser::shortcuts::SHORTCUT_TABLE` entry.
+pub fn shortcut_reference() -> Vec<ShortcutInfo> {
+    let platform = Platform::current();
+    let activate_tab_prefix = SHORTCUT_TABLE
+        .iter()
+        .find(|def| def.id == ShortcutId::ActivateTabAt(1))
+        .and_then(|def| def.chords.first())
+        .map(|chord| chord.modifiers.label(platform))
+        .unwrap_or_default();
+
+    vec![
         ShortcutInfo {
-            action: "新しいタブ",
-            keys: "Ctrl/Cmd+T",
+            action: "新しいタブ".to_owned(),
+            keys: chord_label(ShortcutId::NewTab, platform),
         },
         ShortcutInfo {
-            action: "タブを閉じる",
-            keys: "Ctrl/Cmd+W",
+            action: "タブを閉じる".to_owned(),
+            keys: chord_label(ShortcutId::CloseTab, platform),
         },
         ShortcutInfo {
-            action: "閉じたタブを再度開く",
-            keys: "Ctrl/Cmd+Shift+T",
+            action: "閉じたタブを再度開く".to_owned(),
+            keys: chord_label(ShortcutId::ReopenClosedTab, platform),
         },
         ShortcutInfo {
-            action: "次のタブ",
-            keys: "Ctrl/Cmd+Tab",
+            action: "次のタブ".to_owned(),
+            keys: chord_label(ShortcutId::NextTab, platform),
         },
         ShortcutInfo {
-            action: "前のタブ",
-            keys: "Ctrl/Cmd+Shift+Tab",
+            action: "前のタブ".to_owned(),
+            keys: chord_label(ShortcutId::PrevTab, platform),
         },
         ShortcutInfo {
-            action: "1〜8番目のタブに切り替え",
-            keys: "Ctrl/Cmd+1〜8",
+            action: "1〜8番目のタブに切り替え".to_owned(),
+            keys: format!("{activate_tab_prefix}+1〜8"),
         },
         ShortcutInfo {
-            action: "最後のタブに切り替え",
-            keys: "Ctrl/Cmd+9",
+            action: "最後のタブに切り替え".to_owned(),
+            keys: chord_label(ShortcutId::ActivateLastTab, platform),
         },
         ShortcutInfo {
-            action: "アドレスバーにフォーカス",
-            keys: "Ctrl/Cmd+L",
+            action: "アドレスバーにフォーカス".to_owned(),
+            keys: chord_label(ShortcutId::FocusAddressBar, platform),
         },
         ShortcutInfo {
-            action: "ブックマークの追加/削除",
-            keys: "Ctrl/Cmd+D",
+            action: "ブックマークの追加/削除".to_owned(),
+            keys: chord_label(ShortcutId::ToggleBookmark, platform),
         },
         ShortcutInfo {
-            action: "ブックマークバーの表示切替",
-            keys: "Ctrl/Cmd+Shift+B",
+            action: "ブックマークバーの表示切替".to_owned(),
+            keys: chord_label(ShortcutId::ToggleBookmarkBar, platform),
         },
         ShortcutInfo {
-            action: "DevTools を開く",
-            keys: "F12 (macOS: Cmd+Option+I)",
+            action: "新しいウィンドウ".to_owned(),
+            keys: chord_label(ShortcutId::NewWindow, platform),
         },
         ShortcutInfo {
-            action: "ページを保存",
-            keys: "Ctrl/Cmd+S",
+            action: "ページ内検索を開く".to_owned(),
+            keys: chord_label(ShortcutId::OpenFindBar, platform),
         },
         ShortcutInfo {
-            action: "ページのソースを表示",
-            keys: "Ctrl/Cmd+U",
+            action: "DevTools を開く".to_owned(),
+            keys: chord_label(ShortcutId::OpenDevtools, platform),
+        },
+        ShortcutInfo {
+            action: "ページのソースを表示".to_owned(),
+            keys: chord_label(ShortcutId::ViewSource, platform),
         },
     ]
 }
@@ -874,7 +918,7 @@ mod tests {
     fn shortcut_reference_is_non_empty_with_no_blank_entries() {
         let shortcuts = shortcut_reference();
         assert!(!shortcuts.is_empty());
-        for shortcut in shortcuts {
+        for shortcut in &shortcuts {
             assert!(!shortcut.action.trim().is_empty());
             assert!(!shortcut.keys.trim().is_empty());
         }
@@ -883,7 +927,7 @@ mod tests {
     #[test]
     fn shortcut_reference_actions_are_unique() {
         let shortcuts = shortcut_reference();
-        let mut actions: Vec<&str> = shortcuts.iter().map(|s| s.action).collect();
+        let mut actions: Vec<&str> = shortcuts.iter().map(|s| s.action.as_str()).collect();
         let before = actions.len();
         actions.sort_unstable();
         actions.dedup();
@@ -891,6 +935,41 @@ mod tests {
             actions.len(),
             before,
             "duplicate action in shortcut_reference"
+        );
+    }
+
+    // --- Issue #38 (D77): the two shortcuts (`NewWindow`/#29,
+    // `OpenFindBar`/#43) that D67's original hand-maintained table drifted
+    // out of sync with must now be present, and every row's key label must
+    // reflect the OS this test binary is compiled for. ---
+
+    #[test]
+    fn shortcut_reference_includes_shortcuts_added_after_d67() {
+        let shortcuts = shortcut_reference();
+        assert!(shortcuts
+            .iter()
+            .any(|s| s.action == "新しいウィンドウ" && !s.keys.is_empty()));
+        assert!(shortcuts
+            .iter()
+            .any(|s| s.action == "ページ内検索を開く" && !s.keys.is_empty()));
+    }
+
+    #[test]
+    fn shortcut_reference_key_labels_use_this_platform_s_primary_modifier() {
+        let shortcuts = shortcut_reference();
+        let new_tab = shortcuts
+            .iter()
+            .find(|s| s.action == "新しいタブ")
+            .expect("新しいタブ row must exist");
+        let expected_prefix = if cfg!(target_os = "macos") {
+            "Cmd"
+        } else {
+            "Ctrl"
+        };
+        assert!(
+            new_tab.keys.starts_with(expected_prefix),
+            "{}",
+            new_tab.keys
         );
     }
 
