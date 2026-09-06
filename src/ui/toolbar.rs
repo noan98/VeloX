@@ -300,6 +300,14 @@ pub enum ToolbarCommand {
     /// "✕" button, or Esc while the find input has focus: close the find
     /// bar and clear any highlight left in the page.
     FindClose,
+
+    // --- Save page (Issue #46, "名前を付けて保存"), see docs/decisions.md
+    //     D76 ---
+    /// Ctrl/Cmd+S. Sent by the toolbar's own keydown listener; the content
+    /// webview's equivalent is `ui::window::ContentShortcut::SavePage`,
+    /// routed to the same handler in `app.rs`. Carries no id/URL — like
+    /// `CloseActiveTab`, `app.rs` always resolves the *active* tab.
+    SavePage,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -1380,6 +1388,14 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"find_close"}"#).unwrap(),
             ToolbarCommand::FindClose
+        );
+    }
+
+    #[test]
+    fn parses_save_page_command() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"save_page"}"#).unwrap(),
+            ToolbarCommand::SavePage
         );
     }
 

@@ -7220,3 +7220,248 @@ Secrets/Variables を設定するだけで `release-windows.yml` の署名が有
 着手するとき、合わせて Developer ID 署名 + notarization を実装する。
 (3) Azure Trusted Signing の適格性要件 (地域・事業年数) が緩和されたとき。
 (4) 他ベンダーのクラウド署名サービスへの切り替えを検討するとき。
+
+## D76: 名前を付けて保存 (#46) — Windows は WebView2 の `CallDevToolsProtocolMethod` で MHTML 保存 + ネイティブ Save-As ダイアログ、macOS/Linux は outerHTML の素の保存に留める
+
+**背景 (Issue #46, 依存 #16)**: 現在のページをユーザーが指定した場所へ保存
+できるようにする。受け入れ条件は (1) 保存先を選択できる、(2) ページを
+保存できる、(3) 同名ファイルを安全に扱える、(4) エラー時に原因を表示
+できる、の 4 つ。PR #153 (Issue #45 View Source) の申し送りにあった
+「`outerHTML` スナップショットとは別の取得経路が必要になる可能性が高い」
+という懸念を最初に検証した。
+
+### 保存形式の選択: Windows は MHTML、macOS/Linux は outerHTML
+
+**WebView2 (Windows) の到達可能性を実ソースで確認した**
+(`webview2-com-sys` 0.38.2 のバインディング、および `windows` 0.61.3 を
+実際にフェッチして調査):
+
+- `ICoreWebView2::CallDevToolsProtocolMethod` は **ベースの `ICoreWebView2`
+  インターフェース**(`ICoreWebView2_NN` の世代を問わない、WebView2 の
+  最初期の安定版から存在する)のメソッドで、Chromium DevTools Protocol の
+  任意のメソッドを呼び出せる。ここに `Page.captureSnapshot`
+  (`{"format":"mhtml"}`) を渡すと、ページの HTML に画像・CSS・サブフレーム
+  などのサブリソースを base64/quoted-printable でインライン化した
+  **MHTML 文書一式**が `{"data": "...mhtml テキスト..."}` という JSON で
+  返ってくる。D59/D66 が到達できた `ICoreWebView2_13` はおろか、世代の
+  縛りが一切ないベースインターフェースなので、D69 が経験した「世代が
+  新しすぎて見送る」という制約に一切当たらない。
+- 一方、WebView2 には `ShowSaveAsUI`/`SaveAsUIShowing`
+  (`COREWEBVIEW2_SAVE_AS_KIND_COMPLETE`/`_HTML_ONLY`/`_SINGLE_FILE` を含む、
+  ブラウザ本体の「名前を付けて保存」に相当するネイティブ機能一式)も存在
+  することが分かったが、これらは **`ICoreWebView2_25`** で初めて追加された
+  メソッド/イベントで、D69 が F12/Ctrl+F 相当の判断で見送った前例
+  (「世代が新しすぎる」)と全く同じ理由で、今回も採用を見送った。
+  Evergreen ランタイムは自動更新されるとはいえ、`_25` のような非常に新しい
+  世代を前提にすると、更新が遅れた実機で機能ごと動かなくなるリスクが高い。
+  `CallDevToolsProtocolMethod` で同じ目的 (MHTML 保存) を世代非依存で
+  達成できる以上、あえて `_25` に依存する理由がない。
+
+結論: **Windows は `CallDevToolsProtocolMethod("Page.captureSnapshot",
+{"format":"mhtml"})` で MHTML を取得し、そのまま `.mhtml` として保存する**
+(`src/ui/save_dialog_windows.rs::capture_and_write_mhtml`)。これにより
+Windows では画像・CSS も含めた「完全なページ」の保存が実現できる。
+
+**macOS/Linux は CLAUDE.md の OS 優先度方針どおり最低限の実装に留めた**:
+`document.documentElement.outerHTML` を `evaluate_script_with_callback` で
+取得し(`fetch_page_title`/`fetch_favicon` と同じ fire-and-forget パターン)、
+`<!doctype html>\n` を前置しただけの単一 HTML ファイルとして保存する
+(`browser::save_page::wrap_outer_html_as_document`)。**この経路では画像・
+外部 CSS・その他のサブリソースは一切取得・埋め込みされない** —
+ページの見た目を完全に再現した保存にはならない、既知の制限として明記する。
+View Source (#45, D72) の「HTML エスケープ済みテキスト」とは異なり、
+こちらは実際にブラウザで開ける生のマークアップをエスケープなしでそのまま
+書き出す(表示専用ではなく保存が目的のため)。
+
+Windows と macOS/Linux で保存経路がここまで非対称になったのは、
+`CallDevToolsProtocolMethod` が(現時点で調査した範囲では)WebView2 固有の
+到達手段であり、WebKitGTK/WKWebView 側で同等に手軽な「エンジンに生の
+MHTML を作らせる」公開 API を wry 0.56 経由で見つけられなかったため。
+CLAUDE.md の OS 優先度方針(Windows 最優先、macOS/Linux は動作維持を優先)
+に沿って、macOS/Linux 側の追加調査(たとえば独自の DOM 巡回によるリソース
+インライン化)はこの Issue のスコープ外とした。
+
+### 保存先の選択: Windows はネイティブ `IFileSaveDialog`、macOS/Linux はダウンロードフォルダ固定
+
+「保存先を選択できる」を満たすため、まずクロスプラットフォームのファイル
+ダイアログクレート (`rfd`) の採用を検討したが、`cargo fetch` で実際に
+依存グラフを確認したところ Linux ビルドだけで gtk3/wayland/wasm-bindgen
+系のクレートを大量に引き込むことが分かり、「依存クレートは必要最小限に
+保つ」という方針(CLAUDE.md、D6)に反すると判断して見送った。
+
+代わりに **Windows のみ、Win32 の Shell Common Item Dialog API
+(`IFileSaveDialog`/`IShellItem`、`windows` クレートの `Win32_UI_Shell`/
+`Win32_UI_Shell_Common` フィーチャ)を素の COM 呼び出しで実装した**
+(`src/ui/save_dialog_windows.rs::show_save_dialog`)。これは WebView2 固有
+の API ではなく、あらゆる Windows ネイティブアプリの「開く/保存」ダイアログ
+が使う古典的な仕組みであり、`ui::webview2_blocking` (D59) が確立した
+「wry の外側で素の COM を呼ぶ」パターンをそのまま踏襲している。
+`FOS_OVERWRITEPROMPT` を設定しているため、選んだパスに既存ファイルが
+あれば **OS 標準の「上書きしますか?」確認**が出る — これが「同名ファイル
+を安全に扱える」の Windows での答えであり、VeloX 側で衝突検出ロジックを
+実装する必要がない。
+
+**macOS/Linux はダイアログなし**: 設定画面の「ダウンロード先フォルダ」
+(Issue #30/D67, `Config::download_dir_override`)で解決したディレクトリに
+自動保存する。同名ファイルの衝突は既存の
+`browser::downloads::unique_filename`/`prepare_destination` をそのまま
+再利用し、`report.html` → `report (1).html` の方式で回避する(ダウンロード
+機能 #16 と全く同じ挙動)。「保存先を選べる」という受け入れ条件は、
+macOS/Linux では今回満たせていない既知の制限として記録する。
+
+### ファイル名サニタイズ: ページタイトル向けに新しい防御層を追加した
+
+**保存するファイル名はページのタイトル(または URL のホスト名)由来であり、
+ページ自身が `document.title` を通じて完全に制御できる、信頼できない
+入力である**(D62 の「入力値堅牢性」の脅威モデルそのもの)。
+
+`browser::downloads::sanitize_filename` (Issue #16, D28) がすでに
+パストラバーサル・NUL/制御文字・Windows 予約デバイス名 (`CON`/`PRN`/
+`AUX`/`NUL`/`COM1`-`COM9`/`LPT1`-`LPT9`)・末尾のドット/空白・長さ超過を
+一通り防いでいるため、これをそのまま再利用した。ただし
+`sanitize_filename` は「ダウンロードの提案ファイル名」(`Content-Disposition`
+やダウンロード URL 由来、パスらしい文字列であることが多い)向けに設計
+されており、パストラバーサル対策が「最後の `/`/`\` 区切りセグメントだけ
+残す」という方式になっている。ページの**タイトル**は自由なテキストであり
+`:`/`/`/`|`/`?` を単なる句読点として含むことが日常的にある
+(例: "Breaking: Top Story"、"Tips \& Tricks (Q\&A)") ため、この方式を
+そのまま適用するとタイトルの大部分を意図せず失ってしまう。
+
+そこで `browser::save_page::suggested_file_name` に新しい前処理層を
+追加した: **Windows で禁止されているファイル名文字
+(`< > : " / \\ | ? *`)を `sanitize_filename` に渡す前にすべて `_` へ
+置換する**(`replace_forbidden_filename_chars`)。これにより `/`/`\\` を
+含め一切のパス区切り文字が残らない(＝トラバースする対象が存在しない)
+ことを保証しつつ、タイトルの可読性を極力保つ。処理順序は:
+`default_file_stem`(タイトル、または URL のホスト、またはフォールバック
+`"page"`)→ `replace_forbidden_filename_chars` → `downloads::sanitize_filename`
+→ 最後に `.mhtml`/`.html` を付与、の 4 段階。
+
+**単体テストでの検証** (`src/browser/save_page.rs`、全 21 件):
+
+- `neutralizes_path_traversal_in_the_title` — タイトルが
+  `"../../etc/passwd"` でも、生成されたファイル名に `/`/`\\` が一切残らず
+  `Path::components().count() == 1`(ディレクトリ成分が存在しない)ことを
+  検証。
+- `neutralizes_an_absolute_windows_path_in_the_title` — タイトルが
+  `r"C:\Windows\System32\evil.exe"` でも同様。
+- `escapes_a_windows_reserved_device_name_title` /
+  `does_not_flag_a_title_that_merely_starts_with_a_reserved_prefix` —
+  `CON`/`con`/`LPT9` は `_CON`/`_con`/`_LPT9` に、`CONSTITUTION` は
+  誤検知されないことを検証(`sanitize_filename` 側の既存ロジックの再確認)。
+- `trims_trailing_dots_and_spaces_from_the_title` /
+  `strips_control_characters_from_the_title` — Windows が許さない末尾の
+  ドット・空白、および NUL 等の制御文字が除去されることを検証。
+- `falls_back_to_a_safe_name_when_the_title_is_only_dot_or_dotdot` —
+  タイトルがそのまま `"."`/`".."` の場合、`sanitize_filename` の
+  フォールバック名 (`download`) に落ちることを検証。
+- `stays_non_empty_when_the_title_is_entirely_forbidden_characters` —
+  タイトルが `":::"` のように禁止文字だけで構成されていても
+  (`"___"` のように)空文字列にはならず、`download.html` への意図しない
+  衝突を避けられることを検証。
+- `truncates_an_extremely_long_title` / 各種 Unicode・空タイトルのケースも
+  網羅。
+
+`extract_mhtml`(`Page.captureSnapshot` の JSON 応答パース)も、実際の
+WebView2 なしで検証できる範囲(正常系・欠損フィールド・不正 JSON)を
+単体テストでカバーした。
+
+### エラー時に原因を表示できる: 新しい UI を作らず Downloads パネルを再利用した
+
+保存の進行状況・失敗理由を表示する専用 UI を新設する代わりに、Issue #16
+(D28)の `DownloadStore`/Downloads パネルをそのまま再利用する設計にした。
+`UserEvent::SavePageStarted`/`SavePageFinished` を新設し、
+`DownloadStarted`/`DownloadCompleted` と全く同じ形で `DownloadStore` に
+登録・完了させる。`SavePageFinished` は `error: Option<String>` を
+そのまま人間可読な日本語メッセージとして運べるため、
+`DownloadCompleted` が失敗時に常に固定文言("ダウンロードに失敗しました")
+しか出せないのと異なり、**実際の失敗理由**(保存先ダイアログの COM
+エラー、ファイル書き込みエラー、MHTML 取得エラー等)がそのまま
+Downloads パネルの該当行に表示される。
+
+保存先がまだ決まっていない段階の失敗(タブが休止中で webview が無い、
+ネイティブダイアログの生成に失敗、ダウンロードフォルダの作成に失敗、
+等)も、`SavePageFinished` 単体ではなく必ず `SavePageStarted` →
+`SavePageFinished(error)` の順で 2 つのイベントを送るようにした
+(`ui::window::report_save_page_failure`)。理由:
+`DownloadStore::resolve_completion` は `InProgress` のエントリを url +
+destination で解決する仕組みのため、対応する `Started` を送らずに
+`Finished` だけ送ると解決先が無く、失敗が Downloads パネルに一切
+現れない(エラーを"表示できる"はずが実際には無言で消える)という
+バグになる。この 2 つは同じプレースホルダ (`PathBuf::new()`)
+destination を共有するため、`resolve_completion` の厳密一致経路で
+確実にペアが解決される。
+
+ユーザーが Windows のネイティブ保存ダイアログを**キャンセル**した場合は
+唯一の例外で、これはエラーではないため `SavePageStarted`/`Finished` の
+どちらも送らない(Downloads パネルに何も残らない、キャンセル操作として
+自然な挙動)。
+
+### ショートカット: D18/D23/D69/D72 と同じ二重配送パターン
+
+Ctrl/Cmd+S を、既存の全ショートカットと同じ二重配送で実装した:
+
+- 非信頼の content webview 側は固定センチネル文字列
+  `velox:save-page` (`ContentShortcut::SavePage`)。
+- 信頼された toolbar 側は構造化コマンド `{"cmd":"save_page"}`
+  (`ToolbarCommand::SavePage`)。
+
+どちらも `app::request_save_page` に収束し、アクティブタブの
+`Tab::current_url()`/`Tab::title()` を読んで
+`BrowserWindow::request_save_page` に渡すだけの薄い関数になっている。
+Issue #38(キーボードショートカット管理)が着手されたら、変更が必要な
+箇所は「JS 側でどのキーを監視するか」の 1 か所
+(`tab_shortcut_script`/`toolbar.html` のキーダウンリスナー)だけで済む。
+
+**Save Page の導線は今回 Ctrl/Cmd+S のみ**とした(View Source, D72 と同じ
+スコープ判断)。ツールバーへのボタン追加や右クリックメニューからの起動
+(Issue #39)は見送った — 既存のツールバーに保存専用のボタン/メニューが
+一切無く、新設するには CSS・レイアウトの検討が別途必要になるため。
+
+### 複数ウィンドウ対応 (#29/D68)
+
+`SavePageStarted`/`SavePageFinished` は他の per-tab `UserEvent` と同じく
+`WindowId` を明示的に持つ(`TabId` はウィンドウ内でのみ一意という前提は
+崩していない)。`DownloadStore` 自体はウィンドウ横断で共有される既存の
+設計(D28)をそのまま踏襲し、Downloads パネルの更新はイベントが由来する
+`window_id` のウィンドウにのみ反映する(`DownloadStarted`/`DownloadCompleted`
+と全く同じ扱い)。
+
+### 追加した依存クレート
+
+新規追加なし。`windows`(既存の Windows 専用依存, D59)に
+`Win32_UI_Shell`/`Win32_UI_Shell_Common` フィーチャを追加しただけ
+(Cargo.toml に理由を記載)。`rfd` は上述の理由で見送った。
+
+### 検証できていないこと・満たせなかった受け入れ条件
+
+- **実機 Windows/WebView2 での動作確認はできていない**(この開発環境が
+  Linux のみのため)。`cargo check --target x86_64-pc-windows-msvc
+  --all-targets` で型レベルの整合は確認したが、リンク・実行はしていない。
+  特に以下は未検証:
+  - `IFileSaveDialog::Show` を tao のイベントループ内(モーダル呼び出し)
+    から呼んだ際の実際の挙動(理論上は Win32 のネイティブモーダルとして
+    問題なく動くはずだが、実機での確認はできていない)。
+  - `CallDevToolsProtocolMethod` の完了ハンドラが実際にどのスレッド/
+    タイミングで呼ばれるか、および数百 KB〜数 MB 級の MHTML 文字列を
+    問題なく往復できるか。
+  - WebView2 が Ctrl+S を独自のアクセラレータとして先取りしてしまわないか
+    (D69 が Ctrl+F について残した懸念と同種)。
+- **macOS/Linux では「保存先を選択できる」を満たせていない** —
+  ダウンロード先フォルダに固定保存される(上述)。
+- **macOS/Linux では保存されたページに画像・外部 CSS が含まれない** —
+  `outerHTML` のみの保存のため(上述)。
+- **Windows の保存ダイアログはオーナーウィンドウに紐付けていない**
+  (`Show(None)`)。`raw-window-handle` 経由で HWND を取得する追加実装を
+  見送ったため、ダイアログがブラウザウィンドウの背後に隠れる可能性が
+  理論上ある。
+- **同一ページを複数回連続で保存する際の同時実行**は特に考慮していない
+  (通常の操作フローでは起こりにくいと判断)。
+
+**Revisit condition**: (1) Issue #38(キーボードショートカット管理)に
+着手するとき、Ctrl/Cmd+S の割り当てをその仕組みに載せ替える。(2) 実機
+Windows での検証ができるようになったとき、上記の未検証事項を確認する。
+(3) macOS/Linux 側でも本格的な「完全なページ」保存(リソースの取得・
+埋め込み)が必要になったとき、独自の DOM 巡回実装を検討する。(4) Issue
+#39(コンテキストメニュー)に着手するとき、右クリックからの保存導線を
+追加する。
