@@ -306,6 +306,14 @@ pub enum ToolbarCommand {
     /// "✕" button, or Esc while the find input has focus: close the find
     /// bar and clear any highlight left in the page.
     FindClose,
+
+    // --- View Source (Issue #45, Ctrl/Cmd+U), see docs/decisions.md D72 ---
+    /// View the active tab's page source in a new tab. Sent by the
+    /// toolbar's own keydown listener (Ctrl/Cmd+U while toolbar UI has
+    /// focus); the content-webview equivalent is
+    /// `ui::window::ContentShortcut::ViewSource` (page has focus). Both
+    /// funnel into the same `app::request_view_source`.
+    ViewSource,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -1390,6 +1398,14 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"find_close"}"#).unwrap(),
             ToolbarCommand::FindClose
+        );
+    }
+
+    #[test]
+    fn parses_view_source_command() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"view_source"}"#).unwrap(),
+            ToolbarCommand::ViewSource
         );
     }
 
