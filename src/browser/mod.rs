@@ -34,6 +34,8 @@ pub mod subresource;
 pub mod suspension;
 pub mod tab;
 pub mod tabs;
+pub mod window_id;
+pub mod windows;
 
 pub use automation::{AutomationCommand, AutomationError};
 pub use blocklist::{FilterList, MatchContext, RuleResourceType};
@@ -62,3 +64,5 @@ pub use subresource::{is_blocked_resource, ResourceType, SiteExceptions};
 pub use suspension::{SuspendReason, SuspensionPolicy};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};
+pub use window_id::WindowId;
+pub use windows::Windows;

@@ -12,7 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tao::event::{Event, WindowEvent};
-use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{
+    ControlFlow, EventLoop, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget,
+};
 
 use crate::browser::automation::{self, AutomationCommand};
 use crate::browser::downloads;
@@ -24,50 +26,66 @@ use crate::browser::{
     ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore,
     Favicon, FilterList, HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource,
     InputHistoryStore, SessionSnapshot, Settings, SiteExceptions, SitePermissionStore, TabId, Tabs,
+    WindowId, Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
 use crate::ui::{BrowserWindow, ContentShortcut, SitePolicies};
 
 /// Events forwarded from webview callbacks into the main event loop.
+///
+/// **Multi-window (Issue #29, docs/decisions.md D68)**: every variant below
+/// that a specific window's webview(s) can send now carries a [`WindowId`]
+/// alongside whatever it already carried. This is not redundant with
+/// `TabId`: a `TabId` is only unique within the window that issued it (see
+/// `browser::Windows`'s module doc comment), so a `TabId` alone cannot say
+/// which window's `Tabs` an event belongs to once more than one window is
+/// open. `ui::window::BrowserWindow` bakes its own id into every event its
+/// webviews send (`BrowserWindow::id`), the same way it has always tagged
+/// per-tab events with a `TabId`.
 #[derive(Debug, Clone)]
 pub enum UserEvent {
-    /// Raw IPC message from the toolbar webview (JSON, see
+    /// Raw IPC message from window `.0`'s toolbar webview (JSON, see
     /// [`toolbar::parse_command`]).
-    ToolbarMessage(String),
-    /// Tab `.0`'s content webview is about to navigate to this URL.
-    NavigationStarted(TabId, String),
-    /// Content blocking refused a main-frame navigation in tab `.0` to this
-    /// URL.
-    NavigationBlocked(TabId, String),
+    ToolbarMessage(WindowId, String),
+    /// Tab `.1`'s content webview, in window `.0`, is about to navigate to
+    /// this URL.
+    NavigationStarted(WindowId, TabId, String),
+    /// Content blocking refused a main-frame navigation in tab `.1` (window
+    /// `.0`) to this URL.
+    NavigationBlocked(WindowId, TabId, String),
     /// Content blocking refused a subresource request (image/script/
-    /// XHR/fetch/...) in tab `.0` to this URL. Windows/WebView2 only for now
-    /// — see docs/decisions.md D59 — sent from
+    /// XHR/fetch/...) in tab `.1` (window `.0`) to this URL. Windows/WebView2
+    /// only for now — see docs/decisions.md D59 — sent from
     /// `ui::webview2_blocking::attach`'s `WebResourceRequested` handler.
-    SubresourceBlocked(TabId, String),
-    /// Tab `.0`'s content webview started loading this URL.
-    LoadStarted(TabId, String),
-    /// Tab `.0`'s content webview finished loading this URL.
-    LoadFinished(TabId, String),
-    /// `document.title` for tab `tab_id` came back from its content webview
-    /// (see `BrowserWindow::fetch_page_title`), for the history entry
-    /// `history_id`. Carries `tab_id` — not just `history_id` — precisely so
-    /// this event can be routed back to the right `Tab` as well as the
-    /// right history entry; a `tab_id` for a tab that has since closed is
-    /// simply ignored (see `Tabs::get_mut`), not a panic.
+    SubresourceBlocked(WindowId, TabId, String),
+    /// Tab `.1`'s content webview (window `.0`) started loading this URL.
+    LoadStarted(WindowId, TabId, String),
+    /// Tab `.1`'s content webview (window `.0`) finished loading this URL.
+    LoadFinished(WindowId, TabId, String),
+    /// `document.title` for tab `tab_id` in window `window_id` came back
+    /// from its content webview (see `BrowserWindow::fetch_page_title`), for
+    /// the history entry `history_id`. Carries `tab_id`/`window_id` — not
+    /// just `history_id` — precisely so this event can be routed back to the
+    /// right `Tab` as well as the right history entry; a `tab_id`/
+    /// `window_id` for a tab or window that has since closed is simply
+    /// ignored, not a panic.
     PageTitleResolved {
+        window_id: WindowId,
         tab_id: TabId,
         history_id: u64,
         title: String,
     },
-    /// Tab `tab_id`'s favicon URL came back from its content webview (see
-    /// `BrowserWindow::fetch_favicon`), for the history entry `history_id`
-    /// (`0` when there is none — see `PageTitleResolved`'s doc comment,
-    /// same sentinel, same reasoning, added for the history favicon in
-    /// #18/D27). See docs/decisions.md D22: this is only ever a URL to try,
-    /// never image bytes — the toolbar webview's own `<img>` tag performs
-    /// the actual (async, non-blocking) fetch.
+    /// Tab `tab_id` (window `window_id`)'s favicon URL came back from its
+    /// content webview (see `BrowserWindow::fetch_favicon`), for the history
+    /// entry `history_id` (`0` when there is none — see
+    /// `PageTitleResolved`'s doc comment, same sentinel, same reasoning,
+    /// added for the history favicon in #18/D27). See docs/decisions.md D22:
+    /// this is only ever a URL to try, never image bytes — the toolbar
+    /// webview's own `<img>` tag performs the actual (async, non-blocking)
+    /// fetch.
     FaviconResolved {
+        window_id: WindowId,
         tab_id: TabId,
         history_id: u64,
         /// The page this favicon belongs to, as of when the fetch was
@@ -79,25 +97,26 @@ pub enum UserEvent {
         page_url: String,
         url: String,
     },
-    /// The active content webview's devtools shortcut (F12 / Cmd+Opt+I)
-    /// fired. Sent over a dedicated, tightly-restricted IPC channel, separate
-    /// from the toolbar's — see docs/decisions.md D18. Carries no `TabId`:
-    /// `BrowserWindow::open_devtools` always resolves the currently active
-    /// tab itself, matching how the shortcut is only ever wired into the
-    /// webview the user is actually looking at.
-    OpenDevtoolsRequested,
-    /// One of the tab-management keyboard shortcuts fired while a content
-    /// webview had focus (see `ui::window::ContentShortcut` and
-    /// docs/decisions.md D18/D23). Sent over the same kind of dedicated,
+    /// Window `.0`'s active content webview's devtools shortcut (F12 /
+    /// Cmd+Opt+I) fired. Sent over a dedicated, tightly-restricted IPC
+    /// channel, separate from the toolbar's — see docs/decisions.md D18.
+    /// Carries no `TabId`: `BrowserWindow::open_devtools` always resolves
+    /// that window's currently active tab itself, matching how the shortcut
+    /// is only ever wired into the webview the user is actually looking at.
+    OpenDevtoolsRequested(WindowId),
+    /// One of the tab-management keyboard shortcuts fired while window
+    /// `.0`'s content webview had focus (see `ui::window::ContentShortcut`
+    /// and docs/decisions.md D18/D23). Sent over the same kind of dedicated,
     /// untrusted IPC channel as `OpenDevtoolsRequested`, for the same reason.
-    ContentShortcut(ContentShortcut),
-    /// A content webview asked to open a new window for `url` — a
+    ContentShortcut(WindowId, ContentShortcut),
+    /// Window `.0`'s content webview asked to open a new window for `.1` — a
     /// `target="_blank"` link or `window.open()` — which VeloX always
-    /// answers by opening `url` as a new tab instead (see
-    /// docs/decisions.md D25). Carries no `TabId`: like the shortcuts above,
-    /// this is a browser-wide action ("open a new tab"), not something that
-    /// needs to be routed back to whichever tab asked.
-    NewTabRequested(String),
+    /// answers by opening `.1` as a new tab *in that same window* instead
+    /// (see docs/decisions.md D25). Carries no `TabId`: like the shortcuts
+    /// above, this is a window-wide action ("open a new tab in this
+    /// window"), not something that needs to be routed back to whichever tab
+    /// asked.
+    NewTabRequested(WindowId, String),
     /// A content webview's `download_started_handler` accepted a download
     /// (see docs/decisions.md D28): `destination` is already the final,
     /// sanitized, collision-avoided path
@@ -106,6 +125,12 @@ pub enum UserEvent {
     /// *registers* the download for the UI/`DownloadStore` — the decision
     /// to accept it already happened in `ui::window`.
     DownloadStarted {
+        /// The window whose content webview started this download (Issue
+        /// #29/D68). `DownloadStore` itself stays global/shared across every
+        /// window (see `AppState`'s doc comment) — this is only used to
+        /// decide which window's downloads panel to refresh immediately;
+        /// see `handle_user_event`'s doc comment on that limitation.
+        window_id: WindowId,
         url: String,
         file_name: String,
         destination: PathBuf,
@@ -118,6 +143,8 @@ pub enum UserEvent {
     /// Linux/Windows and always `None` on macOS (see docs/decisions.md
     /// D28); `success` is the authoritative signal either way.
     DownloadCompleted {
+        /// See [`Self::DownloadStarted`]'s `window_id` doc comment.
+        window_id: WindowId,
         url: String,
         path: Option<PathBuf>,
         success: bool,
@@ -142,19 +169,58 @@ pub enum UserEvent {
     /// `AppState::pending_memory_sample` and consumed by exactly one
     /// `sweep_tabs` pass, so the memory signal acts once per sample.
     MemorySampled(MemorySample),
-    /// The in-page find bar's DOM search finished in tab `tab_id`'s content
-    /// webview (Issue #43, see `ui::window::BrowserWindow::search_in_page`
-    /// and docs/decisions.md D69), reporting `total` matches. A `tab_id`
-    /// that no longer matches `AppState::find`'s session (the find bar
-    /// closed, or moved to a different tab, while the DOM search was still
-    /// running) is a safe no-op — a stale result simply never applies.
-    FindMatchesUpdated { tab_id: TabId, total: usize },
+    /// The in-page find bar's DOM search finished in tab `tab_id` of window
+    /// `window_id`'s content webview (Issue #43, see
+    /// `ui::window::BrowserWindow::search_in_page` and docs/decisions.md
+    /// D69), reporting `total` matches. A `tab_id` that no longer matches
+    /// `window_id`'s find session (`Windows::find`) — the find bar closed,
+    /// or moved to a different tab, while the DOM search was still running
+    /// — is a safe no-op, a stale result simply never applies. Carries
+    /// `window_id` for the same reason every other per-tab event does
+    /// (Issue #29/D68): a `tab_id` alone cannot say which window's find
+    /// session this result belongs to, since two windows can share the same
+    /// `TabId` value.
+    FindMatchesUpdated {
+        window_id: WindowId,
+        tab_id: TabId,
+        total: usize,
+    },
 }
 
 /// All mutable application state, gathered so the event handlers below take
 /// one argument instead of a growing list of `&mut` parameters.
+///
+/// **Multi-window (Issue #29, D68)**: `windows` replaces what used to be a
+/// single `tabs: Tabs` field — every other field here (`history`,
+/// `bookmarks`, `input_history`, `downloads`, `history_enabled`, `perf`)
+/// stays whole-process/shared across every window, matching D14's "private
+/// browsing is a whole-app mode" decision; see D68 for the extension path
+/// once #27 (private windows) needs any of these to become per-window.
 struct AppState {
-    tabs: Tabs,
+    windows: Windows,
+    /// The first window opened at startup (Issue #29/D68). Session
+    /// persistence (`persist_session`) only ever saves *this* window's tabs
+    /// — multi-window session restore is out of this issue's scope, see the
+    /// PR description — and it is also the window `AutomationCommand`s
+    /// target by default (`app::run`'s `automation_window`, mutable and
+    /// separate from this field since a script can point itself at a
+    /// different window with `new_window`).
+    primary_window: WindowId,
+    /// What a newly opened window (Ctrl/Cmd+N, `ToolbarCommand::NewWindow`/
+    /// `ContentShortcut::NewWindow`/`AutomationCommand::NewWindow`) is built
+    /// with: the same site-scoped policies every other window shares
+    /// (`Arc`s, cheap to clone). See docs/decisions.md D68.
+    ///
+    /// The `EventLoopProxy` a new `BrowserWindow` also needs is deliberately
+    /// *not* a field here (unlike `site_policies`) — it is threaded through
+    /// as a plain function argument instead (`open_new_window`), closed over
+    /// by `run`'s event loop the same way `homepage`/`suspension_policy` are.
+    /// Keeping `AppState` free of any `wry`/`tao` handle is what lets
+    /// `state_with_history_enabled` build one in a unit test with no
+    /// display — see docs/architecture.md's D20 layering rule, which this
+    /// preserves even though `AppState` (unlike `browser::`) is allowed to
+    /// depend on the UI layer.
+    site_policies: SitePolicies,
     history: HistoryStore,
     bookmarks: BookmarkStore,
     /// Previously-submitted search queries (Issue #20) — see
@@ -197,7 +263,11 @@ struct AppState {
     /// startup (`Config::apply_settings`, in `run` below, before
     /// `BrowserWindow::new`); this copy is what the settings screen itself
     /// reads from and writes back to (`refresh_settings_panel`,
-    /// `apply_updated_settings`).
+    /// `apply_updated_settings`). Whole-process, like `history_enabled`
+    /// (D14) — every window's settings screen shows and edits the same
+    /// value; see D68's multi-window/#30 integration for why appearance
+    /// changes are pushed to every open window, not just the one whose
+    /// settings screen made the change.
     settings: Settings,
     /// Per-origin permission decisions (Issue #24, docs/decisions.md D60),
     /// the same `Arc` handed to `BrowserWindow`'s `with_permission_handler`
@@ -206,13 +276,35 @@ struct AppState {
     /// comment for why this issue does not add a write path from the
     /// settings screen).
     site_permissions: Arc<SitePermissionStore>,
-    /// The in-page find bar's session (Issue #43, Ctrl/Cmd+F), if it is
-    /// currently open. `None` whenever the bar is closed. See
-    /// docs/decisions.md D69: only one session exists at a time, tied to
-    /// whichever tab was active when it opened — `close_find_bar` is called
-    /// whenever that tab switches away or navigates (see `activate_and_refresh`
-    /// and the `NavigationStarted`/`LoadStarted` handler below).
-    find: Option<find::FindState>,
+}
+
+/// `state.windows.tabs_mut(window_id)`, indexed the same way
+/// `browser::tabs::Tabs::active()`/`active_mut()` index their own
+/// `self.tabs[self.active]` — a documented, structural invariant, not a
+/// fallible operation being shortcut (Issue #29/D68).
+///
+/// Every call site of this helper is reached only after the caller already
+/// resolved `window_id` to a live `&mut BrowserWindow` in `ui_windows` (see
+/// `handle_user_event`'s doc comment, and every dispatcher's own —
+/// `handle_toolbar_command`/`handle_content_shortcut`/
+/// `handle_automation_command`/`sweep_tabs` all receive `window: &mut
+/// BrowserWindow` already resolved by their caller from that same
+/// `window_id`). `ui_windows` and `state.windows` are only ever changed
+/// together, both inside `open_new_window` (insert) and
+/// `close_window_by_tao_id` (remove), on this single-threaded event loop —
+/// there is no `await` point or other thread that could remove one without
+/// the other between that resolution and this call — so a `window_id`
+/// already known-good in `ui_windows` is known-good here too, exactly the
+/// same guarantee `Tabs`' own `self.active` index relies on. This keeps
+/// every leaf function below as close as possible to what it looked like
+/// before multi-window (`state.tabs.foo()` becomes `tabs_of(state,
+/// window_id).foo()`) instead of threading an `Option` through every one of
+/// them for a case that cannot actually happen here.
+fn tabs_of(state: &mut AppState, window_id: WindowId) -> &mut Tabs {
+    state
+        .windows
+        .tabs_mut(window_id)
+        .expect("window_id was just resolved against the same ui_windows/state.windows pair")
 }
 
 /// What tab-latency logging needs: where to write records, and the epoch
@@ -334,26 +426,65 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     } else {
         None
     };
-    let tabs = match restored_session {
-        Some(snapshot) => Tabs::restore(&snapshot.tabs, snapshot.active_index),
-        None => Tabs::new(config.homepage.clone()),
+    // Issue #29 (D68): `Windows` starts with exactly one window — restored
+    // from the previous session's snapshot when one applies, a fresh single
+    // tab at the homepage otherwise. Every window opened later (Ctrl/Cmd+N)
+    // always starts fresh at the homepage; multi-window session restore is
+    // out of this issue's scope (see D68).
+    let mut windows = Windows::new(config.homepage.clone());
+    let primary_id = match restored_session {
+        Some(snapshot) => {
+            // Replace the placeholder window `Windows::new` just made above
+            // with the actually-restored one, so there is still exactly one
+            // window (never zero, never two) at this point.
+            let placeholder = windows.ids().next().expect("Windows::new opens one window");
+            windows.close_window(placeholder);
+            windows.open_restored_window(&snapshot.tabs, snapshot.active_index)
+        }
+        None => windows.ids().next().expect("Windows::new opens one window"),
     };
     // Issue #25/D65: the active tab's own `current_url` — not necessarily
     // `config.homepage` once session restore is in play — is what the
     // first real webview must load.
-    let initial_url = tabs.active().current_url().to_owned();
-    let mut window = BrowserWindow::new(
+    let primary_tabs = windows
+        .tabs(primary_id)
+        .expect("primary window just opened");
+    let initial_url = primary_tabs.active().current_url().to_owned();
+    let initial_tab = primary_tabs.active_id();
+    // Kept around in `AppState` (Issue #29/D68): every window opened later
+    // (Ctrl/Cmd+N) needs its own `EventLoopProxy` clone and the exact same
+    // site-scoped policies the first window was built with — see
+    // `SitePolicies`'s doc comment for why cloning it is cheap.
+    let site_policies = SitePolicies {
+        blocklist,
+        site_exceptions,
+        site_permissions,
+    };
+    let window_event_proxy = proxy.clone();
+    let primary_window = BrowserWindow::new(
         &event_loop,
+        primary_id,
         &config,
         proxy,
-        tabs.active_id(),
+        initial_tab,
         &initial_url,
-        SitePolicies {
-            blocklist,
-            site_exceptions,
-            site_permissions,
-        },
+        site_policies.clone(),
     )?;
+    // Every open native window, keyed by the same `browser::WindowId`
+    // `windows: Windows` above uses for its logical (tab-owning) half — see
+    // docs/decisions.md D68. Kept as a separate map (rather than folding
+    // `BrowserWindow` into `AppState`) because `AppState` is meant to be the
+    // UI/engine-independent half of this file's state; `BrowserWindow` is
+    // the one type that actually owns `wry`/`tao` handles.
+    let mut ui_windows: HashMap<WindowId, BrowserWindow> = HashMap::new();
+    ui_windows.insert(primary_id, primary_window);
+    // Which window `AutomationCommand`s currently target (Issue #112).
+    // Automation predates multi-window and addresses tabs by their position
+    // in "the" tab strip; extending it to address a specific window by name
+    // is left to a follow-up (see the PR description) — for now every script
+    // starts out targeting the primary window and can point itself at a
+    // freshly opened one with a `new_window` step (`AutomationCommand::NewWindow`).
+    let mut automation_window = primary_id;
     if let Some(startup) = startup.as_mut() {
         startup.mark_window_created(Instant::now());
     }
@@ -361,12 +492,17 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // Issue #30 (D67): the bookmark bar's shown/hidden state is now
     // persisted (previously session-only, resetting on every restart — see
     // the old note in docs/architecture.md this issue resolves). Applied
-    // once, right after the window exists; the toolbar's `ready` handler
-    // later echoes this same value back via `window.bookmark_bar_visible()`.
-    log_failure(
-        "apply initial bookmark bar visibility",
-        window.set_bookmark_bar_visible(settings.appearance.show_bookmark_bar),
-    );
+    // once, right after the primary window exists; the toolbar's `ready`
+    // handler later echoes this same value back via
+    // `window.bookmark_bar_visible()`. Every window opened later
+    // (Ctrl/Cmd+N) gets the same treatment in `open_new_window` (Issue
+    // #29/D68) — this setting is whole-process, not per-window.
+    if let Some(primary_window_ui) = ui_windows.get_mut(&primary_id) {
+        log_failure(
+            "apply initial bookmark bar visibility",
+            primary_window_ui.set_bookmark_bar_visible(settings.appearance.show_bookmark_bar),
+        );
+    }
 
     // Built once, shared with the RSS sampler thread and every perf-logging
     // call site in this file via `Arc::clone`; `None` when metrics are off,
@@ -391,8 +527,11 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     }
     // One timer per tab: background tabs load concurrently with the active
     // one, so a single shared timer would have their loads overwrite each
-    // other's start times.
-    let mut page_load_timers: HashMap<TabId, metrics::PageLoadTimer> = HashMap::new();
+    // other's start times. Keyed by `(WindowId, TabId)`, not `TabId` alone
+    // (Issue #29/D68): a `TabId` is only unique within its own window, so
+    // two windows loading a page at the same moment could otherwise share
+    // one timer entry and corrupt each other's duration.
+    let mut page_load_timers: HashMap<(WindowId, TabId), metrics::PageLoadTimer> = HashMap::new();
 
     let history = data_dir
         .as_deref()
@@ -408,7 +547,9 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         .unwrap_or_default();
 
     let mut state = AppState {
-        tabs,
+        windows,
+        primary_window: primary_id,
+        site_policies,
         history,
         bookmarks,
         input_history,
@@ -421,7 +562,6 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         pending_memory_sample: None,
         settings,
         site_permissions: site_permissions_for_state,
-        find: None,
     };
 
     // Everything above (history/bookmarks/input-history load, `AppState`
@@ -454,18 +594,30 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         }
     }
 
-    event_loop.run(move |event, _target, control_flow| {
+    event_loop.run(move |event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
 
         match event {
+            // Issue #29 (D68): `window_id` here is `tao`'s own id for the
+            // native window the event happened in — distinct from
+            // `browser::WindowId` — so every window-scoped `WindowEvent` is
+            // first resolved to *which* `BrowserWindow` it belongs to via
+            // `BrowserWindow::tao_id`, rather than assuming there is only
+            // one.
             Event::WindowEvent {
+                window_id: tao_id,
                 event: WindowEvent::CloseRequested,
                 ..
-            } => *control_flow = ControlFlow::Exit,
+            } => close_window_by_tao_id(&mut ui_windows, &mut state, tao_id, control_flow),
             Event::WindowEvent {
+                window_id: tao_id,
                 event: WindowEvent::Resized(_),
                 ..
-            } => log_failure("resize layout", window.sync_layout()),
+            } => {
+                if let Some(window) = window_by_tao_id_mut(&mut ui_windows, tao_id) {
+                    log_failure("resize layout", window.sync_layout());
+                }
+            }
             Event::UserEvent(user_event) => {
                 if std::env::var_os("VELOX_DEBUG").is_some() {
                     eprintln!("velox[debug]: {user_event:?}");
@@ -486,7 +638,16 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 if matches!(user_event, UserEvent::Automation(AutomationCommand::Quit)) {
                     *control_flow = ControlFlow::Exit;
                 } else {
-                    handle_user_event(&mut window, &mut state, &config, &homepage, user_event);
+                    handle_user_event(
+                        target,
+                        &window_event_proxy,
+                        &mut ui_windows,
+                        &mut state,
+                        &config,
+                        &homepage,
+                        &mut automation_window,
+                        user_event,
+                    );
                 }
             }
             _ => {}
@@ -500,15 +661,74 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         // next wake-up for whichever background tab will go idle soonest.
         // `suspension::plan`/`Tabs::next_idle_deadline` are pure and
         // clock-injected, so all the policy logic this loop needs is
-        // unit-tested without a window.
+        // unit-tested without a window. Issue #29/D68: run once per open
+        // window rather than pooling every window's tabs into one policy
+        // decision — each window's live-tab cap/idle timer is evaluated
+        // independently of every other window's. See the PR description for
+        // why a single cross-window budget was not attempted in this issue.
         if *control_flow != ControlFlow::Exit {
-            if let Some(next_wake) =
-                sweep_tabs(&mut window, &mut state, &suspension_policy, Instant::now())
-            {
+            let mut next_wake: Option<Instant> = None;
+            for window_id in state.windows.ids().collect::<Vec<_>>() {
+                if let Some(wake) = sweep_tabs(
+                    &mut ui_windows,
+                    &mut state,
+                    window_id,
+                    &suspension_policy,
+                    Instant::now(),
+                ) {
+                    next_wake = Some(match next_wake {
+                        Some(existing) => existing.min(wake),
+                        None => wake,
+                    });
+                }
+            }
+            if let Some(next_wake) = next_wake {
                 *control_flow = ControlFlow::WaitUntil(next_wake);
             }
         }
     });
+}
+
+/// Find the `BrowserWindow` whose native window is `tao_id`, if any is still
+/// open (Issue #29/D68) — the event-loop closure's one lookup from a `tao`
+/// `WindowEvent` to the `BrowserWindow` it belongs to.
+fn window_by_tao_id_mut(
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    tao_id: tao::window::WindowId,
+) -> Option<&mut BrowserWindow> {
+    ui_windows
+        .values_mut()
+        .find(|window| window.tao_id() == tao_id)
+}
+
+/// Handle a native `WindowEvent::CloseRequested` for the window whose `tao`
+/// id is `tao_id` (Issue #29/D68): drop that window's `BrowserWindow` (which
+/// drops its `tao::window::Window` and every webview it held — the resource
+/// release the issue's acceptance criteria asks for) and its `Tabs`, then
+/// end the process once no window is left open — matching how closing the
+/// last window ends every mainstream desktop browser on Windows/Linux (see
+/// docs/decisions.md D68 for why this, not macOS's "keep running with zero
+/// windows" convention, given CLAUDE.md's Windows-first priority). An
+/// unknown `tao_id` (should not happen — every native window this process
+/// creates is tracked here) is a silent no-op rather than a panic.
+fn close_window_by_tao_id(
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    tao_id: tao::window::WindowId,
+    control_flow: &mut ControlFlow,
+) {
+    let Some(id) = ui_windows
+        .iter()
+        .find(|(_, window)| window.tao_id() == tao_id)
+        .map(|(id, _)| *id)
+    else {
+        return;
+    };
+    ui_windows.remove(&id);
+    state.windows.close_window(id);
+    if state.windows.is_empty() {
+        *control_flow = ControlFlow::Exit;
+    }
 }
 
 /// Build the content-blocking filter list: VeloX's built-in list, plus an
@@ -558,13 +778,13 @@ fn build_perf_log(config: &Config) -> Arc<PerfLog> {
 /// never reaches this function at all.
 fn record_perf_event(
     startup: &mut Option<metrics::StartupTimestamps>,
-    page_load_timers: &mut HashMap<TabId, metrics::PageLoadTimer>,
+    page_load_timers: &mut HashMap<(WindowId, TabId), metrics::PageLoadTimer>,
     perf_log: &PerfLog,
     process_start: Instant,
     event: &UserEvent,
 ) {
     match event {
-        UserEvent::ToolbarMessage(body) => match toolbar::parse_command(body) {
+        UserEvent::ToolbarMessage(_, body) => match toolbar::parse_command(body) {
             Ok(ToolbarCommand::ScriptStarted) => {
                 mark_startup(
                     startup,
@@ -583,16 +803,16 @@ fn record_perf_event(
             }
             _ => {}
         },
-        UserEvent::NavigationStarted(id, _) => {
+        UserEvent::NavigationStarted(window_id, id, _) => {
             page_load_timers
-                .entry(*id)
+                .entry((*window_id, *id))
                 .or_default()
                 .start(Instant::now());
         }
-        UserEvent::LoadFinished(id, url) => {
+        UserEvent::LoadFinished(window_id, id, url) => {
             let now = Instant::now();
             if let Some(duration) = page_load_timers
-                .get_mut(id)
+                .get_mut(&(*window_id, *id))
                 .and_then(|timer| timer.finish(now))
             {
                 let elapsed = now.saturating_duration_since(process_start);
@@ -625,9 +845,9 @@ fn record_perf_event(
         | UserEvent::SubresourceBlocked(..)
         | UserEvent::PageTitleResolved { .. }
         | UserEvent::FaviconResolved { .. }
-        | UserEvent::OpenDevtoolsRequested
-        | UserEvent::ContentShortcut(_)
-        | UserEvent::NewTabRequested(_)
+        | UserEvent::OpenDevtoolsRequested(_)
+        | UserEvent::ContentShortcut(..)
+        | UserEvent::NewTabRequested(..)
         | UserEvent::DownloadStarted { .. }
         | UserEvent::DownloadCompleted { .. }
         // `handle_automation_command` calls the same tab-management
@@ -780,16 +1000,23 @@ fn spawn_memory_pressure_sampler(interval: Duration, proxy: EventLoopProxy<UserE
 /// arrived (`AppState::pending_memory_sample` is `take()`n here), so a
 /// sample never suspends more than one sweep's worth of tabs.
 fn sweep_tabs(
-    window: &mut BrowserWindow,
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
     state: &mut AppState,
+    window_id: WindowId,
     policy: &SuspensionPolicy,
     now: Instant,
 ) -> Option<Instant> {
     if !policy.is_enabled() {
         return None;
     }
+    let window = ui_windows.get_mut(&window_id)?;
+    let tabs = state.windows.tabs(window_id)?;
+    // Issue #29/D68: at most one window's sweep consumes a given memory
+    // sample (`take()` empties it for every other window this same event
+    // loop pass) — a budget shared across every open window is left to a
+    // follow-up; see the PR description.
     let memory = state.pending_memory_sample.take();
-    let candidates = state.tabs.suspension_candidates(
+    let candidates = tabs.suspension_candidates(
         now,
         |id| window.is_playing_audio(id),
         |id| window.process_group_of(id),
@@ -797,15 +1024,17 @@ fn sweep_tabs(
     let planned = suspension::plan(policy, &candidates, memory);
     if !planned.is_empty() {
         for (id, reason) in planned {
-            if suspend_tab(window, state, id) {
+            if suspend_tab(window, window_id, state, id) {
                 record_tab_suspend(state, id, reason);
             }
         }
-        sync_tab_strip(window, state);
+        sync_tab_strip(window, window_id, state);
     }
-    policy
-        .idle_after
-        .and_then(|idle_after| state.tabs.next_idle_deadline(idle_after))
+    let idle_after = policy.idle_after?;
+    state
+        .windows
+        .tabs(window_id)
+        .and_then(|tabs| tabs.next_idle_deadline(idle_after))
 }
 
 /// Suspend tab `id` on both sides — `Tabs` state first, then the webview
@@ -816,8 +1045,16 @@ fn sweep_tabs(
 /// guards), in which case nothing changed. The one implementation behind
 /// the tab strip's suspend button (`ToolbarCommand::SuspendTab`), the
 /// `suspend <index>` automation command, and [`sweep_tabs`].
-fn suspend_tab(window: &mut BrowserWindow, state: &mut AppState, id: TabId) -> bool {
-    if !state.tabs.suspend(id) {
+fn suspend_tab(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    id: TabId,
+) -> bool {
+    let Some(tabs) = state.windows.tabs_mut(window_id) else {
+        return false;
+    };
+    if !tabs.suspend(id) {
         return false;
     }
     log_failure("suspend tab", window.suspend_tab(id));
@@ -836,77 +1073,170 @@ fn record_tab_suspend(state: &AppState, id: TabId, reason: SuspendReason) {
 }
 
 /// Dispatch one [`UserEvent`]. UI failures are logged, never fatal.
+///
+/// **Multi-window (Issue #29/D68)**: most arms first resolve the
+/// [`WindowId`] the event names to a live `&mut BrowserWindow` in
+/// `ui_windows` — an id with no entry (the window closed while the event was
+/// in flight, e.g. a title fetch that lands after its tab's window closed)
+/// is a silent no-op, the same "stale id resolves to nothing" convention
+/// `TabId` already documents. `ToolbarCommand::NewWindow`/
+/// `ContentShortcut::NewWindow`/`AutomationCommand::NewWindow` are the one
+/// family of exceptions: they are intercepted *before* that resolution,
+/// since opening a window needs `&mut HashMap<WindowId, BrowserWindow>` as a
+/// whole (to insert the new entry) at the same time another entry
+/// (`window`, the sender) would otherwise be mutably borrowed — see
+/// `open_new_window`'s call sites below.
+///
+/// One known gap this issue accepts (see the PR description): a
+/// `DownloadStarted`/`DownloadCompleted` refreshes only the *originating*
+/// window's downloads panel, even though `DownloadStore` itself is shared —
+/// a window not otherwise interacted with will not see its downloads panel
+/// update until it next reopens that panel. Refreshing every open window's
+/// panel immediately would need the same "insert vs. one entry" borrow this
+/// doc comment already flags for `NewWindow`, applied to a hot path; left
+/// for a follow-up.
+#[allow(clippy::too_many_arguments)]
 fn handle_user_event(
-    window: &mut BrowserWindow,
+    target: &EventLoopWindowTarget<UserEvent>,
+    window_event_proxy: &EventLoopProxy<UserEvent>,
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
     state: &mut AppState,
     config: &Config,
     homepage: &str,
+    automation_window: &mut WindowId,
     event: UserEvent,
 ) {
     match event {
-        UserEvent::ToolbarMessage(body) => match toolbar::parse_command(&body) {
-            Ok(command) => handle_toolbar_command(window, state, config, homepage, command),
+        UserEvent::ToolbarMessage(window_id, body) => match toolbar::parse_command(&body) {
+            // See this function's doc comment: intercepted before resolving
+            // `window_id` to a `&mut BrowserWindow`.
+            Ok(ToolbarCommand::NewWindow) => {
+                open_new_window(
+                    target,
+                    window_event_proxy,
+                    ui_windows,
+                    state,
+                    config,
+                    homepage,
+                );
+            }
+            // See this function's doc comment, and `apply_updated_settings`'s:
+            // settings are whole-process (D67), so applying one touches
+            // every open window's chrome, which needs `ui_windows` as a
+            // whole — the same reason `NewWindow` is intercepted here.
+            Ok(ToolbarCommand::UpdateSettings { settings }) => {
+                apply_updated_settings(ui_windows, state, *settings);
+            }
+            Ok(ToolbarCommand::ResetSettings) => {
+                apply_updated_settings(ui_windows, state, Settings::default());
+            }
+            Ok(command) => {
+                if let Some(window) = ui_windows.get_mut(&window_id) {
+                    handle_toolbar_command(window, window_id, state, config, homepage, command);
+                }
+            }
             Err(err) => eprintln!(
                 "velox: ignoring malformed toolbar message ({} bytes, preview {:?}): {err}",
                 body.len(),
                 log_preview(&body)
             ),
         },
-        UserEvent::NavigationStarted(id, url) | UserEvent::LoadStarted(id, url) => {
-            if let Some(tab) = state.tabs.get_mut(id) {
-                tab.on_navigation_started(&url);
+        UserEvent::NavigationStarted(window_id, id, url)
+        | UserEvent::LoadStarted(window_id, id, url) => {
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            let is_active = state
+                .windows
+                .tabs_mut(window_id)
+                .map(|tabs| {
+                    if let Some(tab) = tabs.get_mut(id) {
+                        tab.on_navigation_started(&url);
+                    }
+                    tabs.active_id() == id
+                })
+                .unwrap_or(false);
+            // Issue #43/D69, integrated with multi-window in D68: the page
+            // under an open find session is about to change, so its
+            // matches/highlights are about to become stale — close it
+            // rather than keep showing a count (or an active-match
+            // highlight) for content that no longer exists. Scoped to
+            // *this* window's own find session (`Windows::find`) — a
+            // search open in a different window, even one whose active tab
+            // happens to share this `TabId` value, is never touched.
+            if state
+                .windows
+                .find(window_id)
+                .is_some_and(|session| session.tab_id() == id)
+            {
+                close_find_bar(window, window_id, state);
             }
-            // Issue #43/D69: the page under an open find session is about to
-            // change, so its matches/highlights are about to become stale —
-            // close it rather than keep showing a count (or an active-match
-            // highlight) for content that no longer exists.
-            if state.find.as_ref().is_some_and(|f| f.tab_id() == id) {
-                close_find_bar(window, state);
-            }
-            if id == state.tabs.active_id() {
+            if is_active {
                 log_failure("update address bar", window.set_url_display(&url));
                 log_failure("show loading state", window.set_loading(true));
                 sync_bookmark_star(window, state, &url);
             }
-            sync_tab_strip(window, state);
+            sync_tab_strip(window, window_id, state);
         }
-        UserEvent::NavigationBlocked(id, url) => {
-            eprintln!("velox: blocked navigation to {url} in tab {id:?}");
-            if let Some(tab) = state.tabs.get_mut(id) {
+        UserEvent::NavigationBlocked(window_id, id, url) => {
+            eprintln!("velox: blocked navigation to {url} in tab {id:?} (window {window_id:?})");
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            let Some(tabs) = state.windows.tabs_mut(window_id) else {
+                return;
+            };
+            if let Some(tab) = tabs.get_mut(id) {
                 tab.on_navigation_blocked(&url);
             }
             // Only the active tab's badge is visible right now; a blocked
             // navigation in a background tab still updates its own
             // `Tab::blocked_count` above and is picked up the moment that
             // tab becomes active (see `activate_and_refresh`).
-            if id == state.tabs.active_id() {
-                sync_block_count(window, &state.tabs);
+            if id == tabs.active_id() {
+                sync_block_count(window, tabs);
             }
         }
-        UserEvent::SubresourceBlocked(id, url) => {
+        UserEvent::SubresourceBlocked(window_id, id, url) => {
             // Deliberately no `eprintln!` here unlike `NavigationBlocked`
             // above: a busy page can trigger this dozens of times per
             // second (every blocked ad/tracker image, script, XHR...), and
             // spamming stderr at that rate would drown out every other
             // `log_failure` line this file relies on for diagnostics.
-            if let Some(tab) = state.tabs.get_mut(id) {
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            let Some(tabs) = state.windows.tabs_mut(window_id) else {
+                return;
+            };
+            if let Some(tab) = tabs.get_mut(id) {
                 tab.on_subresource_blocked(&url);
             }
             // Same badge-visibility reasoning as `NavigationBlocked` above.
-            if id == state.tabs.active_id() {
-                sync_block_count(window, &state.tabs);
+            if id == tabs.active_id() {
+                sync_block_count(window, tabs);
             }
         }
-        UserEvent::LoadFinished(id, url) => {
-            // A failed load reports an empty URL; keep showing the URL the
-            // tab tried to reach instead of blanking it out.
-            if let Some(tab) = state.tabs.get_mut(id) {
-                if url.is_empty() {
-                    tab.on_load_failed();
-                } else {
-                    tab.on_load_finished(&url);
-                }
-            }
+        UserEvent::LoadFinished(window_id, id, url) => {
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            let is_active = state
+                .windows
+                .tabs_mut(window_id)
+                .map(|tabs| {
+                    // A failed load reports an empty URL; keep showing the
+                    // URL the tab tried to reach instead of blanking it out.
+                    if let Some(tab) = tabs.get_mut(id) {
+                        if url.is_empty() {
+                            tab.on_load_failed();
+                        } else {
+                            tab.on_load_finished(&url);
+                        }
+                    }
+                    tabs.active_id() == id
+                })
+                .unwrap_or(false);
             if !url.is_empty() {
                 // Recorded for whichever tab just finished loading, not only
                 // the active one: a background tab finishing a load is a
@@ -933,66 +1263,108 @@ fn handle_user_event(
                     window.fetch_favicon(id, history_id.unwrap_or(0), url.clone()),
                 );
             }
-            if id == state.tabs.active_id() {
+            if is_active {
                 if !url.is_empty() {
                     log_failure("update address bar", window.set_url_display(&url));
                     sync_bookmark_star(window, state, &url);
                 }
                 log_failure("hide loading state", window.set_loading(false));
             }
-            sync_tab_strip(window, state);
+            sync_tab_strip(window, window_id, state);
         }
         UserEvent::PageTitleResolved {
+            window_id,
             tab_id,
             history_id,
             title,
         } => {
-            // A stale `tab_id` (the tab closed while the title fetch was in
-            // flight) is a safe no-op here — only the history entry still
-            // gets its title.
-            if let Some(tab) = state.tabs.get_mut(tab_id) {
-                tab.set_title(title.clone());
-                // Unlike `FaviconResolved` below, nothing else here already
-                // calls `sync_tab_strip` (which would also cover this) —
-                // persist explicitly so a title that arrives just before a
-                // crash is not lost from the next restore (Issue #25/D65).
-                persist_session(state);
+            // A stale `tab_id`/`window_id` (the tab or window closed while
+            // the title fetch was in flight) is a safe no-op here — only the
+            // history entry still gets its title.
+            if let Some(tabs) = state.windows.tabs_mut(window_id) {
+                if let Some(tab) = tabs.get_mut(tab_id) {
+                    tab.set_title(title.clone());
+                    // Unlike `FaviconResolved` below, nothing else here
+                    // already calls `persist_session` (which
+                    // `sync_tab_strip` would also cover) — persist
+                    // explicitly so a title that arrives just before a
+                    // crash is not lost from the next restore (Issue
+                    // #25/D65).
+                    persist_session(state, window_id);
+                }
             }
             if state.history.update_title(history_id, title) {
                 persist_history(state);
-                refresh_history_panel(window, state, config);
+                if let Some(window) = ui_windows.get(&window_id) {
+                    refresh_history_panel(window, state, config);
+                }
             }
         }
         UserEvent::FaviconResolved {
+            window_id,
             tab_id,
             history_id,
             page_url,
             url,
         } => {
-            // A stale `tab_id` (the tab closed while the fetch was in
-            // flight) is a safe no-op — mirrors `PageTitleResolved` above.
-            if let Some(tab) = state.tabs.get_mut(tab_id) {
-                tab.set_favicon_url(url.clone());
-                sync_tab_strip(window, state);
+            // A stale `tab_id`/`window_id` (the tab or window closed while
+            // the fetch was in flight) is a safe no-op — mirrors
+            // `PageTitleResolved` above.
+            if let Some(tabs) = state.windows.tabs_mut(window_id) {
+                if let Some(tab) = tabs.get_mut(tab_id) {
+                    tab.set_favicon_url(url.clone());
+                    if let Some(window) = ui_windows.get(&window_id) {
+                        sync_tab_strip(window, window_id, state);
+                    }
+                }
             }
             if state.history.update_favicon(history_id, url.clone()) {
                 persist_history(state);
-                refresh_history_panel(window, state, config);
+                if let Some(window) = ui_windows.get(&window_id) {
+                    refresh_history_panel(window, state, config);
+                }
             }
             // Issue #19/D34: a bookmarked page's favicon updates the same
             // way, keyed by URL (a bookmark has no history/tab id of its
-            // own to correlate against).
+            // own to correlate against) — a global store, so every open
+            // window's bookmarks panel is refreshed, not just the
+            // originating one.
             if state.bookmarks.update_favicon_by_url(&page_url, url) {
                 persist_bookmarks(state);
-                refresh_bookmarks_panel(window, state);
+                for window in ui_windows.values() {
+                    refresh_bookmarks_panel(window, state);
+                }
             }
         }
-        UserEvent::OpenDevtoolsRequested => window.open_devtools(),
-        UserEvent::ContentShortcut(shortcut) => {
-            handle_content_shortcut(window, state, homepage, shortcut)
+        UserEvent::OpenDevtoolsRequested(window_id) => {
+            if let Some(window) = ui_windows.get_mut(&window_id) {
+                window.open_devtools();
+            }
         }
-        UserEvent::NewTabRequested(url) => open_new_tab(window, state, &url),
+        UserEvent::ContentShortcut(window_id, ContentShortcut::NewWindow) => {
+            // See this function's doc comment.
+            open_new_window(
+                target,
+                window_event_proxy,
+                ui_windows,
+                state,
+                config,
+                homepage,
+            );
+            let _ = window_id; // Unused: opening a window needs no source tab.
+        }
+        UserEvent::ContentShortcut(window_id, shortcut) => {
+            if let Some(window) = ui_windows.get_mut(&window_id) {
+                handle_content_shortcut(window, window_id, state, homepage, shortcut);
+            }
+        }
+        UserEvent::NewTabRequested(window_id, url) => {
+            if let Some(window) = ui_windows.get_mut(&window_id) {
+                open_new_tab(window, window_id, state, &url);
+            }
+        }
         UserEvent::DownloadStarted {
+            window_id,
             url,
             file_name,
             destination,
@@ -1001,9 +1373,16 @@ fn handle_user_event(
             state
                 .downloads
                 .start(url, file_name, destination, started_at);
-            refresh_downloads_panel(window, state);
+            if let Some(window) = ui_windows.get(&window_id) {
+                refresh_downloads_panel(window, state);
+            }
         }
-        UserEvent::DownloadCompleted { url, path, success } => {
+        UserEvent::DownloadCompleted {
+            window_id,
+            url,
+            path,
+            success,
+        } => {
             let now = now_unix();
             match state.downloads.resolve_completion(&url, path.as_deref()) {
                 Some(id) if success => {
@@ -1021,10 +1400,26 @@ fn handle_user_event(
                     );
                 }
             }
-            refresh_downloads_panel(window, state);
+            if let Some(window) = ui_windows.get(&window_id) {
+                refresh_downloads_panel(window, state);
+            }
+        }
+        UserEvent::Automation(AutomationCommand::NewWindow) => {
+            if let Some(new_id) = open_new_window(
+                target,
+                window_event_proxy,
+                ui_windows,
+                state,
+                config,
+                homepage,
+            ) {
+                *automation_window = new_id;
+            }
         }
         UserEvent::Automation(command) => {
-            handle_automation_command(window, state, command);
+            if let Some(window) = ui_windows.get_mut(automation_window) {
+                handle_automation_command(window, *automation_window, state, command);
+            }
         }
         UserEvent::MemorySampled(sample) => {
             // Acted on by `sweep_tabs` at the end of this loop pass (it
@@ -1032,11 +1427,26 @@ fn handle_user_event(
             // place that combines all three signals.
             state.pending_memory_sample = Some(sample);
         }
-        UserEvent::FindMatchesUpdated { tab_id, total } => {
+        UserEvent::FindMatchesUpdated {
+            window_id,
+            tab_id,
+            total,
+        } => {
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
             // A session for a *different* tab (the find bar moved on, or
             // closed, while this DOM search was still running) means this
-            // result is stale — see this variant's doc comment.
-            if let Some(session) = state.find.as_mut().filter(|s| s.tab_id() == tab_id) {
+            // result is stale — see this variant's doc comment. Scoped to
+            // `window_id`'s own find session (`Windows::find_mut`) — a
+            // result meant for one window's find bar can never update
+            // another window's, even one whose active tab happens to share
+            // this `tab_id` value (Issue #29/D68).
+            if let Some(session) = state
+                .windows
+                .find_mut(window_id)
+                .filter(|session| session.tab_id() == tab_id)
+            {
                 session.set_total(total);
                 let active = session.active();
                 log_failure("update find status", window.set_find_status(total, active));
@@ -1051,8 +1461,71 @@ fn handle_user_event(
     }
 }
 
+/// Open a brand new window (Ctrl/Cmd+N) with a single tab at `url`. The one
+/// path every "open a new window" trigger funnels through —
+/// `ToolbarCommand::NewWindow`, `ContentShortcut::NewWindow`, and
+/// `AutomationCommand::NewWindow` — mirroring how [`open_new_tab`] is the
+/// one path for "open a new tab" (Issue #29, see docs/decisions.md D68).
+///
+/// Returns the new window's id on success. A `BrowserWindow::new` failure —
+/// the same construction the very first window already went through, so
+/// this should not happen in practice — is logged to stderr and rolled back
+/// (the `Windows` entry `open_window` just created is removed again) rather
+/// than taking the whole process down or leaving an orphaned logical window
+/// with no `BrowserWindow` behind it.
+fn open_new_window(
+    target: &EventLoopWindowTarget<UserEvent>,
+    window_event_proxy: &EventLoopProxy<UserEvent>,
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    config: &Config,
+    url: &str,
+) -> Option<WindowId> {
+    let window_id = state.windows.open_window(url.to_owned());
+    let tab_id = state
+        .windows
+        .tabs(window_id)
+        .expect("just opened above")
+        .active_id();
+    match BrowserWindow::new(
+        target,
+        window_id,
+        config,
+        window_event_proxy.clone(),
+        tab_id,
+        url,
+        state.site_policies.clone(),
+    ) {
+        Ok(window) => {
+            // Issue #30/D67, integrated with multi-window in D68: settings
+            // are whole-process (`AppState::settings`), so a window opened
+            // after startup must reflect the *current* saved Appearance
+            // settings from the moment it exists — the same push
+            // `app::run` does once for the primary window, and
+            // `apply_updated_settings` repeats for every open window
+            // whenever the settings screen saves a change.
+            log_failure(
+                "apply theme",
+                window.set_theme(state.settings.appearance.theme),
+            );
+            log_failure(
+                "apply initial bookmark bar visibility",
+                window.set_bookmark_bar_visible(state.settings.appearance.show_bookmark_bar),
+            );
+            ui_windows.insert(window_id, window);
+            Some(window_id)
+        }
+        Err(err) => {
+            eprintln!("velox: failed to open a new window: {err}");
+            state.windows.close_window(window_id);
+            None
+        }
+    }
+}
+
 fn handle_toolbar_command(
     window: &mut BrowserWindow,
+    window_id: WindowId,
     state: &mut AppState,
     config: &Config,
     homepage: &str,
@@ -1082,7 +1555,7 @@ fn handle_toolbar_command(
             }
             match resolve_intent(config, intent) {
                 Some(url) => {
-                    navigate_active_tab(window, state, &url);
+                    navigate_active_tab(window, window_id, state, &url);
                     // A panel entry click drives this same command; close
                     // whichever panel was open now that the user has acted
                     // on it.
@@ -1094,7 +1567,7 @@ fn handle_toolbar_command(
                     // on.
                     log_failure(
                         "restore address bar",
-                        window.set_url_display(state.tabs.active().current_url()),
+                        window.set_url_display(tabs_of(state, window_id).active().current_url()),
                     );
                 }
             }
@@ -1103,44 +1576,44 @@ fn handle_toolbar_command(
         ToolbarCommand::Forward => log_failure("go forward", window.go_forward()),
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
         ToolbarCommand::OpenDevtools => window.open_devtools(),
-        ToolbarCommand::NewTab => open_new_tab(window, state, homepage),
-        ToolbarCommand::CloseTab { id } => close_tab(window, state, TabId::from(id)),
+        ToolbarCommand::NewTab => open_new_tab(window, window_id, state, homepage),
+        ToolbarCommand::CloseTab { id } => close_tab(window, window_id, state, TabId::from(id)),
         ToolbarCommand::ActivateTab { id } => {
             let id = TabId::from(id);
             let started = Instant::now();
-            if let Some(effect) = state.tabs.activate_at(id, started) {
-                activate_and_refresh(window, state, id, effect);
+            if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
+                activate_and_refresh(window, window_id, state, id, effect);
                 record_tab_latency(state, switch_latency_kind(effect), id, started);
             }
         }
         ToolbarCommand::CloseActiveTab => {
-            let id = state.tabs.active_id();
-            close_tab(window, state, id);
+            let id = tabs_of(state, window_id).active_id();
+            close_tab(window, window_id, state, id);
         }
-        ToolbarCommand::ReopenClosedTab => reopen_closed_tab(window, state),
+        ToolbarCommand::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ToolbarCommand::NextTab => {
             let started = Instant::now();
-            let effect = state.tabs.activate_relative(1, started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_relative(1, started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ToolbarCommand::PrevTab => {
             let started = Instant::now();
-            let effect = state.tabs.activate_relative(-1, started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_relative(-1, started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ToolbarCommand::ActivateTabByIndex { index } => {
             let started = Instant::now();
-            let effect = state.tabs.activate_by_position(index as usize, started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_by_position(index as usize, started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ToolbarCommand::ActivateLastTab => {
             let started = Instant::now();
-            let effect = state.tabs.activate_last(started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_last(started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ToolbarCommand::SuspendTab { id } => {
-            if suspend_tab(window, state, TabId::from(id)) {
-                sync_tab_strip(window, state);
+            if suspend_tab(window, window_id, state, TabId::from(id)) {
+                sync_tab_strip(window, window_id, state);
             }
             // Otherwise: unknown id, the active tab (never suspended), or
             // already suspended — a no-op, mirroring `CloseTab`'s guards.
@@ -1151,11 +1624,11 @@ fn handle_toolbar_command(
         ToolbarCommand::Ready => {
             log_failure(
                 "initialize address bar",
-                window.set_url_display(state.tabs.active().current_url()),
+                window.set_url_display(tabs_of(state, window_id).active().current_url()),
             );
             log_failure(
                 "initialize loading state",
-                window.set_loading(state.tabs.active().is_loading()),
+                window.set_loading(tabs_of(state, window_id).active().is_loading()),
             );
             log_failure("show private indicator", window.set_private(config.private));
             log_failure(
@@ -1166,20 +1639,23 @@ fn handle_toolbar_command(
             // same way `set_private` is above — a one-time push on `ready`,
             // since it never changes except through the settings screen
             // (which pushes it again itself via `apply_updated_settings`).
+            // Whole-process (D67/D68): every window's toolbar applies the
+            // same `state.settings`, since the settings screen is not
+            // per-window state.
             log_failure(
                 "apply theme",
                 window.set_theme(state.settings.appearance.theme),
             );
-            sync_block_count(window, &state.tabs);
-            let url = state.tabs.active().current_url().to_owned();
+            sync_block_count(window, tabs_of(state, window_id));
+            let url = tabs_of(state, window_id).active().current_url().to_owned();
             sync_bookmark_star(window, state, &url);
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
             refresh_downloads_panel(window, state);
             refresh_settings_panel(window, state);
-            sync_tab_strip(window, state);
+            sync_tab_strip(window, window_id, state);
         }
-        ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, state),
+        ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
         ToolbarCommand::TogglePanel { panel } => {
             let next = if window.open_panel() == Some(panel) {
                 None
@@ -1231,7 +1707,7 @@ fn handle_toolbar_command(
             if state.bookmarks.remove(id) {
                 persist_bookmarks(state);
                 refresh_bookmarks_panel(window, state);
-                let url = state.tabs.active().current_url().to_owned();
+                let url = tabs_of(state, window_id).active().current_url().to_owned();
                 sync_bookmark_star(window, state, &url);
             }
         }
@@ -1249,7 +1725,7 @@ fn handle_toolbar_command(
             }
         }
         // --- Omnibox (Issue #15) ---
-        ToolbarCommand::FocusAddressBar => focus_address_bar(window, state),
+        ToolbarCommand::FocusAddressBar => focus_address_bar(window, window_id, state),
         ToolbarCommand::OmniboxInput { input } => {
             // Issue #20: history/bookmark matches, then previously-typed
             // search queries, ranked by `browser::ranking` — see
@@ -1291,7 +1767,7 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::OmniboxClose => {
             log_failure("close omnibox", window.set_panel(None));
-            focus_address_bar(window, state);
+            focus_address_bar(window, window_id, state);
         }
         // --- Bookmark folders, editing, reordering, and the bookmark bar
         //     (Issue #19, see docs/decisions.md D32/D33/D34/D35) ---
@@ -1326,7 +1802,7 @@ fn handle_toolbar_command(
             // edit form closes and shows the entry's actual (possibly
             // unchanged) state either way.
             refresh_bookmarks_panel(window, state);
-            let active_url = state.tabs.active().current_url().to_owned();
+            let active_url = tabs_of(state, window_id).active().current_url().to_owned();
             sync_bookmark_star(window, state, &active_url);
         }
         ToolbarCommand::CreateBookmarkFolder { name } => {
@@ -1363,20 +1839,31 @@ fn handle_toolbar_command(
             }
         }
         ToolbarCommand::ToggleBookmarkBar => toggle_bookmark_bar(window),
-        ToolbarCommand::UpdateSettings { settings } => {
-            apply_updated_settings(window, state, *settings)
-        }
-        ToolbarCommand::ResetSettings => apply_updated_settings(window, state, Settings::default()),
+        // Intercepted in `handle_user_event` before it ever reaches here —
+        // see that function's doc comment for why (opening a window, or
+        // applying a settings change to every window, needs `&mut
+        // HashMap<WindowId, BrowserWindow>` as a whole, which conflicts with
+        // the `window: &mut BrowserWindow` entry already borrowed to get
+        // here). Listed explicitly, not folded into a wildcard, so a future
+        // `ToolbarCommand` variant still fails to compile here instead of
+        // silently doing nothing.
+        ToolbarCommand::NewWindow => {}
+        ToolbarCommand::UpdateSettings { .. } | ToolbarCommand::ResetSettings => {}
 
-        // --- In-page find (Issue #43), see docs/decisions.md D69 ---
-        ToolbarCommand::OpenFindBar => open_find_bar(window, state),
+        // --- In-page find (Issue #43), see docs/decisions.md D69, and D68's
+        //     multi-window integration: every one of these now targets
+        //     `window_id`'s own find session (`Windows::find`/`set_find`/
+        //     `take_find`), never a global one shared by every window. ---
+        ToolbarCommand::OpenFindBar => open_find_bar(window, window_id, state),
         ToolbarCommand::FindQuery {
             query,
             case_sensitive,
-        } => update_find_query(window, state, query, case_sensitive),
-        ToolbarCommand::FindNext => step_find(window, state, FindDirection::Next),
-        ToolbarCommand::FindPrevious => step_find(window, state, FindDirection::Previous),
-        ToolbarCommand::FindClose => close_find_bar(window, state),
+        } => update_find_query(window, window_id, state, query, case_sensitive),
+        ToolbarCommand::FindNext => step_find(window, window_id, state, FindDirection::Next),
+        ToolbarCommand::FindPrevious => {
+            step_find(window, window_id, state, FindDirection::Previous)
+        }
+        ToolbarCommand::FindClose => close_find_bar(window, window_id, state),
     }
 }
 
@@ -1384,8 +1871,8 @@ fn handle_toolbar_command(
 /// `ToolbarCommand::ToggleBookmark`, and Ctrl/Cmd+D from either the toolbar
 /// or a content webview — `ContentShortcut::ToggleBookmark` — all funnel
 /// through here).
-fn toggle_current_bookmark(window: &mut BrowserWindow, state: &mut AppState) {
-    let url = state.tabs.active().current_url().to_owned();
+fn toggle_current_bookmark(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let url = tabs_of(state, window_id).active().current_url().to_owned();
     let title = known_title_for(&state.history, &url);
     let now = now_unix();
     let active = state.bookmarks.toggle(&url, title, now);
@@ -1413,25 +1900,34 @@ fn toggle_bookmark_bar(window: &mut BrowserWindow) {
 // helpers below; `UserEvent::FindMatchesUpdated` (the DOM search's async
 // result) is handled directly in `handle_user_event`.
 
-/// Open the find bar for the active tab: starts a fresh
-/// `browser::find::FindState` session (discarding any previous one — e.g.
-/// re-pressing Ctrl/Cmd+F while already open just resets to an empty query,
-/// matching mainstream browsers), shows the bar, and resets the "N/M"
-/// counter to blank. The bar's own JS focuses/selects its input as soon as
-/// it becomes visible (`veloxSetFindBarVisible`), so nothing else to do here.
-fn open_find_bar(window: &mut BrowserWindow, state: &mut AppState) {
-    let tab_id = state.tabs.active_id();
-    state.find = Some(find::FindState::new(tab_id));
+/// Open the find bar for `window_id`'s active tab: starts a fresh
+/// `browser::find::FindState` session for *that window* (discarding any
+/// previous one it had open — e.g. re-pressing Ctrl/Cmd+F while already open
+/// just resets to an empty query, matching mainstream browsers), shows the
+/// bar, and resets the "N/M" counter to blank. The bar's own JS
+/// focuses/selects its input as soon as it becomes visible
+/// (`veloxSetFindBarVisible`), so nothing else to do here.
+///
+/// Multi-window (Issue #29/D68): the session is stored on `window_id`'s own
+/// `WindowEntry` (`Windows::set_find`), never a single global slot — opening
+/// find in one window must never disturb another window's independent
+/// search.
+fn open_find_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let tab_id = tabs_of(state, window_id).active_id();
+    state
+        .windows
+        .set_find(window_id, find::FindState::new(tab_id));
     log_failure("show find bar", window.set_find_bar_visible(true));
     log_failure("reset find status", window.set_find_status(0, None));
 }
 
-/// Close the find bar: clears any DOM highlight left in the session's tab
-/// (a no-op if that tab has since closed — `clear_find_highlights` already
-/// handles an unknown id), drops the session, and hides the bar. A no-op if
-/// the find bar was not open.
-fn close_find_bar(window: &mut BrowserWindow, state: &mut AppState) {
-    let Some(session) = state.find.take() else {
+/// Close `window_id`'s find bar: clears any DOM highlight left in the
+/// session's tab (a no-op if that tab has since closed —
+/// `clear_find_highlights` already handles an unknown id), drops the
+/// session, and hides the bar. A no-op if that window's find bar was not
+/// open (see `Windows::take_find`).
+fn close_find_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let Some(session) = state.windows.take_find(window_id) else {
         return;
     };
     log_failure(
@@ -1441,19 +1937,20 @@ fn close_find_bar(window: &mut BrowserWindow, state: &mut AppState) {
     log_failure("hide find bar", window.set_find_bar_visible(false));
 }
 
-/// The find bar's input changed, or its case-sensitivity toggle flipped
-/// (`ToolbarCommand::FindQuery`). A no-op if the find bar is not open (the
-/// bar's own JS should never send this then, but a stray/racy message must
-/// not panic). An empty/whitespace-only `query`
+/// `window_id`'s find bar input changed, or its case-sensitivity toggle
+/// flipped (`ToolbarCommand::FindQuery`). A no-op if that window's find bar
+/// is not open (the bar's own JS should never send this then, but a
+/// stray/racy message must not panic). An empty/whitespace-only `query`
 /// (`browser::find::normalize_query` returns `None`) clears any existing
 /// highlight instead of asking the DOM to search for nothing.
 fn update_find_query(
     window: &mut BrowserWindow,
+    window_id: WindowId,
     state: &mut AppState,
     query: String,
     case_sensitive: bool,
 ) {
-    let Some(session) = state.find.as_mut() else {
+    let Some(session) = state.windows.find_mut(window_id) else {
         return;
     };
     let tab_id = session.tab_id();
@@ -1485,11 +1982,16 @@ enum FindDirection {
     Previous,
 }
 
-/// "▼"/"▲" in the find bar, or Enter/Shift+Enter in its input
-/// (`ToolbarCommand::FindNext`/`FindPrevious`). A no-op if the find bar is
-/// not open or its query is empty (nothing searched for yet).
-fn step_find(window: &mut BrowserWindow, state: &mut AppState, direction: FindDirection) {
-    let Some(session) = state.find.as_mut() else {
+/// "▼"/"▲" in `window_id`'s find bar, or Enter/Shift+Enter in its input
+/// (`ToolbarCommand::FindNext`/`FindPrevious`). A no-op if that window's
+/// find bar is not open or its query is empty (nothing searched for yet).
+fn step_find(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    direction: FindDirection,
+) {
+    let Some(session) = state.windows.find_mut(window_id) else {
         return;
     };
     if session.query().is_empty() {
@@ -1537,10 +2039,10 @@ fn resolve_intent(config: &Config, intent: Option<Intent>) -> Option<String> {
 /// toolbar), `ContentShortcut::FocusAddressBar` (Ctrl/Cmd+L from a content
 /// webview), and `ToolbarCommand::OmniboxClose` (Esc, which also needs the
 /// address bar restored to the real current URL).
-fn focus_address_bar(window: &mut BrowserWindow, state: &AppState) {
+fn focus_address_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
     log_failure(
         "focus address bar",
-        window.focus_address_bar(state.tabs.active().current_url()),
+        window.focus_address_bar(tabs_of(state, window_id).active().current_url()),
     );
 }
 
@@ -1552,8 +2054,15 @@ fn focus_address_bar(window: &mut BrowserWindow, state: &AppState) {
 /// resolution paths (`resolve_intent`'s search/URL classification vs.
 /// `browser::automation::parse_script`'s `navigation::normalize_input`
 /// call).
-fn navigate_active_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
-    state.tabs.active_mut().on_navigation_started(url);
+fn navigate_active_tab(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    url: &str,
+) {
+    tabs_of(state, window_id)
+        .active_mut()
+        .on_navigation_started(url);
     log_failure("navigate", window.navigate(url));
 }
 
@@ -1572,18 +2081,18 @@ fn loading_probe(tabs: &Tabs) -> impl Fn(TabId) -> bool + '_ {
 /// (a `target="_blank"`/`window.open()` URL, see docs/decisions.md D25),
 /// and `AutomationCommand::Open` (Issue #112) — so the
 /// webview-build-then-activate sequence is written once.
-fn open_new_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
+fn open_new_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState, url: &str) {
     // Reuses the `Instant` `Tabs::open_at` needs anyway, so tab-create
     // latency costs no extra clock read when metrics are off (D19).
     let started = Instant::now();
-    let id = state.tabs.open_at(url.to_owned(), started);
+    let id = tabs_of(state, window_id).open_at(url.to_owned(), started);
     log_failure(
         "open tab",
-        window.open_tab(id, url, loading_probe(&state.tabs)),
+        window.open_tab(id, url, loading_probe(tabs_of(state, window_id))),
     );
     // A brand new tab's webview was just built above; only its visibility
     // needs to change, never a resume.
-    activate_and_refresh(window, state, id, ActivationEffect::Switch);
+    activate_and_refresh(window, window_id, state, id, ActivationEffect::Switch);
     record_tab_latency(state, metrics::TabLatencyKind::Create, id, started);
 }
 
@@ -1593,15 +2102,15 @@ fn open_new_tab(window: &mut BrowserWindow, state: &mut AppState, url: &str) {
 /// `ContentShortcut::CloseTab`, both of which resolve `id` to the active
 /// tab before calling this). A no-op — matching `Tabs::close` — for an
 /// unknown id or the last remaining tab.
-fn close_tab(window: &mut BrowserWindow, state: &mut AppState, id: TabId) {
-    if let Some((new_active, effect)) = state.tabs.close(id) {
+fn close_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState, id: TabId) {
+    if let Some((new_active, effect)) = tabs_of(state, window_id).close(id) {
         window.close_tab(id);
         // The tab that replaces the one just closed may itself have been
         // suspended (a background tab can be suspended while the tab in
         // front of it is closed); `effect` already reflects that
         // (`Tabs::close`), so `activate_and_refresh` resumes it if needed
         // without re-deriving it here.
-        activate_and_refresh(window, state, new_active, effect);
+        activate_and_refresh(window, window_id, state, new_active, effect);
     }
     // Otherwise: unknown id, or `id` was the only remaining tab — VeloX
     // always keeps at least one tab open.
@@ -1610,21 +2119,20 @@ fn close_tab(window: &mut BrowserWindow, state: &mut AppState, id: TabId) {
 /// Reopen the most recently closed tab (Ctrl/Cmd+Shift+T, from either the
 /// toolbar or the content webview). A no-op if nothing has been closed yet
 /// (see `browser::tabs::Tabs::reopen_closed`).
-fn reopen_closed_tab(window: &mut BrowserWindow, state: &mut AppState) {
+fn reopen_closed_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
     let started = Instant::now();
-    let Some(id) = state.tabs.reopen_closed(started) else {
+    let Some(id) = tabs_of(state, window_id).reopen_closed(started) else {
         return;
     };
-    let url = state
-        .tabs
+    let url = tabs_of(state, window_id)
         .get(id)
         .map(|tab| tab.current_url().to_owned())
         .unwrap_or_default();
     log_failure(
         "reopen tab",
-        window.open_tab(id, &url, loading_probe(&state.tabs)),
+        window.open_tab(id, &url, loading_probe(tabs_of(state, window_id))),
     );
-    activate_and_refresh(window, state, id, ActivationEffect::Switch);
+    activate_and_refresh(window, window_id, state, id, ActivationEffect::Switch);
     // A reopened tab builds a fresh webview at the remembered URL, so it is
     // a tab creation as far as D19's latency metric is concerned.
     record_tab_latency(state, metrics::TabLatencyKind::Create, id, started);
@@ -1637,13 +2145,14 @@ fn reopen_closed_tab(window: &mut BrowserWindow, state: &mut AppState) {
 /// position with no tab) is a silent no-op.
 fn apply_activation(
     window: &mut BrowserWindow,
+    window_id: WindowId,
     state: &mut AppState,
     effect: Option<ActivationEffect>,
     started: Instant,
 ) {
     if let Some(effect) = effect {
-        let id = state.tabs.active_id();
-        activate_and_refresh(window, state, id, effect);
+        let id = tabs_of(state, window_id).active_id();
+        activate_and_refresh(window, window_id, state, id, effect);
         record_tab_latency(state, switch_latency_kind(effect), id, started);
     }
 }
@@ -1665,41 +2174,46 @@ fn switch_latency_kind(effect: ActivationEffect) -> metrics::TabLatencyKind {
 /// here mirrors one `ToolbarCommand` arm in `handle_toolbar_command`.
 fn handle_content_shortcut(
     window: &mut BrowserWindow,
+    window_id: WindowId,
     state: &mut AppState,
     homepage: &str,
     shortcut: ContentShortcut,
 ) {
     match shortcut {
-        ContentShortcut::NewTab => open_new_tab(window, state, homepage),
+        ContentShortcut::NewTab => open_new_tab(window, window_id, state, homepage),
         ContentShortcut::CloseTab => {
-            let id = state.tabs.active_id();
-            close_tab(window, state, id);
+            let id = tabs_of(state, window_id).active_id();
+            close_tab(window, window_id, state, id);
         }
-        ContentShortcut::ReopenClosedTab => reopen_closed_tab(window, state),
+        ContentShortcut::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ContentShortcut::NextTab => {
             let started = Instant::now();
-            let effect = state.tabs.activate_relative(1, started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_relative(1, started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ContentShortcut::PrevTab => {
             let started = Instant::now();
-            let effect = state.tabs.activate_relative(-1, started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_relative(-1, started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ContentShortcut::ActivateTabAt(position) => {
             let started = Instant::now();
-            let effect = state.tabs.activate_by_position(position as usize, started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_by_position(position as usize, started);
+            apply_activation(window, window_id, state, effect, started);
         }
         ContentShortcut::ActivateLastTab => {
             let started = Instant::now();
-            let effect = state.tabs.activate_last(started);
-            apply_activation(window, state, effect, started);
+            let effect = tabs_of(state, window_id).activate_last(started);
+            apply_activation(window, window_id, state, effect, started);
         }
-        ContentShortcut::FocusAddressBar => focus_address_bar(window, state),
-        ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, state),
+        ContentShortcut::FocusAddressBar => focus_address_bar(window, window_id, state),
+        ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
         ContentShortcut::ToggleBookmarkBar => toggle_bookmark_bar(window),
-        ContentShortcut::OpenFindBar => open_find_bar(window, state),
+        // Intercepted in `handle_user_event` before it ever reaches here —
+        // see that function's doc comment (same reason as
+        // `ToolbarCommand::NewWindow` in `handle_toolbar_command`).
+        ContentShortcut::NewWindow => {}
+        ContentShortcut::OpenFindBar => open_find_bar(window, window_id, state),
     }
 }
 
@@ -1710,8 +2224,9 @@ fn handle_content_shortcut(
 /// `ContentShortcut` arm, exactly like `handle_content_shortcut` itself
 /// mirrors `handle_toolbar_command`. `Open`/`Close`/`Switch` address a tab
 /// by its position in the tab strip (0-based, matching what a benchmark
-/// script author sees on screen), resolved against `state.tabs` right
-/// here — since by the time this runs, tabs may have been opened/closed
+/// script author sees on screen), resolved against `window_id`'s `Tabs`
+/// (see `tab_id_at`) right here — since by the time this runs, tabs may
+/// have been opened/closed
 /// since the script was parsed, resolving late (rather than up front) is
 /// the only way position `2` reliably means "the third tab, right now".
 /// An out-of-range position is a silent no-op (eprintln'd), never a panic
@@ -1727,30 +2242,31 @@ fn handle_content_shortcut(
 /// compile here instead of silently doing nothing.
 fn handle_automation_command(
     window: &mut BrowserWindow,
+    window_id: WindowId,
     state: &mut AppState,
     command: AutomationCommand,
 ) {
     match command {
-        AutomationCommand::Open { url } => open_new_tab(window, state, &url),
-        AutomationCommand::Navigate { url } => navigate_active_tab(window, state, &url),
-        AutomationCommand::Switch { index } => match tab_id_at(state, index) {
+        AutomationCommand::Open { url } => open_new_tab(window, window_id, state, &url),
+        AutomationCommand::Navigate { url } => navigate_active_tab(window, window_id, state, &url),
+        AutomationCommand::Switch { index } => match tab_id_at(state, window_id, index) {
             Some(id) => {
                 let started = Instant::now();
-                if let Some(effect) = state.tabs.activate_at(id, started) {
-                    activate_and_refresh(window, state, id, effect);
+                if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
+                    activate_and_refresh(window, window_id, state, id, effect);
                     record_tab_latency(state, switch_latency_kind(effect), id, started);
                 }
             }
             None => eprintln!("velox: automation: switch {index} は範囲外です"),
         },
-        AutomationCommand::Close { index } => match tab_id_at(state, index) {
-            Some(id) => close_tab(window, state, id),
+        AutomationCommand::Close { index } => match tab_id_at(state, window_id, index) {
+            Some(id) => close_tab(window, window_id, state, id),
             None => eprintln!("velox: automation: close {index} は範囲外です"),
         },
-        AutomationCommand::Suspend { index } => match tab_id_at(state, index) {
+        AutomationCommand::Suspend { index } => match tab_id_at(state, window_id, index) {
             Some(id) => {
-                if suspend_tab(window, state, id) {
-                    sync_tab_strip(window, state);
+                if suspend_tab(window, window_id, state, id) {
+                    sync_tab_strip(window, window_id, state);
                 }
                 // Otherwise the active or an already-suspended tab: a
                 // no-op, exactly like `ToolbarCommand::SuspendTab`.
@@ -1762,16 +2278,25 @@ fn handle_automation_command(
         // browser state to change.
         AutomationCommand::Mark => {}
         AutomationCommand::Wait { .. } | AutomationCommand::Quit => {}
+        // Intercepted in `handle_user_event` before it ever reaches here —
+        // opening a window (unlike every other automation command) is not
+        // scoped to "the current window" in the first place, and changes
+        // *which* window `automation_window` points at afterwards. See
+        // `browser::AutomationCommand::NewWindow`'s doc comment.
+        AutomationCommand::NewWindow => {}
     }
 }
 
-/// The [`TabId`] currently at tab-strip position `index` (0-based), or
-/// `None` if `index` is out of range — the shared lookup
-/// `handle_automation_command`'s `Switch`/`Close` arms use to turn a
-/// script's positional index into the `TabId` every other tab operation
+/// The [`TabId`] currently at tab-strip position `index` (0-based) in window
+/// `window_id`, or `None` if `index` is out of range — the shared lookup
+/// `handle_automation_command`'s `Switch`/`Close`/`Suspend` arms use to turn
+/// a script's positional index into the `TabId` every other tab operation
 /// in this file addresses tabs by.
-fn tab_id_at(state: &AppState, index: usize) -> Option<TabId> {
-    state.tabs.iter().nth(index).map(|tab| tab.id())
+fn tab_id_at(state: &mut AppState, window_id: WindowId, index: usize) -> Option<TabId> {
+    tabs_of(state, window_id)
+        .iter()
+        .nth(index)
+        .map(|tab| tab.id())
 }
 
 /// Spawn the background thread that drives one parsed
@@ -1808,8 +2333,8 @@ fn spawn_automation(proxy: EventLoopProxy<UserEvent>, commands: Vec<AutomationCo
 /// Show `id` in the window, then bring the toolbar (address bar, loading
 /// indicator, bookmark star, block-count badge, tab strip) up to date with
 /// the now-active tab. The caller must have already made `id` the active
-/// tab in `state.tabs` (`activate`/`activate_at`, `open`/`open_at`, or the
-/// replacement tab returned by `close`) and pass along the
+/// tab in `window_id`'s `Tabs` (`activate`/`activate_at`, `open`/`open_at`,
+/// or the replacement tab returned by `close`) and pass along the
 /// [`ActivationEffect`] that call reported.
 ///
 /// `effect` decides which `BrowserWindow` call applies `id` on the webview
@@ -1821,23 +2346,26 @@ fn spawn_automation(proxy: EventLoopProxy<UserEvent>, commands: Vec<AutomationCo
 /// the answer.
 fn activate_and_refresh(
     window: &mut BrowserWindow,
+    window_id: WindowId,
     state: &mut AppState,
     id: TabId,
     effect: ActivationEffect,
 ) {
-    // Issue #43/D69: the find bar is tied to whichever tab was active when
-    // it opened (see `browser::find::FindState`'s doc comment) — any tab
-    // switch invalidates that, so close it rather than let it keep showing
-    // stale highlights/counts for a tab that is no longer on screen.
-    if state.find.is_some() {
-        close_find_bar(window, state);
+    // Issue #43/D69, integrated with multi-window in D68: the find bar is
+    // tied to whichever tab was active *in this window* when it opened (see
+    // `browser::find::FindState`'s doc comment) — any tab switch in this
+    // window invalidates that, so close this window's own find session
+    // (`Windows::find`) rather than let it keep showing stale
+    // highlights/counts for a tab that is no longer on screen. Never
+    // touches another window's independent find session.
+    if state.windows.find(window_id).is_some() {
+        close_find_bar(window, window_id, state);
     }
     let result = match effect {
-        ActivationEffect::Resume => window.resume_tab(
-            id,
-            state.tabs.active().current_url(),
-            loading_probe(&state.tabs),
-        ),
+        ActivationEffect::Resume => {
+            let tabs = tabs_of(state, window_id);
+            window.resume_tab(id, tabs.active().current_url(), loading_probe(tabs))
+        }
         ActivationEffect::Switch => window.activate_tab(id),
     };
     log_failure(
@@ -1847,14 +2375,14 @@ fn activate_and_refresh(
         },
         result,
     );
-    if let Some(tab) = state.tabs.get(id) {
+    if let Some(tab) = tabs_of(state, window_id).get(id) {
         let url = tab.current_url().to_owned();
         log_failure("update address bar", window.set_url_display(&url));
         log_failure("update loading state", window.set_loading(tab.is_loading()));
         sync_bookmark_star(window, state, &url);
     }
-    sync_block_count(window, &state.tabs);
-    sync_tab_strip(window, state);
+    sync_block_count(window, tabs_of(state, window_id));
+    sync_tab_strip(window, window_id, state);
 }
 
 /// Push the full tab list to the toolbar's tab strip, and persist a fresh
@@ -1864,8 +2392,8 @@ fn activate_and_refresh(
 /// current. `sync_tab_strip` runs unconditionally (`window.set_tabs` doesn't
 /// care about private mode); `persist_session` below is what actually gates
 /// writing to disk on `history_enabled`/`data_dir`.
-fn sync_tab_strip(window: &BrowserWindow, state: &AppState) {
-    let tabs = &state.tabs;
+fn sync_tab_strip(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let tabs = tabs_of(state, window_id);
     let active_id = tabs.active_id();
     let summaries: Vec<toolbar::TabSummary> = tabs
         .iter()
@@ -1883,7 +2411,7 @@ fn sync_tab_strip(window: &BrowserWindow, state: &AppState) {
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));
-    persist_session(state);
+    persist_session(state, window_id);
 }
 
 /// Push the active tab's blocked-navigation count to the toolbar badge.
@@ -2022,18 +2550,37 @@ fn refresh_settings_panel(window: &BrowserWindow, state: &AppState) {
 /// (`ui::window::BrowserWindow::set_theme`/`set_bookmark_bar_visible` —
 /// Appearance) before re-rendering the panel. Every other field only takes
 /// effect on the next restart, via `Config::apply_settings` in `run`.
-fn apply_updated_settings(window: &mut BrowserWindow, state: &mut AppState, settings: Settings) {
+///
+/// **Multi-window (Issue #29/D68)**: `state.settings` is whole-process, the
+/// same way `history`/`bookmarks` are (see `AppState::settings`'s doc
+/// comment) — a change made from *any* window's settings screen must be
+/// reflected in the chrome of *every* open window immediately, not just the
+/// one that made it, and every open window's own settings screen (if it
+/// happens to be open there too) must echo the same saved value back. This
+/// is why the function takes `ui_windows: &mut HashMap<WindowId,
+/// BrowserWindow>` as a whole and loops over every entry, rather than the
+/// single already-resolved `window: &mut BrowserWindow` most other
+/// `ToolbarCommand` handlers take — see `handle_user_event`'s doc comment
+/// for why `UpdateSettings`/`ResetSettings` are intercepted there, before a
+/// single window is resolved, the same way `NewWindow` is.
+fn apply_updated_settings(
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    settings: Settings,
+) {
     let sanitized = settings.sanitize();
     state.settings = sanitized.clone();
     if let Some(dir) = &state.data_dir {
         log_io_failure("save settings", persistence::save_settings(dir, &sanitized));
     }
-    log_failure("apply theme", window.set_theme(sanitized.appearance.theme));
-    log_failure(
-        "apply bookmark bar visibility",
-        window.set_bookmark_bar_visible(sanitized.appearance.show_bookmark_bar),
-    );
-    refresh_settings_panel(window, state);
+    for window in ui_windows.values() {
+        log_failure("apply theme", window.set_theme(sanitized.appearance.theme));
+        log_failure(
+            "apply bookmark bar visibility",
+            window.set_bookmark_bar_visible(sanitized.appearance.show_bookmark_bar),
+        );
+        refresh_settings_panel(window, state);
+    }
 }
 
 /// Open a completed download's file with the OS's default handler
@@ -2175,12 +2722,21 @@ fn clear_all_site_data(window: &BrowserWindow) {
 /// unconditional otherwise, so turning the setting on later always has a
 /// recent session to restore from. A missing `data_dir` is a silent no-op,
 /// like every other `persist_*` function here.
-fn persist_session(state: &AppState) {
-    if !state.history_enabled {
+///
+/// **Multi-window (Issue #29/D68)**: only ever writes `window_id ==
+/// state.primary_window`'s tabs — a window opened later (Ctrl/Cmd+N) is
+/// never part of what the next launch restores. See the PR description for
+/// why multi-window session persistence/restore is a follow-up, not part of
+/// this issue.
+fn persist_session(state: &AppState, window_id: WindowId) {
+    if window_id != state.primary_window || !state.history_enabled {
         return;
     }
     if let Some(dir) = &state.data_dir {
-        let snapshot = SessionSnapshot::from_tabs(&state.tabs);
+        let Some(tabs) = state.windows.tabs(window_id) else {
+            return;
+        };
+        let snapshot = SessionSnapshot::from_tabs(tabs);
         log_io_failure("save session", persistence::save_session(dir, &snapshot));
     }
 }
@@ -2282,12 +2838,32 @@ mod tests {
         assert_eq!(log_preview(&text), text);
     }
 
+    /// The [`WindowId`] `state_with_history_enabled` always opens — every
+    /// test that needs one calls this rather than re-deriving it from
+    /// `state.windows.ids().next()`, since `Windows::new` never issues
+    /// anything else as the very first id.
+    fn test_window_id() -> WindowId {
+        WindowId::from(0)
+    }
+
     /// Build an `AppState` the way `run()` would for a fresh tab, with a
     /// given `history_enabled` (what `Config::private` drives at startup —
-    /// see docs/decisions.md D13/D14).
+    /// see docs/decisions.md D13/D14). Single-window (Issue #29's
+    /// multi-window-specific behavior — `Windows`, `open_new_window` — is
+    /// covered by `browser::windows`'s own unit tests instead; this helper
+    /// only needs *a* window to exist for every pre-#29 test below to keep
+    /// working unchanged).
     fn state_with_history_enabled(history_enabled: bool) -> AppState {
+        let windows = Windows::new("https://example.com/");
+        let primary_window = windows.ids().next().expect("Windows::new opens one window");
         AppState {
-            tabs: Tabs::new("https://example.com/"),
+            windows,
+            primary_window,
+            site_policies: SitePolicies {
+                blocklist: Arc::new(FilterList::built_in()),
+                site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
+                site_permissions: Arc::new(crate::browser::SitePermissionStore::new()),
+            },
             history: HistoryStore::new(),
             bookmarks: BookmarkStore::new(),
             input_history: InputHistoryStore::new(),
@@ -2298,7 +2874,6 @@ mod tests {
             pending_memory_sample: None,
             settings: Settings::default(),
             site_permissions: Arc::new(SitePermissionStore::new()),
-            find: None,
         }
     }
 
@@ -2352,22 +2927,23 @@ mod tests {
 
     #[test]
     fn new_tab_has_no_blocked_navigations_in_app_state() {
-        let state = state_with_history_enabled(true);
-        assert_eq!(state.tabs.active().blocked_count(), 0);
+        let mut state = state_with_history_enabled(true);
+        assert_eq!(
+            tabs_of(&mut state, test_window_id())
+                .active()
+                .blocked_count(),
+            0
+        );
     }
 
     #[test]
     fn record_tab_latency_is_a_noop_when_perf_metrics_are_off() {
-        let state = state_with_history_enabled(true);
+        let mut state = state_with_history_enabled(true);
         assert!(state.perf.is_none());
+        let id = tabs_of(&mut state, test_window_id()).active_id();
         // Must not panic; there is nothing to assert on beyond that, since
         // "off" means no write happens at all.
-        record_tab_latency(
-            &state,
-            metrics::TabLatencyKind::Create,
-            state.tabs.active_id(),
-            Instant::now(),
-        );
+        record_tab_latency(&state, metrics::TabLatencyKind::Create, id, Instant::now());
     }
 
     #[test]
@@ -2377,7 +2953,7 @@ mod tests {
             process_start: Instant::now(),
             log: Arc::new(PerfLog::stderr(metrics::PerfFormat::Text)),
         });
-        let id = state.tabs.active_id();
+        let id = tabs_of(&mut state, test_window_id()).active_id();
         let started = Instant::now();
         // Exercises the write path end-to-end (stderr sink); nothing to
         // assert on the output itself here, but this must not panic.
@@ -2387,19 +2963,27 @@ mod tests {
     #[test]
     fn blocked_navigation_increments_only_the_target_tabs_counter() {
         let mut state = state_with_history_enabled(true);
-        let active_id = state.tabs.active_id();
+        let window_id = test_window_id();
+        let active_id = tabs_of(&mut state, window_id).active_id();
         // Opening a tab makes it active; activate the original tab again so
         // the new one is a real background tab for this test.
-        let background_id = state.tabs.open_at("https://example.com/", Instant::now());
-        state.tabs.activate_at(active_id, Instant::now());
+        let background_id =
+            tabs_of(&mut state, window_id).open_at("https://example.com/", Instant::now());
+        tabs_of(&mut state, window_id).activate_at(active_id, Instant::now());
 
-        if let Some(tab) = state.tabs.get_mut(background_id) {
+        if let Some(tab) = tabs_of(&mut state, window_id).get_mut(background_id) {
             tab.on_navigation_blocked("https://doubleclick.net/");
         }
 
-        assert_eq!(state.tabs.active().blocked_count(), 0);
-        assert_eq!(state.tabs.get(background_id).unwrap().blocked_count(), 1);
-        assert_eq!(state.tabs.active_id(), active_id);
+        assert_eq!(tabs_of(&mut state, window_id).active().blocked_count(), 0);
+        assert_eq!(
+            tabs_of(&mut state, window_id)
+                .get(background_id)
+                .unwrap()
+                .blocked_count(),
+            1
+        );
+        assert_eq!(tabs_of(&mut state, window_id).active_id(), active_id);
     }
 
     // --- Downloads (Issue #16, see docs/decisions.md D28) ---

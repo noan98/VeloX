@@ -51,6 +51,7 @@ use crate::browser::downloads;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
 use crate::browser::{
     group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, SiteExceptions, TabId,
+    WindowId,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
@@ -92,6 +93,9 @@ const TOGGLE_BOOKMARK_MESSAGE: &str = "velox:toggle-bookmark";
 /// Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar. See
 /// `ContentShortcut::ToggleBookmarkBar` and docs/decisions.md D35.
 const TOGGLE_BOOKMARK_BAR_MESSAGE: &str = "velox:toggle-bookmark-bar";
+/// Ctrl/Cmd+N (Issue #29): open a new window. See
+/// `ContentShortcut::NewWindow` and docs/decisions.md D68.
+const NEW_WINDOW_MESSAGE: &str = "velox:new-window";
 /// Prefix shared by the eight `velox:activate-tab-1` .. `velox:activate-tab-8`
 /// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
 /// [`parse_content_shortcut`].
@@ -144,6 +148,10 @@ pub enum ContentShortcut {
     /// `ui::toolbar::ToolbarCommand::ToggleBookmarkBar`. See
     /// docs/decisions.md D35.
     ToggleBookmarkBar,
+    /// Ctrl/Cmd+N (Issue #29): open a new window. The content-webview half
+    /// of `ui::toolbar::ToolbarCommand::NewWindow` — both are handled by the
+    /// same shared function in `app.rs`. See docs/decisions.md D68.
+    NewWindow,
     /// Ctrl/Cmd+F (Issue #43): open the in-page find bar. The
     /// content-webview half of `ui::toolbar::ToolbarCommand::OpenFindBar` —
     /// both are handled by the same shared function in `app.rs`. See
@@ -167,6 +175,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         FOCUS_ADDRESS_BAR_MESSAGE => Some(ContentShortcut::FocusAddressBar),
         TOGGLE_BOOKMARK_MESSAGE => Some(ContentShortcut::ToggleBookmark),
         TOGGLE_BOOKMARK_BAR_MESSAGE => Some(ContentShortcut::ToggleBookmarkBar),
+        NEW_WINDOW_MESSAGE => Some(ContentShortcut::NewWindow),
         OPEN_FIND_BAR_MESSAGE => Some(ContentShortcut::OpenFindBar),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
@@ -209,7 +218,7 @@ fn devtools_shortcut_script() -> String {
 }
 
 /// Initialization script that captures the tab-management keyboard
-/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9) while the content
+/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N) while the content
 /// webview has focus, forwarding a fixed sentinel string per shortcut over
 /// the same untrusted IPC channel devtools uses (see [`ContentShortcut`] and
 /// docs/decisions.md D18/D23 for why this is a separate injected script
@@ -244,6 +253,8 @@ fn tab_shortcut_script() -> String {
         message = "{FOCUS_ADDRESS_BAR_MESSAGE}";
       }} else if (event.key === "d" || event.key === "D") {{
         message = "{TOGGLE_BOOKMARK_MESSAGE}";
+      }} else if (event.key === "n" || event.key === "N") {{
+        message = "{NEW_WINDOW_MESSAGE}";
       }} else if (event.key === "f" || event.key === "F") {{
         message = "{OPEN_FIND_BAR_MESSAGE}";
       }}
@@ -585,6 +596,13 @@ fn pick_process_group(
 /// layer down for [`content_webview_builder`]; this type is the public,
 /// `app.rs`-facing half of it (it deliberately does *not* carry
 /// `content_blocking_enabled`, which `new` derives from `Config` itself).
+///
+/// `Clone` (Issue #29/D68): opening a second window (Ctrl/Cmd+N) needs the
+/// exact same site-scoped policies the first window was built with — every
+/// field here is an `Arc`, so cloning is cheap (a refcount bump, not a deep
+/// copy) and every window ends up sharing the *same* underlying
+/// `FilterList`/`SiteExceptions`/`SitePermissionStore` instances.
+#[derive(Clone)]
 pub struct SitePolicies {
     /// Ad/tracker filter rules content blocking matches against
     /// (docs/decisions.md D17).
@@ -598,6 +616,13 @@ pub struct SitePolicies {
 /// The main browser window: the toolbar webview and one content webview per
 /// tab.
 pub struct BrowserWindow {
+    /// This window's own id (Issue #29, docs/decisions.md D68) — issued by
+    /// `browser::Windows` before this `BrowserWindow` is built and carried
+    /// unchanged for its whole lifetime. Baked into every `UserEvent` this
+    /// window's webviews send that `app.rs` cannot otherwise attribute to a
+    /// window (see the module doc comment on why `TabId` alone is not
+    /// enough: it is only unique *within* one window's own `Tabs`).
+    id: WindowId,
     window: Window,
     #[cfg(any(
         target_os = "linux",
@@ -730,6 +755,7 @@ impl BrowserWindow {
     /// tab.
     pub fn new(
         event_loop: &EventLoopWindowTarget<UserEvent>,
+        id: WindowId,
         config: &Config,
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
@@ -831,8 +857,15 @@ impl BrowserWindow {
             // favicon fetch could persist cookies/cache private browsing is
             // supposed to leave no trace of.
             .with_incognito(config.private)
+            // `id` (`WindowId`) is baked into every event this window's
+            // webviews send (docs/decisions.md D68), including the
+            // toolbar's own IPC messages — `app.rs` needs it to know which
+            // window's `Tabs` a `ToolbarCommand` applies to. `Copy`, so
+            // capturing it here and again in `content_webview_builder` below
+            // just copies it, exactly like `TabId` is already captured by
+            // several sibling closures in that function.
             .with_ipc_handler(move |request| {
-                let _ = ipc_proxy.send_event(UserEvent::ToolbarMessage(request.into_body()));
+                let _ = ipc_proxy.send_event(UserEvent::ToolbarMessage(id, request.into_body()));
             });
         // Downloads (docs/decisions.md D53): on WebKitGTK, wry registers a
         // webview's download handlers on the `WebContext` it is built
@@ -846,15 +879,19 @@ impl BrowserWindow {
         let download_dir_override = config.download_dir_override.clone();
         let toolbar_builder =
             match download_handler_host(config.private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
-                DownloadHandlerHost::SharedContext => {
-                    with_download_handlers(toolbar_builder, &proxy, download_dir_override.clone())
-                }
+                DownloadHandlerHost::SharedContext => with_download_handlers(
+                    toolbar_builder,
+                    id,
+                    &proxy,
+                    download_dir_override.clone(),
+                ),
                 DownloadHandlerHost::EachContentWebview => toolbar_builder,
             };
         let toolbar = attach(toolbar_builder)?;
 
         let content_blocking_enabled = config.content_blocking_enabled;
         let content_builder = content_webview_builder(
+            id,
             initial_tab,
             initial_url,
             content_rect,
@@ -884,6 +921,7 @@ impl BrowserWindow {
         #[cfg(windows)]
         crate::ui::webview2_blocking::attach(
             &content,
+            id,
             initial_tab,
             Arc::clone(&blocklist),
             Arc::clone(&site_exceptions),
@@ -901,6 +939,7 @@ impl BrowserWindow {
         );
 
         Ok(Self {
+            id,
             window,
             #[cfg(any(
                 target_os = "linux",
@@ -1022,6 +1061,7 @@ impl BrowserWindow {
             }
         };
         let builder = content_webview_builder(
+            self.id,
             id,
             url,
             content_rect,
@@ -1068,6 +1108,7 @@ impl BrowserWindow {
         #[cfg(windows)]
         crate::ui::webview2_blocking::attach(
             &webview,
+            self.id,
             id,
             Arc::clone(&self.blocklist),
             Arc::clone(&self.site_exceptions),
@@ -1535,12 +1576,17 @@ impl BrowserWindow {
         };
         let script = find_search_script(&find_query_literal(query), case_sensitive);
         let proxy = self.proxy.clone();
+        let window_id = self.id;
         webview.evaluate_script_with_callback(&script, move |raw| {
             let total = extract_js_string_result(&raw)
                 .and_then(|json| serde_json::from_str::<FindSearchResult>(&json).ok())
                 .map(|result| result.total)
                 .unwrap_or(0);
-            let _ = proxy.send_event(UserEvent::FindMatchesUpdated { tab_id, total });
+            let _ = proxy.send_event(UserEvent::FindMatchesUpdated {
+                window_id,
+                tab_id,
+                total,
+            });
         })
     }
 
@@ -1629,11 +1675,13 @@ impl BrowserWindow {
             None => return Ok(()),
         };
         let proxy = self.proxy.clone();
+        let window_id = self.id;
         webview.evaluate_script_with_callback("document.title", move |raw| {
             if let Some(title) = extract_js_string_result(&raw) {
                 let title = title.trim();
                 if !title.is_empty() {
                     let _ = proxy.send_event(UserEvent::PageTitleResolved {
+                        window_id,
                         tab_id,
                         history_id,
                         title: title.to_owned(),
@@ -1678,10 +1726,12 @@ impl BrowserWindow {
             None => return Ok(()),
         };
         let proxy = self.proxy.clone();
+        let window_id = self.id;
         webview.evaluate_script_with_callback(RESOLVE_FAVICON_SCRIPT, move |raw| {
             if let Some(url) = extract_js_string_result(&raw) {
                 if !url.is_empty() {
                     let _ = proxy.send_event(UserEvent::FaviconResolved {
+                        window_id,
                         tab_id,
                         history_id,
                         page_url: page_url.clone(),
@@ -1690,6 +1740,22 @@ impl BrowserWindow {
                 }
             }
         })
+    }
+
+    /// This window's own id (Issue #29). Stable for the window's whole
+    /// lifetime — see the `id` field's doc comment.
+    pub fn id(&self) -> WindowId {
+        self.id
+    }
+
+    /// The underlying `tao` window's own id, as tao's event loop reports it
+    /// in `Event::WindowEvent { window_id, .. }` — distinct from
+    /// [`Self::id`] (`browser::WindowId`, this crate's own identifier).
+    /// `app.rs` uses this to find which `BrowserWindow` a given
+    /// `WindowEvent` (resize, close request) belongs to when more than one
+    /// is open.
+    pub fn tao_id(&self) -> tao::window::WindowId {
+        self.window.id()
     }
 }
 
@@ -1960,6 +2026,7 @@ struct ContentPolicy {
 /// handler below (docs/decisions.md D60) lives here too, rather than being
 /// bolted on only where a tab happens to be created first.
 fn content_webview_builder<'a>(
+    own_id: WindowId,
     id: TabId,
     url: &str,
     content_rect: LogicalRect,
@@ -2032,7 +2099,7 @@ fn content_webview_builder<'a>(
         .with_initialization_script(tab_shortcut_script())
         .with_navigation_handler(move |url| {
             if content_blocking_enabled && blocklist.is_blocked(&url) {
-                let _ = block_proxy.send_event(UserEvent::NavigationBlocked(id, url));
+                let _ = block_proxy.send_event(UserEvent::NavigationBlocked(own_id, id, url));
                 return false;
             }
             // Keep the permission handler's notion of "current origin" in
@@ -2051,13 +2118,13 @@ fn content_webview_builder<'a>(
             if let Ok(mut origin) = current_origin.lock() {
                 *origin = site_permissions::origin_of(&url);
             }
-            let _ = nav_proxy.send_event(UserEvent::NavigationStarted(id, url));
+            let _ = nav_proxy.send_event(UserEvent::NavigationStarted(own_id, id, url));
             true
         })
         .with_on_page_load_handler(move |event, url| {
             let event = match event {
-                PageLoadEvent::Started => UserEvent::LoadStarted(id, url),
-                PageLoadEvent::Finished => UserEvent::LoadFinished(id, url),
+                PageLoadEvent::Started => UserEvent::LoadStarted(own_id, id, url),
+                PageLoadEvent::Finished => UserEvent::LoadFinished(own_id, id, url),
             };
             let _ = load_proxy.send_event(event);
         })
@@ -2069,9 +2136,9 @@ fn content_webview_builder<'a>(
             // page-supplied treated as structured data.
             let body = request.body().as_str();
             if body == OPEN_DEVTOOLS_MESSAGE {
-                let _ = devtools_proxy.send_event(UserEvent::OpenDevtoolsRequested);
+                let _ = devtools_proxy.send_event(UserEvent::OpenDevtoolsRequested(own_id));
             } else if let Some(shortcut) = parse_content_shortcut(body) {
-                let _ = devtools_proxy.send_event(UserEvent::ContentShortcut(shortcut));
+                let _ = devtools_proxy.send_event(UserEvent::ContentShortcut(own_id, shortcut));
             }
         })
         // `target="_blank"` links and `window.open()` (see docs/decisions.md
@@ -2085,7 +2152,7 @@ fn content_webview_builder<'a>(
         // new VeloX tab ourselves, the same way `ToolbarCommand::NewTab`
         // does but at the requested URL instead of the homepage.
         .with_new_window_req_handler(move |url, _features| {
-            let _ = new_window_proxy.send_event(UserEvent::NewTabRequested(url));
+            let _ = new_window_proxy.send_event(UserEvent::NewTabRequested(own_id, url));
             wry::NewWindowResponse::Deny
         })
         // Site permissions (Issue #24, docs/decisions.md D60): `wry` 0.56
@@ -2109,7 +2176,7 @@ fn content_webview_builder<'a>(
     // see `download_handler_host`.
     match download_handler_host(private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
         DownloadHandlerHost::EachContentWebview => {
-            with_download_handlers(builder, proxy, download_dir_override)
+            with_download_handlers(builder, own_id, proxy, download_dir_override)
         }
         DownloadHandlerHost::SharedContext => builder,
     }
@@ -2272,6 +2339,7 @@ fn download_handler_host(private: bool, per_context: bool) -> DownloadHandlerHos
 /// `browser::downloads::resolve_download_dir_with_override`).
 fn with_download_handlers<'a>(
     builder: WebViewBuilder<'a>,
+    own_id: WindowId,
     proxy: &EventLoopProxy<UserEvent>,
     download_dir_override: Option<String>,
 ) -> WebViewBuilder<'a> {
@@ -2310,6 +2378,7 @@ fn with_download_handlers<'a>(
                 .unwrap_or(suggested_name);
             *destination = final_path.clone();
             let _ = download_started_proxy.send_event(UserEvent::DownloadStarted {
+                window_id: own_id,
                 url,
                 file_name,
                 destination: final_path,
@@ -2319,6 +2388,7 @@ fn with_download_handlers<'a>(
         })
         .with_download_completed_handler(move |url, path, success| {
             let _ = download_completed_proxy.send_event(UserEvent::DownloadCompleted {
+                window_id: own_id,
                 url,
                 path,
                 success,
@@ -2717,6 +2787,7 @@ mod tests {
             FOCUS_ADDRESS_BAR_MESSAGE,
             TOGGLE_BOOKMARK_MESSAGE,
             TOGGLE_BOOKMARK_BAR_MESSAGE,
+            NEW_WINDOW_MESSAGE,
             OPEN_FIND_BAR_MESSAGE,
         ] {
             assert!(
@@ -2766,6 +2837,10 @@ mod tests {
         assert_eq!(
             parse_content_shortcut(TOGGLE_BOOKMARK_BAR_MESSAGE),
             Some(ContentShortcut::ToggleBookmarkBar)
+        );
+        assert_eq!(
+            parse_content_shortcut(NEW_WINDOW_MESSAGE),
+            Some(ContentShortcut::NewWindow)
         );
         assert_eq!(
             parse_content_shortcut(OPEN_FIND_BAR_MESSAGE),

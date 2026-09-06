@@ -1,8 +1,9 @@
 # VeloX Architecture
 
-Status: single window, multiple tabs, tab suspension, visit history,
-bookmarks, content blocking, and a persisted settings screen. This document
-describes what exists today and where the extension points are.
+Status: multiple windows (Issue #29), each with its own multiple tabs, tab
+suspension, visit history, bookmarks, content blocking, and a persisted
+settings screen. This document describes what exists today and where the
+extension points are.
 
 ## Overall structure
 
@@ -195,10 +196,10 @@ settings" below) rather than resetting every restart as it used to.
 ## Private browsing
 
 Private browsing (#7) is a **whole-app** mode, not a per-window one — see
-docs/decisions.md D12 for why, and the extension path once multi-window
-exists. `Config::private` (set from the `VELOX_PRIVATE` env var or a
-`--private` CLI flag, `Config::from_env_and_args`) drives two independent
-things at startup, both in place before the window is shown:
+docs/decisions.md D14 for why, and D68 for the extension path now that
+multi-window (#29) exists. `Config::private` (set from the `VELOX_PRIVATE`
+env var or a `--private` CLI flag, `Config::from_env_and_args`) drives two
+independent things at startup, both in place before the window is shown:
 
 - `ui::window::BrowserWindow::new` builds the *content* webview with
   `.with_incognito(config.private)`, so cookies/storage/cache use the
@@ -476,6 +477,60 @@ subresource hook is wired there. See docs/decisions.md D59 for the
 re-investigation that found this path, exactly what it does and does not
 block (main-frame and iframe document loads are deliberately exempt), and
 what remains unverified without a Windows machine to run it on.
+
+## Multiple windows
+
+- `browser::WindowId` (a `u64` newtype, same shape as `TabId`) and
+  `browser::Windows` (a collection of `{WindowId, Tabs}` entries — plain,
+  UI/engine-independent Rust, unit-tested directly) are the logical half of
+  multi-window support (Issue #29, see docs/decisions.md D68 for the full
+  design). `Tabs` itself is unchanged: `Windows` is one layer *above* it, a
+  collection of otherwise-ordinary `Tabs` instances, one per open window.
+  This is also why a `TabId` is only unique *within* the window that issued
+  it — two different windows' `Tabs` both start numbering from `0` — so
+  every per-tab `UserEvent` that can cross a window boundary carries a
+  `WindowId` alongside its `TabId`, rather than trying to derive one window
+  from the other.
+- `ui::window::BrowserWindow` now carries its own `WindowId` (`id()`,
+  assigned once by `Windows::open_window`/`open_restored_window` before the
+  `BrowserWindow` is built) and bakes it into every event its webviews send.
+  `app::run` owns `ui_windows: HashMap<WindowId, BrowserWindow>` instead of
+  a single `window` variable; `AppState::windows: Windows` is the parallel
+  logical-half map, kept in lockstep with it (both only ever change together,
+  inside `app::open_new_window` and `app::close_window_by_tao_id`).
+- **Opening a window** (Ctrl/Cmd+N) funnels three triggers —
+  `ToolbarCommand::NewWindow` (trusted toolbar webview),
+  `ContentShortcut::NewWindow` (untrusted content webview, same D18/D23
+  trust boundary every other shortcut uses), and
+  `AutomationCommand::NewWindow` (`VELOX_AUTOMATION_SCRIPT`'s `new_window`
+  command) — into one shared `app::open_new_window`, mirroring how
+  `open_new_tab` is the one path for "open a new tab". Every window shares
+  the same `SitePolicies` (`blocklist`/`site_exceptions`/`site_permissions`,
+  now `Clone` — cheap, since every field is an `Arc`) the first window was
+  built with.
+- **Closing a window**: `WindowEvent::CloseRequested` is resolved to the
+  `BrowserWindow` whose `tao::window::WindowId` matches (`ui_windows`
+  is searched linearly — cheap at the handful of windows a real session
+  ever has open), which is then dropped (releasing its native window and
+  every webview it held) along with its `Tabs`. Closing the *last* open
+  window ends the process (`Windows::is_empty()` drives
+  `ControlFlow::Exit`) — the Windows/Linux convention, not macOS's
+  "keep running with zero windows", matching CLAUDE.md's Windows-first
+  priority. `Windows` itself has no "always keep one window open" rule
+  (unlike `Tabs`, which refuses to close its last tab) — the caller decides
+  what an empty `Windows` means.
+- **What stays whole-process, not per-window, in this issue**: `Config`
+  (including `Config::private`), `AppState::history_enabled`, and every
+  store (`history`/`bookmarks`/`input_history`/`downloads`) remain shared
+  across every open window — see docs/decisions.md D14's "private browsing
+  is a whole-app mode" reasoning, which this issue leaves unchanged.
+  `AppState::primary_window` is the one window session persistence (#25)
+  reads/writes; a window opened later is not part of what the next launch
+  restores. Automatic tab suspension (#63) runs independently per window
+  rather than against a cross-window budget. See D68 for the exact list of
+  what a follow-up (in particular #27, private windows) would need to
+  change — the seams (`WindowId`/`Windows`/`ui_windows`) are already in
+  place for it.
 
 ## Multiple tabs
 

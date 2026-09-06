@@ -436,6 +436,112 @@ fn tab_operations_produce_expected_tab_create_and_tab_switch_records() {
 }
 
 // ---------------------------------------------------------------------
+// 2b. Multiple windows (Issue #29, see docs/decisions.md D68).
+// ---------------------------------------------------------------------
+
+/// Guarantees: `new_window` (`AutomationCommand::NewWindow`) drives the real
+/// multi-window path end to end — a second, genuinely separate
+/// `ui::window::BrowserWindow` gets built (`app::open_new_window`), and
+/// every automation command after it (`open`/`switch`) is retargeted to
+/// that new window's own `Tabs` rather than the first window's — not just
+/// that `browser::automation::parse_script`/`browser::Windows` parse and
+/// track this in isolation (already fully covered, without a display, by
+/// their own unit tests). If retargeting silently failed (`automation_window`
+/// never updated, or the new `BrowserWindow` never actually inserted into
+/// `ui_windows`), the `open`/`switch` commands below would find no tab to
+/// act on and produce zero `tab_create`/`tab_switch` records instead of
+/// exactly one/two. The process exiting cleanly with two windows still open
+/// (`quit` before either window is closed by hand) is this test's other
+/// guarantee — the "終了時のリソース解放が正常" acceptance criterion:
+/// nothing here should crash, hang, or leak the second window's resources
+/// past the process ending.
+#[test]
+fn new_window_retargets_automation_and_shuts_down_cleanly() {
+    skip_without_gui!("new_window_retargets_automation_and_shuts_down_cleanly");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("multi-window");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let homepage = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+
+    // Window 1 opens at `homepage` (tab 0). `new_window` opens window 2,
+    // also at `homepage` (its own tab 0) — every command after this line
+    // targets window 2, not window 1. `open` there creates window 2's tab
+    // 1 (one `tab_create`); the two `switch`es revisit window 2's tab 0
+    // and then tab 1 again (two `tab_switch`es). Window 1 is never touched
+    // again and is still open when `quit` runs.
+    let script = format!(
+        "new_window\n\
+         wait 500\n\
+         open {page_a}\n\
+         wait 400\n\
+         switch 0\n\
+         wait 300\n\
+         switch 1\n\
+         wait 300\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+    );
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s with two windows open — this is exactly \
+             the kind of hang/leak the multi-window shutdown path (Issue #29) must not have. \
+             Perf records observed before the forced kill: {:?}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally with two windows open: {status:?}"
+    );
+
+    let tab_create: Vec<_> = events_named(&launch.perf_records, "tab_create").collect();
+    let tab_switch: Vec<_> = events_named(&launch.perf_records, "tab_switch").collect();
+    assert_eq!(
+        tab_create.len(),
+        1,
+        "the `open` after `new_window` should yield exactly 1 `tab_create` record \
+         (window 2's second tab) — 0 would mean automation never actually retargeted to the \
+         new window; got {}: {:?}",
+        tab_create.len(),
+        launch.perf_records
+    );
+    assert_eq!(
+        tab_switch.len(),
+        2,
+        "the two `switch` commands after `new_window` should yield 2 `tab_switch` records \
+         against window 2's tabs, got {}: {:?}",
+        tab_switch.len(),
+        launch.perf_records
+    );
+
+    // Exactly one `startup` record: multi-window does not change how the
+    // *first* window's startup timing is measured (Issue #59/D43 is
+    // unaffected — window 2 is not instrumented the same way, which is
+    // fine, it is not the process's startup).
+    let startup_records: Vec<_> = events_named(&launch.perf_records, "startup").collect();
+    assert_eq!(
+        startup_records.len(),
+        1,
+        "expected exactly one `startup` perf record even with two windows opened, got {}: {:?}",
+        startup_records.len(),
+        launch.perf_records
+    );
+}
+
+// ---------------------------------------------------------------------
 // 3. Visiting pages persists history.json.
 // ---------------------------------------------------------------------
 

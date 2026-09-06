@@ -6133,6 +6133,496 @@ Issue の実装内容一覧には Security・Shortcuts も含まれるが、両�
 した上でないと着手できない)。(4) Windows/macOS 実機での設定画面の動作
 確認 (Issue #33 の「3 OS リリースビルド検証」の一部として)。
 
+## D68: 複数ウィンドウ対応 (#29) — `browser::WindowId`/`Windows` を新設、`TabId` はウィンドウ内でのみ一意という前提のまま `UserEvent` に `WindowId` を明示的に付与する
+
+**対象**: Issue #29。依存関係として挙げられている #11 (タブ管理)・#12
+(タブ状態) は実装済み。関連 Issue #27 (プライベートブラウジング) の
+「Private Window を別ウィンドウとして開く」という将来要件を見据え、拡張点を
+D14 の記述と整合する形で残した (詳細は本項最後の節)。
+
+### 設計判断: `Tabs` 自体は変更せず、その上に `Windows` (複数の `Tabs` の集合) を足す
+
+`docs/architecture.md`/D20 が確立した層分離 — `browser::`(UI/エンジン非依存の
+純粋ロジック、単体テストの主対象) / `app.rs`(配線) / `ui::`(wry/tao) — を
+そのまま踏襲した。既存の `browser::tabs::Tabs`(1 ウィンドウぶんのタブ集合+
+アクティブ index、既に十分にテストされ、`app.rs`・`browser::automation` の
+他、`velox-bench` のシナリオ生成コードまで広く依存している) には一切手を
+入れず、その上に「複数の `Tabs` を管理する」新しいレイヤーを 1 つ足す設計に
+した:
+
+- `src/browser/window_id.rs` — `WindowId(u64)`。`browser::tab::TabId` と
+  全く同じ形 (`Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord`
+  derive、`From<u64>`、`get()`)。
+- `src/browser/windows.rs` — `Windows { entries: Vec<{id: WindowId, tabs:
+  Tabs}>, next_id: u64 }`。`open_window`/`open_restored_window`/
+  `close_window`/`tabs`/`tabs_mut`/`contains`/`ids`/`len`/`is_empty` のみを
+  公開する薄いラッパーで、`Tabs` の中身には一切踏み込まない。
+
+この 2 ファイルは `wry`/`tao` は疎か `ui::` にも依存しない純粋 Rust なので、
+`browser::tabs` と同じく単体テストの主対象にした (`windows.rs` に 12 件:
+一意な id 発行・id の非再利用・ウィンドウ間のタブ隔離・
+`close_window`/`open_restored_window` の挙動など)。
+
+**なぜ `Tabs` 自身にウィンドウの概念を混ぜ込まなかったか**: `Tabs` は
+`browser::automation`(Issue #112)・`velox-bench` のシナリオ生成
+(`generate_bench_script`)・既存の数十件の単体テストまで、「1 つのタブ集合」
+を前提にした API (`new(initial_url)`、`open`/`open_at` が `self.next_id`
+から連番を払い出す、等) にかなり広く依存されている。ここに
+`Vec<Windows>`/`WindowId` を混ぜ込む変更は影響範囲が大きく、動作実績のある
+既存コード・既存テストを壊すリスクが高い。「既存の `Tabs` は 1 ウィンドウの
+状態機械として完成している」という前提を守ったまま、複数ウィンドウは
+「`Tabs` を複数個持つ」という一段上のレイヤーで表現する方が、変更を
+`browser::windows.rs`(新規ファイル) と `app.rs`(配線の書き換え) に閉じ込め
+られ、レビュー可能なサイズに収まると判断した。
+
+### 副作用: `TabId` はウィンドウをまたいで一意ではない
+
+上記の設計の直接の帰結として、**`TabId` はもはやプロセス全体で一意ではない**。
+`Windows::open_window` は毎回 `Tabs::new`(または `Tabs::restore`) を呼ぶが、
+`Tabs::new` は `next_id: u64 = 0` から数え始める実装のままなので、2 つの
+ウィンドウがそれぞれ `TabId(0)` を持つのは正常な状態である
+(`browser::windows` のテスト
+`each_window_has_its_own_independent_tab_id_space` で明文化)。
+`docs/architecture.md`/`TabId` のドキュメントコメントが謳う「一度発行された
+`TabId` は使い回されない」という保証は **1 つの `Tabs` インスタンス内でのみ**
+成立し、ウィンドウをまたいだ一意性は最初から要求しない設計にした。
+
+これを `Tabs` 側 (`Windows` がグローバルなカウンタを注入する等) で解決する
+選択肢も検討したが、`Tabs::new`/`Tabs::restore`/`Tabs::open_at` のシグネチャ
+変更が波及する既存コード・既存テストの量に対して得られる利益
+(「`TabId` 単体でウィンドウを逆引きできる」) が見合わないと判断し、見送った。
+代わりに次の節の通り、ウィンドウをまたいで届くイベント側に `WindowId` を
+明示的に持たせることで曖昧さを解消した。
+
+### `UserEvent` への `WindowId` の付与 — `TabId` からの逆引きに頼らない
+
+`app::UserEvent` のうち、特定のタブ・ウィンドウの webview から送られる
+バリアント (`ToolbarMessage`・`NavigationStarted`・`NavigationBlocked`・
+`SubresourceBlocked`・`LoadStarted`・`LoadFinished`・`PageTitleResolved`・
+`FaviconResolved`・`OpenDevtoolsRequested`・`ContentShortcut`・
+`NewTabRequested`) はすべて `WindowId` を新たに (または追加で) 持つように
+した。`ui::window::BrowserWindow` は自分自身の `WindowId`(構築時に
+`browser::Windows::open_window`/`open_restored_window` が発行したものを
+そのまま受け取る) を `id: WindowId` フィールドとして保持し、上記イベントを
+送るすべてのクロージャに `own_id`(`Copy` なので複数クロージャへのキャプチャ
+は既存の `TabId` キャプチャと同様に安全かつ低コスト) として焼き込む。
+
+上の副作用の節で書いた通り `TabId` 単体ではどのウィンドウの話か分からない
+以上、`app.rs` の `handle_user_event` が `state.windows.window_of(tab_id)`
+のような逆引きをする設計は成立しない (2 つのウィンドウが同じ `TabId` を
+持ちうるため)。イベントの送信元 (`ui::window::BrowserWindow`) が最初から
+自分の `WindowId` を知っているので、逆引きさせず素直に持たせるのが最も
+単純かつ安全な設計だった。
+
+**`DownloadStarted`/`DownloadCompleted` にも `window_id` を追加した**が、
+`browser::DownloadStore` 自体は D28 の設計のままプロセス全体で 1 つの
+共有ストアである — ダウンロード一覧そのものをウィンドウごとに分割する変更
+ではない。`window_id` はあくまで「どのウィンドウのダウンロードパネルを
+即座に再描画するか」を決めるためだけに使う (次の「見送ったもの」節を参照)。
+
+一方、`AutomationCommand`(`Mark`/`Quit`/`Wait` を除く各コマンド) と
+`MemorySampled` には `WindowId` を追加していない。理由はそれぞれ以下の
+「自動化スクリプトの複数ウィンドウ対応」「自動休止ポリシー」の節に譲る。
+
+### `ui::window::BrowserWindow` — `id`/`tao_id()` の追加、`SitePolicies: Clone`
+
+- `BrowserWindow::new` は `event_loop: &EventLoopWindowTarget<UserEvent>` を
+  既に引数に取っていた (`app::run` からの呼び出し1箇所のみが前提だった
+  だけで、シグネチャ自体はイベントループ実行中の追加ウィンドウ生成にも
+  そのまま使える形だった) ため、新規ウィンドウの生成自体に構造変更は不要
+  だった。追加したのは `id: WindowId` 引数と、`Self` に生えた 2 つの
+  アクセサ: `id() -> WindowId`(自分自身の id) と
+  `tao_id() -> tao::window::WindowId`(`tao` 自身が
+  `Event::WindowEvent { window_id, .. }` で報告してくる方の id — 名前が
+  同じ "WindowId" でも別の型なので、実装側で明確に呼び分けている)。
+- `SitePolicies`(`blocklist`/`site_exceptions`/`site_permissions`、いずれも
+  `Arc`) に `#[derive(Clone)]` を追加した。新しいウィンドウを開くたびに
+  最初のウィンドウと全く同じ 3 つの `Arc` を複製 (実体は refcount のみ増加)
+  して渡すためで、複数ウィンドウが同じ `FilterList`/`SiteExceptions`/
+  `SitePermissionStore` インスタンスを共有する — フィルタ設定やサイト権限は
+  「アプリ全体で 1 つ」のままにする、という選択を明示した。
+
+### `app.rs` — `AppState.tabs: Tabs` → `AppState.windows: Windows`、`ui_windows: HashMap<WindowId, BrowserWindow>`
+
+`app::run` は今までただ 1 つの `window: BrowserWindow` 変数を
+イベントループのクロージャにキャプチャしていたが、これを
+`ui_windows: HashMap<browser::WindowId, ui::window::BrowserWindow>` に
+置き換えた。`AppState`(browser 層寄りの純粋な状態) は `windows: Windows`
+を持ち、UI 層の実体 (`ui_windows`) とは別に管理する — `AppState` 自体は
+引き続き `wry`/`tao` の型を一切知らない (`window_event_proxy` を
+`AppState` のフィールドにしなかった理由も同じで、後述)。
+
+- **イベントディスパッチ**: ほぼ全てのハンドラ関数
+  (`handle_toolbar_command`・`handle_content_shortcut`・
+  `handle_automation_command`・`open_new_tab`・`close_tab`・
+  `activate_and_refresh`・`sync_tab_strip`・… ) が、既存の
+  `window: &mut BrowserWindow` パラメータに加えて `window_id: WindowId` を
+  並行して受け取るようになった。関数本体内の `state.tabs.foo()` は
+  `tabs_of(state, window_id).foo()` (新設のヘルパー、
+  `state.windows.tabs_mut(window_id).expect(...)`) に機械的に置き換わって
+  いる。`expect` を使っているが、これは「`window_id` が指すウィンドウは
+  呼び出し時点で `ui_windows` に実在することを呼び出し元が既に確認済み」
+  という不変条件に基づくものであり (`ui_windows`と`state.windows`は
+  `open_new_window`/`close_window_by_tao_id` の 2 箇所でのみ、常に両方
+  同時に変更される — シングルスレッドのイベントループなのでこの不変条件は
+  常に成立する)、CLAUDE.md が禁じる「乱用」ではなく 1 箇所に集約した
+  ドキュメント付きの invariant-backed `expect` である。
+- **`tao::window::WindowId` → `browser::WindowId` の解決**:
+  `Event::WindowEvent { window_id, .. }`(`CloseRequested`/`Resized`) は
+  `tao` 自身の id しか持たないため、`window_by_tao_id_mut`/
+  `close_window_by_tao_id` が `ui_windows.values()` を線形探索して対応する
+  `BrowserWindow`(`tao_id()` で比較) を見つける。同時に開くウィンドウ数は
+  現実的には数個〜十数個程度であり、イベントの都度線形探索しても実用上
+  問題にならないと判断し、逆引き用の別マップは追加しなかった。
+- **ウィンドウを閉じる = そのウィンドウのリソース解放**
+  (受け入れ条件「終了時のリソース解放が正常」): `close_window_by_tao_id`
+  が `ui_windows.remove(&id)` で `BrowserWindow`(`tao::window::Window` と
+  その全 webview を所有) を drop し、`state.windows.close_window(id)` で
+  対応する `Tabs` も破棄する。**最後の 1 枚を閉じたらプロセスを終了する**
+  (`state.windows.is_empty()` を見て `ControlFlow::Exit`) — これは macOS の
+  慣習 (最後のウィンドウを閉じてもアプリは常駐し続ける) ではなく
+  Windows/Linux の慣習を採用したもので、CLAUDE.md の「Windows を最優先」
+  方針に従った判断である。macOS 向けにこの挙動を変える対応は行っていない
+  (docs/decisions.md の他の D と同様、意図的に見送った OS 差分として
+  ここに記録する)。
+
+### Ctrl/Cmd+N の配線 — 新しいコマンド 3 つが同じ `app::open_new_window` に集約する
+
+既存のタブ操作 (Ctrl/Cmd+T 等) が `ToolbarCommand`(信頼された toolbar
+webview 発の構造化コマンド) と `ContentShortcut`(信頼されない content
+webview 発の固定センチネル文字列、D18/D23 の trust boundary) の 2 経路を
+持つのと全く同じパターンで、`ToolbarCommand::NewWindow`/
+`ContentShortcut::NewWindow` を追加した (`velox:new-window` センチネル、
+`tab_shortcut_script`/toolbar.html 双方の keydown リスナに `Ctrl/Cmd+N` を
+追加)。加えて自動化スクリプト向けに `AutomationCommand::NewWindow`
+(`new_window` コマンド、引数なし) も追加し、3 経路すべてが
+`app::open_new_window` という 1 つの実装に集約する — 既存の
+`open_new_tab`/`close_tab` が全トリガーの集約点になっているのと同じ設計
+方針である。
+
+`open_new_window` は `browser::Windows::open_window` で新しい `WindowId`+
+`Tabs` を確保し、`ui::window::BrowserWindow::new` を
+`state.site_policies.clone()` と (`EventLoopProxy` の複製)
+`window_event_proxy` で呼び出して実際の OS ウィンドウを構築、成功したら
+`ui_windows` に挿入する。`BrowserWindow::new` が失敗した場合 (実運用では
+起こらないはずだが、最初のウィンドウと全く同じ構築処理なので理論上は
+同じ失敗モードを共有する) は `state.windows` 側に作った空のエントリも
+`close_window` で巻き戻し、プロセス全体は落とさずログだけ出す —
+既存の `?` を使わない `log_failure` パターンと同じ思想。
+
+**`ToolbarCommand::NewWindow`/`ContentShortcut::NewWindow` は
+`handle_toolbar_command`/`handle_content_shortcut` の中では処理しない**、
+`handle_user_event` の時点で横取りする、という実装上の制約がある: これらの
+関数は既に `window: &mut BrowserWindow`(`ui_windows.get_mut(&window_id)` の
+借用) を受け取っており、新しいウィンドウを開くには `ui_windows` 全体への
+`&mut` が必要で、両方を同時に借用することは Rust の借用規則上できない。
+そのため `handle_user_event` は `ToolbarCommand`/`ContentShortcut` を
+パースした直後、`ui_windows.get_mut` する前に `NewWindow` かどうかを見て
+先に `open_new_window` を呼ぶ。`handle_toolbar_command`/
+`handle_content_shortcut` 自身の `match` にも `NewWindow` の腕は残して
+あるが (`enum` を網羅する必要があるため)、中身は空で「ここには来ない」旨の
+コメントのみを置いた。
+
+### 自動化スクリプト (`VELOX_AUTOMATION_SCRIPT`) の複数ウィンドウ対応 — 「現在のウィンドウ」を切り替えるだけの最小拡張
+
+`browser::automation` は Issue #112 の時点で「1 つのタブ集合」を前提に
+`open`/`switch`/`close`/`suspend` をタブ strip 上の 0-based 位置で指定する
+設計になっており、これを本格的に複数ウィンドウ対応させる (例:
+`switch <window> <index>` のような構文にする) のは本 Issue のスコープを
+大きく超える。代わりに **`new_window` という引数なしコマンドを 1 つ追加し、
+「以降の `open`/`switch`/`close`/`suspend`/`navigate` は新しく開いたウィンドウを
+対象にする」** という最小の拡張にとどめた。
+
+`app::run` は `automation_window: WindowId`(可変、初期値は最初のウィンドウ)
+をイベントループのクロージャにキャプチャしており、
+`UserEvent::Automation(AutomationCommand::NewWindow)` を受けたら
+`open_new_window` を呼んで返ってきた新しい id で `automation_window` を
+更新する。他のすべての `AutomationCommand` は
+`ui_windows.get_mut(automation_window)` で得た「現在のウィンドウ」に対して
+実行される。**この設計により `AutomationCommand` 自体に `WindowId` を
+追加する必要がなかった** — 「今操作対象になっているウィンドウ」という
+1 個のグローバルな可変状態を `app::run` 側に持つだけで済んだ。
+
+この拡張の統合テストとして `tests/integration.rs` に
+`new_window_retargets_automation_and_shuts_down_cleanly` を追加した:
+`new_window` の後の `open`/`switch` が実際に新しいウィンドウの `Tabs` に
+届いていること (`tab_create`/`tab_switch` perf レコードの件数で検証) と、
+2 枚のウィンドウが開いたままの状態で `quit` してもプロセスが正常終了する
+こと (受け入れ条件「終了時のリソース解放が正常」) を、実際に `velox` を
+起動して確認している。
+
+### 見送ったもの・既知の制約 (次の Issue で拾うべきもの)
+
+複数ウィンドウ対応は影響範囲が広く、CLAUDE.md
+の「無理に1 PRに詰め込まず、レビュー可能なサイズを保つ」方針に従い、
+以下は明示的に本 Issue のスコープ外とした:
+
+1. **セッション復元 (#25) は最初のウィンドウのみが対象**。
+   `AppState::primary_window`(起動時に開いた最初のウィンドウの
+   `WindowId`) を新設し、`persist_session` は
+   `window_id == state.primary_window` のときだけ書き込む。Ctrl/Cmd+N で
+   開いた 2 枚目以降のウィンドウのタブは `session.json` に一切残らず、
+   次回起動時は常に最初のウィンドウ 1 枚(+その復元されたタブ)から始まる。
+   複数ウィンドウのセッション復元は `SessionSnapshot` のスキーマ自体を
+   「ウィンドウの配列」に変える必要があり、D65 の設計を拡張する形の
+   別 Issue が必要と判断した。
+2. **タブ自動休止ポリシー (#63) はウィンドウごとに独立して評価する**。
+   `app::sweep_tabs` は `state.windows.ids()` の各ウィンドウに対して
+   個別に `suspension::plan` を呼ぶ — `max_live_tabs`/メモリ予算は
+   「ウィンドウごと」の上限になり、複数ウィンドウ合計に対するグローバルな
+   予算にはなっていない。また `pending_memory_sample`(1 回のメモリ
+   サンプルにつき 1 回だけ消費される) は最初に評価されたウィンドウの
+   sweep でしか消費されないため、あるサンプルが複数ウィンドウの休止判断に
+   同時に反映されることはない (次のサンプルが来れば他のウィンドウにも
+   順番に反映される)。ウィンドウをまたいだグローバルな予算共有は
+   `suspension::plan`/`Candidate` の設計をウィンドウ横断に拡張する必要が
+   あり、見送った。
+3. **ダウンロードパネルの即時反映は操作したウィンドウのみ**。
+   `browser::DownloadStore` はプロセス全体で共有の 1 つのストアのままだが
+   (D28 のまま変更なし)、`DownloadStarted`/`DownloadCompleted` が
+   `refresh_downloads_panel` を呼ぶのは、その通信が発生した
+   (`window_id` が指す) ウィンドウのパネルのみである。別のウィンドウを
+   開いていても、そちらのダウンロードパネルはそのウィンドウ自身で何か
+   操作する (パネルを開閉する等) まで最新の一覧に更新されない。全ウィンドウ
+   への即時反映は、`window: &mut BrowserWindow`(`ui_windows.get_mut` の
+   借用) を保持したまま `ui_windows` 全体を不変イテレートする必要があり、
+   上記の「Ctrl/Cmd+N の配線」節と同種の借用の競合を、頻度の高いパスに
+   対して都度回避する実装が必要になる。ホットパスではない (ダウンロードの
+   開始/完了は頻度が低い) ため対応コストに対して価値が低いと判断し
+   見送ったが、実装ポイントとして記録しておく。
+4. **サイトデータ削除 (#26/D66) はトリガーしたウィンドウの webview のみ**。
+   `clear_all_site_data(window: &BrowserWindow)` は変更しておらず、複数
+   ウィンドウ環境では「サイトデータを削除」ボタンを押したウィンドウの
+   toolbar + 全タブの webview にしか `clear_all_browsing_data()` を
+   呼ばない。D66 の実測 (`WebContext::new(None)` は `ApplicationInfo` の
+   アプリ名 (`"velox"`) 由来で全ウィンドウが実質同じ保存先ディレクトリを
+   指す) を踏まえると、Cookie/キャッシュ等の永続データ自体は 1 つの
+   ウィンドウから消せば (エンジンが同じ保存先を指している限り) 他の
+   ウィンドウの分もまとめて消えている可能性が高いが、**別ウィンドウの
+   生きている webview がメモリ上に保持している状態(その後の書き込みで
+   復活しうる)までは消せない**。「全ウィンドウのサイトデータを確実に
+   消す」ボタンにする場合は (3) と同じ借用の課題を解決する必要があり、
+   別 Issue に切り出す方が安全と判断した。
+5. **`Config::private`(プライベートブラウジング) は引き続きプロセス全体で
+   1 つ**。今回変更していない。D14 が既に書いていた「複数ウィンドウが
+   実現したときの拡張路線」がそのまま使える形で残っていることを本 Issue
+   で確認した:
+   - `Config::private` は今も `ui::window::BrowserWindow::new` の 1 呼び
+     出しあたりの構築時パラメータであり (`app::open_new_window` は
+     `config: &Config` を丸ごと渡している)、これを「プロセス全体の
+     `Config`」から「ウィンドウごとに異なりうる値」に変えるには、
+     `AppState`/`open_new_window` の呼び出し元が
+     `config.private` の代わりに「この新規ウィンドウは Private にする
+     か」という個別のフラグを渡すように変えるだけでよい — `BrowserWindow`
+     側のコード (`.with_incognito(config.private)` 等) は変更不要。
+   - `AppState::history_enabled`(bool 1 個) は D14 が予告した通り、
+     「ウィンドウ(または `Windows` の各エントリ)ごとの値」に変える必要が
+     ある。本 Issue で `Windows` という「ウィンドウごとの状態を持つ場所」
+     が既に存在するようになったので、次に着手する Issue は
+     `WindowEntry`(`browser::windows.rs`) に `private: bool`
+     (または同義の値) を足し、`record_visit_if_enabled`/
+     `record_input_history_if_enabled`/`persist_session` の
+     `state.history_enabled` 参照を `state.windows.tabs(window_id)` 経由の
+     ウィンドウごとの値に置き換える、という具体的な道筋が見えている。
+   - toolbar のプライベートバッジ/ウィンドウタイトルの `— プライベート`
+     接尾辞は既に `BrowserWindow::new` の構築時に `config.private`(1 個の
+     bool) から計算されているだけなので、ウィンドウごとの bool さえ届けば
+     そのまま動く。
+   - **Issue #27 が実装すべきこと (本 Issue が明示的に残した宿題)**:
+     (a) `WindowEntry`/`AppState` にウィンドウごとの private フラグを追加、
+     (b) `open_new_window`(または新しい `open_private_window`) が
+     `Config::private` の代わりにそのフラグを見て `BrowserWindow::new` を
+     呼ぶ、(c) `Ctrl/Cmd+Shift+N` 相当の「新しい Private Window」トリガーを
+     Ctrl/Cmd+N と同じ 3 経路 (`ToolbarCommand`/`ContentShortcut`/
+     `AutomationCommand`) に追加。`WindowId`/`Windows`/
+     `ui_windows: HashMap<WindowId, BrowserWindow>` という土台そのものは
+     本 Issue で完成しているため、#27 は「新しい種類のイベント配線」を
+     1 つ足すだけで済むはずである。
+
+### テスト・検証
+
+- `browser::windows`(新規): 12 件 — id の一意性・非再利用、ウィンドウ間の
+  タブ隔離、`close_window`(最後の 1 枚を閉じられる/2 回閉じても安全)、
+  `open_restored_window`、`len`/`is_empty` の整合性。
+- `browser::automation`: `new_window` のパース (`parses_
+  new_window_and_rejects_arguments_on_it`) を追加。
+- `ui::window`: 新しいセンチネル `velox:new-window`/
+  `ContentShortcut::NewWindow` を、既存の「全センチネルを網羅する」
+  テスト (`tab_shortcut_script_captures_expected_combos_in_capture_phase`/
+  `parse_content_shortcut_matches_every_sentinel_exactly`) に追加。
+- `ui::toolbar`: `{"cmd":"new_window"}` のパース、および
+  `toolbar_html_declares_expected_hooks` に `new_window` の存在確認を追加。
+- `tests/integration.rs`(新規 1 件):
+  `new_window_retargets_automation_and_shuts_down_cleanly` — 実際に
+  `velox` を起動し、`new_window` → `open`/`switch` が新しいウィンドウの
+  タブ操作として実行されること (perf レコード件数で検証) と、2 枚のウィンドウ
+  が開いたまま `quit` してもプロセスが正常終了 (exit code 0) することを
+  確認した。
+- テスト件数: `cargo test --lib` は本 Issue 着手前 700 件 → 713 件
+  (`browser::windows` 12 件 + `automation::new_window` 1 件)。
+  `cargo test --test integration`(`xvfb-run` + `dbus-run-session` 経由) は
+  8 件 → 9 件。既存テストの削除・スキップ化は行っていない。
+- `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` は
+  警告ゼロ。`cargo check --target x86_64-pc-windows-msvc --all-targets`
+  (`ui::webview2_blocking` への `WindowId` 引数追加を含む) も型レベルで
+  通過を確認したが、CLAUDE.md D61 の通りリンク・実行はしていないため、
+  Windows 実機での動作確認はできていない。
+
+**Revisit condition**: 上記「見送ったもの」5 点、特に (1) 複数ウィンドウの
+セッション復元と (5) Private Window (#27) は、両方とも独立した Issue として
+着手可能な状態にある。(2)(3)(4) はいずれも「頻度の低いパス、または
+グローバル予算/即時反映という追加要件が実際に必要になったら」拾えばよい
+優先度の低い改善として記録するに留める。
+
+### 追記: 複数ウィンドウ × ページ内検索 (#43, D69) の統合
+
+**経緯**: 本 PR (#29) を `main` に merge する時点で、Issue #43(ページ内検索、
+D69、PR #147)が既に `main` にマージ済みだった。#43 は本 Issue が存在しない
+前提 (単一ウィンドウ) で実装されており、`AppState::find: Option<
+browser::find::FindState>` という**プロセス全体で 1 個だけのグローバルな
+検索セッション**を持つ設計だった。`browser::find::FindState` 自体は
+`tab_id: TabId` しか保持していないため、これをそのまま複数ウィンドウ環境に
+持ち込むと、本 D68 が明示している「`TabId` はウィンドウ内でのみ一意」という
+前提により、以下 3 箇所で実際にバグになることが判明した:
+
+1. ウィンドウ B のタブ 0 をナビゲートすると、`state.find.as_ref().is_some_and(|f| f.tab_id() == id)` の `id` 比較がウィンドウ A のタブ 0 と衝突し、
+   無関係なウィンドウ A の検索バーが閉じられる。
+2. `UserEvent::FindMatchesUpdated { tab_id, total }` が `WindowId` を持たない
+   ため、DOM 検索の結果イベントがどのウィンドウ宛てかを区別できず、
+   `window.set_find_status`/`highlight_find_match` が別ウィンドウの
+   `BrowserWindow` に適用されうる。
+3. タブ切替時の `close_find_bar` 呼び出し (`activate_and_refresh`) が
+   `state.find.is_some()` というグローバル判定のため、ウィンドウ B での
+   タブ切替がウィンドウ A の検索バーを閉じてしまう。
+
+**決定: 検索セッションをウィンドウ単位の状態にする** — 本 D68 が既に確立した
+「`browser::Windows` の各 `WindowEntry` がその窓固有の状態を持つ (`tabs:
+Tabs` がその筆頭)」という設計パターンをそのまま踏襲し、`find:
+Option<browser::find::FindState>` を `WindowEntry` に追加した
+(`src/browser/windows.rs`)。`AppState::find` フィールド自体は削除し、
+`Windows` に `find`/`find_mut`/`set_find`/`take_find` という 4 つのアクセサ
+(`tabs`/`tabs_mut` と対になる形) を追加して、`app.rs` からは
+`state.windows.find(window_id)` のように必ず `WindowId` 付きで参照する形に
+した。`FindState` 自体 (`src/browser/find.rs`) は無改修— `TabId` しか
+知らなくてよい、という D69 の設計は変えていない。「global な `Option`
+1 個」ではなく「ウィンドウごとに独立したセッション」を選んだのは、実際の
+ブラウザの挙動 (ウィンドウ A で "foo" を検索している間に、ウィンドウ B で
+別に "bar" を検索できる) に合わせるためで、global な 1 個にすると
+「後から開いた方が必ず前のウィンドウの検索を強制終了させる」という
+D68 の設計原則にもそぐわない挙動になっていた。
+
+`UserEvent::FindMatchesUpdated` にも `window_id: WindowId` を追加した
+(発火元は `ui::window::BrowserWindow::search_in_page` — `self.id` を
+`evaluate_script_with_callback` のクロージャにキャプチャするだけで済んだ)。
+これで上記 3 箇所はすべて次のように解消される:
+
+1. `state.windows.find(window_id).is_some_and(|s| s.tab_id() == id)` —
+   `window_id` が一致する `WindowEntry` の中でしか `tab_id` を比較しない。
+2. `UserEvent::FindMatchesUpdated { window_id, tab_id, total }` を受けた
+   `handle_user_event` がまず `window_id` で `BrowserWindow`/`Tabs` を
+   解決してから `state.windows.find_mut(window_id)` を見るため、結果が
+   別ウィンドウに漏れることがない。
+3. `activate_and_refresh` の判定を `state.windows.find(window_id).is_some()`
+   に変更し、その `window_id` 自身の検索セッションだけを見るようにした。
+
+`open_find_bar`/`close_find_bar`/`update_find_query`/`step_find`
+(いずれも `handle_toolbar_command`/`handle_content_shortcut` から
+`window_id: WindowId` を既に受け取っている呼び出し元を持つ) は全て
+`window_id: WindowId` を追加の引数として受け取るように変更した — 配線
+自体は本 Issue (#29) の側で既に `window_id` を全ハンドラに通していたため、
+届いていなかったのは「`state.find`(グローバル)を見る」というロジックの
+部分だけだった。
+
+**テスト**: `src/browser/windows.rs` に、2 つのウィンドウが偶然同じ
+`TabId` を持つ状況 (`each_window_has_its_own_independent_tab_id_space` と
+同じ前提) で検索セッションが独立していることを検証する単体テストを
+6 件追加した:
+`a_new_window_has_no_find_session`、
+`find_sessions_are_independent_per_window`(本題 — 一方の `set_find` が
+他方に漏れないこと)、
+`taking_one_windows_find_session_never_closes_anothers`(上記 3 番の
+バグの再現)、
+`find_mut_edits_only_the_targeted_windows_session`、
+`set_find_take_find_and_find_mut_are_noops_for_an_unknown_window`、
+`closing_a_window_drops_its_find_session_without_a_panic`。
+`app.rs` 側の統合 (`UserEvent::FindMatchesUpdated`/`activate_and_refresh`
+の分岐) 自体は既存の統合テスト方針 (D47: wry 呼び出し自体は統合テストの
+対象にしない) に従い、`browser::windows` の単体テストでロジックを、
+実際の 2 ウィンドウでの目視相当の検証は行っていない — 見送った検証として
+下記に記録する。
+
+**見送った検証**: 実際に 2 つの `BrowserWindow` を開いて同時に別々の
+検索語で検索し、互いのハイライト/件数表示が混線しないことを実機
+(または統合テスト) で確認することはしていない。`tests/integration.rs`
+は `VELOX_AUTOMATION_SCRIPT` 経由の駆動のみで、ページ内検索の
+`ToolbarCommand`(`OpenFindBar`/`FindQuery`/...) は自動化コマンドの
+対象になっていないため、既存の自動化の仕組みだけでは統合テスト化でき
+ない。将来 #43 側で検索コマンドを自動化スクリプトに追加する機会があれば、
+その時に複数ウィンドウの統合テストも追加するのが自然と考える。
+
+### 追記: 複数ウィンドウ × 設定画面 (#30, D67) の統合
+
+**経緯**: 本 PR (#29) を `main` に再度取り込んだ時点で、Issue #30(設定画面と
+永続設定基盤、D67、PR #148)も `main` にマージ済みだった。#30 も単一ウィンドウ
+前提で実装されており、`AppState::settings: Settings` はプロセス全体で
+1 個だけの共有ドキュメントである点は元々ウィンドウの概念に依存していない
+ため問題ないが、**設定を変更した際の即時反映経路 (`app::apply_updated_
+settings`) が単一の `window: &mut BrowserWindow` しか受け取らない**設計
+だったため、複数ウィンドウ環境で次の 2 点が問題になることが判明した:
+
+1. 設定画面で Appearance (テーマ・ブックマークバー表示) を変更して保存
+   すると、**保存操作をしたウィンドウの chrome にしか反映されず**、
+   他のウィンドウは次にそのウィンドウ自身で何か操作するか再起動するまで
+   古いテーマ/表示のままになる。
+2. 同様に、他のウィンドウで設定画面を開いていた場合、そちらの表示 (フォーム
+   の内容) が保存内容を反映せず古いままになる。
+
+**決定**: `app::apply_updated_settings` のシグネチャを `window: &mut
+BrowserWindow` から `ui_windows: &mut HashMap<WindowId, BrowserWindow>`
+(呼び出し元が持つマップそのもの) に変更し、`ui_windows.values()` を
+全走査して **開いている全ウィンドウ**に対して `set_theme`/
+`set_bookmark_bar_visible`/`refresh_settings_panel` を適用するようにした。
+`ToolbarCommand::UpdateSettings`/`ResetSettings` は (`NewWindow` と全く同じ
+理由 — `window: &mut BrowserWindow` という 1 エントリの借用と
+`ui_windows` 全体への `&mut` は同時に成立しない) `handle_toolbar_command`
+の中では処理せず、`handle_user_event` が `window_id` を解決する前に
+横取りするように変更した。
+
+`state.settings`(D67 のプロセス全体で共有という設計)自体は変更していない
+— 「ウィンドウごとに異なる設定を持てるようにする」のではなく、「1 つの
+共有設定を、開いている全ウィンドウの chrome に一貫して反映する」ことを
+選んだ。これは D68 が D14(プライベートブラウジングも whole-app)で
+確立した「アプリ全体で 1 つの値を全ウィンドウが等しく参照する」という
+既存の設計方針とも整合する。
+
+さらに、**新しく開いたウィンドウ (Ctrl/Cmd+N, `app::open_new_window`) にも
+現在の設定 (テーマ・ブックマークバー表示) を construction 直後に適用**する
+ようにした — 起動時に最初のウィンドウへ行っている初期化 (`app::run` の
+「apply initial bookmark bar visibility」)と全く同じ処理を、2 枚目以降の
+ウィンドウにも行う。これがないと、Ctrl+N で開いた新しいウィンドウだけが
+常に既定のテーマ/非表示状態で始まってしまい、既存ウィンドウと見た目が
+食い違う。
+
+`Config::download_dir_override` (ダウンロード先の上書き) はこの変更の対象外
+とした — D67 が元々「Appearance 以外は次回起動まで反映されない」と明記して
+おり、ダウンロード先はウィンドウ構築時に `ContentPolicy`/`with_download_
+handlers` へ焼き込まれる値なので、既存の単一ウィンドウ時代から変わらず
+「保存後、次に開いたタブ/ウィンドウから新しい値が効く」という挙動のままで
+一貫している(今回複数ウィンドウ対応で新たに劣化させた挙動ではない)。
+
+**見送った検証**: 実際に複数ウィンドウを開いた状態で設定画面から
+Appearance を変更し、全ウィンドウの chrome が同時に切り替わることを
+実機/統合テストで確認することはしていない。ページ内検索の統合と同じ理由
+(`tests/integration.rs` は `VELOX_AUTOMATION_SCRIPT` 経由の駆動のみで、
+`ToolbarCommand::UpdateSettings`/`ResetSettings` は自動化コマンドの対象に
+なっていない) で、既存の自動化の仕組みだけでは統合テスト化できなかった。
+`browser::settings`(`Settings`/`sanitize`)自体は本統合で変更しておらず、
+既存の単体テストがそのまま有効。`app::apply_updated_settings`/
+`app::open_new_window` の全ウィンドウ反映ロジックは実際の
+`wry::WebView` 呼び出し (`set_theme`/`set_bookmark_bar_visible`) を伴うため、
+D47 の方針 (wry 呼び出し自体は統合テストの対象にしない) に従い自動テストの
+対象にしていない。
+
 ## D69: ページ内検索 (#43) — 3 エンジンとも自前 JS 実装、ネイティブ find API は Windows を優先する限り使えないと判明
 
 **対象**: Issue #43。Ctrl/Cmd+F・検索 UI・次/前へ移動・件数表示・Esc 終了・
