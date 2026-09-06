@@ -8235,6 +8235,7 @@ Windows での検証ができるようになったとき、上記の未検証事
 #39(コンテキストメニュー)に着手するとき、右クリックからの保存導線を
 追加する。
 
+
 ## D77: キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと
 `browser::shortcuts::SHORTCUT_TABLE` への集約、衝突検出、信頼境界は不変
 
@@ -8402,3 +8403,351 @@ toolbar 側が残るのは、D18 が「toolbar は構造化コマンドを送っ
 着手するとき — `ShortcutId`/`KeyChord` の serde 形式を土台にした
 `Settings` 拡張から始める。(2) #27/#40/#46 のショートカットを実際に
 `SHORTCUT_TABLE` へ統合するとき — 本 D77 の「触る箇所」の手順に従う。
+
+## D78: コンテキストメニュー (#39) — ネイティブ API ではなく JS 描画を採用、content webview からの入力は専用の境界付き第 3 チャネルとして扱う
+
+**対象**: Issue #39 の受け入れ条件 4 点 (右クリックでメニュー表示 /
+リンク上の操作が対象 URL を正しく扱う / テキスト選択時の検索 /
+DevTools 導線との統合)。依存に挙がっている #11 (タブ管理) は実装済み、
+#28 (DevTools 統合) は D18 で実装済みのうえ `#duplicate` としてクローズ
+済みで、本 Issue が求める「Inspect 項目」はその `BrowserWindow::
+open_devtools` をそのまま再利用するだけで満たせる。#27 (プライベート
+ウィンドウ)・#40 (印刷)・#46 (名前を付けて保存)・#38 (ショートカット
+管理) は並行進行中 (#27 は本 PR 作成中にマージされ、後述のとおり
+origin/main を取り込んで統合済み) — 「メニュー項目を 1 つ足すのに
+最小の変更で済む」設計にした理由と、後述の切り出し Issue を参照。
+
+### 調査: wry 0.56 でネイティブのコンテキストメニューに届くか
+
+D25/D59/D60/D66/D69 と同じ「issue の指示に頼らず実ソースを読む」調査
+スタイルを踏襲し、3 エンジンそれぞれを実際のベンダーソース
+(`~/.cargo/registry/src/.../wry-0.56.1`, `webview2-com-sys-0.38.2`) で
+確認した。
+
+- **WebView2 (Windows) — `ICoreWebView2_11::add_ContextMenuRequested` が
+  実在し、しかも D59/D66 が既に実績のある `ICoreWebView2_13` より**さらに
+  古い**インターフェース世代だった** (`webview2-com-sys-0.38.2/src/
+  bindings.rs` 39492 行目、`ICoreWebView2ContextMenuRequestedEventArgs`
+  一式も 8095 行目に確認)。D69 (ページ内検索) が `ICoreWebView2Find`
+  (`ICoreWebView2_28`) を「新しすぎて実機検証できない」という理由で
+  見送ったのとは対照的に、こちらは Windows 最優先の方針にとって
+  むしろ有望な選択肢に見えた。しかし採用しなかった。理由は 2 点:
+  1. **メニュー項目 (`ICoreWebView2ContextMenuItemCollection`) の追加/
+     削除/`Kind` (Command/CheckBox/Submenu/Separator) の扱い、および
+     `ICoreWebView2ContextMenuTarget` から `HasLinkUri`/`LinkUri`/
+     `HasSourceUri`/`SourceUri`/`SelectionText` 等を読み出す一式は、
+     D59 の `WebResourceRequested` (COM オブジェクト 1 個からのプロパティ
+     読み出しのみ) よりもはるかに大きい COM 表面積で、しかも
+     `GetDeferral`/非同期完了ハンドラまで絡む。
+  2. **macOS (WKWebView) と Linux (WebKitGTK) には全く別の API 系統
+     (`webView:contextMenuConfigurationForElement:completionHandler:`と
+     `WebKitWebView::context-menu` シグナル + `WebKitContextMenu`) しか
+     存在せず**、しかも wry 0.56 のソース (`src/wkwebview/mod.rs`、
+     `src/webkitgtk/mod.rs`) にはどちらの委譲/シグナルへのフックも
+     公開されていない。仮に Windows だけネイティブ実装を作っても、
+     macOS/Linux 向けには結局 JS ベースの別実装が要る — 1 機能に
+     全く異なる 3 系統の「メニュー項目」表現 (COM オブジェクト /
+     Objective-C ブロック / GTK ウィジェット) を抱えることになり、
+     「メニュー項目を 1 つ足すときに触る箇所を最小にする」という
+     設計目標そのものと真っ向から矛盾する。D69 が「Windows は理論上の
+     経路はあるが検証不能な最新 API のみ、macOS は経路無し」という
+     非対称な結論から「3 エンジンとも JS で統一」を選んだのと、今回は
+     根拠は違う (Windows 側は経路が"ある") が結論の形は同じになった。
+- **WKWebView (macOS) — ネイティブ相当の API 自体は存在するが wry
+  未公開。** `webView(_:contextMenuConfigurationForElement:
+  completionHandler:)` (`WKUIDelegate`) がネイティブの右クリックメニュー
+  をカスタマイズする唯一の経路だが、wry 0.56 の `WryWebViewDelegate`
+  (デスクトップ版 `src/wkwebview/mod.rs`) はこのデリゲートメソッドを
+  実装/公開していない。
+- **WebKitGTK (Linux) — `WebKitWebView::context-menu` シグナル自体は
+  存在するが、これも wry からは配線されていない**。D69 の
+  `find_controller()` のように `wry::WebViewExtUnix::webview()` 経由で
+  生の `webkit2gtk::WebView` は取れる (`connect_context_menu` は
+  `webkit2gtk` クレートが安全にラップ済み) ものの、上記 2 点の理由
+  (COM 側の表面積・3 系統の非対称性) がそのまま当てはまるため、
+  「Linux だけ個別対応する」価値はないと判断した (CLAUDE.md の OS
+  優先度どおり、Linux は「動けば十分」であり、ここに独自実装を割く
+  理由がない)。
+
+**結論**: 3 エンジンとも、**content webview 内で `contextmenu` イベントを
+捕捉し `event.preventDefault()` で既定メニューを止め、VeloX 側で
+メニューを描画する** JS ベースの方式に統一した (issue が挙げた選択肢の
+2 番目)。`event.preventDefault()` は DOM 標準として 3 エンジンすべてが
+尊重する (自前の右クリックメニューを持つ Web アプリが日常的に使っている
+挙動そのもの) ため、D69 のように「Windows は動くが他 2 つは経路が無い」
+という非対称な妥協を選ぶ必要すらなかった。Windows だけ追加で
+`wry::WebViewBuilderExtWindows::with_default_context_menus(false)`
+(`lib.rs` 1810 行目、`#[cfg(windows)]`) も掛けている — これは
+`preventDefault()` が何らかの理由で効かない場合の多層防御であり、
+CLAUDE.md の Windows 最優先方針を「保険を厚くする」形で反映したもので、
+JS 側の対応が本質的に不十分だからではない。
+
+### 最優先で守った設計: content webview からの入力は信頼できない — D18/D23 の二重配送とは別の、第 3 の境界
+
+D18/D23 が確立した「トールバー webview は信頼済み (構造化コマンド) /
+content webview は信頼できない (固定センチネル文字列のみ)」という原則は、
+今回**そのままの形では使えない**。コンテキストメニューは本質的に
+「クリック位置に何があったか」という**データ**(リンク URL・画像 URL・
+選択テキスト・座標)を content webview から受け取らなければならず、
+これは D18/D23 が扱ってきた「固定の合言葉が来たか来ないか」だけの
+判定には収まらない。かといって、D18 が禁じた「content 由来の入力を
+`ToolbarCommand` のような構造化パーサに流し込む」を素直にやってしまうと、
+任意の Web ページが好きな JSON を送り込める通路が toolbar の信頼済み
+パーサと同格になってしまう。
+
+採った設計は次の通り:
+
+- **`ui::window` に、`ToolbarCommand`/`ContentShortcut` のどちらとも
+  独立した第 3 のパーサを新設した**(`parse_context_menu_open`/
+  `parse_context_menu_action`)。content webview の `with_ipc_handler`
+  は 1 つのクロージャのままだが、その中で試す候補が
+  「固定センチネル文字列との完全一致 (`OPEN_DEVTOOLS_MESSAGE`/
+  `parse_content_shortcut`)」→「`"velox:context-menu-open:"` プレフィックス
+  + JSON」→「`"velox:context-menu-close"` 完全一致」→「`"velox:
+  context-menu-action:"` プレフィックス + 小さな整数」の順に増えた
+  だけで、**`toolbar::parse_command` (トールバー専用の信頼済みパーサ) は
+  一切呼ばれない** — D18 が「2 番目の `ToolbarCommand` 風パーサを生やす
+  くらいなら専用のセンチネル/バリアントを追加せよ」と書いた指針どおり、
+  専用の第 3 チャネルを追加する形にした。
+- **メッセージサイズは事前チェック**: `MAX_CONTEXT_MENU_MESSAGE_BYTES`
+  (32 KiB — D62 の `MAX_IPC_PAYLOAD_BYTES` (1 MiB、トールバー専用) より
+  大幅に小さい。1 回のクリック情報でしかないため) を `serde_json::
+  from_str` を呼ぶ**前**にチェックし、超過は即座に `None` — D62 の
+  「パースを試みる前に弾く」パターンをそのまま踏襲。
+  `parse_context_menu_action` 側も同じ思想で、桁数上限 (3桁) と
+  先頭ゼロ拒否を数値パース前に行う (D23 の「近似一致を許さない完全一致」
+  を数値入力に拡張したもの)。
+- **JSON をデシリアライズできたことは「安全」を何一つ意味しない**。
+  `ContextMenuOpenMessage` (ui::window, ワイヤ形式) →
+  `browser::context_menu::RawMenuContext` (まだ untrusted) →
+  **`browser::context_menu::sanitize`** (ここで初めて信頼できる
+  `MenuContext` になる) という 3 段階を必ず経由する。`sanitize` が行う
+  検証:
+  - **リンク/画像 URL はスキームを `http`/`https` のみに絞った**
+    (`sanitize_menu_url`)。`browser::navigation::ALLOWED_SCHEMES`
+    (`http`/`https`/`file`/`about`/`data`) より**意図的に狭い** —
+    アドレスバーの `file:`/`data:` はユーザ自身が能動的に入力した
+    ものだが、コンテキストメニューのリンク/画像 URL はページが
+    埋め込んだ `<a href>`/`<img src>` をユーザが右クリックしただけの
+    ものであり、「リンクを新しいタブ/ウィンドウで開く」がページ側の
+    `javascript:`/`data:`/`file:` を無条件に実行・表示する経路に
+    ならないようにするための多層防御。`navigation::normalize_input`
+    自体は再実装せず再利用し (`javascript:`/`vbscript:` 等は既存の
+    スキーム許可リストで既に弾かれる — D62 で固定化済みの挙動)、
+    その結果に対して追加で `http`/`https` チェックを重ねる形にした
+    ので、URL パース自体の正しさは D62/既存テストの資産をそのまま
+    引き継いでいる。
+  - **選択テキストは制御文字を除去し、長さを上限
+    (`MAX_SELECTION_LEN` = 4,000 文字) で切り詰める** (UTF-8 の文字境界を
+    尊重、D72 の `truncate_source_utf8` と同じ配慮)。トリム後に空になる
+    場合は `None` 扱い (「選択なし」と区別しない)。
+  - `is_editable` は真偽値なのでサニタイズ不要だが、"Paste" の
+    有効/無効判定にのみ使う。
+- **メニュー内容の決定はすべて `browser::context_menu::build_menu`
+  という 1 つの純粋関数に集約した**(この Issue の設計の核 — 後述の
+  「拡張性」節を参照)。`ui::window`/`app.rs` はこの関数の戻り値
+  (`Vec<MenuEntry>`) をそのまま描画・実行するだけで、どの項目を出すか/
+  有効にするかの判断ロジックを一切持たない。`src/browser/context_menu.rs`
+  に 40 件超の単体テストがあり、webview なしで検証できる
+  (`docs/architecture.md` の 4 層分離のとおり)。
+- **クリックされた項目は「番号」でしか content webview から戻ってこない**。
+  メニューを描画した時点で `browser::context_menu::OpenContextMenu`
+  (対象 `TabId` + `Vec<MenuEntry>`) を `browser::Windows`
+  (ウィンドウごとに 1 個、D69 の `FindState` と全く同じ「ウィンドウ単位で
+  1 セッション」の形) に保存し、`"velox:context-menu-action:<N>"` で
+  戻ってきた `N` を **その保存済みリストに対してのみ** 解決する
+  (`OpenContextMenu::resolve`)。これにより:
+  - ページ側は「VeloX が実際に提示した項目」以外のアクションを
+    絶対に選べない (存在しないインデックス・無効化された行のインデックス
+    はどちらも `resolve` が `None` を返す — `resolve` 自身が
+    `enabled` を再チェックする単体テストあり、
+    `resolve_rejects_a_disabled_entry`)。
+  - リンク URL/選択テキストといった実際に使われる値は、**最初の
+    `sanitize` 時点で確定した文字列がそのまま `MenuAction` の enum
+    ペイロードとして保持される** — 2 回目のメッセージ (クリック) で
+    ページから再度 URL やテキストを送らせる必要が無く、そもそも
+    そのための入力欄も存在しない。
+  - ウィンドウをまたぐ取り違え防止 (#29/D68 の要請): `OpenContextMenu`
+    は `WindowId` ごとに独立して保存され (`browser::windows::
+    WindowEntry::context_menu`)、`UserEvent::ContextMenuRequested`/
+    `ContextMenuActionSelected`/`ContextMenuClosed` はすべて `WindowId`
+    **と** `TabId` の両方を明示的に運ぶ。クリック確定時は
+    「そのウィンドウの現在のメニューが、まさにそのタブ向けに開かれた
+    ものか」を `take_context_menu` する**前に**照合するため
+    (`handle_user_event` のガード節)、あるウィンドウで開いた別タブ向けの
+    メニューを誤って上書き/消費することはない — D69 の find セッションが
+    同じ理由で `Windows::find_mut` を `tab_id()` チェック付きで使うのと
+    同じパターン。
+- **自前 HTML メニューの描画に、選択テキスト/リンク URL を生 HTML として
+  挿入していない**。`ui::window::context_menu_render_script` が生成する
+  JS は、行ラベルを `row.textContent = item.label` という **DOM API**
+  で設定する — `innerHTML` は一度も使わない。`textContent` は代入した
+  文字列をそもそも HTML として解釈しないため、選択テキストに
+  `<script>`/`<img onerror=...>` 等が含まれていても、それが「生きた
+  マークアップ」として現れることは構造的に起こり得ない。D72 (View
+  Source) が `escape_html` で HTML エスケープを行っているのとは
+  **異なる防御レイヤ**であることをモジュールのコメントに明記した — D72
+  は「文字列としてのHTMLドキュメント」を組み立てる必要があったため
+  エスケープが要ったが、今回は生きた DOM 操作なのでその手順自体が
+  不要になる。
+- **残る注入経路は「JS 文字列リテラルからの脱出」であり、これは D62/D69
+  の資産をそのまま再利用して塞いだ**。`item.label` (唯一ページ由来の
+  文字列を含みうるフィールド — `MenuAction::SearchSelection` の選択
+  プレビュー) を含む `items` 配列全体を `serde_json::Value::to_string()`
+  で JSON 化し、その結果に対して `ui::toolbar::escape_js_line_terminators`
+  (D62 で追加済み、U+2028/U+2029 対策) を適用してから
+  `const items = <ここ>;` として埋め込む — D69 の `find_query_literal`
+  と寸分違わぬパターン。`"`/`\`/制御文字は `serde_json` が RFC 8259 通り
+  エスケープするため、選択テキストに引用符やバックスラッシュが
+  含まれていても JS 文字列リテラルの外へ抜け出すことはない。
+
+### これらをどうテストしたか
+
+- **`src/browser/context_menu.rs`** (40 件超):
+  `javascript:`/`vbscript:`/`data:`/`file:` スキームのリンク/画像 URL が
+  `sanitize` 後に `None` になること (大文字小文字・空白・コメント付与
+  トリックを含む)、空/巨大な URL の拒否、選択テキストの制御文字除去・
+  マルチバイト境界を尊重した切り詰め、`build_menu` の決定表 (プレーンな
+  ページ/リンク/画像/選択あり/編集可能ターゲットそれぞれで正しい項目
+  集合と有効/無効になること)、`OpenContextMenu::resolve` が無効な行・
+  範囲外インデックスを拒否すること、ホスティルな入力 (NUL・bidi
+  override 文字など) でパニックしないこと。
+- **`src/ui/window.rs`** (20 件超): `parse_context_menu_open`/
+  `parse_context_menu_action` の正常系・異常系 (不正 JSON・上限超過・
+  非数値・先頭ゼロ・巨大整数でのパニック無し)、座標のクランプ、
+  `context_menu_render_script` が `"`/`\`/U+2028/U+2029/
+  `document.body.innerHTML = ...` 型の JS 文字列脱出試行を無害化すること
+  (D69 と同型のテスト)、選択テキストに `<script>alert(...)</script>` を
+  含めても生成スクリプト中に「解釈されるマークアップとしての
+  `<script>`」が現れず、`items` 配列内の JSON 文字列値としてのみ現れる
+  ことを確認するテスト、`context_menu_script`
+  (contextmenu イベントリスナ) が `preventDefault`/`window.ipc.postMessage`
+  /`.href`・`.src` (IDL 経由の絶対 URL 読み取り) を含むことの内容検証。
+- 単体テスト件数: **823 → 869 (このブランチ単独の変更で +46)**。
+  その後 #27 (プライベートウィンドウ、並行merge) を取り込んだことで
+  さらに +10 され、最終的に **879**。いずれの段階でも減少なし
+  (`cargo test --lib -- --list` で計測)。
+- 統合テスト (`tests/integration.rs`) は今回変更していない (#27 マージ後
+  10 件、全て pass) — D69/D72 と同じ判断で、コンテキストメニューは
+  既存の統合テストが検証する「実プロセス起動・実タブ管理・実ファイル
+  永続化」のいずれとも直接関係しないため、新規の統合テストは追加して
+  いない。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` で
+  `#[cfg(windows)]` の `disable_default_context_menus`
+  (`WebViewBuilderExtWindows::with_default_context_menus`) を含め型
+  レベルの整合は確認したが、実機の Windows/WebView2 での動作確認は
+  できていない (この環境に Windows 実機が無いため) — 特に
+  `event.preventDefault()` が WebView2 の既定コンテキストメニューを
+  実際に抑止するか (D69/D72 の F12/Ctrl+U と同種の「アクセラレータ/
+  既定動作との衝突は理論的には対処済みだが未検証」という限界) は
+  次の一手として記録する。
+
+### メニュー項目を 1 つ足すときに触る箇所 — 意図した設計目標
+
+`browser::context_menu::build_menu` の呼び出し 1 箇所だけが「どの項目を
+出すか/有効にするか」を決める。新しい項目を足す最小手順:
+
+1. `context_menu::MenuAction` に 1 バリアント追加。
+2. `MenuAction::label()` に 1 アーム追加 (静的な日本語文字列、または
+   D72/D69 と同じパターンで動的プレビューを足す)。
+3. `build_menu` に 1 行 (`MenuEntry { action: ..., enabled: ... }`)
+   追加。
+4. `app::handle_context_menu_action` (または、新規ウィンドウが絡む場合は
+   `handle_user_event` の割り込み節、D68 が `NewWindow` 系で既に確立した
+   パターン) に 1 アーム追加して実際の処理を書く。
+
+**ui::window 側のレンダリング/IPC コードは一切変更不要** — `MenuEntry`
+の `label`/`enabled` を読んで描画し、`index` をクリックで送り返すだけの
+汎用的な仕組みだからである。実際、#27/#40/#46 が本 PR 未反映のまま
+メニューに次のように載せられるはずである (将来 Issue 化、後述):
+
+- **#46 (名前を付けて保存)**: `MenuAction::SaveLinkAs(String)`/
+  `SaveImageAs(String)` を追加し、`handle_context_menu_action` から
+  #46 が用意する保存ダイアログ相当の関数を呼ぶだけで済む。
+- **#40 (印刷)**: ページ全体を対象にした `MenuAction::Print` を足し、
+  #40 の印刷起動関数を呼ぶだけ。
+- **#27 (プライベートウィンドウ)**: 実は本 PR で既に
+  `OpenLinkInNewWindow` がソースウィンドウのプライバシーを継承するよう
+  配線済み (下記「#27 との統合」)。「新しいプライベートウィンドウで
+  開く」を明示的な別項目にしたい場合も、`MenuAction::
+  OpenLinkInNewPrivateWindow(String)` を 1 つ足すだけで済む形になって
+  いる。
+
+既存の View Source (`app::request_view_source`) とページ内検索
+(`ToolbarCommand::OpenFindBar`/`ContentShortcut::OpenFindBar`) も
+このテーブルに乗せられる候補だったが、**あえて今回のスコープに含め
+なかった**: どちらもコンテキストメニューの対象 (右クリックした場所) に
+依存しない「ページ全体」に対する操作であり、`MenuContext` に新しい
+フィールドを増やす必要が無い最も足しやすい部類の項目である。issue 本文の
+実装内容リストにも直接の記載が無く、受け入れ条件 4 点をまず確実に
+満たすことを優先し、追加候補として次節の後続 Issue に切り出した。
+
+### #27 (プライベートウィンドウ) との統合
+
+本 PR は #27 のマージ後に origin/main を取り込んで書かれているため、
+`MenuAction::OpenLinkInNewWindow` の実行 (`handle_user_event` の
+`ContextMenuActionSelected` 節) は `state.windows.is_private(window_id)`
+でメニューを開いた**元のウィンドウ**のプライバシーを読み取り、
+`open_new_window` に引き継ぐようにした — プライベートウィンドウで
+右クリックした場合に「リンクを新しいウィンドウで開く」が非プライベート
+ウィンドウを開いてしまう (D74 が守ろうとした分離を素通りする抜け穴に
+なる) のを防ぐ。`ToolbarCommand::NewWindow`/`NewPrivateWindow` のような
+「常に private/常に non-private」の 2 択ではなく、「呼び出し元に合わせる」
+という 3 つ目の扱いを導入した唯一の箇所であり、その理由をここに明記する。
+
+### 実装しなかったもの・切り出した後続 Issue
+
+- **Save (ページ/リンク/画像を保存)・Print (印刷)** は issue の実装内容に
+  挙がっているが、#46 (名前を付けて保存)・#40 (印刷) がまだ未マージの
+  ため、`MenuAction` に含めていない。受け入れ条件 4 点には含まれない
+  ため今回のスコープからは除外したが、それぞれがマージされ次第、上記
+  「触る箇所」の手順で追加できるよう設計してある。→ 後続 Issue #161 を
+  切り出した。
+- **View Source/ページ内検索をメニュー項目として追加すること** — 上記の
+  とおり、対象非依存で最も足しやすいが、受け入れ条件外のため今回は
+  見送った。
+- **Back/Forward の有効/無効判定**: D20 が確立した「VeloX はエンジンの
+  セッション履歴を複製しない」という前提により、「これ以上戻れない/
+  進めない」を判定する手段が無く、常に有効として表示している (トールバー
+  自身の Back/Forward ボタンも同じ制約ですでに常時有効)。
+- **Paste (`document.execCommand("paste")`) の信頼性は未検証**。
+  Chromium 系エンジンはセキュリティ上の理由でスクリプトからの
+  `execCommand("paste")` を無効化していることがある (WebView2 が
+  これに該当するかは実機が無く未確認)。エラーにはならないことは
+  型として保証しているが、実際に貼り付けが起こるかは検証できていない。
+- **選択範囲がテキストノードをまたぐ場合の扱い**は D69 と同じ制約
+  (`window.getSelection().toString()` 自体はブラウザ標準 API なので
+  D69 のようなテキストノード単位の制約は無いが、`<input>`/`<textarea>`
+  内部の選択は `window.getSelection()` では取得できず、常に
+  "選択なし" 扱いになる — フォーム内テキストの「選択して検索」は
+  今回のスコープ外の既知の制限として記録する)。
+- **1 ウィンドウにつき 1 メニューセッションのみ** (D69 の `FindState` と
+  同じ MVP 簡略化)。バックグラウンドタブが偽の `contextmenu` イベントを
+  発火させて同じウィンドウの別タブのメニューを消す、といった攻撃は
+  タブ切り替え/ナビゲーション時に確実にメニューを破棄する対策
+  (`handle_user_event` の `NavigationStarted`/`LoadStarted`、
+  `activate_and_refresh`) と、`resolve` 時の `tab_id` 突合ガードで
+  実害が出ない設計にしてあるが、専用の統合テストは追加していない。
+
+**満たせなかった／部分的にしか満たせなかった受け入れ条件**: 4 点とも
+機能としては満たしている。ただし「DevTools 導線と統合できる」は
+`BrowserWindow::open_devtools` (D18) の既存の「アクティブタブに対して
+開く」契約をそのまま再利用しており、メニューを開いたタブがその後
+非アクティブになっていた場合 (通常は起こり得ないが理論上) はアクティブ
+タブの DevTools が開く — D18/D23 が `ContentShortcut` 全般について
+既に許容している限界と同じものを引き継いだだけで、本 Issue で新たに
+生じた制約ではない。
+
+**Revisit condition**: (1) Issue #38 のキーバインド管理層が導入する
+「ショートカット/操作の一元管理」にコンテキストメニューの項目定義
+(`browser::context_menu::build_menu`) を統合する。(2) #46 が着地したら
+Save 系の `MenuAction` を追加する (上記「触る箇所」の手順どおり)。
+(3) #40 が着地したら Print を追加する。(4) 実機 Windows での動作確認
+(`preventDefault()` が WebView2 の既定メニューを実際に止めるか、
+`execCommand("paste")` が動くか)。(5) `WebKitFindController` 同様、
+Windows の `ICoreWebView2_11::ContextMenuRequested` を将来
+「Windows だけ本格的にネイティブ化する」判断が下ったときの実装ポイント
+として残す (今回は 3 エンジン非対称のコストが見合わないと判断し見送った
+だけで、経路自体は本項で調査・記録済み)。(6) `<input>`/`<textarea>`
+内部の選択テキストを拾えるようにする。(7) メニューセッションをタブごとに
+複数持てるようにする。

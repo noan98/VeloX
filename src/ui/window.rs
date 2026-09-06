@@ -47,6 +47,7 @@ use wry::{
 };
 
 use crate::app::UserEvent;
+use crate::browser::context_menu;
 use crate::browser::downloads;
 use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
@@ -88,6 +89,196 @@ const OPEN_DEVTOOLS_MESSAGE: &str = "velox:open-devtools";
 // rather than each hand-rolling their own copy of the string table, and
 // this module's tests call it directly instead of naming a
 // module-private `const`.
+
+// --- Right-click context menu (Issue #39), see docs/decisions.md D78 ---
+//
+// Unlike every sentinel above (a keyboard shortcut, always an exact-match
+// fixed string with no page-supplied data attached), a context menu is
+// unavoidably about *what the user clicked on* — link/image/selection data
+// the content webview, i.e. untrusted page content, controls. This still
+// never grows the trusted `ToolbarCommand`/`ContentShortcut` parsers into
+// something that accepts structured data from an untrusted source (D18's
+// rule): it is a third, independent, still-untrusted channel, size-capped
+// before parsing, whose output only ever becomes a [`context_menu::MenuContext`]
+// via [`context_menu::sanitize`] — never trusted as-is. See this module's
+// `context_menu_script` and `parse_context_menu_open`, and
+// docs/decisions.md D78 for the full reasoning.
+
+/// Prefix for a context-menu-open report: `"velox:context-menu-open:"` plus
+/// a JSON object (see [`ContextMenuOpenMessage`]). Chosen as a prefix rather
+/// than a single exact-match sentinel specifically because — unlike every
+/// other message on this channel — this one carries real, page-controlled
+/// data that cannot be reduced to picking from a fixed set of strings.
+const CONTEXT_MENU_OPEN_PREFIX: &str = "velox:context-menu-open:";
+
+/// Prefix for "the user clicked menu row N": `"velox:context-menu-action:"`
+/// plus a small unsigned integer — an index into the exact [`context_menu::
+/// MenuEntry`] list [`BrowserWindow::show_context_menu`] most recently sent
+/// down for this tab, resolved server-side via
+/// [`crate::browser::context_menu::OpenContextMenu::resolve`]. Never
+/// anything richer than an integer: the content webview cannot forge a
+/// choice VeloX itself did not already offer.
+const CONTEXT_MENU_ACTION_PREFIX: &str = "velox:context-menu-action:";
+
+/// The menu was dismissed with no selection (clicked outside it, or Esc).
+const CONTEXT_MENU_CLOSE_MESSAGE: &str = "velox:context-menu-close";
+
+/// Hard cap on a `CONTEXT_MENU_OPEN_PREFIX` message's JSON payload, checked
+/// *before* `serde_json::from_str` ever runs — the same "reject outright,
+/// never even attempt to parse" pattern D62 established for the toolbar's
+/// `MAX_IPC_PAYLOAD_BYTES`. Far smaller than that 1 MiB budget: this
+/// payload is just one click's worth of coordinates/URLs/selection text,
+/// never a pasted document.
+const MAX_CONTEXT_MENU_MESSAGE_BYTES: usize = 32 * 1024;
+
+/// Raw wire shape of a [`CONTEXT_MENU_OPEN_PREFIX`] message, exactly as
+/// [`context_menu_script`] serializes it — untrusted input in every field
+/// (see `context_menu`'s module doc comment). Deserializing this
+/// successfully proves nothing about *safety*, only about *shape*; every
+/// field still goes through [`context_menu::sanitize`] before anything
+/// treats it as safe to display or act on.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextMenuOpenMessage {
+    x: f64,
+    y: f64,
+    #[serde(default)]
+    link_href: Option<String>,
+    #[serde(default)]
+    image_src: Option<String>,
+    #[serde(default)]
+    selection_text: Option<String>,
+    #[serde(default)]
+    is_editable: bool,
+}
+
+/// Parse a [`CONTEXT_MENU_OPEN_PREFIX`] message body into clamped
+/// viewport-relative coordinates and a [`context_menu::RawMenuContext`].
+/// `None` for anything that is not this exact prefix, is over
+/// [`MAX_CONTEXT_MENU_MESSAGE_BYTES`], or fails to deserialize — the size
+/// check runs *before* `serde_json::from_str`, so an oversized payload never
+/// reaches the parser at all (D62's pattern).
+///
+/// Coordinates are clamped to a sane non-negative range rather than trusted
+/// outright: a hostile page could otherwise report `NaN`/`Infinity`/an
+/// absurdly large number, which would still be syntactically valid to embed
+/// as a JS numeric literal but would position the rendered menu somewhere
+/// nonsensical.
+fn parse_context_menu_open(body: &str) -> Option<(f64, f64, context_menu::RawMenuContext)> {
+    let json = body.strip_prefix(CONTEXT_MENU_OPEN_PREFIX)?;
+    if json.len() > MAX_CONTEXT_MENU_MESSAGE_BYTES {
+        return None;
+    }
+    let message: ContextMenuOpenMessage = serde_json::from_str(json).ok()?;
+    let clamp = |v: f64| {
+        if v.is_finite() {
+            v.clamp(0.0, 1_000_000.0)
+        } else {
+            0.0
+        }
+    };
+    Some((
+        clamp(message.x),
+        clamp(message.y),
+        context_menu::RawMenuContext {
+            link_href: message.link_href,
+            image_src: message.image_src,
+            selection_text: message.selection_text,
+            is_editable: message.is_editable,
+        },
+    ))
+}
+
+/// Parse a [`CONTEXT_MENU_ACTION_PREFIX`] message body into a menu-entry
+/// index. Strict on purpose (D23's "closed match, no near-miss accepted"
+/// spirit extended to a numeric payload): the remainder must be 1-3 ASCII
+/// digits with no sign, no leading/trailing whitespace, and no leading
+/// zero padding tricks — anything else, including a value so large it would
+/// not fit a realistic menu, is rejected rather than clamped, since there is
+/// no sane index to clamp it *to*.
+fn parse_context_menu_action(body: &str) -> Option<usize> {
+    let digits = body.strip_prefix(CONTEXT_MENU_ACTION_PREFIX)?;
+    if digits.is_empty() || digits.len() > 3 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return None;
+    }
+    digits.parse::<usize>().ok()
+}
+
+/// Initialization script that reports a right-click's target (Issue #39,
+/// see docs/decisions.md D78) to Rust and suppresses the engine's own
+/// native context menu.
+///
+/// `event.preventDefault()` in a `contextmenu` listener is the standard,
+/// cross-engine way web content already suppresses the browser's native
+/// menu (used by every site with its own custom right-click UI) — WebKitGTK,
+/// WKWebView, and WebView2 (Chromium) all honor it, so this one script,
+/// injected the same way `devtools_shortcut_script`/`tab_shortcut_script`
+/// are, needs no per-platform branch. `content_webview_builder` also passes
+/// `.with_default_context_menus(false)` on Windows as defense in depth (see
+/// its call site) in case some edge case ever bypasses the JS-level
+/// suppression there; nothing equivalent exists (or is needed) on the other
+/// two engines.
+///
+/// Every field gathered here is then reported completely raw — see
+/// [`ContextMenuOpenMessage`] and `context_menu::sanitize` for where it
+/// actually gets validated. `.href`/`.src` are read through the DOM's own
+/// IDL getters (not `getAttribute`), which already resolve a relative
+/// `href`/`src` to an absolute URL per the DOM spec — this script never does
+/// its own URL resolution.
+fn context_menu_script() -> String {
+    format!(
+        r#"(() => {{
+  "use strict";
+  function closestLinkHref(el) {{
+    while (el) {{
+      if (el.tagName === "A" && el.hasAttribute("href")) return el.href;
+      el = el.parentElement;
+    }}
+    return null;
+  }}
+  function closestImageSrc(el) {{
+    while (el) {{
+      if (el.tagName === "IMG" && el.src) return el.src;
+      el = el.parentElement;
+    }}
+    return null;
+  }}
+  const NON_TEXT_INPUT_TYPES = ["button","checkbox","radio","submit","reset","file","image","range","color"];
+  function isEditableTarget(el) {{
+    if (!el) return false;
+    if (el.isContentEditable) return true;
+    if (el.tagName === "TEXTAREA") return true;
+    if (el.tagName === "INPUT") {{
+      const type = (el.getAttribute("type") || "text").toLowerCase();
+      return NON_TEXT_INPUT_TYPES.indexOf(type) === -1;
+    }}
+    return false;
+  }}
+  window.addEventListener("contextmenu", (event) => {{
+    event.preventDefault();
+    let selectionText = null;
+    try {{
+      const selected = window.getSelection ? String(window.getSelection()) : "";
+      selectionText = selected.length > 0 ? selected : null;
+    }} catch (e) {{}}
+    const payload = {{
+      x: event.clientX,
+      y: event.clientY,
+      linkHref: closestLinkHref(event.target),
+      imageSrc: closestImageSrc(event.target),
+      selectionText: selectionText,
+      isEditable: isEditableTarget(event.target),
+    }};
+    if (window.ipc) {{
+      window.ipc.postMessage("{CONTEXT_MENU_OPEN_PREFIX}" + JSON.stringify(payload));
+    }}
+  }}, true);
+}})();"#
+    )
+}
 
 /// A tab-management keyboard shortcut reported by the content webview's
 /// shortcut IPC channel (see [`parse_content_shortcut`]).
@@ -2199,6 +2390,90 @@ impl BrowserWindow {
         })
     }
 
+    /// Render the right-click context menu (Issue #39, see
+    /// docs/decisions.md D78) for tab `tab_id` at viewport coordinates
+    /// `(x, y)`. `entries` is the already-decided
+    /// [`context_menu::MenuEntry`] list from `browser::context_menu::
+    /// build_menu` — this method only ever turns already-sanitized/already-
+    /// decided data into a script (see [`context_menu_render_script`]); it
+    /// makes no decisions of its own.
+    ///
+    /// A no-op for an unknown or currently suspended `tab_id`, the same
+    /// contract every other per-tab method above uses — there is no webview
+    /// to render into.
+    pub fn show_context_menu(
+        &self,
+        tab_id: TabId,
+        entries: &[context_menu::MenuEntry],
+        x: f64,
+        y: f64,
+    ) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.evaluate_script(&context_menu_render_script(entries, x, y))
+    }
+
+    /// Remove tab `tab_id`'s context menu overlay from the page, if one is
+    /// currently shown — called when the menu is closed without a
+    /// selection reaching the point where Rust already knows to discard its
+    /// own `OpenContextMenu` state (e.g. the tab is about to navigate away,
+    /// see `app::handle_user_event`'s `NavigationStarted`/`LoadStarted`
+    /// handling). A no-op for an unknown/suspended tab, or one with nothing
+    /// to remove — the script itself checks before touching the DOM.
+    pub fn hide_context_menu(&self, tab_id: TabId) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.evaluate_script(CONTEXT_MENU_HIDE_SCRIPT)
+    }
+
+    /// Run the "Copy" context-menu action in tab `tab_id`'s content webview
+    /// (`document.execCommand("copy")`, acting on whatever selection is
+    /// still current there). A no-op for an unknown/suspended tab.
+    pub fn copy_selection(&self, tab_id: TabId) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.evaluate_script("document.execCommand('copy');")
+    }
+
+    /// Run the "Paste" context-menu action in tab `tab_id`'s content webview
+    /// (`document.execCommand("paste")` into whatever editable element still
+    /// has focus there). A no-op for an unknown/suspended tab.
+    ///
+    /// **Known limitation** (docs/decisions.md D78): some engines restrict
+    /// programmatic `execCommand("paste")` for security reasons regardless
+    /// of caller — this has not been verified to actually paste on all
+    /// three of VeloX's engines, only that it does not error out. See D78's
+    /// "検証できていないこと" section.
+    pub fn paste_into(&self, tab_id: TabId) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.evaluate_script("document.execCommand('paste');")
+    }
+
     /// This window's own id (Issue #29). Stable for the window's whole
     /// lifetime — see the `id` field's doc comment.
     pub fn id(&self) -> WindowId {
@@ -2244,6 +2519,145 @@ const VIEW_SOURCE_FETCH_SCRIPT: &str = r#"(() => {
 /// get the actual string `document.title` evaluated to.
 fn extract_js_string_result(raw: &str) -> Option<String> {
     serde_json::from_str::<String>(raw).ok()
+}
+
+// --- Right-click context menu render script (Issue #39), see
+// docs/decisions.md D78 ---
+
+/// Root element id the rendered menu overlay uses inside the content
+/// webview's own DOM — also relied on by [`CONTEXT_MENU_HIDE_SCRIPT`] to
+/// find and remove it.
+const CONTEXT_MENU_ROOT_ID: &str = "velox-context-menu-root";
+const CONTEXT_MENU_STYLE_ID: &str = "velox-context-menu-style";
+
+/// Removes the context menu overlay (if present) from the page — used when
+/// Rust already knows the menu should go away without the user having
+/// clicked a row (a background navigation, tab close, etc.).
+const CONTEXT_MENU_HIDE_SCRIPT: &str = r#"(() => {
+  const root = document.getElementById("velox-context-menu-root");
+  if (root && root.__veloxClose) {
+    root.__veloxClose();
+  } else if (root) {
+    root.remove();
+  }
+})();"#;
+
+/// One row of the menu, exactly as serialized into the render script's
+/// `items` array. `label` is the only field that can ever contain
+/// page-derived text (via `MenuAction::SearchSelection`'s selection
+/// preview, see docs/decisions.md D78) — every other field is a plain
+/// number/boolean.
+fn context_menu_item_json(index: usize, entry: &context_menu::MenuEntry) -> serde_json::Value {
+    serde_json::json!({
+        "index": index,
+        "label": entry.action.label(),
+        "enabled": entry.enabled,
+    })
+}
+
+/// Build the script [`BrowserWindow::show_context_menu`] evaluates: renders
+/// a small absolutely-positioned overlay listing `entries` at viewport
+/// coordinates `(x, y)`, clamped to stay on screen after layout.
+///
+/// **Why this needs no HTML-escaping (unlike View Source, D72) but does
+/// need JS-string escaping (like D62/D69's `escape_js_line_terminators`):**
+/// every row's label is inserted via `row.textContent = item.label` — a DOM
+/// API that cannot interpret its argument as markup, structurally ruling
+/// out the classic "attacker's `<script>` ends up as live HTML" failure
+/// mode no matter what `item.label` contains (see
+/// `context_menu::MenuAction::label`'s doc comment). The risk that
+/// *remains* is `item.label` breaking out of the JS string literal this
+/// whole `items` array is embedded as — handled exactly the way
+/// `find_query_literal`/D69 and D62's `set_*_script` functions handle it:
+/// `serde_json` escapes `"`/`\`/control characters per RFC 8259, and
+/// [`toolbar::escape_js_line_terminators`] additionally neutralizes
+/// U+2028/U+2029, which pre-ES2019 engines treat as string-terminating even
+/// inside a JSON-escaped literal.
+///
+/// `x`/`y` are plain `f64`s formatted directly (never through JSON/string
+/// escaping) — safe because [`parse_context_menu_open`] already clamped
+/// them to a finite, non-negative range before this function ever sees
+/// them; there is no string content here to escape.
+fn context_menu_render_script(entries: &[context_menu::MenuEntry], x: f64, y: f64) -> String {
+    let items: Vec<serde_json::Value> = entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| context_menu_item_json(index, entry))
+        .collect();
+    let items_json =
+        toolbar::escape_js_line_terminators(&serde_json::Value::Array(items).to_string());
+    format!(
+        r#"(() => {{
+  "use strict";
+  const ROOT_ID = "{CONTEXT_MENU_ROOT_ID}";
+  const STYLE_ID = "{CONTEXT_MENU_STYLE_ID}";
+  const existing = document.getElementById(ROOT_ID);
+  if (existing) {{
+    if (existing.__veloxClose) existing.__veloxClose(); else existing.remove();
+  }}
+  if (!document.getElementById(STYLE_ID)) {{
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = `#${{ROOT_ID}}{{position:fixed;z-index:2147483647;background:#fff;color:#1a1a1a;border:1px solid #ccc;border-radius:4px;box-shadow:0 2px 10px rgba(0,0,0,.25);font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;padding:4px 0;min-width:180px;}}
+#${{ROOT_ID}} .velox-cm-item{{padding:6px 16px;cursor:default;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px;}}
+#${{ROOT_ID}} .velox-cm-item[data-enabled="1"]{{cursor:pointer;}}
+#${{ROOT_ID}} .velox-cm-item[data-enabled="0"]{{color:#999;}}
+#${{ROOT_ID}} .velox-cm-item[data-enabled="1"]:hover{{background:#e8e8e8;}}`;
+    (document.head || document.documentElement).appendChild(style);
+  }}
+  const items = {items_json};
+  const root = document.createElement("div");
+  root.id = ROOT_ID;
+  function close() {{
+    document.removeEventListener("mousedown", onOutside, true);
+    document.removeEventListener("keydown", onKey, true);
+    if (root.parentNode) root.remove();
+  }}
+  root.__veloxClose = close;
+  function onOutside(event) {{
+    if (!root.contains(event.target)) {{
+      close();
+      if (window.ipc) window.ipc.postMessage("{CONTEXT_MENU_CLOSE_MESSAGE}");
+    }}
+  }}
+  function onKey(event) {{
+    if (event.key === "Escape") {{
+      event.preventDefault();
+      close();
+      if (window.ipc) window.ipc.postMessage("{CONTEXT_MENU_CLOSE_MESSAGE}");
+    }}
+  }}
+  for (const item of items) {{
+    const row = document.createElement("div");
+    row.className = "velox-cm-item";
+    row.textContent = item.label;
+    row.dataset.enabled = item.enabled ? "1" : "0";
+    if (item.enabled) {{
+      row.addEventListener("click", () => {{
+        close();
+        if (window.ipc) {{
+          window.ipc.postMessage("{CONTEXT_MENU_ACTION_PREFIX}" + item.index);
+        }}
+      }});
+    }}
+    root.appendChild(row);
+  }}
+  document.body.appendChild(root);
+  document.addEventListener("mousedown", onOutside, true);
+  document.addEventListener("keydown", onKey, true);
+  const rect = root.getBoundingClientRect();
+  let left = {x};
+  let top = {y};
+  const maxLeft = window.innerWidth - rect.width;
+  const maxTop = window.innerHeight - rect.height;
+  if (maxLeft >= 0 && left > maxLeft) left = maxLeft;
+  if (maxTop >= 0 && top > maxTop) top = maxTop;
+  if (left < 0) left = 0;
+  if (top < 0) top = 0;
+  root.style.left = left + "px";
+  root.style.top = top + "px";
+}})();"#
+    )
 }
 
 // --- In-page find (Issue #43), see docs/decisions.md D69 ---
@@ -2490,6 +2904,23 @@ struct ContentPolicy {
     download_dir_override: Option<String>,
 }
 
+/// Windows-only: `wry::WebViewBuilderExtWindows::with_default_context_menus`
+/// disables WebView2's native context menu at the engine level. See the
+/// call site in [`content_webview_builder`] for why this exists alongside
+/// (not instead of) `context_menu_script`'s `event.preventDefault()`. A
+/// plain identity function on every other platform, so the call site never
+/// needs its own `#[cfg]`.
+#[cfg(windows)]
+fn disable_default_context_menus(builder: WebViewBuilder<'_>) -> WebViewBuilder<'_> {
+    use wry::WebViewBuilderExtWindows;
+    builder.with_default_context_menus(false)
+}
+
+#[cfg(not(windows))]
+fn disable_default_context_menus(builder: WebViewBuilder<'_>) -> WebViewBuilder<'_> {
+    builder
+}
+
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
 /// URL, and navigation/page-load handlers that tag their `UserEvent`s with
 /// `id` so `app.rs` knows which tab they belong to.
@@ -2533,6 +2964,7 @@ fn content_webview_builder<'a>(
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
+    let context_menu_proxy = proxy.clone();
     // Current origin of this tab, for the permission handler below
     // (docs/decisions.md D60): `with_permission_handler`'s callback
     // receives only a `PermissionKind`, no URL/origin (see the vendored
@@ -2578,6 +3010,26 @@ fn content_webview_builder<'a>(
         // sentinel strings, rather than growing the devtools one to mean two
         // different things.
         .with_initialization_script(tab_shortcut_script())
+        // Right-click context menu (Issue #39, see docs/decisions.md D78):
+        // a third injected script, same treatment as the two above —
+        // captures the click target and suppresses the engine's native
+        // menu (`event.preventDefault()`, honored cross-engine — see the
+        // script's own doc comment) so VeloX's own menu can replace it.
+        .with_initialization_script(context_menu_script());
+    // Defense in depth, Windows only: `with_default_context_menus(false)`
+    // is a WebView2-specific setting (`wry::WebViewBuilderExtWindows`, only
+    // compiled `#[cfg(windows)]` in wry itself) that disables its native
+    // context menu at the engine level. `context_menu_script`'s
+    // `event.preventDefault()` is expected to already suppress it on every
+    // platform per the standard DOM contract, so this is redundant in the
+    // common case — but costs nothing to also set on the one platform
+    // CLAUDE.md prioritizes, in case some edge case (e.g. a WebView2
+    // version quirk) ever lets the native menu through despite
+    // `preventDefault()`. No equivalent builder option exists for
+    // WebKitGTK/WKWebView in wry 0.56, so nothing is done there beyond the
+    // JS-level suppression every platform already gets.
+    let builder = disable_default_context_menus(builder);
+    let builder = builder
         .with_navigation_handler(move |url| {
             if content_blocking_enabled && blocklist.is_blocked(&url) {
                 let _ = block_proxy.send_event(UserEvent::NavigationBlocked(own_id, id, url));
@@ -2612,14 +3064,31 @@ fn content_webview_builder<'a>(
         .with_ipc_handler(move |request| {
             // Untrusted content-webview IPC channel (see OPEN_DEVTOOLS_MESSAGE
             // and ContentShortcut's doc comment): every branch here is either
-            // one fixed exact-match string comparison or a lookup into a
-            // fixed, closed set of them — never JSON parsing, never anything
-            // page-supplied treated as structured data.
+            // one fixed exact-match string comparison, a lookup into a
+            // fixed, closed set of them, or (context menu only, see D78) a
+            // bounded, size-capped parse whose result is never trusted
+            // as-is — never a page-supplied value used directly.
             let body = request.body().as_str();
             if body == OPEN_DEVTOOLS_MESSAGE {
                 let _ = devtools_proxy.send_event(UserEvent::OpenDevtoolsRequested(own_id));
             } else if let Some(shortcut) = parse_content_shortcut(body) {
                 let _ = devtools_proxy.send_event(UserEvent::ContentShortcut(own_id, shortcut));
+            } else if let Some((x, y, raw)) = parse_context_menu_open(body) {
+                let _ = context_menu_proxy.send_event(UserEvent::ContextMenuRequested {
+                    window_id: own_id,
+                    tab_id: id,
+                    x,
+                    y,
+                    raw,
+                });
+            } else if body == CONTEXT_MENU_CLOSE_MESSAGE {
+                let _ = context_menu_proxy.send_event(UserEvent::ContextMenuClosed(own_id, id));
+            } else if let Some(index) = parse_context_menu_action(body) {
+                let _ = context_menu_proxy.send_event(UserEvent::ContextMenuActionSelected {
+                    window_id: own_id,
+                    tab_id: id,
+                    index,
+                });
             }
         })
         // `target="_blank"` links and `window.open()` (see docs/decisions.md
@@ -3554,6 +4023,223 @@ mod tests {
         // exception through `evaluate_script_with_callback`.
         assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("try {"));
         assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("catch"));
+    }
+
+    // --- Right-click context menu (Issue #39), see docs/decisions.md D78 ---
+
+    #[test]
+    fn context_menu_script_suppresses_default_menu_and_reports_via_ipc() {
+        let script = context_menu_script();
+        assert!(script.contains("addEventListener(\"contextmenu\""));
+        assert!(script.contains("event.preventDefault();"));
+        assert!(script.contains(CONTEXT_MENU_OPEN_PREFIX));
+        assert!(script.contains("window.ipc.postMessage"));
+        // Reads via the DOM's own `.href`/`.src` IDL getters (already
+        // absolute), never `getAttribute` (which would hand back a
+        // possibly-relative raw attribute value this script would then have
+        // to resolve itself).
+        assert!(script.contains("el.href"));
+        assert!(script.contains("el.src"));
+    }
+
+    #[test]
+    fn parse_context_menu_open_accepts_a_well_formed_message() {
+        let body = format!(
+            "{CONTEXT_MENU_OPEN_PREFIX}{{\"x\":12.5,\"y\":34.0,\"linkHref\":\"https://example.com/\",\"imageSrc\":null,\"selectionText\":\"hi\",\"isEditable\":false}}"
+        );
+        let (x, y, raw) = parse_context_menu_open(&body).expect("should parse");
+        assert_eq!(x, 12.5);
+        assert_eq!(y, 34.0);
+        assert_eq!(raw.link_href.as_deref(), Some("https://example.com/"));
+        assert_eq!(raw.image_src, None);
+        assert_eq!(raw.selection_text.as_deref(), Some("hi"));
+        assert!(!raw.is_editable);
+    }
+
+    #[test]
+    fn parse_context_menu_open_defaults_missing_optional_fields() {
+        let body = format!("{CONTEXT_MENU_OPEN_PREFIX}{{\"x\":0,\"y\":0}}");
+        let (_, _, raw) = parse_context_menu_open(&body).expect("should parse");
+        assert_eq!(raw.link_href, None);
+        assert_eq!(raw.image_src, None);
+        assert_eq!(raw.selection_text, None);
+        assert!(!raw.is_editable);
+    }
+
+    #[test]
+    fn parse_context_menu_open_rejects_wrong_prefix_and_malformed_json() {
+        assert!(parse_context_menu_open("velox:new-tab").is_none());
+        assert!(parse_context_menu_open(&format!("{CONTEXT_MENU_OPEN_PREFIX}not json")).is_none());
+        assert!(parse_context_menu_open(&format!("{CONTEXT_MENU_OPEN_PREFIX}{{}}")).is_none());
+    }
+
+    #[test]
+    fn parse_context_menu_open_rejects_oversized_payloads_before_parsing() {
+        // A pathologically large "selectionText" must be rejected outright
+        // (D62's "reject before ever calling `serde_json::from_str`"
+        // pattern), not merely truncated after a slow parse.
+        let huge_string = "a".repeat(MAX_CONTEXT_MENU_MESSAGE_BYTES + 100);
+        let body = format!(
+            "{CONTEXT_MENU_OPEN_PREFIX}{{\"x\":0,\"y\":0,\"selectionText\":\"{huge_string}\"}}"
+        );
+        assert!(parse_context_menu_open(&body).is_none());
+    }
+
+    #[test]
+    fn parse_context_menu_open_clamps_non_finite_or_out_of_range_coordinates() {
+        let body = format!("{CONTEXT_MENU_OPEN_PREFIX}{{\"x\":NaN,\"y\":-500}}");
+        // `NaN`/negative numbers are valid JSON5-ish JS literals but not
+        // standard JSON — serde_json rejects `NaN` outright, which is fine:
+        // that whole message is simply refused. Exercise the in-range
+        // negative case (valid JSON) instead to check clamping.
+        let _ = parse_context_menu_open(&body); // must not panic either way
+
+        let body = format!("{CONTEXT_MENU_OPEN_PREFIX}{{\"x\":-500,\"y\":50000000}}");
+        let (x, y, _) = parse_context_menu_open(&body).expect("should parse");
+        assert_eq!(x, 0.0, "negative x must clamp to 0");
+        assert_eq!(y, 1_000_000.0, "absurdly large y must clamp to the cap");
+    }
+
+    #[test]
+    fn parse_context_menu_open_does_not_panic_on_hostile_input() {
+        for body in [
+            CONTEXT_MENU_OPEN_PREFIX,
+            &format!("{CONTEXT_MENU_OPEN_PREFIX}\0\0\0"),
+            &format!("{CONTEXT_MENU_OPEN_PREFIX}{}", "{".repeat(10_000)),
+            &"a".repeat(1_000_000),
+        ] {
+            let _ = parse_context_menu_open(body);
+        }
+    }
+
+    #[test]
+    fn parse_context_menu_action_accepts_small_plain_integers() {
+        assert_eq!(
+            parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}0")),
+            Some(0)
+        );
+        assert_eq!(
+            parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}7")),
+            Some(7)
+        );
+        assert_eq!(
+            parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}42")),
+            Some(42)
+        );
+    }
+
+    #[test]
+    fn parse_context_menu_action_rejects_anything_not_a_plain_small_integer() {
+        for body in [
+            "velox:context-menu-action:",
+            "velox:context-menu-action:-1",
+            "velox:context-menu-action:01",
+            "velox:context-menu-action:1.5",
+            "velox:context-menu-action:1a",
+            "velox:context-menu-action: 1",
+            "velox:context-menu-action:1 ",
+            "velox:context-menu-action:99999",
+            "velox:context-menu-action:18446744073709551616", // overflows usize
+            "velox:new-tab",
+        ] {
+            assert_eq!(parse_context_menu_action(body), None, "body={body:?}");
+        }
+    }
+
+    #[test]
+    fn parse_context_menu_action_does_not_panic_on_hostile_input() {
+        let huge = format!("{CONTEXT_MENU_ACTION_PREFIX}{}", "9".repeat(1_000_000));
+        assert_eq!(parse_context_menu_action(&huge), None);
+    }
+
+    #[test]
+    fn context_menu_render_script_embeds_labels_and_positions_via_textcontent() {
+        let entries = vec![context_menu::MenuEntry {
+            action: context_menu::MenuAction::Back,
+            enabled: true,
+        }];
+        let script = context_menu_render_script(&entries, 12.0, 34.0);
+        assert!(script.contains("row.textContent = item.label;"));
+        assert!(script.contains("\"label\":\"戻る\""));
+        assert!(script.contains("let left = 12;"));
+        assert!(script.contains("let top = 34;"));
+    }
+
+    #[test]
+    fn context_menu_render_script_neutralizes_quotes_and_script_closing_sequences_in_a_label() {
+        // The only page-derived text that ever reaches a label is a
+        // selection preview (`MenuAction::SearchSelection`) — exercise the
+        // exact injection attempt D62/D69 already guard other embeddings
+        // against: a value trying to break out of the JS string literal the
+        // `items` JSON array is spliced into.
+        let hostile = r#""; document.body.innerHTML = "pwned"; //"#.to_owned();
+        let entries = vec![context_menu::MenuEntry {
+            action: context_menu::MenuAction::SearchSelection(hostile),
+            enabled: true,
+        }];
+        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        // The generated `const items = [...]` must remain one syntactically
+        // closed JS statement — i.e. still contain the trailing pieces of
+        // the script that come after it, proving the hostile string did not
+        // prematurely terminate anything.
+        assert!(script.contains("const items ="));
+        assert!(script.contains("document.body.appendChild(root);"));
+        assert!(script.contains("root.style.left"));
+    }
+
+    #[test]
+    fn context_menu_render_script_escapes_u2028_and_u2029_line_terminators_in_a_label() {
+        let hostile = "foo\u{2028}bar\u{2029}baz".to_owned();
+        let entries = vec![context_menu::MenuEntry {
+            action: context_menu::MenuAction::SearchSelection(hostile),
+            enabled: true,
+        }];
+        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        assert!(script.contains("\\u2028"), "{script}");
+        assert!(script.contains("\\u2029"), "{script}");
+        assert!(!script.contains('\u{2028}'));
+        assert!(!script.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn context_menu_render_script_never_emits_a_raw_script_tag_for_a_hostile_selection_label() {
+        // The label is inserted via `textContent`, never HTML — but this
+        // test fixes that guarantee at the *generated script's own source
+        // text* level too: the literal bytes `<script>` from a hostile
+        // selection must not appear unescaped as if it were meant to be
+        // parsed as markup (it only ever appears inside a JSON string
+        // value assigned to a JS variable, never inside an HTML tag
+        // position).
+        let hostile = "<script>alert(document.cookie)</script>".to_owned();
+        let entries = vec![context_menu::MenuEntry {
+            action: context_menu::MenuAction::SearchSelection(hostile.clone()),
+            enabled: true,
+        }];
+        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        // The text is present (it is safe precisely *because* it ends up as
+        // a JS string value, never HTML) but only inside the `items` JSON,
+        // never as a document-level `<script>` tag of its own.
+        assert!(script.contains("alert(document.cookie)"));
+        assert_eq!(
+            script.matches("<script>").count(),
+            1,
+            "the hostile text's own literal <script> should appear exactly once, as inert JSON string content"
+        );
+    }
+
+    #[test]
+    fn context_menu_render_script_shows_disabled_entries_as_unclickable() {
+        let entries = vec![context_menu::MenuEntry {
+            action: context_menu::MenuAction::Copy,
+            enabled: false,
+        }];
+        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        assert!(script.contains("\"enabled\":false"));
+    }
+
+    #[test]
+    fn hide_script_targets_the_same_root_id_the_render_script_uses() {
+        assert!(CONTEXT_MENU_HIDE_SCRIPT.contains(CONTEXT_MENU_ROOT_ID));
     }
 
     /// The embedded logo must stay decodable into the 8-bit RGBA layout the

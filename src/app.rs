@@ -22,11 +22,11 @@ use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
-    find, input_history, metrics, navigation, omnibox, persistence, print, shortcut_reference,
-    site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry,
-    DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource, HistoryEntry,
-    HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, Settings, SiteExceptions,
-    SitePermissionStore, TabId, Tabs, WindowId, Windows,
+    context_menu, find, input_history, metrics, navigation, omnibox, persistence, print,
+    shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
+    DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
+    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, Settings,
+    SiteExceptions, SitePermissionStore, TabId, Tabs, WindowId, Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -254,6 +254,38 @@ pub enum UserEvent {
         page_url: String,
         html: String,
     },
+    /// A right-click landed in tab `tab_id` (window `window_id`)'s content
+    /// webview (Issue #39, see docs/decisions.md D78). `x`/`y` are already
+    /// clamped to a finite, non-negative range; `raw` is otherwise
+    /// completely untrusted (see `ui::window::parse_context_menu_open` and
+    /// `browser::context_menu`'s module doc comment) — `handle_user_event`
+    /// must run it through `context_menu::sanitize` before it is safe to
+    /// act on or display. Carries `tab_id` explicitly (unlike
+    /// `ContentShortcut`): unlike a keyboard shortcut, this arrives from a
+    /// specific tab's own webview closure, so which tab it came from is
+    /// always known precisely, never assumed to be "the active one".
+    ContextMenuRequested {
+        window_id: WindowId,
+        tab_id: TabId,
+        x: f64,
+        y: f64,
+        raw: context_menu::RawMenuContext,
+    },
+    /// The content webview reported that menu row `index` was clicked (see
+    /// `ui::window::CONTEXT_MENU_ACTION_PREFIX`). `index` is resolved
+    /// against `Windows::context_menu(window_id)`'s own
+    /// [`context_menu::OpenContextMenu`] — the exact list that menu was
+    /// rendered with — never re-derived, so a stale or out-of-range index
+    /// (including one for an already-closed menu) simply resolves to
+    /// nothing rather than acting on the wrong target.
+    ContextMenuActionSelected {
+        window_id: WindowId,
+        tab_id: TabId,
+        index: usize,
+    },
+    /// The context menu was dismissed with no selection (clicked outside
+    /// it, or Esc) — see `ui::window::CONTEXT_MENU_CLOSE_MESSAGE`.
+    ContextMenuClosed(WindowId, TabId),
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -935,7 +967,11 @@ fn record_perf_event(
         | UserEvent::PdfExportFinished { .. }
         // Same for Issue #45's View Source: no performance budget calls for
         // it either.
-        | UserEvent::ViewSourceReady { .. } => {}
+        | UserEvent::ViewSourceReady { .. }
+        // Issue #39's context menu is not a perf-tracked operation either.
+        | UserEvent::ContextMenuRequested { .. }
+        | UserEvent::ContextMenuActionSelected { .. }
+        | UserEvent::ContextMenuClosed(..) => {}
     }
 }
 
@@ -1260,6 +1296,22 @@ fn handle_user_event(
                 .is_some_and(|session| session.tab_id() == id)
             {
                 close_find_bar(window, window_id, state);
+            }
+            // Issue #39/D78: same reasoning as the find bar above — a menu
+            // opened against the page that is about to be replaced would
+            // otherwise keep offering actions (a link URL, a selection)
+            // that no longer make sense once navigation completes.
+            // `hide_context_menu` also removes the overlay from the DOM —
+            // the new page will eventually replace it anyway, but a slow
+            // load could otherwise leave the stale menu visible in the
+            // meantime.
+            if state
+                .windows
+                .context_menu(window_id)
+                .is_some_and(|menu| menu.tab_id() == id)
+            {
+                state.windows.take_context_menu(window_id);
+                log_failure("hide context menu", window.hide_context_menu(id));
             }
             if is_active {
                 log_failure("update address bar", window.set_url_display(&url));
@@ -1667,6 +1719,104 @@ fn handle_user_event(
                 return;
             };
             open_view_source_tab(window, window_id, state, &page_url, &html);
+        }
+        UserEvent::ContextMenuRequested {
+            window_id,
+            tab_id,
+            x,
+            y,
+            raw,
+        } => {
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            // The one and only place `raw` — completely untrusted content-
+            // webview input, see `context_menu::RawMenuContext`'s doc
+            // comment — is turned into something safe to act on or display.
+            // `build_menu` (pure, `browser::context_menu`) is the single
+            // table deciding which items apply and whether each is enabled.
+            let context = context_menu::sanitize(raw);
+            let entries = context_menu::build_menu(&context);
+            state.windows.set_context_menu(
+                window_id,
+                context_menu::OpenContextMenu::new(tab_id, entries.clone()),
+            );
+            log_failure(
+                "show context menu",
+                window.show_context_menu(tab_id, &entries, x, y),
+            );
+        }
+        UserEvent::ContextMenuActionSelected {
+            window_id,
+            tab_id,
+            index,
+        } => {
+            // Only resolve against *this* window's open menu, and only if
+            // it is still the one opened for `tab_id` — a stale click for a
+            // menu already replaced by a different tab's (in the same
+            // window) must never touch the new one. Checked before
+            // `take_context_menu` so a mismatch never discards a menu that
+            // is not actually the one this click belongs to.
+            let matches = state
+                .windows
+                .context_menu(window_id)
+                .is_some_and(|menu| menu.tab_id() == tab_id);
+            if !matches {
+                return;
+            }
+            let Some(menu) = state.windows.take_context_menu(window_id) else {
+                return;
+            };
+            // `resolve` also re-checks `enabled` — a hostile page dispatching
+            // a fake click on a greyed-out row cannot run it anyway.
+            let Some(action) = menu.resolve(index) else {
+                return;
+            };
+            match action {
+                // Needs `&mut ui_windows` as a whole (a brand new window),
+                // same reason `ToolbarCommand::NewWindow`/
+                // `ContentShortcut::NewWindow` are intercepted before
+                // narrowing to one `&mut BrowserWindow` — see this
+                // function's doc comment.
+                context_menu::MenuAction::OpenLinkInNewWindow(url) => {
+                    // Issue #27/D74: inherit the *source* window's privacy
+                    // rather than `config.private` — a link opened from a
+                    // private window's context menu must stay private, the
+                    // same way a real browser's "開くリンクを新しいプライベート
+                    // ウィンドウで開く" would, without needing a second,
+                    // dedicated menu item for it. Falls back to
+                    // `config.private` only if `window_id` is somehow
+                    // already gone (should not happen — the menu was just
+                    // resolved against that same window above).
+                    let private = state
+                        .windows
+                        .is_private(window_id)
+                        .unwrap_or(config.private);
+                    open_new_window(
+                        target,
+                        window_event_proxy,
+                        ui_windows,
+                        state,
+                        config,
+                        &url,
+                        private,
+                    );
+                }
+                other => {
+                    if let Some(window) = ui_windows.get_mut(&window_id) {
+                        handle_context_menu_action(window, window_id, state, config, tab_id, other);
+                    }
+                }
+            }
+        }
+        UserEvent::ContextMenuClosed(window_id, tab_id) => {
+            let matches = state
+                .windows
+                .context_menu(window_id)
+                .is_some_and(|menu| menu.tab_id() == tab_id);
+            if matches {
+                state.windows.take_context_menu(window_id);
+            }
         }
     }
 }
@@ -2677,6 +2827,66 @@ fn handle_content_shortcut(
     }
 }
 
+/// Dispatch one resolved, already-sanitized context-menu action (Issue #39,
+/// see docs/decisions.md D78) — every branch here reuses an existing shared
+/// tab-management function, exactly like [`handle_content_shortcut`] mirrors
+/// `handle_toolbar_command`. `action` has already been resolved against the
+/// exact menu list that was rendered (`context_menu::OpenContextMenu::
+/// resolve`), so nothing here re-checks `enabled` or re-validates a URL —
+/// that already happened in `browser::context_menu::sanitize`/`build_menu`.
+///
+/// `tab_id` is the tab the menu was opened on (not necessarily the active
+/// tab any more by the time the user clicks a row, though in practice it
+/// almost always still is — see `context_menu::RawMenuContext`'s doc
+/// comment) — actions that read/write a specific tab's webview (`Copy`/
+/// `Paste`) act on *that* tab; actions that open something new
+/// (`SearchSelection`/`OpenLinkInNewTab`/`OpenImageInNewTab`) still open it
+/// as a new tab in this window, matching every other "open a new tab" path.
+///
+/// [`context_menu::MenuAction::OpenLinkInNewWindow`] is intercepted in
+/// `handle_user_event` before this function is ever called (needs
+/// `&mut ui_windows` as a whole, same reason `ContentShortcut::NewWindow`
+/// is) — its arm here is unreachable in practice but kept so this match
+/// stays exhaustive over the whole enum.
+fn handle_context_menu_action(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    config: &Config,
+    tab_id: TabId,
+    action: context_menu::MenuAction,
+) {
+    match action {
+        context_menu::MenuAction::Back => log_failure("context menu back", window.go_back()),
+        context_menu::MenuAction::Forward => {
+            log_failure("context menu forward", window.go_forward())
+        }
+        context_menu::MenuAction::Reload => log_failure("context menu reload", window.reload()),
+        context_menu::MenuAction::Copy => {
+            log_failure("context menu copy", window.copy_selection(tab_id))
+        }
+        context_menu::MenuAction::Paste => {
+            log_failure("context menu paste", window.paste_into(tab_id))
+        }
+        context_menu::MenuAction::SearchSelection(query) => {
+            if let Some(url) =
+                navigation::build_search_url(&config.search_engine.query_template, &query)
+            {
+                open_new_tab(window, window_id, state, &url);
+            }
+        }
+        context_menu::MenuAction::OpenLinkInNewTab(url) => {
+            open_new_tab(window, window_id, state, &url)
+        }
+        context_menu::MenuAction::OpenImageInNewTab(url) => {
+            open_new_tab(window, window_id, state, &url)
+        }
+        context_menu::MenuAction::Inspect => window.open_devtools(),
+        // See this function's doc comment.
+        context_menu::MenuAction::OpenLinkInNewWindow(_) => {}
+    }
+}
+
 /// Dispatch one step of a `VELOX_AUTOMATION_SCRIPT` (Issue #112, see
 /// docs/decisions.md D44 and `browser::automation`) to the same tab
 /// operations `handle_toolbar_command`/`handle_content_shortcut` already
@@ -2820,6 +3030,17 @@ fn activate_and_refresh(
     // touches another window's independent find session.
     if state.windows.find(window_id).is_some() {
         close_find_bar(window, window_id, state);
+    }
+    // Issue #39/D78: a context menu belongs to the specific tab it was
+    // opened against; switching away from that tab in this window makes it
+    // stale the same way a tab switch invalidates the find bar above.
+    // Unlike a navigation (which replaces the DOM the overlay lives in), a
+    // tab switch just hides the previous tab's still-live webview (D8/D9),
+    // so the overlay would otherwise still be sitting in that tab's DOM the
+    // next time it is switched back to — `hide_context_menu` removes it
+    // from *that* tab specifically, not whichever tab ends up active.
+    if let Some(menu) = state.windows.take_context_menu(window_id) {
+        log_failure("hide context menu", window.hide_context_menu(menu.tab_id()));
     }
     let result = match effect {
         ActivationEffect::Resume => {

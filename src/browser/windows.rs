@@ -37,6 +37,7 @@
 //! "複数ウィンドウ × ページ内検索" section, added when Issue #43 (D69) and
 //! this issue were integrated).
 
+use super::context_menu::OpenContextMenu;
 use super::find::FindState;
 use super::session::SavedTab;
 use super::tabs::Tabs;
@@ -55,6 +56,11 @@ struct WindowEntry {
     /// a time *per window*, tied to whichever tab was active in that window
     /// when it opened.
     find: Option<FindState>,
+    /// This window's currently-open right-click context menu (Issue #39),
+    /// if any. Exactly the same "one session per window" shape as `find`
+    /// above, and for the same reason: a menu opened by a right-click in
+    /// one window must never be resolvable (or closeable) from another.
+    context_menu: Option<OpenContextMenu>,
     /// Whole-window private browsing (Issue #27, see docs/decisions.md D74).
     /// Set once, at construction (`push_window`), and never flipped
     /// afterwards — a window's privacy is decided the moment it opens
@@ -120,6 +126,7 @@ impl Windows {
             id,
             tabs,
             find: None,
+            context_menu: None,
             private,
         });
         id
@@ -252,6 +259,37 @@ impl Windows {
             .iter_mut()
             .find(|entry| entry.id == id)
             .and_then(|entry| entry.find.take())
+    }
+
+    /// Window `id`'s currently-open context menu (Issue #39), if any. `None`
+    /// for a closed menu *or* an unknown window id, same convention as
+    /// [`Self::find`].
+    pub fn context_menu(&self, id: WindowId) -> Option<&OpenContextMenu> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.context_menu.as_ref())
+    }
+
+    /// Open (or replace) window `id`'s context menu — a fresh right-click
+    /// always discards whatever menu that window had open before (only one
+    /// can sensibly be on screen at a time). A no-op for an unknown window
+    /// id.
+    pub fn set_context_menu(&mut self, id: WindowId, menu: OpenContextMenu) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.context_menu = Some(menu);
+        }
+    }
+
+    /// Close window `id`'s context menu, returning it if one was open —
+    /// same shape as [`Self::take_find`]. `app.rs` uses this both when an
+    /// item is actually clicked (resolve the action, then discard the
+    /// menu) and when it is dismissed with no selection (discard only).
+    pub fn take_context_menu(&mut self, id: WindowId) -> Option<OpenContextMenu> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.context_menu.take())
     }
 
     /// Whether `id` refers to a currently open window.
@@ -569,6 +607,118 @@ mod tests {
         // `first` is gone entirely now; querying its (former) find session
         // must behave exactly like any other unknown-id lookup, not panic.
         assert!(windows.find(first).is_none());
+    }
+
+    // --- Right-click context menu (Issue #39) is per-window, not global —
+    // the exact same reasoning/shape as in-page find above. ---
+
+    #[test]
+    fn a_new_window_has_no_context_menu() {
+        let windows = Windows::new("https://example.com/");
+        let id = windows.ids().next().unwrap();
+        assert!(windows.context_menu(id).is_none());
+    }
+
+    #[test]
+    fn context_menus_are_independent_per_window() {
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let second = windows.open_window("https://b.example/");
+        let first_tab = windows.tabs(first).unwrap().active_id();
+        let second_tab = windows.tabs(second).unwrap().active_id();
+        assert_eq!(
+            first_tab, second_tab,
+            "test assumes both windows share a TabId value"
+        );
+
+        windows.set_context_menu(
+            first,
+            crate::browser::context_menu::OpenContextMenu::new(
+                first_tab,
+                crate::browser::context_menu::build_menu(
+                    &crate::browser::context_menu::MenuContext::default(),
+                ),
+            ),
+        );
+
+        assert!(windows.context_menu(first).is_some());
+        assert!(
+            windows.context_menu(second).is_none(),
+            "opening a context menu in one window must not leak into another"
+        );
+    }
+
+    #[test]
+    fn taking_one_windows_context_menu_never_closes_anothers() {
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let second = windows.open_window("https://b.example/");
+        let first_tab = windows.tabs(first).unwrap().active_id();
+        let second_tab = windows.tabs(second).unwrap().active_id();
+
+        let empty_menu = || {
+            crate::browser::context_menu::OpenContextMenu::new(
+                first_tab,
+                crate::browser::context_menu::build_menu(
+                    &crate::browser::context_menu::MenuContext::default(),
+                ),
+            )
+        };
+        windows.set_context_menu(first, empty_menu());
+        windows.set_context_menu(
+            second,
+            crate::browser::context_menu::OpenContextMenu::new(
+                second_tab,
+                crate::browser::context_menu::build_menu(
+                    &crate::browser::context_menu::MenuContext::default(),
+                ),
+            ),
+        );
+
+        let taken = windows.take_context_menu(first);
+        assert!(taken.is_some());
+        assert!(windows.context_menu(first).is_none());
+        assert!(
+            windows.context_menu(second).is_some(),
+            "closing window 1's context menu must not close window 2's"
+        );
+    }
+
+    #[test]
+    fn context_menu_helpers_are_noops_for_an_unknown_window() {
+        let mut windows = Windows::new("https://example.com/");
+        let existing = windows.ids().next().unwrap();
+        let tab_id = windows.tabs(existing).unwrap().active_id();
+        let unknown = WindowId::from(9999);
+        windows.set_context_menu(
+            unknown,
+            crate::browser::context_menu::OpenContextMenu::new(
+                tab_id,
+                crate::browser::context_menu::build_menu(
+                    &crate::browser::context_menu::MenuContext::default(),
+                ),
+            ),
+        );
+        assert!(windows.context_menu(unknown).is_none());
+        assert!(windows.take_context_menu(unknown).is_none());
+    }
+
+    #[test]
+    fn closing_a_window_drops_its_context_menu_without_a_panic() {
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let tab = windows.tabs(first).unwrap().active_id();
+        windows.set_context_menu(
+            first,
+            crate::browser::context_menu::OpenContextMenu::new(
+                tab,
+                crate::browser::context_menu::build_menu(
+                    &crate::browser::context_menu::MenuContext::default(),
+                ),
+            ),
+        );
+        assert!(windows.close_window(first));
+        assert!(windows.context_menu(first).is_none());
     }
 
     // --- Per-window private browsing (Issue #27, see docs/decisions.md D74) ---
