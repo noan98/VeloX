@@ -985,7 +985,15 @@ mod tests {
     }
 
     // --- download directory resolution (pure branch only — see D28) ---
+    //
+    // テスト対象の `resolve_unix_download_dir` 自体が
+    // `#[cfg(not(any(macos, windows)))]` なので、テスト側にも同じ cfg が要る。
+    // これが無いと Windows/macOS では「存在しない関数を呼ぶテスト」が残り、
+    // `cargo test` がコンパイルエラーで落ちる (Issue #33 で Windows ジョブを
+    // 追加して初めて表面化した。後段の `open_path_command_*` テストは
+    // 最初から同じ cfg を持っており、ここが書き漏れだった)。
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn unix_dir_prefers_xdg_download_dir_when_set() {
         assert_eq!(
@@ -994,6 +1002,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn unix_dir_falls_back_to_home_downloads() {
         assert_eq!(
@@ -1002,6 +1011,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     #[test]
     fn unix_dir_is_none_without_xdg_or_home() {
         assert_eq!(resolve_unix_download_dir(None, None), None);
