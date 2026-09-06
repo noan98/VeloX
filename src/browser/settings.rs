@@ -546,6 +546,10 @@ pub fn shortcut_reference() -> &'static [ShortcutInfo] {
             action: "DevTools を開く",
             keys: "F12 (macOS: Cmd+Option+I)",
         },
+        ShortcutInfo {
+            action: "ページのソースを表示",
+            keys: "Ctrl/Cmd+U",
+        },
     ]
 }
 
