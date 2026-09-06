@@ -14,6 +14,7 @@ pub mod automation;
 pub mod benchmark;
 pub mod blocklist;
 pub mod bookmarks;
+pub mod context_menu;
 pub mod downloads;
 pub mod find;
 pub mod gui_probe;
