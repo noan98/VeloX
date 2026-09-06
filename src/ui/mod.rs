@@ -8,6 +8,8 @@ pub mod save_dialog_windows;
 pub mod toolbar;
 #[cfg(windows)]
 pub mod webview2_blocking;
+#[cfg(windows)]
+pub mod webview2_print;
 pub mod window;
 
-pub use window::{BrowserWindow, ContentShortcut, SitePolicies};
+pub use window::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};

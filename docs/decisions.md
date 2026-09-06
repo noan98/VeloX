@@ -7471,6 +7471,7 @@ Secrets/Variables を設定するだけで `release-windows.yml` の署名が有
 (3) Azure Trusted Signing の適格性要件 (地域・事業年数) が緩和されたとき。
 (4) 他ベンダーのクラウド署名サービスへの切り替えを検討するとき。
 
+
 ## D74: プライベートブラウジング、残りスコープ (#27) — Private Window を別ウィンドウとして開けるようにする。分離は D14/D15 の既存メカニズムのまま、per-window 化だけを行う
 
 **対象**: Issue #27。Epic #53 の言葉を借りれば「大半は #7 (D14) で実装済み。
@@ -7750,6 +7751,242 @@ cross-window リークを修正する Issue に着手するとき — `window_id
 (4) WebKitGTK/WKWebView 側で「Private Window 内はタブ間で共有し、通常
 ウィンドウとは分離する」ような、呼び出し単位でない共有 ephemeral
 context を wry が公開するようになったとき。
+
+## D75: 印刷・PDF保存 (#40) — 印刷は `wry::WebView::print()` (unsafe 不要)、
+PDF直接書き出しは Windows のみ `ICoreWebView2_7::PrintToPdf`
+
+**対象**: Issue #40。CLAUDE.md「対応 OS の優先度」により Windows を最優先し、
+D59/D66/D69 と同じ「issue の指示に頼らず、ビルダーメソッドだけでなく拡張
+トレイト経由の生インターフェースまで実ソースを読む」調査スタイルを踏襲した。
+
+### 調査: wry 0.56 経由で印刷・PDF出力 API に届くか
+
+`~/.cargo/registry/src/.../wry-0.56.1`、`webview2-com-sys-0.38.2/src/
+bindings.rs`、`webview2-com-0.38.2/src/callback.rs` を実際に読んだ。
+
+**まず、D59/D66/D69 が調べてこなかった場所に答えがあった**:
+`wry::WebView` 自身が `pub fn print(&self) -> Result<()>` という、
+`WebViewBuilder` の `with_*` 系でも `WebViewExtWindows` のような
+プラットフォーム限定拡張トレイトでもない、**3 OS 共通・`cfg` 無しで常に
+コンパイルされる素の `impl WebView` メソッド** (`wry-0.56.1/src/lib.rs`
+2119-2122 行目) を既に公開している。中身はプラットフォームごとに全く
+別物:
+
+- **WebKitGTK (Linux)** — `src/webkitgtk/mod.rs` 772-776 行目:
+  `webkit2gtk::PrintOperation::new(&self.webview)` を作って
+  `run_dialog(None::<&gtk::Window>)` を呼ぶだけ。GTK のネイティブ印刷
+  ダイアログが開き、その中に「ファイルに印刷」→ PDF という出力先が
+  標準で存在する。
+- **WKWebView (macOS)** — `src/wkwebview/mod.rs` 879-919 行目:
+  `respondsToSelector(printOperationWithPrintInfo:)` (macOS 11+ でのみ
+  真) を確認した上で `NSPrintInfo.sharedPrintInfo()` から
+  `printOperationWithPrintInfo` → `runOperationModalForWindow_delegate_
+  didRunSelector_contextInfo` という正規の `NSPrintOperation` モーダルを
+  開く。macOS 10 以前では `can_print` が偽になり、**エラーにならず何も
+  起きずに `Ok(())` を返す** (下記「既知の制約」参照)。
+- **WebView2 (Windows)** — `src/webview2/mod.rs` 1801-1806 行目:
+  `self.eval("window.print()", None)` — ページの JS コンテキストで
+  `window.print()` を実行するだけ。WebView2 は Chromium ベースなので、
+  これは Chrome/Edge の Ctrl+P と全く同じ印刷プレビュー UI (「Microsoft
+  Print to PDF」を含む) を開く。COM を一切経由しない。
+
+**この 1 メソッドで `unsafe` ゼロ・新規依存クレートゼロ**（`wry`/
+`webview2-com`/`windows` は既存の D59 由来の依存のみ）で 3 OS 共通の
+「印刷ダイアログを開く」が実現でき、そのダイアログ自身が (Windows/macOS/
+Linux いずれも) PDF への出力先を持つ。D4 が back/forward をエンジンの
+セッション履歴に任せて自前実装しなかったのと同じ理由 — **エンジンが既に
+持っている機能を、ラッパー越しに安全に呼べるなら、VeloX 側で作り直さない**
+— で、Ctrl/Cmd+P はこの `print()` 一本に決めた。
+
+### 生 COM API (WebView2) も調べた — 世代差の結論
+
+Issue の指示どおり、上記に落ち着く前に生の `ICoreWebView2` 系 API にも
+実際に手を伸ばして確認した（D59 が D17 の結論をビルダーメソッドの外側で
+覆した前例があるため、`WebViewExtWindows` 経由の生インターフェースまで
+必ず見る）:
+
+| API | インターフェース世代 | 到達可能性 |
+|---|---|---|
+| `ICoreWebView2_7::PrintToPdf`（ファイルへ直接、ダイアログ無し） | `ICoreWebView2_7` | **到達可能** — D59/D66 で実績のある `ICoreWebView2_13` より**古い**世代 |
+| `ICoreWebView2Environment6::CreatePrintSettings` | `ICoreWebView2Environment6` | 到達可能（`_7` と同じ理由） |
+| `ICoreWebView2_16::Print`（印刷ダイアログ相当、印刷完了コールバック付き） | `ICoreWebView2_16` | 理論上到達可能だが**未採用**（下記） |
+| `ICoreWebView2_16::ShowPrintUI` | `ICoreWebView2_16` | 同上 |
+| `ICoreWebView2_16::PrintToPdfStream` | `ICoreWebView2_16` | 同上 |
+
+`webview2-com-sys-0.38.2/src/bindings.rs` を実際に読み、`ICoreWebView2_7`
+(43213-43312 行目) が `PrintToPdf(resultfilepath: PCWSTR, printsettings:
+Option<ICoreWebView2PrintSettings>, handler:
+ICoreWebView2PrintToPdfCompletedHandler) -> Result<()>` を、
+`ICoreWebView2Environment6` (15549-15596 行目) が
+`CreatePrintSettings() -> Result<ICoreWebView2PrintSettings>` を持つことを
+確認した。**WebView2 のインターフェース番号は累積的**（`_N` は常に `_N-1`
+の上位互換のスーパーセットで、対応する WebView2 Runtime のバージョンが
+新しいほど番号が大きい）ため、D59/D66 が既に「実績あり」と結論づけた
+`ICoreWebView2_13` (D59 のサブリソースブロック、D66 の
+`ClearBrowsingDataAll`) が届く実行環境なら、それより**古い** `_7`/
+`Environment6` も届く。つまり `PrintToPdf` は D66 の `_13` キャストより
+**むしろ安全側に倒れた賭け**であり、採用に足る根拠があると判断した。
+
+一方 `Print`/`ShowPrintUI`/`PrintToPdfStream` はいずれも `ICoreWebView2_16`
+(`webview2-com-sys-0.38.2/src/bindings.rs` 40358-40667 行目) が要求され、
+これは D69 が「対応する WebView2 Runtime も相応に新しいバージョンを要求し、
+この環境には実機の Windows が無く検証もできない」という理由で見送った
+`ICoreWebView2_28` (Find API) ほどではないにせよ、D59/D66 で実績のある
+`_13` より**新しい**世代であり、同じ「Windows 最優先は検証できない
+最新 API に賭けることではない」という D69 の判断の型がそのまま当てはまる。
+加えて `Print`/`ShowPrintUI` は `wry::WebView::print()` が既に (COM 抜きで)
+同じユーザー体験 (印刷ダイアログを開く) を提供できてしまうため、わざわざ
+`unsafe` な COM 呼び出しへ切り替える理由も無い。**よって `ICoreWebView2_16`
+系は見送り**、Ctrl/Cmd+P は前述のとおり `wry::WebView::print()` に統一した。
+
+### 実装したもの
+
+1. **印刷 (Ctrl/Cmd+P、受け入れ条件「現在ページを印刷できる」)** —
+   `ui::window::BrowserWindow::print_tab(tab_id) -> wry::Result<()>` が
+   アクティブタブの content webview に対して `WebView::print()` を呼ぶ。
+   D18/D23/D69/D72 と同じ二重配送: 信頼された toolbar webview からは
+   構造化コマンド `ToolbarCommand::Print`（キー入力またはツールバーの
+   印刷ボタン）、非信頼の content webview からは固定センチネル文字列
+   `"velox:print"` → `ContentShortcut::Print`。どちらも
+   `app::print_active_tab` に合流する。Issue #38 (ショートカット管理) が
+   まだ無いための暫定固定割り当てである点も D69 と同じ。
+2. **PDFとして保存（受け入れ条件「PDFとして保存できる」）** —
+   全 OS 共通の一次手段は (1) のダイアログ自身が持つ PDF 出力先
+   （Linux の GTK 印刷ダイアログの「ファイルに印刷」、macOS の印刷パネルの
+   「PDF として保存」、Windows の Chromium 印刷プレビューの「Microsoft
+   Print to PDF」）。加えて **Windows のみ**、ツールバーの「PDFとして
+   保存」ボタン (`ToolbarCommand::SaveAsPdf`) からダイアログを介さない
+   直接書き出しを提供する:
+   - `browser::print`（`src/browser/print.rs`、新規、UI/エンジン非依存の
+     純粋ロジック）— `Orientation`/`PaperSize`（A4/Letter/Legal、インチ
+     単位。`ICoreWebView2PrintSettings::PageWidth`/`PageHeight` がインチ
+     単位のため）/`Margins`/`PdfExportSettings`（scale・
+     print_backgrounds を含む）と、それぞれの `sanitize()`（範囲外・
+     非有限値をクランプ/デフォルトへフォールバック）。設定画面には
+     まだ載せていない（このIssueのスコープ外、後述）ため現状は常に
+     `PdfExportSettings::default().sanitize()` を使うが、将来 UI から
+     値を受け取る際も同じ検証済みの経路を通せるようにしてある。
+     `suggest_pdf_filename(title, url)` はページタイトル（あれば）→
+     URL のホスト → 固定の汎用名、という順で保存ファイル名を決める純粋
+     関数。25 件のユニットテストがある。
+   - `ui::webview2_print`（`src/ui/webview2_print.rs`、新規、
+     `#[cfg(windows)]`）— `wry::WebViewExtWindows::webview()`/
+     `environment()`（D59/D66/D69 と同じ入口）から
+     `ICoreWebView2Environment6::CreatePrintSettings` →
+     設定を `browser::print::PdfExportSettings` から適用 →
+     `ICoreWebView2_7::PrintToPdf` を呼ぶ。完了コールバックは
+     `webview2-com` が既に用意している `PrintToPdfCompletedHandler`
+     ヘルパー（D66 の `ClearBrowsingDataCompletedHandler` と全く同じ
+     `#[completed_callback]` マクロ由来のヘルパーで、VeloX 側で COM
+     vtable を組み立てる必要はない）を使い、成功可否を
+     `UserEvent::PdfExportFinished { window_id, tab_id, destination,
+     success, error }` として非同期に返す。`unsafe` はこのファイルの
+     数箇所（`.cast::<T>()` 自体は安全だが、その後の COM プロパティ
+     セッターと `PrintToPdf` 呼び出し自体が `unsafe fn`）にとどまり、
+     すべて「このモジュールが生成・保持している生きた COM 参照に対する
+     プレーンな COM 呼び出しであり、有効性を保証できる」という理由を
+     コメントで明記した（D59/D66 と同じ形）。保存先ディレクトリ・
+     ファイル名の決定は `browser::downloads` の既存資産をそのまま
+     再利用した（新規ロジックを増やさない）:
+     `resolve_download_dir_with_override`（Issue #16/#30 の
+     `Config::download_dir_override`/`VELOX_DOWNLOAD_DIR`/OS既定値の
+     解決をそのまま流用）と `prepare_destination`（ファイル名の
+     サニタイズ・ディレクトリ作成・`report (1).pdf` 方式の重複回避を
+     そのまま流用）。
+   - **macOS/Linux**: `BrowserWindow::export_tab_as_pdf` の
+     `#[cfg(not(windows))]` 側は `PdfExportRequest::UnsupportedPlatform`
+     を返すだけで、ファイル書き込みは一切試みない — 「未実装」ではなく
+     「呼べる安全な API が無い」ことを D75 の調査で確認した結果であり、
+     CLAUDE.md の「Windows の実装を先に用意し、macOS/Linux は動作する
+     ことを優先した最小実装で構わない」という方針どおりの意図的な
+     見送り。呼び出し側 (`app::save_active_tab_as_pdf`) はこの場合、
+     印刷ダイアログ (Ctrl/Cmd+P) から PDF を保存するよう促す
+     ステータスメッセージを表示する。
+3. **エラー表示（受け入れ条件「印刷失敗時にエラーを表示」）** —
+   ツールバーに新設した `#print-status`（find bar/bookmark bar のような
+   高さ加算式の帯ではなく、`#toolbar` 行内の 1 個の `<span>` —
+   長いメッセージは CSS の `text-overflow: ellipsis` で省略表示しつつ
+   `title` 属性に全文を保持、クリックまたは 8 秒で自動的に消える）に
+   `veloxSetPrintStatus(message)` で表示する。`print_tab`
+   の COM 非依存の失敗と `UserEvent::PdfExportFinished` の成功/失敗の
+   両方がここに合流する。**ただし正直に書くと、この受け入れ条件は
+   `print_tab`（Ctrl/Cmd+P）経路では実質的にほとんど満たせない**:
+   `wry::WebView::print()` は 3 OS いずれも「ダイアログを開く/JS を
+   実行する」呼び出し自体が失敗したかどうかしか `Result` に反映せず、
+   実際の印刷ジョブの成否（ユーザーがダイアログをキャンセルした、
+   プリンタが無い、ドライバエラー等）は wry 0.56 の公開 API からは一切
+   観測できない（WebKitGTK 版は `run_dialog` の戻り値を捨てて常に
+   `Ok(())`、macOS 版は古い macOS で無条件に `Ok(())`、Windows 版は
+   `window.print()` という fire-and-forget な JS 呼び出し）。**この条件を
+   本当の意味で満たせるのは Windows 限定の PDF 直接書き出し経路だけ**
+   （`PrintToPdfCompletedHandler` が本物の成功/失敗を返す）。
+
+### 見送ったもの・意図的なスコープ外
+
+- **`ICoreWebView2_16::Print`/`ShowPrintUI`/`PrintToPdfStream`**:
+  上記のとおり世代が新しすぎて実機検証できないため（D69 と同じ判断）。
+- **ページ範囲の指定**: `ICoreWebView2PrintSettings`（`PrintToPdf` が
+  受け取る基底インターフェース）には存在せず、`PageRanges` は
+  `ICoreWebView2PrintSettings2`（`Print`/`ShowPrintUI` 側でのみ使う、
+  物理プリンタ向けの拡張）にしかない。今回採用した `PrintToPdf` 経路では
+  ページ範囲を指定する API 自体が無いため、PDF書き出しは常に全ページ
+  出力になる。
+- **設定画面 UI（用紙サイズ/向き/余白/背景印刷のユーザー選択）**:
+  `browser::print::PdfExportSettings` は値の形と検証ロジックだけを
+  用意し、`browser::settings::Settings`（Issue #30/D67）には今回フィールド
+  を追加していない — 常に `PdfExportSettings::default()` を使う。この
+  Issue のスコープ（「印刷・PDF保存が動く」）を超えるため、UI 化は
+  follow-up とする。
+- **macOS の `print_with_options`（余白カスタマイズ）**:
+  `wry::WebViewExtDarwin`/`WebViewExtMacOS::print_with_options(&PrintOptions)`
+  はマージン (`PrintMargin`) だけを受け取れる macOS 限定 API だが、
+  CLAUDE.md の OS 優先度（macOS は最低限の整備）に従い、`print_tab` は
+  3 OS とも引数無しの `print()` に統一し、この macOS 限定の余白調整には
+  乗らなかった。
+- **PDF書き出しのファイル名/ページ設定を選ぶダイアログ**: 「PDFとして
+  保存」ボタンは常に既定のダウンロード先へ既定設定で書き出す
+  （場所を選ばせない）。これは D28 の「保存先を選ばせず既定ディレクトリに
+  即保存する」ダウンロードの流儀に合わせた意図的な単純化。
+
+### 検証できたこと・できなかったこと（正直な記録）
+
+**この開発環境は Linux のみで、Windows/macOS 実機は無い。**
+
+- `cargo test`（Linux, `browser::print` 25 件 + `ui::toolbar` の新規
+  print 系テスト + `ui::window` のセンチネル/スクリプトテスト）と
+  `cargo clippy --all-targets -- -D warnings`（Linux）はエラー・警告
+  0 件。単体テスト件数: 800 → 815（+15、減少なし）。統合テスト
+  (`tests/integration.rs`) は 9 件のまま全て pass（この Issue は既存の
+  「実プロセス起動・実タブ管理・実ファイル永続化」シナリオと直接
+  関係しないため、新規の統合テストは追加していない）。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` はエラー
+  0 件（型チェックのみ、リンク・実行はしていない）。
+  `ui::webview2_print` 内の 2 件の unit test（`orientation_to_native`
+  の分岐網羅、D59 の `resource_type_from_context` テストと同じ位置づけ）
+  はこの Linux 環境では `#[cfg(windows)]` によりビルドにすら含まれず
+  一度も実行されていない — Windows 実機でのみ実行される。
+  なお `cargo clippy --target x86_64-pc-windows-msvc --all-targets --
+  -D warnings` は本 PR と無関係な**既存の**警告
+  (`src/ui/webview2_blocking.rs` の `handle_request` が clippy の
+  `too_many_arguments`(8/7) に抵触、D59 由来) で失敗する — `git stash`
+  して確認したところ、この PR の変更を一切含まない `main` でも同じ理由で
+  失敗することを確認済み。本 PR の要求検証コマンドには含まれておらず
+  （CLAUDE.md 上も `cargo check --target ... --all-targets` のみが必須）、
+  本 PR が原因でもないため直していない。
+- **実行時の動作（実際に印刷ダイアログが開くか、PDF が書き出されるか、
+  Chromium の印刷プレビューに Microsoft Print to PDF が実在するか、
+  `ICoreWebView2Environment6`/`ICoreWebView2_7` へのキャストが実機の
+  WebView2 Runtime で本当に成功するか）は一切確認できていない** —
+  WebView2 ランタイムも Windows も macOS も無いため。
+
+**Revisit condition**: (1) `ICoreWebView2_16` 系 API — 対象ランタイムの
+普及が進み、実機検証できる環境が揃った段階で `Print`/`ShowPrintUI` への
+切り替え（本物の印刷完了コールバック、物理プリンタへの直接印刷、ページ
+範囲指定）を再検討する。(2) 設定画面 (#30) に印刷設定タブを追加する際、
+`browser::print::PdfExportSettings` をそのままフォームの検証層として
+再利用する。(3) Issue #38 のキーバインド管理層が実装されたら、
+Ctrl/Cmd+P の固定割り当てをそこに載せ替える。(4) macOS の余白カスタム
+(`print_with_options`) — macOS 本格対応 (#33) に着手する段階で検討する。
 
 ## D76: 名前を付けて保存 (#46) — Windows は WebView2 の `CallDevToolsProtocolMethod` で MHTML 保存 + ネイティブ Save-As ダイアログ、macOS/Linux は outerHTML の素の保存に留める
 

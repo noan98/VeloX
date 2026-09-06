@@ -25,6 +25,7 @@ pub mod omnibox;
 pub mod omnibox_candidates;
 pub mod perf_log;
 pub mod persistence;
+pub mod print;
 pub mod ranking;
 pub mod save_page;
 pub mod session;

@@ -110,6 +110,9 @@ const OPEN_FIND_BAR_MESSAGE: &str = "velox:open-find-bar";
 /// Ctrl/Cmd+S (Issue #46): save the current page ("名前を付けて保存"). See
 /// `ContentShortcut::SavePage` and docs/decisions.md D76.
 const SAVE_PAGE_MESSAGE: &str = "velox:save-page";
+/// Ctrl/Cmd+P (Issue #40): print the active tab's page. See
+/// `ContentShortcut::Print` and docs/decisions.md D75.
+const PRINT_MESSAGE: &str = "velox:print";
 /// Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
 /// `ContentShortcut::ViewSource` and docs/decisions.md D72.
 const VIEW_SOURCE_MESSAGE: &str = "velox:view-source";
@@ -177,11 +180,40 @@ pub enum ContentShortcut {
     /// both are handled by the same shared function in `app.rs`. See
     /// docs/decisions.md D76.
     SavePage,
+    /// Ctrl/Cmd+P (Issue #40): print the active tab's page. The
+    /// content-webview half of `ui::toolbar::ToolbarCommand::Print` — both
+    /// are handled by the same shared function in `app.rs`. See
+    /// docs/decisions.md D75.
+    Print,
     /// Ctrl/Cmd+U (Issue #45): view the active tab's page source. The
     /// content-webview half of `ui::toolbar::ToolbarCommand::ViewSource` —
     /// both are handled by the same shared function in `app.rs`. See
     /// docs/decisions.md D72.
     ViewSource,
+}
+
+/// Result of [`BrowserWindow::export_tab_as_pdf`] — what to tell the user
+/// (via the print-status banner, `app::save_active_tab_as_pdf`)
+/// immediately, before an async [`crate::app::UserEvent::PdfExportFinished`]
+/// (if any) arrives. See docs/decisions.md D75.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PdfExportRequest {
+    /// Windows: the COM call was dispatched; the real outcome arrives later
+    /// as `UserEvent::PdfExportFinished`.
+    Started,
+    /// The tab has no live webview right now — an unknown id, or (in
+    /// practice this should not happen for the always-live active tab, see
+    /// `browser::TabState`'s invariant) a suspended one.
+    NoWebview,
+    /// macOS/Linux: no headless export path exists (see
+    /// `BrowserWindow::export_tab_as_pdf`'s `#[cfg(not(windows))]` doc
+    /// comment) — the caller should point the user at [`BrowserWindow::
+    /// print_tab`]'s native dialog instead.
+    UnsupportedPlatform,
+    /// Windows: a COM call failed *synchronously* (an interface cast, or
+    /// creating the settings object) — no async result will follow, unlike
+    /// `Started`.
+    Failed { message: String },
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
@@ -204,6 +236,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         NEW_PRIVATE_WINDOW_MESSAGE => Some(ContentShortcut::NewPrivateWindow),
         OPEN_FIND_BAR_MESSAGE => Some(ContentShortcut::OpenFindBar),
         SAVE_PAGE_MESSAGE => Some(ContentShortcut::SavePage),
+        PRINT_MESSAGE => Some(ContentShortcut::Print),
         VIEW_SOURCE_MESSAGE => Some(ContentShortcut::ViewSource),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
@@ -290,6 +323,8 @@ fn tab_shortcut_script() -> String {
         message = "{OPEN_FIND_BAR_MESSAGE}";
       }} else if (event.key === "s" || event.key === "S") {{
         message = "{SAVE_PAGE_MESSAGE}";
+      }} else if (event.key === "p" || event.key === "P") {{
+        message = "{PRINT_MESSAGE}";
       }} else if (event.key === "u" || event.key === "U") {{
         message = "{VIEW_SOURCE_MESSAGE}";
       }}
@@ -1698,6 +1733,120 @@ impl BrowserWindow {
             None => return Ok(()),
         };
         webview.evaluate_script(&find_clear_script())
+    }
+
+    // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
+
+    /// Print tab `tab_id`'s page (Ctrl/Cmd+P) via the OS's own native print
+    /// UI: `wry::WebView::print()`, a stable, safe, public method the base
+    /// `WebView` type exposes on every platform VeloX ships — no `unsafe`,
+    /// no new dependency, no WebView2/COM interface-generation question at
+    /// all (see D75 for why this, and not the raw
+    /// `ICoreWebView2_16::Print`/`ShowPrintUI` COM API, is what Ctrl/Cmd+P
+    /// calls). Each backend does something different under this one call:
+    /// runs `window.print()` in the page's own JS on Windows (WebView2 is
+    /// Chromium-based, so this opens Chromium's own print preview, whose
+    /// "Microsoft Print to PDF" destination is how "PDFとして保存" is meant
+    /// to be reached from here — see D75), a native `NSPrintOperation`
+    /// modal on macOS, and a native GTK print dialog on Linux (WebKitGTK).
+    ///
+    /// A no-op for an unknown/suspended tab (`Ok(())`, same contract as
+    /// `search_in_page`/`clear_find_highlights` above) — this should not
+    /// happen in practice, since `tab_id` is always the active tab and the
+    /// active tab is never suspended (see `browser::TabState`'s invariant,
+    /// docs/decisions.md D20), but a stale id must still not panic.
+    ///
+    /// **Known limitation, documented in D75**: none of the three
+    /// platforms' `print()` implementations report a genuine print-job
+    /// failure back through this `Result` — a cancelled dialog, no printer
+    /// configured, or a driver error are all invisible to Rust (wry 0.56's
+    /// public API has no completion callback for this path, unlike the PDF
+    /// export below). An `Err` here only ever means the call itself could
+    /// not be dispatched (e.g. a script-evaluation failure), which is still
+    /// surfaced via the print-status banner (see [`Self::set_print_status`])
+    /// for the "印刷失敗時にエラーを表示" acceptance criterion, but that
+    /// criterion is only partially satisfiable through this API.
+    pub fn print_tab(&self, tab_id: TabId) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.print()
+    }
+
+    /// Push (or clear, with `None`) the print/PDF-export status banner —
+    /// shared by [`Self::print_tab`]'s failure path and the async
+    /// [`crate::app::UserEvent::PdfExportFinished`] result.
+    pub fn set_print_status(&self, message: Option<&str>) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_print_status_script(message))
+    }
+
+    /// Windows-only headless PDF export (see `ui::webview2_print` and
+    /// docs/decisions.md D75): reaches past `print_tab`'s native dialog
+    /// entirely and writes tab `tab_id`'s page straight to `destination`
+    /// using `settings`, with no user interaction. Returns immediately;
+    /// [`PdfExportRequest::Started`] means the real result arrives later as
+    /// [`crate::app::UserEvent::PdfExportFinished`] (this is the one
+    /// print-related path that *can* report a genuine failure, since
+    /// WebView2's own `PrintToPdfCompletedHandler` reports one — see
+    /// `print_tab`'s doc comment for the contrast).
+    #[cfg(windows)]
+    pub fn export_tab_as_pdf(
+        &self,
+        tab_id: TabId,
+        destination: PathBuf,
+        settings: &crate::browser::print::PdfExportSettings,
+    ) -> PdfExportRequest {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return PdfExportRequest::NoWebview,
+        };
+        match crate::ui::webview2_print::export_as_pdf(
+            webview,
+            settings,
+            &destination,
+            self.proxy.clone(),
+            self.id,
+            tab_id,
+        ) {
+            Ok(()) => PdfExportRequest::Started,
+            Err(err) => PdfExportRequest::Failed {
+                message: err.to_string(),
+            },
+        }
+    }
+
+    /// macOS/Linux: no headless "write straight to a PDF path" API is
+    /// reachable through wry 0.56's safe public surface on either platform
+    /// (see D75 — this is not a "not implemented yet", it is "nothing to
+    /// call") — VeloX degrades to reporting [`PdfExportRequest::
+    /// UnsupportedPlatform`] so the caller can point the user at
+    /// [`Self::print_tab`]'s dialog instead, per CLAUDE.md's "Windows最優先、
+    /// 他 OS は最低限の整備" policy.
+    #[cfg(not(windows))]
+    pub fn export_tab_as_pdf(
+        &self,
+        tab_id: TabId,
+        _destination: PathBuf,
+        _settings: &crate::browser::print::PdfExportSettings,
+    ) -> PdfExportRequest {
+        if !self
+            .contents
+            .get(&tab_id)
+            .is_some_and(|tab| tab.webview.is_some())
+        {
+            return PdfExportRequest::NoWebview;
+        }
+        PdfExportRequest::UnsupportedPlatform
     }
 
     /// Replace the downloads panel's contents (Issue #16, see
@@ -3180,6 +3329,7 @@ mod tests {
             NEW_PRIVATE_WINDOW_MESSAGE,
             OPEN_FIND_BAR_MESSAGE,
             SAVE_PAGE_MESSAGE,
+            PRINT_MESSAGE,
             VIEW_SOURCE_MESSAGE,
         ] {
             assert!(
@@ -3245,6 +3395,10 @@ mod tests {
         assert_eq!(
             parse_content_shortcut(SAVE_PAGE_MESSAGE),
             Some(ContentShortcut::SavePage)
+        );
+        assert_eq!(
+            parse_content_shortcut(PRINT_MESSAGE),
+            Some(ContentShortcut::Print)
         );
         assert_eq!(
             parse_content_shortcut(VIEW_SOURCE_MESSAGE),
