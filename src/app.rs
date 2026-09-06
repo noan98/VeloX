@@ -23,8 +23,7 @@ use crate::browser::{
     input_history, metrics, navigation, omnibox, persistence, site_data, ActivationEffect,
     BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList,
     HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore,
-    SessionSnapshot,
-    SiteExceptions, TabId, Tabs,
+    SessionSnapshot, SiteExceptions, TabId, Tabs,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -1873,6 +1872,8 @@ fn clear_all_site_data(window: &BrowserWindow) {
                 .map(ToString::to_string)
                 .unwrap_or_default()
         ),
+    }
+}
 
 /// Persist the current tab session (Issue #25 — see docs/decisions.md D65).
 ///
