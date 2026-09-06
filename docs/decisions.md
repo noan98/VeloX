@@ -7129,6 +7129,256 @@ Window を開くと、toolbar 全体は Light になるのに Private Window の
 ことを確認する。(3) toolbar chrome の `System` 解決を CSS 依存から
 `tao::window::Window::theme()` 起点の明示解決に置き換える方が有利だと
 判明したとき (現状は上記のとおりリスク回避のため見送っている)。
+
+## D72: View Source (#45) — `document.documentElement.outerHTML` を取得し、HTML エスケープ済みテキストとして新規タブに `data:` URL で表示する
+
+**対象**: Issue #45 の受け入れ条件 3 点 (ページソースを表示できる /
+ショートカット (Ctrl/Cmd+U) から起動できる / 現在ページを壊さず新規タブ等で
+表示できる)。依存として挙げられている Issue #38 (キーボードショートカット
+管理) は D69 の時点と同じくまだ着手されていないため、今回も既存の D18/D23/
+D69 と同じ「固定の Ctrl/Cmd+U 割り当て」で最小実装し、後から #38 の仕組みに
+載せ替えやすい形にした (D69 の「Ctrl/Cmd+F の割り当てと Issue #38 への申し
+送り」節と全く同じ構造 — 詳細は後述)。
+
+### この機能で最優先すべきセキュリティ設計: 取得したソースは「テキスト」としてしか描画しない
+
+View Source は「ページの HTML ソースをそのまま画面に出す」機能である以上、
+入力（ページの生ソース）は本質的に信頼できない — ソース自体が
+`<script>` タグや `onerror` 属性を含んでいて当然で、それこそが表示したい
+内容そのものである。**もしこのソースを一度でも「HTML マークアップ」として
+別ページに挿入してしまえば、View Source は事実上「そのページをもう一度
+VeloX の（表示上は新しい、しかし技術的には同じ特権を持つ）タブで実行する」
+機能に成り下がり、閲覧者に "ソースを見せている" つもりが実際にはスクリプト
+を実行させてしまう深刻な脆弱性になる。**
+
+対策は単純かつ徹底している: 取得したソースの**すべてのバイト**を
+`browser::view_source::escape_html` (`&` `<` `>` `"` `'` の 5 文字を実体
+参照に変換する、標準的な HTML テキストエスケープ) に通してから、生成した
+ドキュメントの `<pre>` 要素の**テキストコンテンツとしてのみ**埋め込む。
+これにより、ソースの中身が丸ごとの `<script>...</script>` ブロックであれ、
+`</pre>` を使って囲みタグから抜け出そうとする試みであれ、タグの途中で
+ぶつ切りになった不完全なソースであれ、ブラウザの HTML パーサーには
+「解釈不能な地の文」としてしか見えない。生成するドキュメント自体に
+`<script>` 要素を一切含めていない (実行すべき JS がそもそも無い) ことも
+重ねての設計上の防御になっている — D69/D62 の `escape_js_line_terminators`
+はコンテンツが JS 文字列/正規表現リテラルの中に埋め込まれる前提のエスケープ
+だが、本機能にはそのコンテキストが存在しないため、標準的な HTML エスケープ
+だけで足りる (この違いは `browser::view_source` のモジュールドキュメントに
+明記した)。
+
+**この設計を検証する単体テストを `src/browser/view_source.rs` に用意した**
+(抜粋、全て pass):
+
+- `build_view_source_document_never_reproduces_a_live_script_tag` —
+  ソースに `<script>alert(document.cookie)</script>` を含めても、
+  生成ドキュメントに生の `<script>alert` が現れないこと、代わりに
+  `&lt;script&gt;alert(document.cookie)&lt;/script&gt;` という
+  エスケープ済みテキストとして現れることを確認。
+- `build_view_source_document_is_safe_when_source_is_cut_off_mid_tag` —
+  ソースが `<scr` のようにタグの途中で切れていても、`<` が生のまま
+  残らないことを確認 (Issue の指示にある「閉じタグの途中で切れたソース」
+  のケース)。
+- `build_view_source_document_escapes_an_attempted_pre_closing_tag` —
+  ソースが `</pre><img src=x onerror=alert(1)>` のように、こちらが
+  ソースを包んでいる `<pre>` 自体を早期に閉じて隣に要素を注入しようと
+  しても、生成ドキュメント中の実際の `<pre>`/`</pre>` ペアが 1 組のまま
+  であることを確認。
+- `build_view_source_document_escapes_the_page_url_in_title_and_header` —
+  ページ URL 自体 (ヘッダーと `<title>` に埋め込む) にも同じエスケープを
+  適用していることを確認 (実際の呼び出し元は必ず
+  `navigation::normalize_input` を通過済みの URL しか渡さないが、
+  多重防御として)。
+- `truncate_source_utf8_never_splits_a_multibyte_character` — 打ち切り
+  位置が UTF-8 のマルチバイト文字の途中に来ても panic せず、文字境界まで
+  後退することを確認 (日本語ページのソースを想定)。
+
+### ソース取得方法: `document.documentElement.outerHTML` を JS で取得（生 HTTP 再フェッチはしない）
+
+検討した選択肢は 2 つ:
+
+1. **`document.documentElement.outerHTML` を `evaluate_script_with_callback`
+   で読む**（採用）。`BrowserWindow::fetch_page_title`/`fetch_favicon`
+   (D12) と全く同じ「fire-and-forget な JS 評価 → `UserEvent` で非同期に
+   結果を受け取る」パターンを再利用するだけで済み、3 エンジン
+   (WebKitGTK/WKWebView/WebView2) すべてで無条件に動く — wry 0.56 は
+   `evaluate_script_with_callback` を全プラットフォームでサポートして
+   いるため、D69 のネイティブ find API 調査のような「Windows だけ賭けに
+   出る」判断すら不要だった。**CLAUDE.md の「Windows を最優先」を素直に
+   満たす** (Windows で動く実装を最初に選び、そのまま 3 OS 共通で使える)。
+2. **ページの元 HTTP レスポンスバイト列を再取得する** (見送り)。ブラウザの
+   ネイティブ「View Source」に近い挙動 (JS 実行前の生の応答をそのまま
+   見せる) だが、wry 0.56 はレスポンスボディを取り出せる汎用のネットワーク
+   API を公開していない — D17/D59 で確認済みの「wry はビルダーレベルの
+   main-frame ナビゲーションフックとリクエストブロッキングは持つが、
+   レスポンス本文を読めるフックは持たない」という制約がそのまま当てはまる。
+   別途 HTTP クライアント (例えば `reqwest`) を追加してページを独立に
+   再フェッチする案も検討したが、(a) Cookie・認証状態・User-Agent
+   などをブラウザのセッションと二重管理する必要が生じる、(b)
+   同一 URL に対して 2 回目のリクエストを飛ばすことになり、副作用のある
+   POST 送信後のページ等では意味が変わってしまう、(c) 依存クレートが
+   増える (D6) — というコストに見合わないと判断した。
+
+**採用した方式の既知の限界**: `outerHTML` は「今この瞬間の DOM」のスナップ
+ショットであり、ページ自身の JS が `document.write`/DOM 操作でサーバの
+応答から書き換えた後の状態を返す。つまり「サーバが実際に送ってきたバイト
+列」とは一致しないことがある (SPA 等では顕著)。ブラウザの devtools の
+「View Page Source」相当ではなく「Inspect Element の outerHTML」相当の
+挙動である。実務上ほとんどのページ検証用途 (レイアウト崩れの原因調査、
+メタタグの確認など) は現在の DOM を見たいことが多く、この差異は許容できる
+簡略化と判断したが、正直に記録しておく。
+
+### 表示先: 既存の「新規タブを開く」経路 (`open_new_tab`) にそのまま乗せる `data:` URL
+
+新しいタブとして開くこと自体は Issue の指示どおりで迷いは無かったが、
+「そのタブに何を読み込ませるか」に選択肢があった:
+
+- **カスタム URL スキーム/プロトコルハンドラ (`view-source:` 相当) を実装
+  する** (見送り)。Chrome 等の `view-source:https://example.com/` を模倣
+  できればアドレスバー表示は理想的になるが、wry 0.56 に「エンジンが
+  ロードしようとした任意の URL に対して VeloX 側が代わりにレスポンスを
+  返す」ようなカスタムプロトコルハンドラの公開 API は無く (D18/D59/D69 が
+  積み重ねてきた「wry の実ソースを読んでから機能を選ぶ」調査スタイルの
+  結論)、`browser::navigation::normalize_input` の URL 検証・タブの
+  `current_url`・セッション永続化 (`SessionSnapshot::sanitize`) など
+  複数箇所が前提にしている「`current_url` は実際にエンジンがロードした
+  URL と一致する」という不変条件を壊さずに擬似スキームを割り込ませるのは、
+  P2 の機能 1 つのために見合わないコストと判断した。
+- **`data:text/html` URL として、既存の `app::open_new_tab` にそのまま
+  渡す** (採用)。エスケープ済みドキュメントを組み立てたら、それを
+  `data:` URL にエンコードし、`ToolbarCommand::NewTab`/`Ctrl+T`/
+  `target="_blank"` などが最終的に必ず通る `app::open_new_tab` に、
+  他の呼び出し元と全く同じ形で渡すだけで済む。`data:` は既に
+  `browser::navigation::ALLOWED_SCHEMES` に含まれるスキームであり、
+  タブのプロセス配置 (D54)・アクティブ化・タブ作成レイテンシ計測 (D19)
+  などを一切新設せずにそのまま享受できる。
+
+**この方式が生む、正直に記録すべき既知の制限**:
+
+- **アドレスバーには `view-source:https://example.com/` のような読みやすい
+  疑似 URL ではなく、`data:text/html;charset=utf-8;base64,....` という
+  長い文字列がそのまま表示される。** Issue の受け入れ条件「現在ページの
+  URL を正しく扱う」は、(a) ソース取得元のタブ・URL を取り違えない
+  (`BrowserWindow::fetch_page_source` が `page_url` を要求時点で捕捉し、
+  非同期の結果に一貫して紐付ける — `fetch_favicon` の `page_url` 引数と
+  同じ設計)、(b) 取得元の URL を生成ドキュメントのヘッダー/`<title>` に
+  明示表示する、の 2 点では満たしているが、**アドレスバー表示の見た目に
+  関しては満たせていない**。`Tab::current_url`/`on_navigation_started`/
+  `on_load_finished` は「エンジンが実際にロードした URL」を無条件に
+  正としてタブストリップ・セッション永続化に反映する設計であり (D20)、
+  ここに「表示用の別 URL」を割り込ませるには `Tab` に新しいフィールドを
+  足すか、ナビゲーションイベントハンドラに view-source 用の特別扱いを
+  複数箇所へ差し込む必要がある — D20 が守ってきた「`current_url` は常に
+  真実」という前提を、この 1 機能のためだけに壊すコストに見合わないと
+  判断し、見送った。**この受け入れ条件は文字どおりには満たせていない**
+  ことをここに明記する。
+- **`data:` URL はそのタブの `current_url` としてタブの生存期間中
+  保持され続け、`app::sync_tab_strip` が触れるたびに (`TabSummary`/
+  `veloxSetTabs` の JSON として) トールバー webview へ再送され、
+  `app::persist_session` が呼ばれるたびに `session.json` にも書き出される。
+  1 回きりのペイロードではなく、以後のほぼ全イベントで繰り返し
+  シリアライズされる「アンビエントな状態」になる。** これが
+  `browser::view_source::MAX_SOURCE_BYTES` を意図的に 300,000 バイトと
+  かなり保守的な値に抑えた理由そのものである — 数 MB 級のソースをそのまま
+  許すと、無関係なタブの開閉やタブ切替のたびに数 MB の `evaluate_script`
+  呼び出しとセッションファイル書き込みが発生しかねない。300 KB であれば
+  base64 化後 (約 1.33 倍) でも数百 KB に収まる。上限を超えたソースは
+  `browser::view_source::truncate_source_utf8` が文字境界を尊重して
+  切り詰め、生成ドキュメントに切り詰め済みである旨の通知
+  (`.velox-notice`) を表示する。
+- **セッション復元・履歴への影響**: `data:` URL は
+  `browser::navigation::ALLOWED_SCHEMES` に含まれるため、
+  `SessionSnapshot::sanitize` は View Source タブの `current_url` を
+  そのまま (拒否せず) 通す — 次回起動時のセッション復元が有効なら、
+  そのタブは古いソースのスナップショットのまま復元される (実害はないが、
+  やや直感に反する)。一方、履歴 (`HistoryStore`) には**意図的に**記録
+  されないよう `app::handle_user_event` の `LoadFinished` 処理に
+  `url.starts_with("data:")` の除外を 1 箇所追加した — でなければ、
+  ページを閲覧するたびに数百 KB の base64 文字列が visit history と
+  オムニボックスの候補に紛れ込むことになり、これは実用上明確な UX
+  劣化だと判断したため。タイトル/favicon の取得 (`fetch_page_title`/
+  `fetch_favicon`) は除外していない — `fetch_page_title` が読む
+  `document.title` は生成ドキュメント自身の `<title>ソースを表示: ...`
+  なので、タブストリップに「ソースを表示: https://example.com/」という
+  読める見出しが出るのはこの経路によるものであり、あえて残した。
+- **再読み込み (リロード)** はスナップショット時点の内容を再表示する
+  だけで、元ページを再取得しない (`data:` URL はエンジンにとって
+  「その場で完結した」ページであるため)。
+- **閉じたタブの再オープン (Ctrl/Cmd+Shift+T)**: `browser::tabs::
+  ClosedTabs` (D24) は URL 文字列をそのまま LIFO に積むだけなので、
+  View Source タブを閉じた直後に再オープンすると理屈の上では元の
+  `data:` URL が復元されるはずだが、専用のテストは追加していない
+  (優先度の低いエッジケースと判断)。
+
+### ショートカット (Ctrl/Cmd+U) の実装: D18/D23/D69 と全く同じ二重配送
+
+`ContentShortcut::ViewSource` (固定センチネル文字列
+`"velox:view-source"`、`ui::window::tab_shortcut_script` に追加) と
+`ToolbarCommand::ViewSource` (`{"cmd":"view_source"}`、`toolbar.html` の
+キーダウンリスナーに追加) の 2 経路を、D18/D23/D69 と寸分違わぬパターンで
+追加した。どちらも `app::request_view_source` という 1 つの共有関数に
+収束する — Issue #38 (キーボードショートカット管理) が今後この 2 経路
+すべてに乗ってくる設計になったとき、変更が必要な箇所は「JS 側でどのキーを
+監視するか」の 1 か所だけで済むよう、D69 と同じ配慮を踏襲した。
+`browser::settings::shortcut_reference` (Issue #30/D67 の Shortcuts タブ)
+にも「ページのソースを表示 — Ctrl/Cmd+U」の行を追加し、発見可能性を確保
+した (なお Ctrl/Cmd+F は D69 実装時にこの一覧への追加が漏れていたことに
+気づいたが、本 Issue のスコープ外のため今回は手を付けていない)。
+
+### 実装の全体像
+
+- **`browser::view_source`** (`src/browser/view_source.rs`、新規) —
+  UI/エンジン非依存の純粋ロジック一式:
+  `escape_html`/`truncate_source_utf8`/`build_view_source_document`/
+  `base64_encode`/`to_data_url`。依存クレートを増やさず (D6)、base64
+  エンコーダは RFC 4648 の固定アルゴリズム (~20 行、セキュリティ上の
+  難しい判断を要さない) を自前実装し、RFC のテストベクタで単体テスト
+  済み。`docs/architecture.md` の 4 層分離のとおりここは webview を
+  一切知らず、単体テストの主対象 (24 ケース)。
+- **`ui::window::BrowserWindow::fetch_page_source`** — 実際の DOM 読み取り
+  を担う唯一のメソッド。`fetch_page_title`/`fetch_favicon` と同じ
+  「不明/休止中タブは黙って no-op」「fire-and-forget、結果は
+  `UserEvent` で非同期に返る」契約 (D12)。
+- **`app::request_view_source`**/**`app::open_view_source_tab`** —
+  前者がショートカット発火時にアクティブタブの `page_url` を捕捉して
+  取得をキックし、後者が `UserEvent::ViewSourceReady` を受けて
+  ドキュメントを組み立て `data:` URL 化し、`open_new_tab` に渡す。
+
+### テスト
+
+- `src/browser/view_source.rs`: 24 件 (エスケープ・打ち切り・ドキュメント
+  組み立て・XSS 耐性・base64・data URL のそれぞれ)。
+- `src/ui/toolbar.rs`: `ToolbarCommand::ViewSource` の IPC パーステスト
+  1 件を追加。
+- `src/ui/window.rs`: `parse_content_shortcut`/`tab_shortcut_script` に
+  `ViewSource`/`VIEW_SOURCE_MESSAGE` を追加した既存テストの拡張、および
+  `VIEW_SOURCE_FETCH_SCRIPT` の内容検証テスト 1 件を追加。
+- 単体テスト件数: 776 → 799 (+23、`cargo test --lib -- --list` で計測)。
+  減少なし。
+- 統合テスト (`tests/integration.rs`) は今回変更していない (8 件のまま、
+  全て pass) — D69 のときと同じ判断で、View Source は既存の統合テストが
+  検証する「実プロセス起動・実タブ管理・実ファイル永続化」のいずれとも
+  直接関係しないため、新規の統合テストは追加していない。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` で型
+  レベルの整合は確認したが、実機の Windows/WebView2 での動作確認は
+  できていない (この環境に Windows 実機が無いため) — 特に
+  `evaluate_script_with_callback` が数百 KB 級の文字列を問題なく
+  往復できるか、Ctrl+U が WebView2 自身の既定アクセラレータと衝突しないか
+  (D69 の F12/Ctrl+F と同じ懸念) は未検証。
+
+**満たせなかった／部分的にしか満たせなかった受け入れ条件**:
+「現在ページの URL を正しく扱う」— 取得元 URL の取り違え防止と
+ドキュメント内表示は満たしているが、**アドレスバーの表示** (生の `data:`
+URL が見える) は満たせていない。上記「表示先」の節に理由を記録した。
+
+**Revisit condition**: (1) Issue #38 のキーバインド管理層への Ctrl/Cmd+U
+の載せ替え。(2) `Tab`/`TabState` にビュー専用の表示 URL を持たせる設計が
+別の必要性 (例えば他の内部ページ) から生まれた場合、View Source の
+アドレスバー表示もそれに乗せる。(3) 巨大ページの全文表示が本当に必要に
+なった場合、`data:` URL 方式を専用スキーム/プロトコルハンドラに置き換える
+(前述のとおり現状は見送り)。(4) 実機 Windows での動作確認
+(`evaluate_script_with_callback` の大きな文字列、Ctrl+U のアクセラレータ
+衝突)。(5) 閉じた View Source タブの再オープン専用のテスト追加。
+
 ## D73: コード署名 (#42) — 証明書が無いため「有効化可能な仕組み」に留め、実際の署名は見送り
 
 **対象**: Issue #42 の受け入れ条件 4 点 (macOS 署名/notarize、Windows 署名、

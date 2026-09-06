@@ -1287,6 +1287,10 @@
         // Ctrl/Cmd+P (Issue #40): print the active tab. See
         // docs/decisions.md D75.
         message = { cmd: "print" };
+      } else if (event.key === "u" || event.key === "U") {
+        // Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
+        // docs/decisions.md D72.
+        message = { cmd: "view_source" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {

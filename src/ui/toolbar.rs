@@ -313,6 +313,13 @@ pub enum ToolbarCommand {
     /// export_tab_as_pdf` and D75) — macOS/Linux answer with a print-status
     /// message pointing at [`Self::Print`]'s dialog instead.
     SaveAsPdf,
+    // --- View Source (Issue #45, Ctrl/Cmd+U), see docs/decisions.md D72 ---
+    /// View the active tab's page source in a new tab. Sent by the
+    /// toolbar's own keydown listener (Ctrl/Cmd+U while toolbar UI has
+    /// focus); the content-webview equivalent is
+    /// `ui::window::ContentShortcut::ViewSource` (page has focus). Both
+    /// funnel into the same `app::request_view_source`.
+    ViewSource,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -1427,6 +1434,14 @@ mod tests {
         assert_eq!(
             parse_command(r#"{"cmd":"save_as_pdf"}"#).unwrap(),
             ToolbarCommand::SaveAsPdf
+        );
+    }
+
+    #[test]
+    fn parses_view_source_command() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"view_source"}"#).unwrap(),
+            ToolbarCommand::ViewSource
         );
     }
 

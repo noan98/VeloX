@@ -23,9 +23,9 @@ use crate::browser::perf_log::PerfLog;
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
     find, input_history, metrics, navigation, omnibox, persistence, print, shortcut_reference,
-    site_data, ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry, DownloadId,
-    DownloadStore, Favicon, FilterList, HistoryBookmarkSource, HistoryEntry, HistoryStore,
-    InputHistorySource, InputHistoryStore, SessionSnapshot, Settings, SiteExceptions,
+    site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry,
+    DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource, HistoryEntry,
+    HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, Settings, SiteExceptions,
     SitePermissionStore, TabId, Tabs, WindowId, Windows,
 };
 use crate::config::Config;
@@ -205,6 +205,22 @@ pub enum UserEvent {
         destination: PathBuf,
         success: bool,
         error: Option<String>,
+    },
+    /// The active tab's page markup came back from
+    /// `BrowserWindow::fetch_page_source` for View Source (Issue #45, see
+    /// docs/decisions.md D72). `page_url` is the page it belongs to, as
+    /// captured when the fetch was requested; `html` is the page's raw,
+    /// **unescaped** `outerHTML` — `open_view_source_tab` is the only place
+    /// that turns it into something safe to display
+    /// (`browser::view_source::build_view_source_document`).
+    ///
+    /// Carries `window_id` (Issue #29/D68) so the resulting View Source tab
+    /// opens in the window the request came from, for the same reason
+    /// `FindMatchesUpdated` above does.
+    ViewSourceReady {
+        window_id: WindowId,
+        page_url: String,
+        html: String,
     },
 }
 
@@ -885,7 +901,10 @@ fn record_perf_event(
         | UserEvent::FindMatchesUpdated { .. }
         // Same for Issue #40's PDF export — no performance budget calls
         // for it either.
-        | UserEvent::PdfExportFinished { .. } => {}
+        | UserEvent::PdfExportFinished { .. }
+        // Same for Issue #45's View Source: no performance budget calls for
+        // it either.
+        | UserEvent::ViewSourceReady { .. } => {}
     }
 }
 
@@ -1266,7 +1285,17 @@ fn handle_user_event(
                 // the active one: a background tab finishing a load is a
                 // real visit too (see docs/decisions.md D13 and the "Visit
                 // history and bookmarks" section of docs/architecture.md).
-                let history_id = record_visit_if_enabled(state, &url, config.history_max_entries);
+                //
+                // Exception: a `data:` URL — today, only ever a View Source
+                // tab (Issue #45, D72) — is never recorded. It is a
+                // synthetic, address-bar-unfriendly base64 blob with no real
+                // "site" behind it to revisit; recording it would only
+                // pollute history/the omnibox with a huge unreadable string.
+                let history_id = if url.starts_with("data:") {
+                    None
+                } else {
+                    record_visit_if_enabled(state, &url, config.history_max_entries)
+                };
                 if history_id.is_some() {
                     persist_history(state);
                     refresh_history_panel(window, state, config);
@@ -1501,6 +1530,20 @@ fn handle_user_event(
                 }
             };
             log_failure("show print status", window.set_print_status(Some(&message)));
+        }
+        UserEvent::ViewSourceReady {
+            window_id,
+            page_url,
+            html,
+        } => {
+            // Issue #29/D68: the View Source tab belongs in the window the
+            // request came from. A window closed while its source fetch was
+            // still in flight is a safe no-op, same as every other
+            // window-addressed event here.
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            open_view_source_tab(window, window_id, state, &page_url, &html);
         }
     }
 }
@@ -1912,6 +1955,8 @@ fn handle_toolbar_command(
         // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
         ToolbarCommand::Print => print_active_tab(window, window_id, state),
         ToolbarCommand::SaveAsPdf => save_active_tab_as_pdf(window, window_id, state, config),
+        // --- View Source (Issue #45), see docs/decisions.md D72 ---
+        ToolbarCommand::ViewSource => request_view_source(window, window_id, state),
     }
 }
 
@@ -2164,6 +2209,65 @@ fn save_active_tab_as_pdf(
     }
 }
 
+// --- View Source (Issue #45, Ctrl/Cmd+U), see docs/decisions.md D72 ---
+//
+// `ToolbarCommand::ViewSource`/`ContentShortcut::ViewSource` (D18/D23's usual
+// dual-channel shortcut delivery — Ctrl/Cmd+U assigned directly here rather
+// than through a keybinding-config layer, since Issue #38 (keyboard shortcut
+// management) has not landed yet, exactly like D69's Ctrl/Cmd+F before it)
+// both call `request_view_source`. The actual tab only gets built once the
+// asynchronous source fetch comes back as `UserEvent::ViewSourceReady`,
+// handled by `open_view_source_tab` below.
+
+/// Kick off View Source for the active tab: ask its content webview for its
+/// current markup (`BrowserWindow::fetch_page_source`); `open_view_source_tab`
+/// finishes the job once `UserEvent::ViewSourceReady` reports the result.
+///
+/// `page_url` is captured *now*, from `Tabs`' own state — not re-read later
+/// from the webview — so the source that eventually comes back is always
+/// correctly labeled with the page it was actually requested for, even if
+/// the user switches tabs or that tab navigates again while the (async)
+/// fetch is in flight (see `BrowserWindow::fetch_page_source`'s doc comment).
+/// A no-op — not a crash — when the active tab has no live webview
+/// (suspended): the same "nothing to read from yet" contract every other
+/// `fetch_*` call in this file already uses.
+fn request_view_source(window: &BrowserWindow, window_id: WindowId, state: &AppState) {
+    // Issue #29/D68: read the active tab of *this* window, not a
+    // process-global "the tabs". A window that is already gone is a no-op.
+    let Some(tabs) = state.windows.tabs(window_id) else {
+        return;
+    };
+    let tab = tabs.active();
+    let page_url = tab.current_url().to_owned();
+    log_failure(
+        "fetch page source",
+        window.fetch_page_source(tab.id(), page_url),
+    );
+}
+
+/// Finish View Source once the requested page's markup has come back
+/// (`UserEvent::ViewSourceReady`): escape/number/truncate it into a safe
+/// document (`browser::view_source::build_view_source_document` — see its
+/// doc comment and docs/decisions.md D72 for why escaping here is what
+/// keeps this feature from being an XSS vector), encode that document as a
+/// `data:` URL, and open it exactly the way every other new tab opens
+/// (`open_new_tab` — the toolbar's "+" button, Ctrl/Cmd+T,
+/// `target="_blank"`, ...), so it inherits the same process-placement,
+/// activation, and latency-logging behavior as any other new tab, and never
+/// touches the tab the source was read from.
+fn open_view_source_tab(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    page_url: &str,
+    html: &str,
+) {
+    let document =
+        view_source::build_view_source_document(page_url, html, view_source::MAX_SOURCE_BYTES);
+    let data_url = view_source::to_data_url(&document);
+    open_new_tab(window, window_id, state, &data_url);
+}
+
 /// Resolve an already-classified [`Intent`] to a loadable URL: a URL intent
 /// passes through unchanged, a search intent is turned into the configured
 /// search engine's URL via [`navigation::build_search_url`]. `None` covers
@@ -2367,6 +2471,7 @@ fn handle_content_shortcut(
         ContentShortcut::NewWindow => {}
         ContentShortcut::OpenFindBar => open_find_bar(window, window_id, state),
         ContentShortcut::Print => print_active_tab(window, window_id, state),
+        ContentShortcut::ViewSource => request_view_source(window, window_id, state),
     }
 }
 
