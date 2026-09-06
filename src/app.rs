@@ -185,6 +185,38 @@ pub enum UserEvent {
         tab_id: TabId,
         total: usize,
     },
+    /// Issue #46 ("名前を付けて保存"):
+    /// `ui::window::BrowserWindow::request_save_page` chose a destination —
+    /// via the native Windows Save-As dialog, or (macOS/Linux, see
+    /// docs/decisions.md D76) this window's resolved download directory —
+    /// and is now registering the save so its progress/outcome shows up in
+    /// the same Downloads panel a real download does, rather than growing a
+    /// second, parallel piece of UI for it. Same shape as
+    /// [`Self::DownloadStarted`] (down to the field names) other than not
+    /// coming from a wry download-started callback.
+    SavePageStarted {
+        window_id: WindowId,
+        url: String,
+        file_name: String,
+        destination: PathBuf,
+        started_at: u64,
+    },
+    /// The save started by a `SavePageStarted` event for `destination`
+    /// finished — successfully (`error: None`) or not (`error:
+    /// Some(reason)`, an already-Japanese, human-readable message suitable
+    /// to show as-is, unlike [`Self::DownloadCompleted`]'s fixed generic
+    /// failure string — Issue #46's "エラー時に原因を表示できる" acceptance
+    /// criterion). Resolved to a [`DownloadId`] via
+    /// `DownloadStore::resolve_completion(&url, Some(&destination))` — the
+    /// exact-destination-match path that function already has, see its doc
+    /// comment — since a save's destination is always known exactly up
+    /// front, unlike a wry download completion's ambiguous callback.
+    SavePageFinished {
+        window_id: WindowId,
+        url: String,
+        destination: PathBuf,
+        error: Option<String>,
+    },
     /// The Windows-only headless PDF export (Issue #40, see
     /// `ui::webview2_print::export_as_pdf` and docs/decisions.md D75)
     /// finished — `success`/`error` come from WebView2's own
@@ -881,6 +913,11 @@ fn record_perf_event(
         | UserEvent::NewTabRequested(..)
         | UserEvent::DownloadStarted { .. }
         | UserEvent::DownloadCompleted { .. }
+        // Issue #46's save-page flow is not a perf-tracked operation either
+        // (same reasoning as `FindMatchesUpdated` below) — nothing to log
+        // here.
+        | UserEvent::SavePageStarted { .. }
+        | UserEvent::SavePageFinished { .. }
         // `handle_automation_command` calls the same tab-management
         // functions the toolbar path does, which already call
         // `record_tab_latency` themselves — nothing extra to log here.
@@ -1436,7 +1473,7 @@ fn handle_user_event(
         }
         UserEvent::ContentShortcut(window_id, shortcut) => {
             if let Some(window) = ui_windows.get_mut(&window_id) {
-                handle_content_shortcut(window, window_id, state, homepage, shortcut);
+                handle_content_shortcut(window, window_id, state, config, homepage, shortcut);
             }
         }
         UserEvent::NewTabRequested(window_id, url) => {
@@ -1478,6 +1515,47 @@ fn handle_user_event(
                     eprintln!(
                         "velox: could not correlate download completion for {url:?} \
                          (path={path:?}, success={success})"
+                    );
+                }
+            }
+            if let Some(window) = ui_windows.get(&window_id) {
+                refresh_downloads_panel(window, state);
+            }
+        }
+        UserEvent::SavePageStarted {
+            window_id,
+            url,
+            file_name,
+            destination,
+            started_at,
+        } => {
+            state
+                .downloads
+                .start(url, file_name, destination, started_at);
+            if let Some(window) = ui_windows.get(&window_id) {
+                refresh_downloads_panel(window, state);
+            }
+        }
+        UserEvent::SavePageFinished {
+            window_id,
+            url,
+            destination,
+            error,
+        } => {
+            let now = now_unix();
+            match state.downloads.resolve_completion(&url, Some(&destination)) {
+                Some(id) => match error {
+                    Some(reason) => {
+                        state.downloads.fail(id, reason, now);
+                    }
+                    None => {
+                        state.downloads.complete(id, now);
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "velox: could not correlate page-save completion for {url:?} \
+                         (destination={destination:?}, error={error:?})"
                     );
                 }
             }
@@ -2044,6 +2122,9 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::FindClose => close_find_bar(window, window_id, state),
 
+        // --- Save page (Issue #46, "名前を付けて保存"), see
+        //     docs/decisions.md D76 ---
+        ToolbarCommand::SavePage => request_save_page(window, window_id, state, config),
         // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
         ToolbarCommand::Print => print_active_tab(window, window_id, state),
         ToolbarCommand::SaveAsPdf => save_active_tab_as_pdf(window, window_id, state, config),
@@ -2301,6 +2382,33 @@ fn save_active_tab_as_pdf(
     }
 }
 
+// --- Save page (Issue #46, "名前を付けて保存"), see docs/decisions.md D76 ---
+
+/// Save the active tab's current page (Ctrl/Cmd+S from either the toolbar —
+/// `ToolbarCommand::SavePage` — or a content webview —
+/// `ContentShortcut::SavePage`, D18/D23's usual dual-channel shortcut
+/// delivery). Resolves the active tab's URL/title from `state` (the same
+/// `Tab::current_url`/`Tab::title` the tab strip already shows) and the
+/// configured download-directory override (Issue #30/D67 — only consulted
+/// by `BrowserWindow::request_save_page`'s non-Windows fallback), then hands
+/// the rest to that method: it decides the save format/destination itself
+/// (platform-specific, see D76) and reports the outcome asynchronously via
+/// [`UserEvent::SavePageStarted`]/[`UserEvent::SavePageFinished`] —
+/// nothing further to do here.
+fn request_save_page(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    config: &Config,
+) {
+    let tabs = tabs_of(state, window_id);
+    let tab_id = tabs.active_id();
+    let tab = tabs.active();
+    let url = tab.current_url().to_owned();
+    let title = tab.title().map(str::to_owned);
+    window.request_save_page(tab_id, url, title, config.download_dir_override.clone());
+}
+
 // --- View Source (Issue #45, Ctrl/Cmd+U), see docs/decisions.md D72 ---
 //
 // `ToolbarCommand::ViewSource`/`ContentShortcut::ViewSource` (D18/D23's usual
@@ -2524,6 +2632,7 @@ fn handle_content_shortcut(
     window: &mut BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
+    config: &Config,
     homepage: &str,
     shortcut: ContentShortcut,
 ) {
@@ -2562,6 +2671,7 @@ fn handle_content_shortcut(
         // `ToolbarCommand::NewWindow` in `handle_toolbar_command`).
         ContentShortcut::NewWindow | ContentShortcut::NewPrivateWindow => {}
         ContentShortcut::OpenFindBar => open_find_bar(window, window_id, state),
+        ContentShortcut::SavePage => request_save_page(window, window_id, state, config),
         ContentShortcut::Print => print_active_tab(window, window_id, state),
         ContentShortcut::ViewSource => request_view_source(window, window_id, state),
     }
