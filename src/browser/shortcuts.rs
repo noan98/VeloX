@@ -234,6 +234,7 @@ pub enum ShortcutId {
     NewWindow,
     NewPrivateWindow,
     OpenFindBar,
+    Print,
     ViewSource,
     OpenDevtools,
 }
@@ -270,6 +271,7 @@ impl ShortcutId {
             ShortcutId::NewWindow => "velox:new-window".to_owned(),
             ShortcutId::NewPrivateWindow => "velox:new-private-window".to_owned(),
             ShortcutId::OpenFindBar => "velox:open-find-bar".to_owned(),
+            ShortcutId::Print => "velox:print".to_owned(),
             ShortcutId::ViewSource => "velox:view-source".to_owned(),
             ShortcutId::OpenDevtools => "velox:open-devtools".to_owned(),
         }
@@ -406,6 +408,11 @@ pub const SHORTCUT_TABLE: &[ShortcutDef] = &[
         id: ShortcutId::OpenFindBar,
         label: "ページ内検索を開く",
         chords: &[KeyChord::new(Key::Char('f'), Modifiers::PRIMARY)],
+    },
+    ShortcutDef {
+        id: ShortcutId::Print,
+        label: "印刷",
+        chords: &[KeyChord::new(Key::Char('p'), Modifiers::PRIMARY)],
     },
     ShortcutDef {
         id: ShortcutId::ViewSource,
