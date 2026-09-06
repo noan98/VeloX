@@ -1239,16 +1239,18 @@ fn handle_user_event(
             // Issue #39/D78: same reasoning as the find bar above — a menu
             // opened against the page that is about to be replaced would
             // otherwise keep offering actions (a link URL, a selection)
-            // that no longer make sense once navigation completes. The
-            // content webview's own DOM is about to be replaced too, so
-            // there is no overlay left to hide — only the server-side
-            // `OpenContextMenu` state needs discarding.
+            // that no longer make sense once navigation completes.
+            // `hide_context_menu` also removes the overlay from the DOM —
+            // the new page will eventually replace it anyway, but a slow
+            // load could otherwise leave the stale menu visible in the
+            // meantime.
             if state
                 .windows
                 .context_menu(window_id)
                 .is_some_and(|menu| menu.tab_id() == id)
             {
                 state.windows.take_context_menu(window_id);
+                log_failure("hide context menu", window.hide_context_menu(id));
             }
             if is_active {
                 log_failure("update address bar", window.set_url_display(&url));
@@ -2770,8 +2772,13 @@ fn activate_and_refresh(
     // Issue #39/D78: a context menu belongs to the specific tab it was
     // opened against; switching away from that tab in this window makes it
     // stale the same way a tab switch invalidates the find bar above.
-    if state.windows.context_menu(window_id).is_some() {
-        state.windows.take_context_menu(window_id);
+    // Unlike a navigation (which replaces the DOM the overlay lives in), a
+    // tab switch just hides the previous tab's still-live webview (D8/D9),
+    // so the overlay would otherwise still be sitting in that tab's DOM the
+    // next time it is switched back to — `hide_context_menu` removes it
+    // from *that* tab specifically, not whichever tab ends up active.
+    if let Some(menu) = state.windows.take_context_menu(window_id) {
+        log_failure("hide context menu", window.hide_context_menu(menu.tab_id()));
     }
     let result = match effect {
         ActivationEffect::Resume => {
