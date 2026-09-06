@@ -6698,3 +6698,94 @@ URL が見える) は満たせていない。上記「表示先」の節に理�
 (前述のとおり現状は見送り)。(4) 実機 Windows での動作確認
 (`evaluate_script_with_callback` の大きな文字列、Ctrl+U のアクセラレータ
 衝突)。(5) 閉じた View Source タブの再オープン専用のテスト追加。
+## D73: コード署名 (#42) — 証明書が無いため「有効化可能な仕組み」に留め、実際の署名は見送り
+
+**対象**: Issue #42 の受け入れ条件 4 点 (macOS 署名/notarize、Windows 署名、
+秘密鍵をリポジトリに置かない、リリース手順の docs 記録) の棚卸しと対応。
+
+### 前提となる制約
+
+このプロジェクトは Windows 用コード署名証明書 (OV/EV) も macOS の Apple
+Developer Program の Developer ID も保有しておらず、リポジトリの Secrets
+にも登録されていない。証明書の新規取得には認証局への費用支払いや (Azure
+Trusted Signing の場合は) 組織の 3 年以上の事業実績または米国/カナダ在住の
+個人という適格性要件があり、このセッション内では取得できない。したがって
+**「署名された成果物を実際に生成する」ことは今回のスコープ外**とし、
+証明書が用意でき次第すぐに有効化できる仕組みと、証明書が無くても今できる
+配布信頼性の改善に絞って実装した。調査の詳細と出典 (公式ドキュメントを
+直接確認できたもの/検索結果からの要約に留まるものの区別を含む) は
+[docs/windows-code-signing.md](windows-code-signing.md) に記録した。
+
+### 実装したもの
+
+1. **`release-windows.yml` への署名ステップ追加 (opt-in)**: 以下 6 つの
+   Secrets/Variables が全て設定されている場合のみ、`azure/login` →
+   `azure/artifact-signing-action@v2` (Azure Trusted Signing。2024年前後に
+   Artifact Signing へ改称) で `velox.exe`/`velox-bench.exe` に
+   Authenticode 署名し、`Get-AuthenticodeSignature` で結果を検証する。
+   1 つでも未設定なら (現状は全て未設定) 署名ステップ一式をスキップし、
+   これまでどおり無署名の zip を作る — 既存のリリースフローを壊さない
+   ことを最優先した。
+   - `secrets.WINDOWS_CODESIGN_AZURE_CLIENT_ID` /
+     `WINDOWS_CODESIGN_AZURE_TENANT_ID` /
+     `WINDOWS_CODESIGN_AZURE_SUBSCRIPTION_ID`
+   - `vars.WINDOWS_CODESIGN_ENDPOINT` / `WINDOWS_CODESIGN_ACCOUNT_NAME` /
+     `WINDOWS_CODESIGN_CERT_PROFILE_NAME`
+   - 認証は GitHub Actions の OIDC (`permissions: id-token: write` +
+     `azure/login`) によるフェデレーション認証とし、長期のクライアント
+     シークレットや証明書そのものを Secrets に置かない設計にした
+     (秘密鍵は Azure 側の HSM に留まり CI には渡らない)。
+   - `if:` で `secrets.*` を直接比較する条件分岐は job 単位では使えず
+     step 単位でも挙動が不安定という調査結果を踏まえ、判定用の
+     `Check Windows code signing configuration` ステップを 1 つ設け、
+     env 経由でシェル変数に落としてから `enabled=true/false` を
+     `GITHUB_OUTPUT` に出す方式にした (以降のステップはその出力だけを
+     参照する、より確実な分岐)。
+2. **なぜ Azure Trusted Signing を選んだか**: 2023 年 6 月の CA/Browser
+   Forum の要件変更により、新規発行のコード署名証明書は EV/OV を問わず
+   秘密鍵がハードウェア HSM に閉じ込められエクスポート不可になった
+   (複数の独立したソースで確認)。そのため「`.pfx` を base64 化して
+   Secrets に入れて `signtool` で署名する」という古典的な GitHub Actions
+   パターンは新規証明書では成立しない。クラウド HSM 型のリモート署名
+   サービスが必要になるが、その中で GitHub 公式相当の Action
+   (`azure/artifact-signing-action`) が公開されており GitHub Actions との
+   統合コストが最も低いと判断した Azure Trusted Signing を採用した。
+   他ベンダー (DigiCert KeyLocker, SSL.com eSigner 等) への切り替えも
+   構造 (判定ステップ → ログイン/認証 → 署名 → 検証) は流用できる。
+3. **証明書なしでの配布信頼性改善**: README に SHA-256 チェックサムの
+   検証手順 (`Get-FileHash` / `sha256sum -c`) を追記し、GitHub Release
+   本文に署名済み/未署名を自動で明記するようにした
+   (`release-windows.yml` の `Create GitHub Release` ステップ)。
+4. **macOS**: release workflow 自体が D70 の判断により未着手のため、
+   署名・notarization の実装は行わず、`docs/windows-code-signing.md` に
+   Developer ID 署名 → notarytool による公証 → stapler での staple、
+   という一般的な流れの概要のみ記録した。
+
+### 見送ったもの・未検証のもの
+
+- **実際の署名の実行**: 証明書/Azure サブスクリプションが無いため、
+  `azure/login`/`azure/artifact-signing-action` のステップは一度も
+  実行されておらず (`enabled=false` で常にスキップ)、**Azure 側の設定と
+  繋げた動作確認はできていない**。証明書取得後、最初のタグ push 前に
+  必ず `workflow_dispatch` で手動実行して確認すること
+  (docs/windows-code-signing.md の「証明書を取得した後に行う作業」)。
+- **Azure Trusted Signing の適格性審査そのもの**: 組織の 3 年実績、
+  個人の米国/カナダ居住のいずれの要件もこのプロジェクトの現状では
+  満たせないため、申請自体を行っていない。
+- **macOS の署名・notarization の実装**: 概要調査のみで、
+  `codesign`/`notarytool`/`stapler` を実際に呼ぶ workflow は書いていない
+  (macOS の release workflow 自体が D70 により未着手のため)。
+- **SmartScreen レピュテーションの実際の蓄積過程**: 署名を有効化しても
+  即座に警告が消えるわけではなく、ダウンロード実績に応じて徐々に
+  蓄積されるとされる (複数ソースで確認) が、具体的な閾値は Microsoft から
+  公開されていない。実際に署名した初回リリース以降、様子を見て
+  docs/windows-code-signing.md に追記する。
+
+**Revisit condition**: (1) Windows 用コード署名証明書 (Azure Trusted
+Signing の適格性を満たす、または他ベンダーのクラウド署名サービスを契約
+する) が用意できたとき — `docs/windows-code-signing.md` の手順に従い
+Secrets/Variables を設定するだけで `release-windows.yml` の署名が有効化
+される。(2) macOS の release workflow (D70 の Revisit condition (1)) に
+着手するとき、合わせて Developer ID 署名 + notarization を実装する。
+(3) Azure Trusted Signing の適格性要件 (地域・事業年数) が緩和されたとき。
+(4) 他ベンダーのクラウド署名サービスへの切り替えを検討するとき。
