@@ -4662,3 +4662,238 @@ Windows についてはその「手を伸ばす」経路が wry 自身によっ�
    判断し、今回は追わなかった。
 4. **サイト例外は静的設定のみ**: `VELOX_CONTENT_BLOCKING_ALLOW` による
    起動時指定のみで、ツールバーからのトグル UI は無い。UI 化は follow-up。
+
+## D61: CI に Windows ジョブを追加する — macOS は対象外、統合テストは実行しない
+
+**対象**: Issue #33 (Epic #53)。当初の受け入れ条件「3 OS でビルド可能な状態を
+検証できる」は、Epic #53 のスコープ見直し (CLAUDE.md「対応 OS の優先度」) に
+より外れている。本 Issue でやるのは「Windows の CI 品質ゲートを整える」こと。
+
+**判断**:
+
+- **`ci.yml` に `check-windows` (windows-latest) ジョブを追加する。** 既存の
+  `check` (Linux) ジョブは変更しない — `VELOX_INTEGRATION_REQUIRE_GUI` +
+  `xvfb-run` + `dbus-run-session` の組み合わせは Issue #34/#72 の再発防止策
+  そのものなので、触らない。追加ジョブは同じ `CI` workflow 内の別ジョブに
+  するため、`auto-merge.yml` の `workflow_run.workflows` リスト
+  (`CI` / `Performance Regression Gate` / `Release (Windows)`) は変更不要
+  (workflow 単位のトリガであり、ジョブ追加では変わらない)。一方で
+  auto-merge 自体は PR の head commit の check-runs を全件見て
+  success/skipped/neutral を要求するため、`check-windows` の追加によって
+  「Windows のビルド/テストが通らない PR は自動マージされない」が新たに
+  効くようになる — これは本 Issue の目的 (Windows の品質ゲート) と合致する
+  望ましい副作用であり、`auto-merge.yml` 側の追加対応は不要と判断した。
+- **macOS ジョブは追加しない。** CLAUDE.md の「macOS / Linux は当面
+  『最低限の整備』に留める」方針に明記されている通りで、macOS ランナーは
+  Linux より高コスト (課金上の重み) なうえ、CI 時間とメンテコストが増える
+  だけで Windows 優先方針には寄与しない。Linux は既存 CI と性能計測の
+  実行環境として引き続き必要だが、macOS には今のところそのどちらの役割も
+  無い。macOS の本格対応は Issue #33 の完了を待たず、3 OS の品質が
+  「担保できた段階」(CLAUDE.md 該当節) で改めて着手する。
+- **Windows ジョブは `cargo build` + `cargo test --lib` のみで、統合テスト
+  (`tests/integration.rs`) は実行しない。** `tests/integration.rs` の
+  `gui_skip_reason()` は Linux でのみ `DISPLAY`/`DBUS_SESSION_BUS_ADDRESS`
+  を見てスキップ判定をし、macOS/Windows では常に `None` (スキップしない)
+  を返す設計になっている — 「デスクトップ OS なら追加の下準備なしに GUI が
+  起動できるはず」という前提のためだが、GitHub Actions の `windows-latest`
+  ホストランナー (対話セッションはあるが CI 専用の仮想環境) で実際に
+  `velox` (WebView2) のウィンドウ起動・イベントループが安定して成立するかは
+  未検証・不確実。これを確かめずに `cargo test` (引数なし) をそのまま
+  Windows ジョブで動かすと、(a) 実際に統合テストが GUI 起動に失敗して
+  ジョブが赤くなり続ける、または (b) 何らかの理由で当たり障りなく通って
+  しまい「Windows で検証できた」と誤認する、のどちらに転んでも本 Issue の
+  目的に反する。特に (b) は Issue #34 がまさに防ごうとした「見かけ上は緑だが
+  何も検証できていない」形そのものなので避けたい。そこで **確実に成立する
+  範囲 (`src/browser/` 配下の純粋ロジックに対する `--lib` 単体テスト) だけを
+  Windows ジョブの対象にし、GUI を要する統合テストは対象外であることを
+  ワークフローのコメントに明記する**、という安全側の設計にした。
+  「動いたことにする」のではなく「まだ検証していない」ことを明示している。
+- **`cargo build --release` は通常の PR 向け CI には追加しない。**
+  `release-windows.yml` が `workflow_dispatch` / `v*` タグ push で thin LTO
+  付きの release ビルドをすでに検証しており (WebView2 のセットアップ含めて
+  前例がある)、それを PR ごとに複製すると thin LTO のぶん CI 時間が伸びる
+  だけで得るものが少ない。PR ゲートでは debug ビルドの `cargo build` で
+  「ビルドが壊れていないか」だけを見れば十分と判断した。
+- **fmt / clippy は Windows ジョブに複製しない。** どちらもソースコードの
+  静的な整形・lint であり OS 依存の結果差が無いため、Linux ジョブで 1 回
+  実行すれば足りる。Windows ジョブは「Windows 固有の懸念 (ビルド・実行時の
+  単体テスト)」に絞った。
+- **依存キャッシュは Linux ジョブと同じ `Swatinem/rust-cache@v2` を使う。**
+  ランナー OS ごとにキーが分かれるため、Linux 用キャッシュと衝突しない。
+
+**追加したジョブが初回実行で既存バグを 1 件検出した**: `check-windows` を
+入れた最初の CI 実行で `cargo test --lib` が**コンパイルエラー**で落ちた。
+`src/browser/downloads.rs` の `resolve_unix_download_dir` は
+`#[cfg(not(any(target_os = "macos", target_os = "windows")))]` でガードされて
+いるのに、それを呼ぶ 3 つのテスト (`unix_dir_*`) には同じ cfg が付いておらず、
+Windows/macOS では「存在しない関数を呼ぶテスト」が残ってしまう、という
+書き漏れである。同ファイルの `open_path_command_*` テストは最初から同じ cfg
+を持っており、そこと不揃いだった。**この不整合は main に元からあったもので、
+CI が Linux 専用だったために誰も気づけなかった** — Windows ジョブを足す価値が
+そのまま出た形なので、本 PR のスコープ内 (追加したジョブを緑にする) として
+同じ PR で修正した。テストを削除・スキップしたのではなく、テスト対象の関数と
+同じ cfg をテスト側にも付けて対象プラットフォームを揃えただけであり、Linux
+では従来通り 3 件とも実行される。
+
+**Linux から Windows のコンパイルを事前検証できる**: 上記の切り分けの過程で、
+`rustup target add x86_64-pc-windows-msvc` を入れれば Linux 上でも
+
+```sh
+cargo check --target x86_64-pc-windows-msvc --all-targets
+```
+
+が通ることを確認した。リンクを伴わない型チェックのみなので MSVC ツール
+チェーンは不要で、`webview2-com` / `tao` の Windows 版まで検査される。実際、
+修正前はこのコマンドが CI と同一の 3 エラーを再現し、修正後は解消した。
+Windows 固有コードや cfg 分岐を触るときは、CI を一往復させる前にこれで
+確認できる。ただし**リンクと実行を伴わないため、これが通っても
+`cargo build` / `cargo test` が Windows で通る保証にはならない** — 実行時の
+挙動を見るのは引き続き `check-windows` ジョブの役割である。この事情から、
+このコマンドを CI に足すことはしない (Windows ジョブが上位互換であり、
+Linux ジョブに足しても検査が重複するだけ)。開発者の手元での事前確認手段と
+して CLAUDE.md に記載するに留める。
+
+**検証の限界 (正直な記録)**: 本 Issue の実装は Linux 環境で行っており、
+`check-windows` ジョブが `windows-latest` 上で最終的にグリーンになるかは
+本 PR の CI 実行結果で確認する。上記の Windows ターゲット型チェック、YAML
+構文の妥当性 (`yaml.safe_load`)、既存 Linux ジョブのコマンドがローカルで
+通ることは確認済みだが、Windows ランナー上での実行時の挙動 (WebView2 を
+含む) はこの環境では確かめられない。
+
+**Revisit condition**: (1) `windows-latest` 上で `tests/integration.rs` の
+GUI 起動 (WebView2) が安定して動くことを実際の CI 実行で確認できたら、
+`check-windows` にも統合テスト (`cargo test` 全体、あるいは
+`VELOX_INTEGRATION_REQUIRE_GUI` 相当の仕組み) を追加する。(2) 3 OS の
+品質が担保できた段階 (CLAUDE.md「対応 OS の優先度」) で macOS ジョブの
+追加を再検討する。(3) Windows ジョブが赤くなったときは、原因が CI 環境
+固有の問題なのか実コードの Windows 対応不足なのかを切り分ける — 初回の
+`resolve_unix_download_dir` は後者だった。
+
+## D63: 依存関係・セキュリティ監査を CI 化 (#37) — cargo-deny 単体を採用し、PR は依存グラフを触った時だけブロッカーにする
+
+**対象**: Issue #37。Rust 依存クレートの脆弱性・ライセンス・更新状況を CI で
+継続監視する。実装前に `cargo install cargo-audit` / `cargo install
+cargo-deny` を実際にこの環境で行い、VeloX の依存ツリー (Cargo.lock 286
+クレート、`gtk = "0.18"` を含む Linux ターゲット cfg 依存も含む) に対して
+両方を実際に走らせた結果に基づいて判断した (机上の一般論やよくある
+allow-list のコピペではない)。
+
+**判断**:
+
+- **`cargo-audit` と `cargo-deny` の両方をローカルで実行して比較し、
+  最終的に CI には `cargo-deny` だけを採用した。** `cargo audit` の結果は
+  「既知脆弱性 (vulnerability) 0 件、warning 12 件」。12 件の内訳は
+  `Cargo.toml` の `[target.'cfg(any(target_os = "linux", ...))'.dependencies]`
+  にある `gtk = "0.18"` (wry の gtk バックエンドが Linux ビルドに必要と
+  する gtk-rs GTK3 バインディング) が引き込む transitive 依存
+  (`atk`/`atk-sys`/`gdk`/`gdk-sys`/`gdkwayland-sys`/`gdkx11`/
+  `gdkx11-sys`/`gtk`/`gtk-sys`/`gtk3-macros` の unmaintained
+  advisory 10 件、`proc-macro-error` の unmaintained 1 件、`glib` の
+  unsound 1 件、RUSTSEC ID は deny.toml の `[advisories].ignore` に
+  列挙) だけで、VeloX 自身のコードに起因するものは無い。`cargo deny
+  check advisories` は同じ RustSec DB を使うため検知内容は同一だが、
+  advisories に加えて licenses/bans/sources もカバーする上位互換であり、
+  Issue の受け入れ条件にある「ライセンス監査」を別ツールで賄う必要が
+  無くなる。CLAUDE.md / D6 の「依存クレートは必要最小限に保つ」は
+  Rust クレートの話だが、CI ツールについても「同じ RustSec DB を見る
+  ツールを 2 本併走させて設定ファイルを 2 つメンテする」意味は無いと
+  判断し、`cargo-audit` は本 Issue の調査目的にのみ使い、CI には積まない。
+- **ライセンス監査は実データに基づく allow-list にした。**
+  `cargo deny init` の空 allow-list で `cargo deny check licenses` を
+  走らせ、実際に拒否された全エントリの SPDX 式 (286 クレート分) を
+  集計した結果、VeloX の依存ツリーに現れる atomic license は
+  `0BSD` / `Apache-2.0` / `Apache-2.0 WITH LLVM-exception` /
+  `BSD-3-Clause` / `CC0-1.0` / `MIT` / `MIT-0` / `MPL-2.0` /
+  `Unicode-3.0` / `Unlicense` / `Zlib` の 11 種類のみで、GPL 系の
+  copyleft ライセンスは一切無かった。`deny.toml` の `[licenses].allow`
+  にはこの 11 種類だけを列挙している (「よくある allow-list」のコピペ
+  ではなく実測値)。唯一の非パーミッシブ枠は `MPL-2.0` (wry →
+  `dom_query` → `cssparser`/`cssparser-macros`/`selectors` 経由) で、
+  ファイル単位の弱いコペレフト (バイナリ配布・リンクは制限しない) の
+  ため許可した。VeloX 自身は MIT (Cargo.toml の `license = "MIT"`) で、
+  MPL-2.0 のファイルを改変して再配布する予定は無い。
+- **advisories の `unsound` スコープを既定の `"workspace"` から
+  `"all"` に上書きした。** `unmaintained` の既定は `"all"` (transitive
+  依存も検査) だが `unsound` の既定は `"workspace"` (自クレート自身が
+  unsound advisory を持つ場合のみ) で、そのままだと `glib 0.18.5`
+  (RUSTSEC-2024-0429, `glib::VariantStrIter` の Iterator 実装の
+  unsound) のような transitive advisory を検査対象から外してしまう。
+  見落としを防ぐため明示的に `"all"` にした。
+- **例外ルールは `deny.toml` の `[advisories].ignore` に RUSTSEC ID +
+  理由を 1 件ずつ書く運用にした。** 一括で `unmaintained = "allow"` に
+  するような包括的な緩和はせず、個別 ID を列挙する。個別に列挙する
+  ことで、将来 VeloX 自身が直接依存する別のクレートが新たに
+  unmaintained/unsound になったときはちゃんと検知され (`ignore` に
+  無い ID なので `advisories FAILED` になる)、今回把握済みの 12 件
+  だけが素通りする。誤検知や「対応版が無い」既知の警告を握りつぶす
+  のではなく、1 件ごとに `docs/decisions.md` (本項) への参照込みで
+  記録した。
+- **CI は新しい workflow `.github/workflows/dependency-audit.yml` を
+  追加し、既存の `ci.yml` (#33 の成果物、`check-windows` を含む) には
+  一切手を入れていない。** ジョブは `EmbarkStudios/cargo-deny-action@v2`
+  (ビルド済みバイナリを取得して実行するため、ソースからの
+  `cargo install cargo-deny` (ローカル検証で約 3 分) を CI 毎回走らせ
+  ずに済む) で `cargo deny check` (advisories/bans/licenses/sources
+  すべて) を実行する。
+- **CI failure policy: `continue-on-error` は使わず、代わりに
+  トリガーの `paths` フィルタでブロッカーの範囲を絞った。** 2 系統の
+  トリガーを用意している。
+  1. `pull_request` (`paths: ["Cargo.toml", "Cargo.lock", "deny.toml",
+     ".github/workflows/dependency-audit.yml"]` に限定): 依存グラフ
+     そのものを変更する PR に対してだけ、通常どおり (継続不可の)
+     マージブロッカーとして働く。依存を一切触らない大多数の PR では
+     `paths` に一致するファイルが無いためジョブそのものが起動せず、
+     check-run も生成されない。
+  2. `schedule` (毎日 1 回、`cron: "0 18 * * *"` = JST 03:00): 依存を
+     まったく動かしていない期間に後から公表される advisory を拾う
+     ための定期監視。PR の head commit に紐付かないので、失敗しても
+     `auto-merge.yml` の判定には影響しない。
+  この設計により「VeloX 側に非がなく突然公表される advisory で、依存を
+  何も動かしていない無関係な PR まで巻き込んで開発が止まる」という
+  Issue 本文の懸念を、`continue-on-error` で失敗を握りつぶすのではなく
+  「そもそもその PR では検査が走らない/走っても PR 自身の変更が原因」
+  という形で構造的に避けた。
+- **`auto-merge.yml` への影響**: 上記の `paths` フィルタにより、依存を
+  触らない PR ではこのジョブの check-run 自体が存在しないため、
+  `auto-merge.yml` の「head commit の全 check-runs が success/skipped」
+  判定には最初から数えられない (影響ゼロ)。依存を触った PR では
+  他のジョブと同様に 1 つの check-run として扱われ、失敗すれば
+  (継続不可なので) 従来どおりマージが止まる — これは意図した挙動
+  (依存グラフを変えた張本人に対応してもらう)。`workflow_run.workflows`
+  リストにも `Dependency Audit` を追加した (D55 のコメント「新しい
+  workflow を追加したら追加する」に従う。追加漏れがあっても 30 分毎の
+  `schedule` フォールバックがあるため誤動作にはならない)。
+- **lockfile 監視・依存更新チェックは Dependabot (`.github/dependabot.yml`)
+  を新規導入した。** `cargo` エコシステムと `github-actions` エコシステム
+  の両方を対象にし、週次 (月曜) + `groups` で minor/patch 更新を 1 本の
+  PR にまとめる (major はグルーピング対象外で個別 PR のまま — wry/tao/gtk
+  のような描画スタック本体の major bump は挙動が変わりうるため一括
+  マージしたくない)。Dependabot が作る PR には `no-automerge` ラベルを
+  付与し、`auto-merge.yml` の対象から明示的に外した。理由は、
+  `cargo fmt`/`clippy`/`cargo test` が通っても依存更新が WebView の
+  実際の描画・IPC 挙動まで検証できるわけではなく、人間のレビューを
+  必ず挟みたいため。
+
+**検証の限界 (正直な記録)**: (1) `EmbarkStudios/cargo-deny-action@v2` を
+実際に GitHub Actions 上で実行して確認したわけではない (この環境では
+`cargo deny` をソースからインストールしてローカルで直接走らせて検証した)。
+action 自体の配布バイナリ取得やキャッシュ挙動は、本 PR マージ後の実際の
+CI 実行で確認する必要がある。(2) `deny.toml` の advisories ignore
+(RUSTSEC-2024-0411/0412/0413/0414/0415/0416/0417/0418/0419/0420/0370/0429)
+はすべて `gtk = "0.18"` (Linux 専用ターゲット依存) 由来で、CLAUDE.md の
+「対応 OS の優先度」(Windows 最優先、Linux は最低限の整備) と整合する
+判断だが、上流の gtk-rs が GTK4 版に移行しない限り、あるいは wry が
+gtk4-rs 対応の新しい gtk backend を出さない限り解消しない — VeloX 単独
+では直せない。(3) `dependabot.yml` の実際の PR 生成・grouping の挙動も
+マージ後の初回実行を待って確認する必要がある。
+
+**Revisit condition**: (1) wry が GTK4 (gtk4-rs) ベースの gtk backend を
+リリースし、`gtk = "0.18"` を上げられるようになったら、`deny.toml` の
+gtk-rs 関連の `ignore` エントリを削除する。(2) `EmbarkStudios/cargo-deny-action`
+が実際の CI 実行で想定通り動くか (プラットフォーム互換のバイナリ取得・
+キャッシュ) を確認し、問題があれば `cargo install cargo-deny --locked`
+方式に切り替える。(3) Dependabot の週次 PR 頻度・grouping が実際に
+運用してみて多すぎる/少なすぎると分かったら `interval`/`groups` を
+調整する。(4) 新しい直接依存の追加で MPL-2.0 以外の copyleft ライセンス
+(GPL 系など) が入りそうになったら、`deny.toml` の allow ではなく
+依存追加自体を見直す。
