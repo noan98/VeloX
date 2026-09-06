@@ -7470,3 +7470,171 @@ Secrets/Variables を設定するだけで `release-windows.yml` の署名が有
 着手するとき、合わせて Developer ID 署名 + notarization を実装する。
 (3) Azure Trusted Signing の適格性要件 (地域・事業年数) が緩和されたとき。
 (4) 他ベンダーのクラウド署名サービスへの切り替えを検討するとき。
+
+## D77: キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと
+`browser::shortcuts::SHORTCUT_TABLE` への集約、衝突検出、信頼境界は不変
+
+**対象**: Issue #38 の受け入れ条件 4 点 (主要ショートカットの一元定義、
+OS 別 modifier 表示、キー衝突検出、テストでの主要 mapping 保証)。依存
+Issue #11 (タブ管理ショートカット)/#30 (設定基盤) は着手済み。
+
+### 前提: この Issue は「ゼロから作る」ではなく「集約」
+
+着手前に既存実装を棚卸しした結果、VeloX には既に **21 個**のキーボード
+ショートカットが実装済みで、`src/ui/window.rs`(`ContentShortcut`/
+`tab_shortcut_script`/`parse_content_shortcut`、content webview 向けの
+センチネル文字列チャネル)、`src/ui/toolbar.rs`/`toolbar.html`
+(`ToolbarCommand`、toolbar 自身の trusted チャネル)、`src/app.rs`
+(`handle_content_shortcut`/`handle_toolbar_command`)、
+`src/browser/settings.rs`(`shortcut_reference`、設定画面 Shortcuts タブの
+表示専用リスト、Issue #30/D67) の**最大 4 箇所**に定義が散在していた:
+
+| # | 操作 | キー | 導入 Issue |
+|---|------|------|-----------|
+| 1 | 新しいタブ | Ctrl/Cmd+T | #11 |
+| 2 | タブを閉じる | Ctrl/Cmd+W | #11 |
+| 3 | 閉じたタブを再度開く | Ctrl/Cmd+Shift+T | #11 |
+| 4 | 次のタブ | Ctrl/Cmd+Tab | #11 |
+| 5 | 前のタブ | Ctrl/Cmd+Shift+Tab | #11 |
+| 6-13 | 1〜8番目のタブに切り替え | Ctrl/Cmd+1〜8 | #11 |
+| 14 | 最後のタブに切り替え | Ctrl/Cmd+9 | #11 |
+| 15 | アドレスバーにフォーカス | Ctrl/Cmd+L | #15 |
+| 16 | ブックマークの追加/削除 | Ctrl/Cmd+D | #19 |
+| 17 | ブックマークバーの表示切替 | Ctrl/Cmd+Shift+B | #19 |
+| 18 | 新しいウィンドウ | Ctrl/Cmd+N | #29 |
+| 19 | ページ内検索を開く | Ctrl/Cmd+F | #43 |
+| 20 | ページのソースを表示 | Ctrl/Cmd+U | #45 |
+| 21 | DevTools を開く | F12 (macOS: Cmd+Option+I) | 初期実装 (D18) |
+
+棚卸し中に見つかった実害のあるドリフト: `settings::shortcut_reference`
+(#30 が D67 で作った設定画面の一覧) は #29 (`NewWindow`) と #43
+(`OpenFindBar`) を欠いたままだった — この 2 つは `ui::window`/
+`ui::toolbar` には実装済みなのに、設定画面には一度も表示されていなかった。
+定義が 1 箇所に無いと起きる、まさに本 Issue が解消すべき問題の実例。
+
+エディタ内 (`urlInput`/`findInputEl`/`historySearchEl` 等) の Enter/Esc/
+Shift+Enter は対象外とした: これらは特定 UI 要素にフォーカスがあるときだけ
+意味を持つウィジェット固有の挙動で、OS 別 modifier も衝突検出も本質的に
+関係しない (Ctrl/Cmd を伴わない、対象範囲外)。
+
+### 設計: `browser::shortcuts` を唯一のテーブルにする
+
+新設 `src/browser/shortcuts.rs`(UI/エンジン非依存、`browser::` 配下 —
+アーキテクチャの 4 層分離を維持) に以下を実装した:
+
+- **`Platform`**(Windows/MacOs/Linux) — `Platform::current()` のみが
+  `cfg(target_os)` を読み、他の関数はすべて `Platform` を引数に取る
+  purely な形にした。CI が Linux でしか動かない (CLAUDE.md の OS 優先度
+  方針) 環境でも、3 OS 分のラベル生成ロジックを全て単体テストできる。
+- **`Key`/`Modifiers`/`KeyChord`** — 物理キーと修飾キーの組。
+  `Modifiers::primary` は「Ctrl-or-Cmd を両方受け付ける」という*表示上*の
+  概念であり、実際のキー判定 (`event.ctrlKey || event.metaKey`、D23) は
+  一切変更していない — `KeyChord::label(platform)` は表示文字列
+  (`"Ctrl+T"`/`"Cmd+T"`) を組み立てるだけの純粋関数。
+- **`ShortcutId`** — 21 個の操作それぞれに対応する安定な識別子。
+  `serde(rename_all = "snake_case")` を付け、将来 `Settings` に
+  `HashMap<ShortcutId, KeyChord>` 的な上書きテーブルを足す際の鍵として
+  そのまま使える形にした (「将来のユーザーカスタマイズを考慮した定義形式」
+  という受け入れ条件への回答)。
+- **`SHORTCUT_TABLE: &[ShortcutDef]`** — 21 行のテーブル。各行は
+  `{ id, label (日本語表示名), chords }`。これが**唯一の**定義箇所。
+- **`find_conflicts(&[ShortcutDef]) -> Vec<ShortcutConflict>`** — 同一
+  `KeyChord` に 2 つ以上の異なる `ShortcutId` が結び付いていないかを
+  検出する純粋関数。`SHORTCUT_TABLE` 自体に衝突が無いことを回帰テスト
+  (`default_table_has_no_conflicts`) として固定した — #27/#40/#46 が
+  Ctrl/Cmd+Shift+N・+P・+S を追加する際、既存の割り当てと衝突すれば
+  この 1 テストが red になる。
+- **`parse_sentinel(&str) -> Option<ShortcutId>`** — センチネル文字列 →
+  `ShortcutId` の逆引き。`SHORTCUT_TABLE` を線形走査して厳密一致のみを
+  見る、コンパイル時に閉じた集合に対する検索であり、JSON 化やパターン
+  マッチの類推は一切行わない。
+
+### 信頼境界 (D18/D23) は一切変更していない
+
+**この Issue が変えたのは「同じ文字列がどこで宣言されているか」だけで、
+「content webview から何が送れるか」は 1 文字も変えていない。**
+
+- content webview の IPC ハンドラは今までどおり、`window.ipc` から届いた
+  生文字列を**厳密一致でのみ**比較する。`ui::window::parse_content_shortcut`
+  は `browser::shortcuts::parse_sentinel` に処理を委譲するようになったが、
+  `parse_sentinel` 自体も「コンパイル時に固定された文字列の集合との厳密
+  一致」以外の何もしない — JSON デコードや構造化データの解釈は一切ない。
+  これは D18/D23 が定めた「content webview の IPC チャネルは
+  `ToolbarCommand` 型の構造化コマンドパーサに成長させてはいけない」という
+  制約をそのまま維持している。
+- **`ShortcutId::OpenDevtools` は `ContentShortcut` に写像されない**
+  (`parse_content_shortcut` が明示的に `None` を返す) — DevTools は今までと
+  同じ、独立した `OPEN_DEVTOOLS_MESSAGE`/`devtools_shortcut_script`
+  経由の配送を維持している (`devtools` フィーチャ/`debug_assertions` の
+  gating も含め D18 のまま)。`SHORTCUT_TABLE` に載っているのはドキュメント
+  化と衝突検出のためであり、配送経路を統合したわけではない。
+- toolbar (信頼済み webview) 側は今までどおり `ToolbarCommand` という
+  実 enum を送り続ける。`SHORTCUT_TABLE` はこの enum を生成しない —
+  生成してしまうと「データ駆動のコマンド」という、まさに D18 が禁じている
+  形に近づいてしまうため、意図的に手動のまま残した (下記参照)。
+- **新規テスト** `content_webview_cannot_smuggle_an_unknown_command_
+  through_the_shortcut_channel`(`src/ui/window.rs`) で、`ToolbarCommand`
+  を偽装した JSON ペイロードや近似文字列を含む未知のコマンド文字列が
+  すべて `None` になることを明示的に検証した。既存の
+  `parse_content_shortcut_rejects_anything_not_an_exact_known_sentinel`/
+  `parse_content_shortcut_does_not_panic_on_hostile_content_webview_input`
+  (Issue #35 由来) は変更せずそのまま維持している。
+
+### 新しいショートカットを 1 つ追加するとき、実際に触る箇所
+
+目標としていた「1 行足せば済む」は content webview 側の配送コードに限って
+達成できた。全体としては以下の通り (#27/#40/#46 が Ctrl/Cmd+Shift+N・+P・
++S を統合する際の実際の作業量):
+
+- **`browser::shortcuts::SHORTCUT_TABLE` に 1 行追加**(`ShortcutId` に
+  バリアントを 1 つ追加、`sentinel()` に 1 アーム追加) — これだけで
+  ①衝突検出のスコープに入る、②設定画面 Shortcuts タブに表示される
+  (`settings::shortcut_reference` がテーブルを読むだけになったため)、
+  ③content webview 向け JS (`tab_shortcut_script`、
+  `tab_shortcut_branches` が `SHORTCUT_TABLE` を読んで `if`/`else if`
+  チェーンを自動生成する) にも自動的に反映される。
+- **`ui::window::ContentShortcut` に 1 バリアント追加、
+  `parse_content_shortcut` に 1 アーム追加** — content webview 経由でも
+  発火させたい場合のみ。型安全な enum を保つための必須の手作業で、
+  データテーブルには生成させない (信頼境界の節を参照)。
+- **`ui::toolbar::ToolbarCommand` に 1 バリアント追加、`toolbar.html` の
+  `keydown` リスナーに 1 分岐追加** — toolbar (アドレスバー/パネルに
+  フォーカスがあるとき) 経由でも発火させたい場合。同じ理由で手作業のまま。
+- **`app.rs` の `handle_content_shortcut`/`handle_toolbar_command` に
+  1 アームずつ追加** — 実際の処理を呼ぶ。
+
+4 箇所が 2 箇所 (テーブル 1 箇所 + toolbar 側の enum/JS/dispatch) に減った。
+toolbar 側が残るのは、D18 が「toolbar は構造化コマンドを送ってよい信頼済み
+チャネル」と定めていることの直接の帰結であり、それ自体を自動生成に
+置き換えることは信頼境界の設計そのものに触れるため見送った (下記参照)。
+
+### 見送ったこと・後続 Issue に切り出したこと
+
+- **設定画面からの再割り当て UI は実装していない**。`ShortcutId`/
+  `KeyChord` は serde 対応済みで `Settings` に上書きテーブルを足す土台は
+  あるが、実際に `Settings` へフィールドを追加し、`toolbar.html`
+  の Shortcuts タブを編集可能にし、`ToolbarCommand::UpdateSettings` 経由で
+  検証・永続化する UI 実装は行っていない。理由: 本 Issue の主目的である
+  「既存ショートカットの集約・衝突検出・OS 別 modifier 表示」だけでも
+  実装・テストの規模が大きく、UI までスコープに入れると本 PR の変更範囲が
+  過大になると判断した。後続 Issue #156 として切り出し、
+  `cost:medium`/`benefit:3` を付与した。
+- **toolbar 側 (`ToolbarCommand`/`toolbar.html`) の JS/enum の自動生成**は
+  行っていない。content webview 側と同じ生成パターンを適用することも
+  技術的には可能だが、`ToolbarCommand` は `serde` の構造化コマンドであり
+  (フィールド付きバリアントもある)、汎用的なコード生成にすると
+  「データテーブルが実質的にコマンドディスパッチを決める」形に近づき、
+  D18 が意図的に避けた設計に踏み込むリスクがあるため見送った。
+  `find_conflicts`/`shortcut_reference` は toolbar 側の割り当ても
+  (`SHORTCUT_TABLE` に含めているので) カバーしている。
+- **macOS 実機での動作検証はできていない** (CLAUDE.md の OS 優先度方針
+  どおり、Linux で実装・テストし、`cargo check --target
+  x86_64-pc-windows-msvc` で Windows のコンパイルのみ確認した)。
+  `Platform::label`/`Platform::current` の macOS 分岐は単体テストで
+  網羅しているが、実機の Cmd キー入力そのものは D23 から変更していない
+  ため新規リスクではないと判断した。
+
+**Revisit condition**: (1) 上記の再割り当て UI を実装する後続 Issue に
+着手するとき — `ShortcutId`/`KeyChord` の serde 形式を土台にした
+`Settings` 拡張から始める。(2) #27/#40/#46 のショートカットを実際に
+`SHORTCUT_TABLE` へ統合するとき — 本 D77 の「触る箇所」の手順に従う。

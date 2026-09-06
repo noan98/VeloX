@@ -1497,7 +1497,7 @@ mod tests {
         let shortcuts = crate::browser::shortcut_reference();
         let view = SettingsView {
             settings: &settings,
-            shortcuts,
+            shortcuts: &shortcuts,
             site_permissions: &[],
         };
         let script = set_settings_script(&view);
