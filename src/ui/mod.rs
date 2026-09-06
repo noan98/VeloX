@@ -4,6 +4,8 @@
 //! it talks to Rust over the webview IPC channel (see [`toolbar`]).
 
 pub mod toolbar;
+#[cfg(windows)]
+pub mod webview2_blocking;
 pub mod window;
 
-pub use window::{BrowserWindow, ContentShortcut};
+pub use window::{BrowserWindow, ContentShortcut, SitePolicies};

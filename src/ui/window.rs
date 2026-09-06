@@ -35,16 +35,22 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Icon, Window, WindowBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
-use wry::{PageLoadEvent, Rect, WebContext, WebView, WebViewBuilder};
+use wry::{
+    PageLoadEvent, PermissionKind as WryPermissionKind, PermissionResponse, Rect, WebContext,
+    WebView, WebViewBuilder,
+};
 
 use crate::app::UserEvent;
 use crate::browser::downloads;
-use crate::browser::{group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, TabId};
+use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
+use crate::browser::{
+    group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, SiteExceptions, TabId,
+};
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
 
@@ -543,6 +549,29 @@ fn pick_process_group(
         .map(|(group, _)| group)
 }
 
+/// The site-scoped stores [`BrowserWindow::new`] needs, bundled into one
+/// argument.
+///
+/// These three arrived from three separate issues (#17/#21 の `blocklist`、
+/// #22 の `site_exceptions`、#24 の `site_permissions`) and were originally
+/// three separate parameters. Together with `initial_url` (#25) that pushed
+/// `new` past clippy's `too_many_arguments` limit, and the three are always
+/// passed together anyway — every one of them is a policy that must apply
+/// identically to every tab, whenever and however its webview comes into
+/// existence. Bundling them is the same move [`ContentPolicy`] makes one
+/// layer down for [`content_webview_builder`]; this type is the public,
+/// `app.rs`-facing half of it (it deliberately does *not* carry
+/// `content_blocking_enabled`, which `new` derives from `Config` itself).
+pub struct SitePolicies {
+    /// Ad/tracker filter rules content blocking matches against
+    /// (docs/decisions.md D17).
+    pub blocklist: Arc<FilterList>,
+    /// Per-site content-blocking exceptions (Issue #22, D59).
+    pub site_exceptions: Arc<SiteExceptions>,
+    /// Per-origin permission decisions (Issue #24, D60).
+    pub site_permissions: Arc<SitePermissionStore>,
+}
+
 /// The main browser window: the toolbar webview and one content webview per
 /// tab.
 pub struct BrowserWindow {
@@ -610,6 +639,24 @@ pub struct BrowserWindow {
     /// Whether content blocking is currently active; threaded into every
     /// [`content_webview_builder`] call alongside `blocklist`.
     content_blocking_enabled: bool,
+    /// Per-site content-blocking exceptions (Issue #22, D59). Kept
+    /// alongside `blocklist` for the same reason: every tab's content
+    /// webview, however and whenever it comes into existence, must see the
+    /// same exception list. Consulted only by the Windows/WebView2
+    /// subresource-blocking hook today (`ui::webview2_blocking`); main-frame
+    /// navigation blocking does not use it yet (D17's `with_navigation_handler`
+    /// predates this field). Kept unconditionally (not `#[cfg(windows)]`,
+    /// unlike `host`) so `BrowserWindow::new`'s signature — and therefore
+    /// `app.rs`, which is otherwise OS-agnostic — does not need a
+    /// platform-specific branch just to build this struct; `#[allow(dead_code)]`
+    /// on macOS/Linux is the cheaper cost of the two.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    site_exceptions: Arc<SiteExceptions>,
+    /// Per-origin permission decisions (Issue #24, docs/decisions.md D60).
+    /// Kept for the same reason as `blocklist`: every tab's content
+    /// webview, however and whenever it comes into existence, is built
+    /// through [`content_webview_builder`] with the same store.
+    site_permissions: Arc<SitePermissionStore>,
 }
 
 impl BrowserWindow {
@@ -625,18 +672,24 @@ impl BrowserWindow {
     /// `Tabs::new(config.homepage.clone())` set as the same tab's
     /// `current_url` too.
     ///
-    /// `blocklist` is the ad/tracker filter list content blocking matches
-    /// against (see docs/decisions.md D17); it is stored on `self` so every
-    /// tab opened later — or rebuilt on resume from suspension — is built
-    /// through the same [`content_webview_builder`] with blocking applied.
+    /// `policies` carries the site-scoped stores every tab must share (see
+    /// [`SitePolicies`]). They are stored on `self` so every tab opened
+    /// later — or rebuilt on resume from suspension — is built through the
+    /// same [`content_webview_builder`] with the same policies as the first
+    /// tab.
     pub fn new(
         event_loop: &EventLoopWindowTarget<UserEvent>,
         config: &Config,
         proxy: EventLoopProxy<UserEvent>,
         initial_tab: TabId,
         initial_url: &str,
-        blocklist: Arc<FilterList>,
+        policies: SitePolicies,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        let SitePolicies {
+            blocklist,
+            site_exceptions,
+            site_permissions,
+        } = policies;
         // A window-title suffix is a second, independent tell for private
         // mode (docs/decisions.md D14): unlike the toolbar badge it survives
         // being covered by another window in a taskbar/alt-tab switcher.
@@ -762,10 +815,28 @@ impl BrowserWindow {
                 // join (D54).
                 related: None,
             },
-            Arc::clone(&blocklist),
-            content_blocking_enabled,
+            ContentPolicy {
+                blocklist: Arc::clone(&blocklist),
+                content_blocking_enabled,
+                site_permissions: Arc::clone(&site_permissions),
+            },
         );
         let content = attach(content_builder)?;
+        // Windows-only subresource blocking (Issue #22, D59): a no-op on
+        // every other platform (`attach` compiles away entirely there — see
+        // its doc comment). Attached after `attach()` because it needs the
+        // *built* `wry::WebView` (specifically `WebViewExtWindows::webview`)
+        // to reach the raw `ICoreWebView2`, which does not exist yet on a
+        // bare `WebViewBuilder`.
+        #[cfg(windows)]
+        crate::ui::webview2_blocking::attach(
+            &content,
+            initial_tab,
+            Arc::clone(&blocklist),
+            Arc::clone(&site_exceptions),
+            content_blocking_enabled,
+            proxy.clone(),
+        );
 
         let mut contents = HashMap::new();
         contents.insert(
@@ -801,6 +872,8 @@ impl BrowserWindow {
             private: config.private,
             blocklist,
             content_blocking_enabled,
+            site_exceptions,
+            site_permissions,
         })
     }
 
@@ -900,8 +973,11 @@ impl BrowserWindow {
                 context: self.context.as_mut(),
                 related,
             },
-            Arc::clone(&self.blocklist),
-            self.content_blocking_enabled,
+            ContentPolicy {
+                blocklist: Arc::clone(&self.blocklist),
+                content_blocking_enabled: self.content_blocking_enabled,
+                site_permissions: Arc::clone(&self.site_permissions),
+            },
         )
         .with_visible(false);
         // Not `self.attach_webview(builder)`: `builder` may already hold a
@@ -925,6 +1001,20 @@ impl BrowserWindow {
             target_os = "netbsd",
         )))]
         let webview = Self::attach_webview(&self.window, builder)?;
+        // Same Windows-only hook as `BrowserWindow::new` — see its call
+        // site's doc comment. Covers every tab opened after startup and
+        // every tab rebuilt on resume from suspension (`resume_tab` reuses
+        // this function), so a resumed tab does not silently lose
+        // subresource blocking.
+        #[cfg(windows)]
+        crate::ui::webview2_blocking::attach(
+            &webview,
+            id,
+            Arc::clone(&self.blocklist),
+            Arc::clone(&self.site_exceptions),
+            self.content_blocking_enabled,
+            self.proxy.clone(),
+        );
         if std::env::var_os("VELOX_DEBUG").is_some() {
             // Which `WebKitWebProcess` group this tab landed in (D54) —
             // the one piece of placement state nothing else surfaces, and
@@ -1393,6 +1483,26 @@ struct WebviewIsolation<'a> {
     related: Option<&'a WebView>,
 }
 
+/// Site-scoped policy every content webview is built with: the ad/tracker
+/// blocklist (docs/decisions.md D17) and the site permission store
+/// (docs/decisions.md D60), bundled for the same reason
+/// [`WebviewIsolation`] exists — keeping [`content_webview_builder`] under
+/// clippy's argument-count lint as the set of cross-cutting, per-tab
+/// policies grows.
+struct ContentPolicy {
+    /// Ad/tracker filter rules content blocking matches against.
+    blocklist: Arc<FilterList>,
+    /// Whether content blocking is currently active.
+    content_blocking_enabled: bool,
+    /// Per-origin camera/microphone/geolocation/notifications/clipboard
+    /// decisions (Issue #24, docs/decisions.md D60). Loaded once at startup
+    /// and shared read-only across every tab's webview — nothing in this
+    /// iteration mutates it at runtime, so a plain `Arc` (no lock) is
+    /// enough; see the doc comment on [`content_webview_builder`]'s
+    /// `with_permission_handler` call for why.
+    site_permissions: Arc<SitePermissionStore>,
+}
+
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
 /// URL, and navigation/page-load handlers that tag their `UserEvent`s with
 /// `id` so `app.rs` knows which tab they belong to.
@@ -1406,21 +1516,27 @@ struct WebviewIsolation<'a> {
 /// [`UserEvent::NavigationStarted`], refusing the navigation (returning
 /// `false`) and reporting [`UserEvent::NavigationBlocked`] instead when
 /// `content_blocking_enabled` is set and the URL matches (see
-/// docs/decisions.md D17).
+/// docs/decisions.md D17). The same uniformity is why the permission
+/// handler below (docs/decisions.md D60) lives here too, rather than being
+/// bolted on only where a tab happens to be created first.
 fn content_webview_builder<'a>(
     id: TabId,
     url: &str,
     content_rect: LogicalRect,
     proxy: &EventLoopProxy<UserEvent>,
     isolation: WebviewIsolation<'a>,
-    blocklist: Arc<FilterList>,
-    content_blocking_enabled: bool,
+    policy: ContentPolicy,
 ) -> WebViewBuilder<'a> {
     let WebviewIsolation {
         private,
         context,
         related,
     } = isolation;
+    let ContentPolicy {
+        blocklist,
+        content_blocking_enabled,
+        site_permissions,
+    } = policy;
     // Never relate a private webview (see `WebviewIsolation::related`).
     let related = if private { None } else { related };
     let nav_proxy = proxy.clone();
@@ -1428,6 +1544,23 @@ fn content_webview_builder<'a>(
     let load_proxy = proxy.clone();
     let devtools_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
+    // Current origin of this tab, for the permission handler below
+    // (docs/decisions.md D60): `with_permission_handler`'s callback
+    // receives only a `PermissionKind`, no URL/origin (see the vendored
+    // `wry` source cited in D60), so this webview's navigation handler —
+    // the one place in this builder that *does* see every URL it loads —
+    // keeps it up to date. Starts from the tab's initial `url` so a
+    // permission requested before the first `NavigationStarted` (unlikely,
+    // but not impossible) still resolves against a real origin rather than
+    // `None`. A `Mutex` (not a `Cell`, which is not `Sync`) because
+    // `with_permission_handler` requires `Send + Sync` — unlike the rest of
+    // this file's state, which is never read outside the main thread's
+    // `UserEvent` dispatch (see the crate-level architecture doc comment),
+    // this closure may run off it, since the trait bound is the same across
+    // every `wry` platform backend regardless of whether a given one
+    // actually needs it.
+    let current_origin = Arc::new(Mutex::new(site_permissions::origin_of(url)));
+    let permission_origin = Arc::clone(&current_origin);
     let builder = with_related_content_view(new_webview_builder(context), related)
         .with_bounds(to_bounds(content_rect))
         .with_url(url)
@@ -1460,6 +1593,22 @@ fn content_webview_builder<'a>(
             if content_blocking_enabled && blocklist.is_blocked(&url) {
                 let _ = block_proxy.send_event(UserEvent::NavigationBlocked(id, url));
                 return false;
+            }
+            // Keep the permission handler's notion of "current origin" in
+            // sync with what this tab is actually about to show — see
+            // `current_origin`'s doc comment above and docs/decisions.md
+            // D60. Only updated for a navigation that is actually allowed
+            // to proceed (this function already returned above for a
+            // blocked one), so a denied navigation never overwrites the
+            // origin of the page still on screen. `if let Ok` rather than
+            // `unwrap`/`expect`: a poisoned mutex (only possible if some
+            // other holder of this `Arc` panicked while holding the lock)
+            // must not crash page navigation — see CLAUDE.md's
+            // "`unwrap()`/`expect()` の乱用を避ける" rule; worst case the
+            // permission handler below keeps resolving against a stale
+            // origin instead.
+            if let Ok(mut origin) = current_origin.lock() {
+                *origin = site_permissions::origin_of(&url);
             }
             let _ = nav_proxy.send_event(UserEvent::NavigationStarted(id, url));
             true
@@ -1497,6 +1646,20 @@ fn content_webview_builder<'a>(
         .with_new_window_req_handler(move |url, _features| {
             let _ = new_window_proxy.send_event(UserEvent::NewTabRequested(url));
             wry::NewWindowResponse::Deny
+        })
+        // Site permissions (Issue #24, docs/decisions.md D60): `wry` 0.56
+        // does have a cross-platform permission-request hook — unlike D17's
+        // content-blocking investigation, this one is not a dead end — but
+        // it hands the handler only a `PermissionKind`, synchronously, with
+        // no origin and no way to suspend the decision for a custom prompt
+        // (see D60 for the exact source citations). `resolve_permission`
+        // below is the actual decision logic (unit-tested directly, no
+        // `wry` involved); this closure is just wiring: look up the
+        // request's origin from `permission_origin`, ask the store, and
+        // translate the answer into what `wry` expects.
+        .with_permission_handler(move |kind| {
+            let origin = permission_origin.lock().ok().and_then(|o| o.clone());
+            resolve_permission(&site_permissions, origin.as_deref(), kind)
         });
     // Downloads (Issue #16, docs/decisions.md D28 / D53): only where wry
     // scopes download handlers to the webview itself. On WebKitGTK in
@@ -1506,6 +1669,68 @@ fn content_webview_builder<'a>(
     match download_handler_host(private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
         DownloadHandlerHost::EachContentWebview => with_download_handlers(builder, proxy),
         DownloadHandlerHost::SharedContext => builder,
+    }
+}
+
+/// Map `wry`'s permission-kind enum onto VeloX's own
+/// [`crate::browser::site_permissions::PermissionKind`] (Issue #24,
+/// docs/decisions.md D60). `wry::PermissionKind` is `#[non_exhaustive]` and
+/// covers far more kinds than VeloX's own list tracks (window management,
+/// MIDI, local fonts, ...) — every one of those, and anything a future
+/// `wry` version adds, falls into the wildcard arm and maps to
+/// [`PermissionKind::Other`], which [`SitePermissionStore::resolve`] always
+/// blocks regardless of any stored decision. This is the browser-agnostic
+/// enum staying decoupled from `wry` (see `site_permissions`' module doc
+/// comment) while still degrading safely for anything it does not
+/// explicitly know about.
+fn map_permission_kind(kind: WryPermissionKind) -> PermissionKind {
+    match kind {
+        WryPermissionKind::Camera => PermissionKind::Camera,
+        WryPermissionKind::Microphone => PermissionKind::Microphone,
+        WryPermissionKind::Geolocation => PermissionKind::Geolocation,
+        WryPermissionKind::Notifications => PermissionKind::Notifications,
+        WryPermissionKind::ClipboardRead => PermissionKind::ClipboardRead,
+        _ => PermissionKind::Other,
+    }
+}
+
+/// Decide how to answer one `wry` permission request (docs/decisions.md
+/// D60): the actual logic behind [`content_webview_builder`]'s
+/// `with_permission_handler` closure, pulled out as a free function so it
+/// is unit-testable without building a real webview.
+///
+/// `origin` is `None` for a request with no known/meaningful origin (the
+/// tab has not navigated anywhere with an `http`/`https` origin yet, or
+/// [`crate::browser::site_permissions::origin_of`] rejected its URL, e.g.
+/// `file://`/`about:`) — treated the same as an unmapped
+/// [`PermissionKind::Other`]: always [`PermissionResponse::Deny`], never
+/// looked up in `store`, since a permission decision with nothing to scope
+/// it to cannot be "site-scoped" at all.
+///
+/// For a known origin and a kind VeloX tracks, an explicit stored decision
+/// ([`Resolution::Allow`]/[`Resolution::Block`]) is applied directly — no
+/// `wry`-native prompt runs in that case. With no stored decision
+/// ([`Resolution::Ask`]) this returns [`PermissionResponse::Default`],
+/// which — per the doc comment on `wry`'s `with_permission_handler` (see
+/// D60) — hands the request to the platform's own default behavior:
+/// WebView2 and WKWebView show their native permission prompt (so the user
+/// still sees an explicit Allow/Block UI, just not a VeloX-drawn one) while
+/// WebKitGTK denies. VeloX has no way to observe what the user chose in
+/// that native prompt (see D60), so it is never written back into `store`
+/// — only an explicit VeloX-level decision (not implemented in this
+/// iteration; see D60's "future work") ever is.
+fn resolve_permission(
+    store: &SitePermissionStore,
+    origin: Option<&str>,
+    kind: WryPermissionKind,
+) -> PermissionResponse {
+    let Some(origin) = origin else {
+        return PermissionResponse::Deny;
+    };
+    match store.resolve(origin, map_permission_kind(kind)) {
+        Resolution::Allow => PermissionResponse::Allow,
+        Resolution::Block => PermissionResponse::Deny,
+        Resolution::Ask => PermissionResponse::Default,
     }
 }
 
@@ -1720,6 +1945,138 @@ mod tests {
         // 0 is meaningless (a tab must live somewhere) and is read as 1,
         // matching `Config`'s own "0 means unset" rule.
         assert_eq!(pick_process_group([(0, false)], 0), None);
+    }
+
+    // --- Site permissions (Issue #24, docs/decisions.md D60) ---
+
+    #[test]
+    fn known_wry_kinds_map_onto_velox_kinds() {
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::Camera),
+            PermissionKind::Camera
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::Microphone),
+            PermissionKind::Microphone
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::Geolocation),
+            PermissionKind::Geolocation
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::Notifications),
+            PermissionKind::Notifications
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::ClipboardRead),
+            PermissionKind::ClipboardRead
+        );
+    }
+
+    #[test]
+    fn unmapped_wry_kinds_fall_back_to_other() {
+        // A representative sample of the kinds VeloX does not track —
+        // every one of these must land on `Other`, which always denies.
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::Midi),
+            PermissionKind::Other
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::WindowManagement),
+            PermissionKind::Other
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::DisplayCapture),
+            PermissionKind::Other
+        );
+        assert_eq!(
+            map_permission_kind(WryPermissionKind::Other),
+            PermissionKind::Other
+        );
+    }
+
+    #[test]
+    fn resolve_permission_denies_when_there_is_no_origin() {
+        let store = SitePermissionStore::new();
+        assert_eq!(
+            resolve_permission(&store, None, WryPermissionKind::Camera),
+            PermissionResponse::Deny
+        );
+    }
+
+    #[test]
+    fn resolve_permission_denies_an_unmapped_kind_even_with_a_known_origin() {
+        let store = SitePermissionStore::new();
+        assert_eq!(
+            resolve_permission(&store, Some("https://example.com"), WryPermissionKind::Midi),
+            PermissionResponse::Deny
+        );
+    }
+
+    #[test]
+    fn resolve_permission_defers_to_the_platform_default_when_undecided() {
+        let store = SitePermissionStore::new();
+        assert_eq!(
+            resolve_permission(
+                &store,
+                Some("https://example.com"),
+                WryPermissionKind::Camera
+            ),
+            PermissionResponse::Default
+        );
+    }
+
+    #[test]
+    fn resolve_permission_applies_a_stored_allow() {
+        let mut store = SitePermissionStore::new();
+        store.set(
+            "https://example.com",
+            PermissionKind::Camera,
+            crate::browser::site_permissions::PermissionDecision::Allow,
+            1,
+        );
+        assert_eq!(
+            resolve_permission(
+                &store,
+                Some("https://example.com"),
+                WryPermissionKind::Camera
+            ),
+            PermissionResponse::Allow
+        );
+    }
+
+    #[test]
+    fn resolve_permission_applies_a_stored_block() {
+        let mut store = SitePermissionStore::new();
+        store.set(
+            "https://example.com",
+            PermissionKind::Microphone,
+            crate::browser::site_permissions::PermissionDecision::Block,
+            1,
+        );
+        assert_eq!(
+            resolve_permission(
+                &store,
+                Some("https://example.com"),
+                WryPermissionKind::Microphone
+            ),
+            PermissionResponse::Deny
+        );
+    }
+
+    #[test]
+    fn resolve_permission_is_scoped_to_the_given_origin() {
+        let mut store = SitePermissionStore::new();
+        store.set(
+            "https://a.example",
+            PermissionKind::Camera,
+            crate::browser::site_permissions::PermissionDecision::Allow,
+            1,
+        );
+        assert_eq!(
+            resolve_permission(&store, Some("https://b.example"), WryPermissionKind::Camera),
+            PermissionResponse::Default
+        );
     }
 
     #[test]
@@ -1942,6 +2299,27 @@ mod tests {
             "velox:open-devtools",
         ] {
             assert_eq!(parse_content_shortcut(body), None, "body was {body:?}");
+        }
+    }
+
+    #[test]
+    fn parse_content_shortcut_does_not_panic_on_hostile_content_webview_input() {
+        // The content webview loads arbitrary, potentially hostile web
+        // pages (unlike the toolbar webview) — this is the least-trusted
+        // IPC boundary in the app (Issue #35, docs/decisions.md D18/D23/
+        // D62), so it gets the same "malformed/huge input must never
+        // panic" treatment as `ui::toolbar::parse_command`.
+        let huge = "a".repeat(5_000_000);
+        assert_eq!(parse_content_shortcut(&huge), None);
+
+        for hostile in [
+            "\0\0\0",
+            "velox:new-tab\0",
+            "velox:activate-tab-18446744073709551616", // overflows u32/usize
+            "🚀日本語velox:new-tab",
+            "\u{202e}velox:new-tab",
+        ] {
+            assert_eq!(parse_content_shortcut(hostile), None, "{hostile:?}");
         }
     }
 

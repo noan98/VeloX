@@ -425,6 +425,16 @@ impl Tab {
     pub fn on_navigation_blocked(&mut self, _url: &str) {
         self.blocked_count += 1;
     }
+
+    /// Content blocking refused a subresource request (image/script/
+    /// XHR/fetch/...) in this tab (Issue #22, Windows/WebView2 only — see
+    /// docs/decisions.md D59). Shares `blocked_count` with
+    /// [`Self::on_navigation_blocked`]: both are "content blocking stopped a
+    /// request in this tab" from the toolbar badge's point of view, and the
+    /// badge does not distinguish which layer did the blocking.
+    pub fn on_subresource_blocked(&mut self, _url: &str) {
+        self.blocked_count += 1;
+    }
 }
 
 #[cfg(test)]
@@ -485,6 +495,19 @@ mod tests {
         assert!(!tab.is_loading());
 
         tab.on_navigation_blocked("https://googlesyndication.com/");
+        assert_eq!(tab.blocked_count(), 2);
+    }
+
+    #[test]
+    fn blocked_subresource_shares_the_counter_with_blocked_navigations() {
+        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        tab.on_load_finished("https://example.com/");
+
+        tab.on_subresource_blocked("https://ads.example/banner.js");
+        assert_eq!(tab.blocked_count(), 1);
+        assert_eq!(tab.current_url(), "https://example.com/");
+
+        tab.on_navigation_blocked("https://doubleclick.net/");
         assert_eq!(tab.blocked_count(), 2);
     }
 

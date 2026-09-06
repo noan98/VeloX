@@ -328,6 +328,37 @@ impl BookmarkStore {
             None => false,
         }
     }
+
+    /// Reparent every entry whose `folder_id` does not name a folder that
+    /// actually exists in [`Self::folders`] back to the root level (`None`)
+    /// — the same fallback [`Self::edit`] already applies to a
+    /// caller-supplied unknown folder id. Returns how many entries were
+    /// repaired.
+    ///
+    /// Needed because `BookmarkEntry::folder_id`'s "always `None` or a real
+    /// folder id" invariant is only actively *enforced* by `edit` and
+    /// `remove_folder` — plain `#[derive(Deserialize)]` (what loading
+    /// `bookmarks.json` from disk actually goes through, see
+    /// `browser::persistence::load_bookmarks`) does not call either, so a
+    /// hand-edited or partially-corrupted file could otherwise carry a
+    /// dangling `folder_id` straight through untouched. Left unrepaired,
+    /// such an entry would be silently invisible everywhere: not in
+    /// [`Self::entries_in`]`(None)` (its `folder_id` is `Some`, not `None`)
+    /// and not in the folder it claims either (that folder does not exist
+    /// to render it) — see docs/decisions.md D62.
+    pub fn repair_dangling_folder_ids(&mut self) -> usize {
+        let valid: std::collections::HashSet<u64> = self.folders.iter().map(|f| f.id).collect();
+        let mut repaired = 0;
+        for entry in &mut self.entries {
+            if let Some(folder_id) = entry.folder_id {
+                if !valid.contains(&folder_id) {
+                    entry.folder_id = None;
+                    repaired += 1;
+                }
+            }
+        }
+        repaired
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -671,5 +702,126 @@ mod tests {
         // A folder created after loading old data must not collide with
         // anything — `next_folder_id` must default sanely, not to 0.
         assert_eq!(store.create_folder("新規".to_owned(), 1), 1);
+    }
+
+    // --- Robustness against extreme/hostile field values (Issue #35) ---
+
+    #[test]
+    fn add_does_not_panic_with_an_extremely_long_url_or_title() {
+        let mut store = BookmarkStore::new();
+        let huge_url = format!("https://example.com/{}", "a".repeat(1_000_000));
+        let huge_title = "た".repeat(200_000);
+        let id = store.add(&huge_url, Some(huge_title.clone()), 1);
+        assert_eq!(store.entries()[0].id, id);
+        assert_eq!(
+            store.entries()[0].title.as_deref(),
+            Some(huge_title.as_str())
+        );
+    }
+
+    #[test]
+    fn add_handles_unicode_control_characters_and_html_meaningful_text_in_the_title() {
+        let mut store = BookmarkStore::new();
+        store.add(
+            "https://example.com/\u{0}\u{202e}",
+            Some("\"quoted\" </script><script>alert(1)</script> 🚀".to_owned()),
+            1,
+        );
+        assert_eq!(store.entries().len(), 1);
+    }
+
+    #[test]
+    fn edit_rejects_a_folder_id_at_the_type_boundary_without_panicking() {
+        let mut store = BookmarkStore::new();
+        let id = store.add("https://example.com/", None, 1);
+        // `u64::MAX` is never a real folder id here — must fall back to
+        // root, exactly like any other unknown id, not panic on the lookup.
+        store
+            .edit(id, None, "https://example.com/".to_owned(), Some(u64::MAX))
+            .unwrap();
+        assert_eq!(store.entries()[0].folder_id, None);
+    }
+
+    #[test]
+    fn many_folders_and_deeply_reordered_entries_do_not_panic() {
+        let mut store = BookmarkStore::new();
+        let folder = store.create_folder("フォルダ".to_owned(), 1);
+        let mut ids = Vec::new();
+        for i in 0..500u64 {
+            let id = store.add(&format!("https://{i}.example/"), None, i);
+            store
+                .edit(id, None, format!("https://{i}.example/"), Some(folder))
+                .unwrap();
+            ids.push(id);
+        }
+        // Repeatedly moving the same (now-first) entry up must be a no-op,
+        // never panic past the top of its scope.
+        for _ in 0..10 {
+            store.move_up(ids[0]);
+        }
+        assert_eq!(store.entries_in(Some(folder)).count(), 500);
+    }
+
+    // --- repair_dangling_folder_ids (Issue #35, D62) ---
+
+    #[test]
+    fn plain_deserialization_alone_does_not_repair_a_dangling_folder_id() {
+        // `#[derive(Deserialize)]` has no notion of the folder-id invariant
+        // — this pins that a raw deserialize (as opposed to going through
+        // `browser::persistence::load_bookmarks`, which additionally calls
+        // `repair_dangling_folder_ids`) really does let a dangling id
+        // through unchanged, which is exactly why the repair step is
+        // needed at all rather than being redundant.
+        let json = r#"{
+            "entries": [
+                {"id": 1, "url": "https://example.com/", "title": "Example", "created_at": 100, "folder_id": 999}
+            ],
+            "next_id": 2,
+            "folders": [],
+            "next_folder_id": 1
+        }"#;
+        let store: BookmarkStore =
+            serde_json::from_str(json).expect("valid JSON should still parse");
+        assert_eq!(store.entries()[0].folder_id, Some(999));
+    }
+
+    #[test]
+    fn repair_dangling_folder_ids_reparents_unknown_folders_to_root() {
+        let json = r#"{
+            "entries": [
+                {"id": 1, "url": "https://a.example/", "title": null, "created_at": 100, "folder_id": 999},
+                {"id": 2, "url": "https://b.example/", "title": null, "created_at": 100, "folder_id": null}
+            ],
+            "next_id": 3,
+            "folders": [],
+            "next_folder_id": 1
+        }"#;
+        let mut store: BookmarkStore = serde_json::from_str(json).unwrap();
+        let repaired = store.repair_dangling_folder_ids();
+        assert_eq!(repaired, 1);
+        assert_eq!(store.entries()[0].folder_id, None);
+        assert_eq!(store.entries()[1].folder_id, None);
+        // The entry is now actually visible at the root, unlike before the
+        // repair (see `plain_deserialization_alone_does_not_repair_a_dangling_folder_id`).
+        assert_eq!(store.entries_in(None).count(), 2);
+    }
+
+    #[test]
+    fn repair_dangling_folder_ids_leaves_valid_folder_references_untouched() {
+        let mut store = BookmarkStore::new();
+        let folder = store.create_folder("仕事".to_owned(), 1);
+        let id = store.add("https://example.com/", None, 1);
+        store
+            .edit(id, None, "https://example.com/".to_owned(), Some(folder))
+            .unwrap();
+        assert_eq!(store.repair_dangling_folder_ids(), 0);
+        assert_eq!(store.entries()[0].folder_id, Some(folder));
+    }
+
+    #[test]
+    fn repair_dangling_folder_ids_on_an_already_healthy_store_is_a_noop() {
+        let mut store = BookmarkStore::new();
+        store.add("https://example.com/", None, 1);
+        assert_eq!(store.repair_dangling_folder_ids(), 0);
     }
 }

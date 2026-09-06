@@ -435,11 +435,46 @@ shown for the active tab; switching tabs re-renders the badge from the
 newly active tab's count (`veloxSetBlockCount`), the same pattern already
 used for the address bar and the bookmark star.
 
-This only covers **main-frame navigation** — wry 0.56 exposes no hook for
-subresource requests (images/scripts/XHR), so ad/tracker resources loaded
-*within* an allowed page are not filtered today. See docs/decisions.md D17
-for the platform-by-platform investigation and why that gap is not closed
-in this iteration.
+This only covers **main-frame navigation** through `wry::WebViewBuilder`'s
+own hooks — wry exposes no *builder*-level hook for subresource requests
+(images/scripts/XHR). See docs/decisions.md D17 for that investigation.
+
+**Windows (WebView2) only**, Issue #22 closes part of that gap by reaching
+past the builder: `wry::WebViewExtWindows::webview()` — a stable, safe,
+public method on the already-*built* `wry::WebView` — hands back the raw
+`ICoreWebView2` COM object, which supports `AddWebResourceRequestedFilter` +
+`add_WebResourceRequested` directly. `ui::webview2_blocking::attach` (called
+right after every content webview is attached, in both `BrowserWindow::new`
+and `open_tab`) registers a listener on it:
+
+```
+WebView2 WebResourceRequested fires  (any resource, any tab, Windows only)
+        │
+        ▼
+resource context == Document?  (main-frame nav, or an <iframe>'s own doc load)
+   │ yes                              │ no
+   ▼                                  ▼
+never touched here            browser::subresource::is_blocked_resource
+(main-frame: D17's handler        (page-host site exception, then
+ already decided it;                FilterList::is_blocked — the same
+ iframe documents: left              domain-anchor matcher D17 uses)
+ unblocked, see D59)             │ blocked          │ allowed
+                                 ▼                  ▼
+                    args.SetResponse(403, empty)   request proceeds
+                    UserEvent::SubresourceBlocked(id, url)
+                                 │
+                                 ▼
+                    Tab::on_subresource_blocked → same block-count badge
+```
+
+The matching logic (`browser::subresource`: `ResourceType`, `SiteExceptions`,
+`is_blocked_resource`) is pure and engine-agnostic, unit-tested without any
+WebView2/COM machinery; only `ui::webview2_blocking` (Windows-only,
+`#[cfg(windows)]`) touches COM. macOS/Linux are unchanged from D17 — no
+subresource hook is wired there. See docs/decisions.md D59 for the
+re-investigation that found this path, exactly what it does and does not
+block (main-frame and iframe document loads are deliberately exempt), and
+what remains unverified without a Windows machine to run it on.
 
 ## Multiple tabs
 
