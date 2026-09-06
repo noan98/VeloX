@@ -232,6 +232,14 @@ pub enum ToolbarCommand {
     /// toolbar button) — distinct from `TogglePanel`, since the bar is a
     /// permanent strip, not a dropdown panel (see docs/decisions.md D35).
     ToggleBookmarkBar,
+    /// Open a new window (Ctrl/Cmd+N, Issue #29). Carries no id: unlike
+    /// `NewTab`, this never touches the sending window's own state — it is
+    /// forwarded straight to `app::open_new_window` before `app.rs` even
+    /// resolves which `BrowserWindow` sent it, so it works the same way no
+    /// matter which window's toolbar (or content webview —
+    /// `ui::window::ContentShortcut::NewWindow`) the request came from. See
+    /// docs/decisions.md D68.
+    NewWindow,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -782,6 +790,10 @@ mod tests {
             parse_command(r#"{"cmd":"activate_last_tab"}"#).unwrap(),
             ToolbarCommand::ActivateLastTab
         );
+        assert_eq!(
+            parse_command(r#"{"cmd":"new_window"}"#).unwrap(),
+            ToolbarCommand::NewWindow
+        );
     }
 
     #[test]
@@ -1286,6 +1298,8 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("prev_tab"));
         assert!(TOOLBAR_HTML.contains("activate_tab_by_index"));
         assert!(TOOLBAR_HTML.contains("activate_last_tab"));
+        // New window (Ctrl/Cmd+N, Issue #29, see docs/decisions.md D68).
+        assert!(TOOLBAR_HTML.contains("new_window"));
         // Downloads (Issue #16, see docs/decisions.md D28).
         assert!(TOOLBAR_HTML.contains("veloxSetDownloads"));
         assert!(TOOLBAR_HTML.contains("open_download"));

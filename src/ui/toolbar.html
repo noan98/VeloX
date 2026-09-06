@@ -825,6 +825,9 @@
       } else if (event.key === "d" || event.key === "D") {
         // Ctrl/Cmd+D (Issue #19): bookmark/unbookmark the current page.
         message = { cmd: "toggle_bookmark" };
+      } else if (event.key === "n" || event.key === "N") {
+        // Ctrl/Cmd+N (Issue #29): open a new window.
+        message = { cmd: "new_window" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {

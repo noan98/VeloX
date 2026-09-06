@@ -46,7 +46,9 @@ use windows::Win32::System::Com::IStream;
 use wry::{WebView, WebViewExtWindows};
 
 use crate::app::UserEvent;
-use crate::browser::{is_blocked_resource, FilterList, ResourceType, SiteExceptions, TabId};
+use crate::browser::{
+    is_blocked_resource, FilterList, ResourceType, SiteExceptions, TabId, WindowId,
+};
 
 /// HTTP status VeloX answers a blocked subresource request with. Any value
 /// works from WebView2's point of view (the request simply never reaches
@@ -74,6 +76,7 @@ const BLOCKED_STATUS: i32 = 403;
 /// to take the whole window down.
 pub fn attach(
     webview: &WebView,
+    own_id: WindowId,
     id: TabId,
     blocklist: Arc<FilterList>,
     exceptions: Arc<SiteExceptions>,
@@ -134,6 +137,7 @@ pub fn attach(
                     &env,
                     &blocklist,
                     &exceptions,
+                    own_id,
                     id,
                     &proxy,
                 )
@@ -157,6 +161,7 @@ fn handle_request(
     env: &ICoreWebView2Environment,
     blocklist: &FilterList,
     exceptions: &SiteExceptions,
+    own_id: WindowId,
     id: TabId,
     proxy: &EventLoopProxy<UserEvent>,
 ) -> windows::core::Result<()> {
@@ -199,7 +204,7 @@ fn handle_request(
         )?;
         args.SetResponse(&response)?;
     }
-    let _ = proxy.send_event(UserEvent::SubresourceBlocked(id, url));
+    let _ = proxy.send_event(UserEvent::SubresourceBlocked(own_id, id, url));
     Ok(())
 }
 

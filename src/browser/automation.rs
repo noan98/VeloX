@@ -29,6 +29,9 @@
 //! switch <index>    # activate the tab at position <index> (0-based)
 //! close <index>     # close the tab at position <index> (0-based)
 //! suspend <index>   # suspend the tab at position <index> (0-based; never the active tab)
+//! new_window        # open a new window at the homepage; every following
+//!                   # open/switch/close/suspend/navigate targets it instead
+//!                   # (Issue #29, see docs/decisions.md D68)
 //! mark              # mark the start of the measured phase (drops everything logged before it)
 //! navigate <url>    # navigate the active tab
 //! wait <ms>         # sleep before the next command (<= MAX_WAIT_MS)
@@ -77,6 +80,16 @@ pub enum AutomationCommand {
     /// — suspend, then `switch` back — without depending on the automatic
     /// policy's timing.
     Suspend { index: usize },
+    /// `new_window` — open a new window at the homepage and make it the
+    /// target of every following `open`/`switch`/`close`/`suspend`/
+    /// `navigate` command (Issue #29, see docs/decisions.md D68). Automation
+    /// predates multi-window and addresses tabs by position within "the"
+    /// current window; this is the one command that changes which window
+    /// that is. The window it replaces is not closed — it keeps running,
+    /// simply no longer targeted by later commands unless another
+    /// `new_window` (there is none — a script can only ever move forward to
+    /// a fresh window, never back to an earlier one).
+    NewWindow,
     /// `navigate <url>` — navigate the active tab to `url` (already
     /// normalized).
     Navigate { url: String },
@@ -154,6 +167,16 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
         "suspend" => Ok(AutomationCommand::Suspend {
             index: parse_index(line, "suspend", rest)?,
         }),
+        "new_window" => {
+            if rest.is_empty() {
+                Ok(AutomationCommand::NewWindow)
+            } else {
+                Err(err(
+                    line,
+                    format!("new_window は引数を取りません: {rest:?}"),
+                ))
+            }
+        }
         "wait" => Ok(AutomationCommand::Wait {
             ms: parse_wait(line, rest)?,
         }),
@@ -571,6 +594,17 @@ mod tests {
                 AutomationCommand::Quit,
             ]
         );
+    }
+
+    #[test]
+    fn parses_new_window_and_rejects_arguments_on_it() {
+        assert_eq!(
+            parse_script("new_window\n").unwrap(),
+            vec![AutomationCommand::NewWindow]
+        );
+        let err = parse_script("new_window 3\n").unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("new_window"), "{}", err.message);
     }
 
     #[test]
