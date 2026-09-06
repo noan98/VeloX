@@ -51,6 +51,15 @@ sudo apt install libwebkit2gtk-4.1-dev   # Debian/Ubuntu
 cargo build
 ```
 
+#### Release build via GitHub Actions
+
+`.github/workflows/release-linux.yml` builds `velox` (and `velox-bench`) in
+release mode on an `ubuntu-latest` runner and packages them into a tar.gz —
+the same two triggers as the Windows release below (manual `workflow_dispatch`
+or a `v*` tag push). This is a minimal, unpackaged build (no AppImage/deb);
+see docs/decisions.md D70 for why native packaging formats are out of scope
+for now.
+
 ### macOS
 
 No extra dependencies — the system WKWebView is used.
@@ -58,6 +67,13 @@ No extra dependencies — the system WKWebView is used.
 ```sh
 cargo build
 ```
+
+There is currently no macOS release-build workflow in CI (no `.dmg`/`.app`
+packaging, no GitHub Release publishing) — see docs/decisions.md D70. Per
+CLAUDE.md's OS priority policy, macOS support stays at "builds, doesn't
+break existing features" until Windows quality is established; a dedicated
+release workflow can follow later using the same pattern as
+`release-windows.yml` / `release-linux.yml`.
 
 ### Windows
 
@@ -75,7 +91,11 @@ cargo build
 - **Manual**: Actions → "Release (Windows)" → "Run workflow". The zip is
   attached to the run as the `velox-windows-x86_64` artifact.
 - **Tag push**: `git tag v0.1.0 && git push origin v0.1.0` additionally
-  creates a GitHub Release with the zip and its SHA-256 attached.
+  creates a GitHub Release with the zip and its SHA-256 attached. The same
+  tag also triggers `release-linux.yml`, which attaches a Linux tar.gz to
+  the same Release. Both workflows verify the tag (`vX.Y.Z`) matches the
+  `version` in `Cargo.toml` and fail the build if it doesn't, so a Release
+  can't be published under a version that doesn't match its own artifacts.
 
 The zip contains the two executables plus README/LICENSE. WebView2 Runtime
 must be present on the target machine (it is on Windows 11).

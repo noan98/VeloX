@@ -5920,3 +5920,107 @@ macOS の実機検証 (`clear_all_browsing_data` が実際にファイルを消�
 は今回の環境では不可能だった。
 
 
+## D70: リリースパッケージング (#41) — Windows は tag/version 整合チェックを追加、Linux は最小 tarball を新設、macOS は明示的に見送り
+
+**対象**: Issue #41 の受け入れ条件 4 点 (3 OS の release artifact 生成 /
+tag からの再現可能なビルド / GitHub Release への自動公開 / 配布手順の
+docs 記録) を、既存の `release-windows.yml` (D51) と突き合わせて棚卸しした。
+
+### 棚卸し結果 (着手前)
+
+| 受け入れ条件 | 状態 |
+|---|---|
+| 3 OS の release artifact | 未達 — Windows のみ |
+| tag からの再現可能なビルド | 部分達成 (Windows) — `--locked` は使われているが、push したタグと `Cargo.toml` の `version` が一致することを検証していない |
+| GitHub Release への自動公開 | 部分達成 (Windows) — tag push で `softprops/action-gh-release` により実施済み |
+| 配布手順の docs 記録 | 達成 (Windows) — README に手動/tag push の手順あり |
+
+`release-windows.yml` 自体は D51 の設計 (分離した専用 workflow、
+`workflow_dispatch` + `v*` タグ push の 2 起動経路、`--locked`、SHA-256
+チェックサム、スモークテストは「実行ファイルの存在とサイズ」) を既に
+満たしており、**作り直す必要はなかった**。
+
+### 判断: Windows を最優先に直す、Linux は最小 tarball を追加、macOS は見送る
+
+CLAUDE.md の OS 優先度方針 (Windows 最優先、macOS/Linux は「ビルドが通り
+既存機能を壊さない」最低限の整備に留め、3 OS 同時対応を完了条件に据えない)
+と、この Issue が依存する #33 (「3 OS でビルド可能な状態を検証できる」を
+含む CI 品質ゲート epic) が **macOS を含めないまま完了 (closed) 済み**で
+あるという既成事実の 2 点を踏まえ、以下の粒度に決めた。
+
+1. **Windows (`release-windows.yml`)**: 既存の仕組みは維持しつつ、
+   「tag と `Cargo.toml` の version が一致しない状態で Release が
+   作られてしまう」抜けを塞いだ。タグを打つ前に `Cargo.toml` の
+   version を上げ忘れると、GitHub Release のタグ名と zip 内の
+   ファイル名が食い違ったまま公開されてしまう — 「tag からの再現可能な
+   ビルド」の一貫性を損なう実害のある抜けと判断し、tag push 時のみ
+   走る検証ステップ (`tagVersion -ne $cargoVersion` なら `throw`) を
+   ビルド前に追加した。既存のビルド・パッケージ・アップロード・
+   Release 作成ロジックには手を入れていない。
+2. **Linux (`release-linux.yml`, 新設)**: `ci.yml` が既に
+   `libwebkit2gtk-4.1-dev` を入れた `ubuntu-latest` で `cargo build`
+   (debug) を実行しており、release ビルドまでの追加コストが低いこと、
+   かつ CLAUDE.md が Linux を CI/性能計測の実行環境として明示的に
+   引き続き使う対象としていることから、**AppImage/deb 等のネイティブ
+   パッケージ化はせず**、Windows の zip と同じ構成 (velox, velox-bench,
+   README.md, LICENSE) を tar.gz + SHA-256 に固めるだけの最小 workflow を
+   新設した。トリガー・tag/version 整合チェック・成果物検証・Release
+   添付の流れは `release-windows.yml` と揃えた (同じ `v*` タグで両方の
+   workflow が起動し、同じ GitHub Release に zip と tar.gz が並んで
+   添付される)。パッケージスクリプト (バージョン取得 →
+   ディレクトリ構成 → tar.gz → sha256sum) はこのブランチの Linux 環境で
+   実際に `cargo build --release --locked` した成果物を使って手動で
+   一度実行し、生成物の展開・チェックサム検証まで確認済み。
+3. **macOS**: 今回は着手しない。理由は (a) #33 が macOS を含めずに
+   「完了」と判定されており、プロジェクトとして現時点でその判断を
+   覆す情報がないこと、(b) macOS の release ビルド (署名なし `.app`/
+   `.dmg` の作成、`actions/upload-artifact`・`softprops/action-gh-release`
+   との組み合わせ) を検証できる実機/CI 実行環境がこのセッションには
+   無く、動かないワークフローを「動く」体で追加するのは D61 が避けた
+   ("素通りさせて緑にする") のと同じ失敗パターンになること。README に
+   「macOS の release workflow は無い」ことを明記し、将来
+   `release-windows.yml`/`release-linux.yml` と同じパターンで追加できる
+   ことだけ示した。
+
+### 見送ったもの・未検証のもの
+
+- **AppImage / deb** (Issue 本文が調査対象として挙げていたもの):
+  検討の結果、現段階では tar.gz で十分と判断し、実装しなかった。将来
+  ディストリビューションパッケージが必要になった時点で別 Issue とする。
+- **macOS の `.app`/`.dmg` パッケージング、コード署名・notarization**:
+  未着手。コード署名は Windows 分も含め Issue #42 のスコープ
+  (README ロードマップにも「Packaging, code signing and notarization for
+  macOS / Windows」として記載済み)。
+- **実際にタグを打っての公開テスト**: 本 PR ではタグ push を行っていない
+  ため、`release-windows.yml`/`release-linux.yml` が実際に GitHub Release
+  を作成・添付する一連の流れ (2 つの workflow が同じタグで同時に
+  `softprops/action-gh-release` を呼ぶ際の競合を含む) は GitHub Actions
+  上で未検証。YAML の構文チェックと、Linux 側はローカルでのビルド・
+  パッケージスクリプトの動作確認のみ行った。
+- **2 workflow が同じタグに対して同時に Release 作成 API を呼ぶ際の
+  競合**: `softprops/action-gh-release` は対象タグの Release が既に
+  あれば追記する挙動だが、Windows/Linux 両 workflow がほぼ同時に初回
+  作成を試みると、両方が「Release が無い」と判断して作成しに行き、
+  片方が失敗し得る。**対策として、タグ push のときだけ両 workflow が同じ
+  `concurrency.group` (`release-tag-<github.ref>`) を共有し、
+  `cancel-in-progress: false` で直列化した。** キャンセルではなく
+  キューイングさせるため、片方の完了後にもう片方が走り、後発は
+  「既存 Release への添付」になる。group にタグ名 (`github.ref`) を
+  含めているので、別タグのリリース同士は従来どおり並列に走る。
+  なお PR / `workflow_dispatch` では Release を作らないため直列化する
+  理由が無く、むしろ両 workflow の CI が不必要に待たされる (実際に
+  PR #146 で Linux 側の release ジョブが Windows 側の完了待ちになった)。
+  そのため group 名を `startsWith(github.ref, 'refs/tags/v')` で分岐させ、
+  タグ以外では workflow ごとに別 group (`release-windows-*` /
+  `release-linux-*`) にして並列に走らせている。
+  なお GitHub の concurrency は「実行中 1 件 + 待機 1 件」しか保持せず
+  3 件目以降は待機中のものがキャンセルされる仕様だが、同一タグで走る
+  release workflow は 2 つだけなので問題にならない。**この直列化自体は
+  実際のタグ push で未検証**であり、初回リリース時に確認すること。
+
+**Revisit condition**: (1) #33 の macOS 除外判断が変わり、macOS の
+release workflow 追加に着手できる環境が整ったとき。(2) 実際にタグを
+打って Windows/Linux 両方の Release 公開フローを検証したとき (特に
+上記の同時実行競合)。(3) ディストリビューション向けパッケージ
+(AppImage/deb) の要望が具体化したとき。(4) コード署名 (#42) 着手時に
+`release-windows.yml`/`release-linux.yml` の署名ステップを追加する。
