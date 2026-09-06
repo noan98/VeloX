@@ -4495,6 +4495,7 @@ D57 と同じく、Epic #57 のルール 1 の裏返しとして、測って効�
 タブ (#63 で保護対象にした) が本当にバックグラウンドでも再生を続けるかは、
 この環境に音声デバイスが無いため未検証。
 
+
 ## D59: サブリソースブロック — D17 の再検証、Windows (WebView2) のみ実装できることが判明
 
 **対象**: Issue #22 (依存する #21 は D17 で main-frame navigation blocking として
@@ -5423,4 +5424,214 @@ crates.io/docs.rs (docs.rs 自体はプロキシで `EGRESS_BLOCKED`) を実際�
 3. **実データの動作確認が Windows 実機でしかできない** — 上記のとおり。
 4. **自動更新の UI/機構は無い** — `extra_blocklist_path` の手動再配置 +
    再起動のみ。ホットリロードや定期フェッチは follow-up。
+
+## D65: タブセッション復元 (#25) — 保存は `sync_tab_strip` に相乗り、復元は休止/復帰機構をそのまま再利用、クラッシュ検知フックは wry 0.56 に存在しない
+
+**対象**: Issue #25 (依存: #12)。起動時セッション読み込み・終了時タブ情報
+保存・URL/title/favicon の保存・WebView 再生成・WebView/renderer クラッシュ
+検知の調査・タブ単位の復旧・「前回のタブを復元」設定。
+
+### 保存形式とタイミング
+
+- **形式**: `browser::session::SessionSnapshot { tabs: Vec<SavedTab>,
+  active_index: usize }`、`SavedTab { url, title: Option<String>, favicon:
+  Option<String> }`。`history.json`/`bookmarks.json`/`input_history.json`
+  と同じ 3 点構成 — 純粋なデータ型+ロジックは `browser::session`、IO は
+  `browser::persistence::{load,save}_session` (`session.json`、同じ
+  データディレクトリ、D10) — を厳密に踏襲した。持たせるのはタブ strip
+  自身が描画に使っている情報 (`app::sync_tab_strip` の `TabSummary` と同じ
+  3 フィールド) だけで、スクロール位置・フォーム入力・エンジン側セッション
+  履歴は最初から対象外 — これは新しい割り切りではなく、タブ休止 (D9) が
+  既に受け入れているのと同じ損失をセッション復元にも適用しているだけ。
+- **タイミング**: `app::persist_session` を `app::sync_tab_strip` の内部から
+  呼ぶ。`sync_tab_strip` はタブに影響する変更のほぼ全て (open/close/
+  activate/suspend/load 完了/favicon 解決) が既に通る唯一の関数なので、
+  ここに相乗りすれば専用の呼び出し箇所を各所に増やさずに済む。唯一の例外は
+  `PageTitleResolved` (この方法内は元々 `sync_tab_strip` を呼んでいない) で、
+  ここだけ個別に `persist_session` を呼ぶ。**終了時保存ではなく変更の都度
+  保存**にしたのは、Issue が名指しした「クラッシュ復旧」がまさに
+  `WindowEvent::CloseRequested` のような正常終了フックが実行され*ない*
+  ケースだから — 終了時だけの保存ではクラッシュした瞬間の直前状態を
+  再現できない。書き込みは `history`/`bookmarks` と同じ「その都度 best-
+  effort、失敗は `log_io_failure` で stderr に流すだけで継続」パターン。
+- **プライバシー**: `AppState::history_enabled` (D13/D14 の private browsing
+  choke point) が `false` の間は `persist_session` は何も書かない —
+  `Config::restore_previous_session` の値に関係なく、プライベートセッション
+  が開いていたタブをディスクに残さない。復元側も `config.private` なら
+  常にスキップする (後述)。
+
+### 復元とタブ単位の復旧 — 休止/復帰機構との統合
+
+Issue 自身が「WebView 再生成は休止/復帰機構と重複する可能性が高い」と
+指摘していたとおり、`suspension.rs`/`TabState` を読んでからの設計判断:
+
+- **`Tabs::restore(saved: &[SavedTab], active_index: usize) -> Tabs`**
+  (`browser::tabs`) は、アクティブだったタブ 1 つだけを `Tab::new` (通常の
+  `Active` 開始) で作り、**それ以外の全タブを新設の `Tab::new_suspended`
+  (`pub(super)`) でいきなり `TabState::Suspended` として作る**。
+  `Active -> Background -> Suspended` の通常遷移を経由しない直接コンストラクタ
+  だが、理由は単純: 復元されたタブは一度も webview を持ったことがなく、
+  「そこから休止する」遷移ではなく「最初から休止状態」でしかありえない。
+  `TabState` の遷移テーブル (D20) 自体は変更していない — 遷移不能な状態を
+  型で表現するのではなく、コンストラクタで直接その状態を作るところが
+  新しい部分。
+- **`ui::window::BrowserWindow` の休止/復帰そのものは 1 行も変更して
+  いない**。`BrowserWindow::new` は元々「渡された 1 個の `TabId`」用の
+  webview しか作らない — 復元後の `Tabs` からアクティブなタブの id を渡す
+  だけで、それ以外の復元タブは `BrowserWindow::contents`(`HashMap<TabId,
+  ContentTab>`) に一切エントリを持たない。ユーザがそのタブをクリックする
+  (あるいは前のタブが閉じられて繰り上がる) と、`Tabs::activate` は既存の
+  ロジックだけで `ActivationEffect::Resume` を返す (`TabState::Suspended`
+  だから) — `app::activate_and_refresh` はそれをセッション中に休止された
+  タブと**区別せず**同じ `BrowserWindow::resume_tab` (= `open_tab` +
+  `activate_tab`) に渡す。つまり「WebView 再生成」という専用パスは実装
+  していない — 休止/復帰機構をそのまま復元にも使っている。副作用として、
+  10 タブ復元しても起動時に実際に張られる webview は 1 個だけ (アクティブ
+  タブの分) で、残り 9 個はユーザが実際に開くまでプロセスもメモリも
+  消費しない。
+  **唯一見つけて直した既存のバグ**: `BrowserWindow::new` は最初のタブの
+  webview を常に `config.homepage` で読み込んでいた — `Tabs::restore` が
+  そのタブの `current_url` を正しく復元済みタブの URL にしていても、実際に
+  表示される最初のページは無条件にホームページのままだった (この issue が
+  無ければ気づかれなかったであろう、既存コードの潜在バグ)。`BrowserWindow::new`
+  に `initial_url: &str` 引数を追加し、`app::run` から `tabs.active().
+  current_url()` を渡すよう修正 — 通常時 (`Tabs::new(homepage)`) はその
+  タブの `current_url` も `homepage` と同じ値なので、非復元時の挙動は
+  1 バイトも変わらない。統合テスト
+  `restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch`
+  はこの修正が無いと (`VELOX_HOMEPAGE` に無関係な第三のページを渡した上で)
+  確実に落ちる。
+- **id は必ず採番し直す** (`Tabs::restore` は `next_id = 0` から
+  `SavedTab` の並び順に割り当てる)。前回プロセスの `TabId` は元々永続化
+  していない (`u64` の内部値に意味はなく、プロセスをまたいで再現する
+  必要もない)。
+- **起動時の配線** (`app::run`): `Config::restore_previous_session &&
+  !config.private` のときだけ `persistence::load_session` →
+  `SessionSnapshot::sanitize` を試み、`Some` なら `Tabs::restore`、それ
+  以外 (設定 OFF・データディレクトリ無し・ファイル無し・壊れている・
+  private mode) は従来どおり `Tabs::new(homepage)`。`data_dir` の解決を
+  `Tabs`/`BrowserWindow` 構築より前に前倒しした以外、既存の起動シーケンス
+  (history/bookmarks/input_history の読み込み、`AppState` 構築) は変えて
+  いない。
+
+### 「前回のタブを復元」設定
+
+`Config::restore_previous_session: bool` (既定 `false`)、
+`VELOX_RESTORE_SESSION` の有無で切り替え — `VELOX_PRIVATE`/
+`VELOX_PERF_METRICS` と同じ「有無だけを見る」パターン。既定を OFF にしたのは
+D9 (自動休止) と同じ理由: 今まで存在しなかった「前回のタブが勝手に開く」
+挙動で驚かせるのは、機能を足さないより悪い既定。保存自体は
+`restore_previous_session` の値に関係なく (private mode 以外) 常に行う
+ので、後から設定をオンにした瞬間から直近のセッションを復元できる。設定
+画面 (#30) はまだ無いので、当面は環境変数のみ。
+
+### 破損データの扱い (最重要の受け入れ条件)
+
+`SessionSnapshot::sanitize` が唯一の検証ゲート — アドレスバー入力に対する
+`navigation::normalize_input` と同じ役割をセッションデータに対して果たす:
+
+- 各タブの `url` を `normalize_input` に通し直す。拒否されたスキーム
+  (`javascript:` 等)・空文字・パース不能な文字列を持つエントリはその 1 件
+  だけを捨てる (セッション全体は破棄しない)。
+- 生き残ったタブが 0 件になったら `None` を返し、呼び出し側は
+  `Tabs::new(homepage)` にフォールバックする。
+- `active_index` は信用せず、直前にアクティブだった URL を生き残った
+  リストの中から位置で探し直す。見つからなければ (アクティブだった
+  エントリ自体が捨てられた、または元の `active_index` が最初から範囲外)
+  先頭のタブにフォールバックする — 添字を直接使い回さないので、範囲外
+  インデックスによる panic は構造的に起こらない。
+- `#[serde(default)]` を `SessionSnapshot`/`SavedTab` の全フィールドに
+  付けたので、古いスキーマの (フィールドが足りない) ファイルも読める。
+- JSON として壊れている場合 (truncated・型違い・配列/数値/文字列/null が
+  トップレベルに来ている等) は `serde_json::from_str` がそのまま失敗し、
+  `persistence::load_session` は `history`/`bookmarks` の既存ローダーと
+  全く同じ「`Option::None` を返すだけ」という契約に従う — 起動を止める
+  経路が存在しない。
+- `Tabs::restore` 自体も `saved` が空・`active_index` が範囲外という
+  想定外の入力に対して (`sanitize` を経由しない直接呼び出しに備えて)
+  それぞれ「`about:blank` の 1 タブにフォールバック」「`0` に丸める」と
+  自己防衛しており、`SessionSnapshot::sanitize` 頼みの単一障害点にしていない。
+- テスト: `browser::session`・`browser::tabs`・`browser::persistence` の
+  各層で、正常系に加えて「壊れた JSON」「truncated (書き込み途中で
+  クラッシュした想定)」「型が違う (`tabs` が文字列、`active_index` が
+  文字列)」「トップレベルが配列/数値/文字列/null」「2 万タブの巨大ファイル」
+  「存在しないアクティブタブ・全滅した URL」を個別にケース化した — 本体
+  コードでの `unwrap()`/`expect()` は使っていない (CLAUDE.md のルール通り)。
+
+### クラッシュ検知の調査結果 (wry 0.56.1、`~/.cargo/registry/src/index.crates.io-*/wry-0.56.1/src`)
+
+Issue #22 の教訓 (`WebViewBuilder` の `with_*` だけでなく、ビルド後の
+プラットフォーム別拡張トレイトも確認する) に従い、`grep -rniE
+"crash|terminat|render_process|process_fail|web.?process"` で `src/`
+全体を機械的に走査した上で、ヒットした箇所を実際に読んだ。
+
+| プラットフォーム | wry が公開する API | 場所 |
+|---|---|---|
+| macOS/iOS (WKWebView) | **あり**: `WebViewBuilderExtDarwin::with_on_web_content_process_terminate_handler(impl Fn() + 'static)` — `webView:webContentProcessDidTerminate:` (WKNavigationDelegate) をラップしたビルド後拡張トレイト。 | `src/lib.rs:1633-1660`、`src/wkwebview/navigation.rs:107-114`、`src/wkwebview/class/wry_navigation_delegate.rs:101-103` |
+| Windows (WebView2) | **無し**。`WebViewExtWindows` (`src/lib.rs:2340-2375`) は `controller()`/`environment()`/`webview()`/`set_theme`/`set_memory_usage_level`/`reparent`/`hwnd` のみ — `ICoreWebView2::add_ProcessFailed` に対応するものは無い。`webview()` が生の `ICoreWebView2` COM インターフェースを返すので技術的には呼び出し側が `unsafe` な COM 呼び出しで直接登録することは可能だが、wry 自体はそれを一切ラップしていない。 | `src/lib.rs:2340-2375`。`grep` で `ProcessFailed`/`process_fail` は 0 件。 |
+| Linux/BSD (WebKitGTK) | **無し**。`with_related_content_view`/`is_playing_audio` が使っているのと同じ「wry の `WebViewExtUnix::webview()` で生の `webkit2gtk::WebView` を取り、GLib の汎用プロパティ/シグナル API を叩く」という抜け道は存在しうる (libwebkit2gtk 自体には `WebKitWebView::web-process-terminated` という実在のシグナルがある) が、これは **wry のソースには一切現れない** — wry を読んで確認できる範囲を超え、`webkit2gtk`/GIR のドキュメントに頼ることになる。D9 が同じ理由 (wry を経由しない生 API) で `CacheModel` 調整を見送ったのと同じ扱いとし、本 Issue でも実装しなかった。 | `grep` で `terminat`/`crash`/`process_fail`/`web-process-terminated` は `src/webkitgtk/` に 0 件。 |
+| 全プラットフォーム共通 | `WebView::clear_all_browsing_data` はクラッシュ検知ではなく Cookie/キャッシュ/ストレージの一括消去であり無関係。 | — |
+
+**判断: 実装しない**。理由:
+
+- **CLAUDE.md の OS 優先度**は Windows を最優先とし、「OS 別分岐を書く場合は
+  Windows の実装を先に用意する」ことを求めている。ここで唯一実在する
+  フックは macOS/iOS 専用であり、Windows には対応するものが無い。Windows に
+  何も無いまま macOS だけにクラッシュ復旧の作り込みを入れるのは、この方針と
+  正面から矛盾する。
+- Windows 側の「技術的には可能」な道 (生の `ICoreWebView2` を取り出し
+  `unsafe` な COM 呼び出しで `add_ProcessFailed` を自前で登録する) は、
+  CLAUDE.md が原則禁止する `unsafe` の新規使用と、D6 が求める「新しい
+  依存を足す理由の説明」を同時に要求する重い変更であり、本 Issue の主目的
+  (セッション永続化) の付随作業として見合わない。
+- Linux 側の GLib シグナル案も同様に、wry のソースだけでは実在も挙動も
+  検証できず、「憶測で API があることにしない」という Issue 自身の指示に
+  反する。
+- 以上より、**セッション永続化と復元 (wry に依存せず実装できる部分) を
+  確実に仕上げる** という Issue が示した代替方針を採用した。
+
+### 受け入れ条件との対応
+
+- [x] 再起動後に前回のタブを復元できる — `Tabs::restore` + 上記の起動時
+  配線。`VELOX_RESTORE_SESSION=1` で有効化。単体テストの
+  `Tabs::restore`/`SessionSnapshot` 往復に加え、統合テスト
+  `restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch`
+  (`tests/integration.rs`) が実際に `velox` バイナリを 2 回起動して
+  (Xvfb + `dbus-run-session` 環境で) 検証: 1 回目でタブを 2 つ開いて
+  終了 → `session.json` の内容 (URL・順序・active_index) を確認 →
+  2 回目を `VELOX_RESTORE_SESSION=1` かつセッションと無関係な
+  `VELOX_HOMEPAGE` で起動 → ホームページが一切読み込まれず、復元された
+  アクティブタブが自分の URL を読み込み、もう一方の復元タブへの
+  `switch` が `tab_resume` (= 本物の休止からの復帰) として記録される
+  ことまで確認済み。
+- [ ] 1 タブの WebView 障害でブラウザ全体が終了しない — wry 0.56 に
+  Windows/Linux 向けの検知フックが無いため、能動的な検知・自動復旧は
+  実装していない。構造的には各タブの `WebView` は `ui::window` の
+  `TabId` ごとの独立したエントリであり、あるタブのエンジンコールバック
+  が他のタブやイベントループ自体に触れる経路はコード上存在しないが、
+  これは実機での検証が必要な主張であり、テストで固定化できていない。
+- [ ] 復旧不能なページでもエラーUIを表示できる — 同上の理由でスコープ外。
+  wry の `with_on_page_load_handler`/`with_navigation_handler` はページ内容
+  レベルのナビゲーション失敗理由 (DNS/TLS 等) を判別可能な形で渡してこない
+  ため、根拠のあるエラー UI をこの Issue の範囲で実装することを見送った。
+  各エンジンの既定のエラーページ (WebKitGTK/WKWebView/WebView2 がナビゲー
+  ション失敗時に自前で描画するもの) がある程度この役割を代替している。
+- [x] セッション保存データが破損しても起動不能にならない — 上記
+  「破損データの扱い」の節と `browser::session`/`browser::persistence` の
+  テストで担保。
+
+### Revisit condition
+
+(1) Windows/WebView2 の `ICoreWebView2::add_ProcessFailed` を `unsafe` な
+COM 呼び出しで直接ラップする道は、CLAUDE.md が Windows を最優先する以上
+最初に検討すべき次の一手 — ただし `unsafe` 原則禁止の例外化を伴うので、
+実装前に別途方針判断が要る。(2) wry の将来バージョンが
+`WebViewExtWindows`/`WebViewExtUnix` にクラッシュ通知を追加したら、この
+D65 を更新した上でそちらに乗り換える。(3) 「復旧不能なページのエラー UI」
+は、まずナビゲーション失敗理由を判別できる hook の有無を別途調査してから
+着手すべきで、本 Issue のスコープには含めなかった。(4) 設定画面 (#30) が
+できたら `VELOX_RESTORE_SESSION` を UI トグルに昇格させる。(5) macOS/Linux
+は CLAUDE.md の方針どおり「動作すれば十分」の最小実装 (`Tabs::restore`/
+`persistence` は 3 OS 共通の純粋 Rust なので実質差分は無いが、実機検証は
+Windows を優先し、macOS/Linux は未検証のまま)。
 

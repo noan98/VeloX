@@ -8,4 +8,4 @@ pub mod toolbar;
 pub mod webview2_blocking;
 pub mod window;
 
-pub use window::{BrowserWindow, ContentShortcut};
+pub use window::{BrowserWindow, ContentShortcut, SitePolicies};
