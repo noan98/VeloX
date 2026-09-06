@@ -34,6 +34,13 @@ env:
 permissions:
   contents: write # タグ push 時に GitHub Release へ添付するため
 
+# release-windows.yml と同じ group 名を共有し、同一タグに対する GitHub
+# Release の作成を直列化する (理由は release-windows.yml のコメントと
+# docs/decisions.md D70 を参照)。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build-linux:
     name: Build release (Linux x86_64)

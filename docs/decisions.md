@@ -5999,10 +5999,18 @@ CLAUDE.md の OS 優先度方針 (Windows 最優先、macOS/Linux は「ビル�
   パッケージスクリプトの動作確認のみ行った。
 - **2 workflow が同じタグに対して同時に Release 作成 API を呼ぶ際の
   競合**: `softprops/action-gh-release` は対象タグの Release が既に
-  あれば追記する挙動のはずだが、Windows/Linux 両 workflow がほぼ同時に
-  初回作成を試みた場合の競合は未検証。発生しても実害は「一方の
-  workflow が失敗し再実行が必要」程度に留まる見込みだが、要注意事項
-  として記録しておく。
+  あれば追記する挙動だが、Windows/Linux 両 workflow がほぼ同時に初回
+  作成を試みると、両方が「Release が無い」と判断して作成しに行き、
+  片方が失敗し得る。**対策として両 workflow に同じ
+  `concurrency.group: release-${{ github.ref }}` を置き、
+  `cancel-in-progress: false` で直列化した。** キャンセルではなく
+  キューイングさせるため、片方の完了後にもう片方が走り、後発は
+  「既存 Release への添付」になる。group にタグ名 (`github.ref`) を
+  含めているので、別タグのリリース同士は従来どおり並列に走る。
+  なお GitHub の concurrency は「実行中 1 件 + 待機 1 件」しか保持せず
+  3 件目以降は待機中のものがキャンセルされる仕様だが、同一タグで走る
+  release workflow は 2 つだけなので問題にならない。**この直列化自体は
+  実際のタグ push で未検証**であり、初回リリース時に確認すること。
 
 **Revisit condition**: (1) #33 の macOS 除外判断が変わり、macOS の
 release workflow 追加に着手できる環境が整ったとき。(2) 実際にタグを
