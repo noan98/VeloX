@@ -592,6 +592,10 @@ pub fn shortcut_reference() -> &'static [ShortcutInfo] {
             keys: "F12 (macOS: Cmd+Option+I)",
         },
         ShortcutInfo {
+            action: "ページを保存",
+            keys: "Ctrl/Cmd+S",
+        },
+        ShortcutInfo {
             action: "ページのソースを表示",
             keys: "Ctrl/Cmd+U",
         },
