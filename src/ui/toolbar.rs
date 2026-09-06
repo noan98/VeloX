@@ -1552,4 +1552,40 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("reset_settings"));
         assert!(TOOLBAR_HTML.contains("settings-toggle"));
     }
+
+    /// Issue #31/D71: an explicit Light/Dark theme override must reach the
+    /// Private Window colors too, not just the non-private ones — regression
+    /// test for the bug where `--private-bg`/`--private-fg`/
+    /// `--private-field-bg`/`--private-border` were only ever defined by the
+    /// plain `:root`/`@media (prefers-color-scheme: dark)` rules, leaving a
+    /// Private Window's colors tied to the OS theme even when the user had
+    /// explicitly picked the other one via `data-velox-theme`.
+    #[test]
+    fn private_theme_variables_are_overridden_by_an_explicit_light_or_dark_theme() {
+        let light_block = TOOLBAR_HTML
+            .split(":root[data-velox-theme=\"light\"] {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("a data-velox-theme=\"light\" override block must exist");
+        let dark_block = TOOLBAR_HTML
+            .split(":root[data-velox-theme=\"dark\"] {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("a data-velox-theme=\"dark\" override block must exist");
+        for var in [
+            "--private-bg",
+            "--private-fg",
+            "--private-field-bg",
+            "--private-border",
+        ] {
+            assert!(
+                light_block.contains(var),
+                "light theme override block is missing {var}"
+            );
+            assert!(
+                dark_block.contains(var),
+                "dark theme override block is missing {var}"
+            );
+        }
+    }
 }

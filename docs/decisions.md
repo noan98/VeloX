@@ -6448,3 +6448,194 @@ release workflow 追加に着手できる環境が整ったとき。(2) 実際�
 上記の同時実行競合)。(3) ディストリビューション向けパッケージ
 (AppImage/deb) の要望が具体化したとき。(4) コード署名 (#42) 着手時に
 `release-windows.yml`/`release-linux.yml` の署名ステップを追加する。
+
+## D71: ダークモードとブラウザ UI テーマ (#31) — #30 の資産の棚卸しを行い、
+「明示的な Light/Dark がネイティブウィンドウ枠と Private Window 配色に
+届いていなかった」2 点のギャップだけを埋める
+
+**対象**: Issue #31 (依存: #30、D67 で実装済み)。CLAUDE.md「対応 OS の
+優先度」により Windows を最優先の判断基準としたが、開発・実測は他の
+Issue と同じく Linux (CI・性能計測環境) で行っている。
+
+### 棚卸し: #31 の受け入れ条件は #30 (D67) の時点で大半が実装済みだった
+
+着手前に `browser::settings::Theme`(`System`/`Light`/`Dark`)・
+`ui::toolbar.html`・`ui::window::BrowserWindow::set_theme`・`app.rs` の
+`Ready`/`UpdateSettings` ハンドラを読んだところ、Issue #31 の 4 つの
+受け入れ条件のうち 3 つは **#30 で既に実装済み**だったと確認できた
+(ゼロから作る要素ではない):
+
+- **「手動で Light/Dark を切り替えられる」**: `AppearanceSettings::theme`
+  (`Theme::System`/`Light`/`Dark`) が既にあり、設定画面から選ぶと
+  `ToolbarCommand::UpdateSettings` → `BrowserWindow::set_theme` →
+  `veloxSetTheme(...)` → `toolbar.html` の `:root[data-velox-theme]` が
+  即座に切り替わる (D67)。
+- **「再起動後も設定が維持される」**: `Settings` は `settings.json` に
+  永続化され (`browser::persistence`)、起動時 `app::run` が
+  `ToolbarCommand::Ready` ハンドラで `window.set_theme(state.settings.
+  appearance.theme)` を一度push している (`app.rs:1171` 付近) ため、
+  明示的な選択は次回起動後も toolbar chrome に正しく反映される。
+- **「UI 全体でテーマが統一される」(toolbar/tab strip/bookmark bar/
+  dialogs/settings)**: これらは全て `ui/toolbar.html` という 1 枚の
+  HTML/CSS に同居しており (別ファイルに分かれていない)、CSS 変数
+  (`--bg`/`--fg`/`--field-bg`/`--border`/`--tab-bg` 等) 経由で統一済み。
+  `grep` で `#[0-9a-f]{3,6}` のハードコード色を全数確認したが、`:root`/
+  `@media`/`[data-velox-theme]` の変数宣言以外に地の色コードは無かった。
+  なお VeloX 自身が生成する HTML はこの `toolbar.html` のみ (新規タブ
+  ページ相当の専用 HTML は存在せず、ホームページは通常の URL 読み込みで
+  済ませている) ため、この Issue の「VeloX 自身が生成する HTML もテーマ
+  に追従させる」という注意点についても、追加で対応すべき別ファイルは
+  無かった。
+
+未達だったのは実質 1 点、**「OS テーマに追従できる」**の一部 (後述の
+ネイティブウィンドウ枠) と、棚卸し中に見つけた **2 つの具体的なバグ**
+だった。
+
+### 調査: OS ダークモードの取得は Windows を含む 3 OS とも `tao` 0.37 の
+標準 API だけで足りる (追加実装は不要、既に「タダで」動いている部分がある)
+
+指示どおり Windows を最優先に、`tao` 0.37.0 の実ソース
+(`~/.cargo/registry/.../tao-0.37.0/src/`) を確認した:
+
+- `tao::window::Window::theme() -> Theme`(`Theme::Light`/`Dark` の 2値)
+  — 現在の実効テーマを取得できる。3 OS 全てで実装あり
+  (`platform_impl/{windows,macos,linux}/window.rs`)。
+- `tao::event::WindowEvent::ThemeChanged(Theme)` — OS 側でテーマが
+  変わった瞬間に発火するイベント。**Windows**:
+  `platform_impl/windows/event_loop.rs` が `WM_SETTINGCHANGE` を捕捉し
+  `try_window_theme` で再判定して発火 (ポーリング不要)。**macOS**:
+  `platform_impl/macos/window_delegate.rs` が
+  `AppleInterfaceThemeChangedNotification` を購読。**Linux**:
+  `platform_impl/linux/event_loop.rs` が GTK のテーマ変更通知を捕捉。
+- `tao::window::Window::set_theme(Option<Theme>)` —
+  `None` を渡すと「OS に追従したままにする」、`Some(Light|Dark)` を
+  渡すと明示的に固定する。**重要な発見**: `WindowBuilder` の
+  `preferred_theme` はデフォルトで `None` であり、
+  `platform_impl/windows/window.rs` の `try_window_theme` はこれを
+  `self.event_loop.preferred_theme.lock()` にフォールバックさせた上で
+  現在の OS テーマを都度解決する。つまり **VeloX が一切コードを書かなく
+  ても、ネイティブウィンドウ枠 (タイトルバー等) は #31 着手前から既に
+  OS テーマに追従していた** (`window.set_theme(...)` を一度も呼んで
+  いなかったため)。ドキュメントコメントいわく `set_theme` の効果は
+  Windows/Linux はウィンドウ単位、macOS はアプリ全体。
+- toolbar chrome 側 (`:root` の `@media (prefers-color-scheme: dark)`)
+  も、WebView2/WebKitGTK/WKWebView いずれも OS のダーク設定を自前で
+  監視して `prefers-color-scheme` を再評価する一般的なブラウザエンジン
+  機能であり、これも VeloX 側のコード無しに OS 変更へ追従する
+  (D67 のコメントが既にこの前提に立っている)。
+
+結論: **「OS テーマに追従できる」自体は、toolbar chrome についても
+ネイティブウィンドウ枠についても、#31 着手前から (意図せず) 概ね
+成立していた。** `tao`/wry の制約で「できない」ことにはならなかった —
+むしろ「明示的に何もしていないことが、たまたま正しい」状態だった。
+
+### 見つけた実際のギャップ 1: 明示的な Light/Dark 選択がネイティブ
+ウィンドウ枠に届いていなかった
+
+`BrowserWindow::set_theme`(D67 実装) は `toolbar.evaluate_script(...)`
+だけを呼び、`tao::window::Window::set_theme` を一度も呼んでいなかった。
+このため「OS がダークモードのときに設定画面で明示的に Light を選ぶ」と、
+toolbar webview の中身 (アドレスバー・タブストリップ等) は Light に
+なるが、**OS が描画するタイトルバーはダークのまま**という食い違いが
+起きる — この Issue の「UI 全体でテーマが統一される」という受け入れ
+条件に反する具体的なバグだった。
+
+**修正**: `browser::settings` に純粋関数 `native_window_theme(theme:
+Theme) -> Option<ResolvedTheme>` を追加した (`ResolvedTheme` は
+`tao::window::Theme` の 2 値だけを写した browser 層のミラー型 —
+`browser::` は `tao` に依存できないため、変換は `ui::window` 側の 1 箇所
+[`tao_theme_of`] だけで行う、アーキテクチャの 4 層分離を維持)。
+`Theme::System` は `None` (= tao 自身の OS 追従に委ねる、上記調査の
+「タダで動く」経路をそのまま活かす) に、`Theme::Light`/`Dark` は
+`Some(Light|Dark)` にマップするだけの、状態を持たない全域関数。
+`BrowserWindow::set_theme` はこれを使って
+`self.window.set_theme(...)` を toolbar への `evaluate_script` と
+同じタイミング (Ready / UpdateSettings) で呼ぶよう変更した。
+`WindowEvent::ThemeChanged` 自体のハンドリングは追加していない —
+`System` 時は `set_theme(None)` により tao が自分で追従を続け、
+明示選択時は OS 変更を無視するのが正しい挙動なので、VeloX 側で
+イベントを拾って何かする必要が無かった。
+
+### 見つけた実際のギャップ 2: Private Window の配色が明示的なテーマ
+選択に追従していなかった
+
+`toolbar.html` の `--private-bg`/`--private-fg`/`--private-field-bg`/
+`--private-border` は `:root` と `@media (prefers-color-scheme: dark)`
+にしか定義されておらず、`:root[data-velox-theme="light"]`/`"dark"`
+(D67 で追加された明示的上書きブロック) には無かった。つまり
+「OS はダーク、VeloX の設定は明示的に Light」という状況で Private
+Window を開くと、toolbar 全体は Light になるのに Private Window の
+バッジ・背景だけがダーク色のまま残る — Issue 本文が名指しした
+「Private Window の視覚的テーマ拡張に備える」を先取りする形で見つかった
+バグ。
+
+**修正**: 上記 4 変数を両方の `data-velox-theme` 上書きブロックにも追加
+した。`--private-badge-bg`/`--private-badge-fg` は元々ライト/ダークで
+同じ値 (`#6b3fa0`/`#ffffff`) なので上書きブロックには追加していない
+(上書きの必要が無い)。
+
+### なぜこれ以上は広げなかったか
+
+- **`Theme::System` 時に toolbar へ実際に解決した Light/Dark を push
+  する案は見送った**。CSS の `@media (prefers-color-scheme: dark)` は
+  各 WebView エンジンが OS 設定を直接見て判定するのに対し、
+  `tao::window::Window::theme()` は `tao` 自身の OS 判定ロジックを経由
+  する — 3 OS × 2 エンジンの組み合わせで両者が理論上ズレる余地があり
+  (今回 Windows 実機・macOS 実機のどちらでも検証できていない)、
+  今まで安定して動いていた CSS 経路を、検証できない Rust 側の解決に
+  置き換えるのはリスクに見合わないと判断した。ネイティブウィンドウ枠
+  向けの `Option<ResolvedTheme>` (System→`None`) はこの問題が起きない
+  — `None` を渡すことは「tao に丸投げする」ことであり、VeloX 自身が
+  OS テーマを解決する必要が無いため。
+- **`WindowEvent::ThemeChanged` を明示的に処理するコードは追加して
+  いない**。理由は上記のとおり、`System` 時の追従は tao/WebView エンジン
+  側が自律的に行い、明示選択時はそもそも OS 変更を無視するのが仕様
+  だから。`app.rs` の `event_loop.run` の `match event` は既存の
+  `_ => {}` に自然に落ちるため、これを追加してもコンパイル上・実行上の
+  問題は生じない。
+
+### テスト・検証
+
+- `browser::settings`: `native_window_theme` の 3 状態
+  (System→None、Light→Some(Light)、Dark→Some(Dark)) と純粋性を確認する
+  テストを 3 件追加。
+- `ui::window`: `tao::window::Theme` への変換関数 `tao_theme_of` の
+  単体テストを 1 件追加 (`BrowserWindow` 自体の GUI 依存メソッドは
+  既存方針どおりユニットテスト対象外 — 実ウィンドウでの検証は下記の
+  「検証できていないこと」参照)。
+- `ui::toolbar`: `toolbar.html` の `data-velox-theme="light"`/`"dark"`
+  各ブロックに 4 つの `--private-*` 変数が実際に含まれることを確認する
+  回帰テストを 1 件追加 (ギャップ 2 の修正の検証)。
+- `cargo test`(xvfb-run + dbus-run-session): 既存の統合テスト 8 本は
+  変更なしで全数グリーン。ユニットテストは着手前 776 件→着手後 781 件
+  (+5、上記の追加テストと一致)、減少なし。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets`: 型検査
+  のみ通過 (リンク・実行はしていない — この開発環境は Linux のみ)。
+
+### 満たせなかった/検証できていない点
+
+- **「OS テーマに追従できる」の実機検証は行っていない**。この開発環境は
+  Linux (Xvfb) のみで、実際に OS のダーク/ライト設定を切り替えてタイトル
+  バー・toolbar 双方が追従するかを目視確認することはできなかった。上記の
+  `tao` 0.37 のソースコード解析に基づく推論であり、特に Windows 実機
+  (最優先 OS) での確認は今後の課題として残る。
+- **`WindowEvent::ThemeChanged` の実発火・実挙動は未検証**(Xvfb 環境に
+  は「OS のダークモード設定」という概念自体が無く、切り替えて発火させる
+  ことができない)。
+- **Linux (WebKitGTK) での `prefers-color-scheme` の実際の追従確認も
+  未実施**。CLAUDE.md の OS 優先度方針により最低限の整備に留めている。
+- **Private Window 機能自体 (Issue 本文の「Private Windowの視覚的
+  テーマ拡張に備える」の主題) はまだ実装されていない**— 現状の
+  `--private-*` 変数は「今後 Private Window 機能が入ったときにテーマと
+  矛盾しないよう備える」という位置づけの CSS 変数であり、この Issue の
+  スコアではその機能自体は追加していない (別 Issue の領域)。
+- **設定画面 UI 上、「システム (現在: ダーク)」のように解決済み OS テーマ
+  を表示する機能は追加していない**。受け入れ条件には無いため見送った。
+
+**Revisit condition**: (1) 実際に Windows/macOS 実機で OS テーマ切替を
+目視検証できる環境が整ったとき (現状 Linux 専用の開発環境という制約に
+よる)。(2) Private Window 機能そのものを実装する Issue に着手すると
+き、本 Issue で用意した `--private-*` の明示的テーマ対応が実際に使われる
+ことを確認する。(3) toolbar chrome の `System` 解決を CSS 依存から
+`tao::window::Window::theme()` 起点の明示解決に置き換える方が有利だと
+判明したとき (現状は上記のとおりリスク回避のため見送っている)。

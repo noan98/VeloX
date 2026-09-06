@@ -333,6 +333,19 @@ const RESOLVE_FAVICON_SCRIPT: &str = r#"(() => {
   }
 })();"#;
 
+/// Convert [`crate::browser::ResolvedTheme`] (the `browser::`-layer, `tao`-
+/// independent mirror — see its doc comment for why it exists at all) to the
+/// real `tao::window::Theme` `Window::set_theme` expects. The one place this
+/// conversion needs to happen (Issue #31/D71); everything upstream of it
+/// (`browser::native_window_theme`) stays UI-toolkit-independent and
+/// unit-tested without `tao`.
+fn tao_theme_of(theme: crate::browser::ResolvedTheme) -> tao::window::Theme {
+    match theme {
+        crate::browser::ResolvedTheme::Light => tao::window::Theme::Light,
+        crate::browser::ResolvedTheme::Dark => tao::window::Theme::Dark,
+    }
+}
+
 /// Split the window area into a toolbar strip and the content area below it.
 fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, LogicalRect) {
     let toolbar_height = toolbar_height.min(height);
@@ -1593,12 +1606,28 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_settings_script(view))
     }
 
-    /// Apply the chrome (toolbar/tab-strip) theme override (Issue #30's
-    /// Appearance tab). Takes effect immediately — unlike every other
-    /// settings-screen field, this never goes through `Config`/a restart;
-    /// see docs/decisions.md D67. Never touches web page content (wry 0.56
-    /// exposes no per-webview `prefers-color-scheme` override).
+    /// Apply the chrome theme override (Issue #30's Appearance tab; the
+    /// native-window half is Issue #31, see docs/decisions.md D67/D71).
+    /// Takes effect immediately — unlike every other settings-screen field,
+    /// this never goes through `Config`/a restart. Two independent surfaces
+    /// are kept in sync from the one `theme` value:
+    ///
+    /// - The toolbar/tab-strip/bookmark-bar/panels webview's own
+    ///   `data-velox-theme` attribute (`toolbar::set_theme_script`) — never
+    ///   web page content, which wry 0.56 exposes no per-webview
+    ///   `prefers-color-scheme` override for.
+    /// - The native window frame `tao` draws around it (title bar etc, via
+    ///   `Window::set_theme`) — added by Issue #31, since an explicit
+    ///   Light/Dark choice previously only ever reached the toolbar webview,
+    ///   leaving the OS-drawn frame tracking the OS regardless of what the
+    ///   user picked (docs/decisions.md D71). `browser::native_window_theme`
+    ///   is the pure, unit-tested decision of what to pass `tao`; `None` for
+    ///   `Theme::System` deliberately hands control back to `tao`'s own
+    ///   OS-tracking default rather than VeloX resolving the OS theme
+    ///   itself.
     pub fn set_theme(&self, theme: crate::browser::Theme) -> wry::Result<()> {
+        self.window
+            .set_theme(crate::browser::native_window_theme(theme).map(tao_theme_of));
         self.toolbar
             .evaluate_script(&toolbar::set_theme_script(theme))
     }
@@ -2602,6 +2631,18 @@ mod tests {
         assert_eq!(
             download_handler_host(true, false),
             DownloadHandlerHost::EachContentWebview
+        );
+    }
+
+    #[test]
+    fn tao_theme_of_maps_light_and_dark_straight_across() {
+        assert_eq!(
+            tao_theme_of(crate::browser::ResolvedTheme::Light),
+            tao::window::Theme::Light
+        );
+        assert_eq!(
+            tao_theme_of(crate::browser::ResolvedTheme::Dark),
+            tao::window::Theme::Dark
         );
     }
 
