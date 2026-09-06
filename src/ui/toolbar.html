@@ -232,6 +232,33 @@
   }
   #block-count[hidden] { display: none; }
 
+  /* Print/PDF-export status banner (Issue #40, see docs/decisions.md D75):
+     a plain inline span inside the existing, already fixed-height
+     `#toolbar` row — unlike the find bar/bookmark bar above, this never
+     needs to add its own height to `ui::window::effective_toolbar_height`,
+     since it is just text sharing the row the address bar already sits in,
+     not a separate control surface. `max-width`+`text-overflow: ellipsis`
+     keep a long COM error message (or a full destination path) from
+     stretching the toolbar; the full text is still in the DOM (and in the
+     `title` attribute veloxSetPrintStatus sets), so nothing is lost, only
+     visually clipped. */
+  #print-status {
+    flex: none;
+    max-width: 220px;
+    padding: 0 8px;
+    height: 20px;
+    line-height: 20px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    border-radius: 10px;
+    background: rgba(128, 128, 128, 0.2);
+    color: var(--fg);
+    font-size: 11px;
+    cursor: pointer;
+  }
+  #print-status[hidden] { display: none; }
+
   /* Private browsing: an always-visible color shift plus a badge, so the
      mode is never mistaken for normal browsing (see docs/decisions.md
      D14). Applied via a class on <body> so it also covers the panel. */
@@ -816,9 +843,12 @@
   <input id="url" type="text" spellcheck="false" autocomplete="off"
          placeholder="Enter a URL, e.g. example.com" />
   <span id="block-count" title="Blocked ad/tracker requests" hidden>0</span>
+  <span id="print-status" hidden></span>
   <button id="devtools" title="Open DevTools (F12)">&#9881;</button>
   <button id="bookmark-star" title="ブックマークに追加/削除 (Ctrl/Cmd+D)">&#9733;</button>
   <button id="find-toggle" title="ページ内を検索 (Ctrl/Cmd+F)">&#128269;</button>
+  <button id="print-toggle" title="印刷 (Ctrl/Cmd+P)">&#128424;</button>
+  <button id="pdf-export-toggle" title="PDFとして保存">&#128196;</button>
   <button id="history-toggle" title="履歴">&#128337;</button>
   <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
   <button id="bookmark-bar-toggle" title="ブックマークバーの表示切替 (Ctrl/Cmd+Shift+B)">&#9644;</button>
@@ -1170,6 +1200,14 @@
   document.getElementById("find-toggle").addEventListener("click", () => {
     send({ cmd: "open_find_bar" });
   });
+
+  /* Print / PDF export (Issue #40, see docs/decisions.md D75). */
+  document.getElementById("print-toggle").addEventListener("click", () => {
+    send({ cmd: "print" });
+  });
+  document.getElementById("pdf-export-toggle").addEventListener("click", () => {
+    send({ cmd: "save_as_pdf" });
+  });
   findInputEl.addEventListener("input", () => {
     if (findDebounceHandle !== null) {
       clearTimeout(findDebounceHandle);
@@ -1245,6 +1283,10 @@
         // Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
         // docs/decisions.md D69.
         message = { cmd: "open_find_bar" };
+      } else if (event.key === "p" || event.key === "P") {
+        // Ctrl/Cmd+P (Issue #40): print the active tab. See
+        // docs/decisions.md D75.
+        message = { cmd: "print" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {
@@ -1330,6 +1372,38 @@
   window.veloxSetFindStatus = (total, active) => {
     findCountEl.textContent = total === 0 ? "0/0" : `${active + 1}/${total}`;
   };
+
+  /* Print/PDF-export status banner (Issue #40, see docs/decisions.md D75):
+     `message === null` hides it (Rust never has anything to show, or the
+     previous message should be cleared); a non-null message shows it with
+     both the visible (possibly ellipsis-truncated by CSS) text and the
+     full text in `title` so it is still readable on hover. Auto-hides
+     after a few seconds so a stale success/failure message from an earlier
+     export does not linger indefinitely; clicking it dismisses it early —
+     purely local UI state, Rust never needs to know whether it is still
+     showing. */
+  let printStatusTimeout = null;
+  window.veloxSetPrintStatus = (message) => {
+    const el = document.getElementById("print-status");
+    if (printStatusTimeout !== null) {
+      clearTimeout(printStatusTimeout);
+      printStatusTimeout = null;
+    }
+    if (message === null) {
+      el.hidden = true;
+      return;
+    }
+    el.textContent = message;
+    el.title = message;
+    el.hidden = false;
+    printStatusTimeout = setTimeout(() => {
+      el.hidden = true;
+      printStatusTimeout = null;
+    }, 8000);
+  };
+  document.getElementById("print-status").addEventListener("click", () => {
+    window.veloxSetPrintStatus(null);
+  });
 
   /* Full re-render of the tab strip from the current tab list. Simpler and
      plenty fast for the handful of tabs a desktop browser session has open,

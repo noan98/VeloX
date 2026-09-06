@@ -300,6 +300,19 @@ pub enum ToolbarCommand {
     /// "✕" button, or Esc while the find input has focus: close the find
     /// bar and clear any highlight left in the page.
     FindClose,
+
+    // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
+    /// Ctrl/Cmd+P, or the toolbar's print button: open the OS's native
+    /// print UI for the active tab (`ui::window::BrowserWindow::print_tab`).
+    /// The content-webview equivalent is
+    /// `ui::window::ContentShortcut::Print`; both funnel into the same
+    /// `app::print_active_tab`.
+    Print,
+    /// The toolbar's "PDFとして保存" button: headless PDF export with no
+    /// dialog. Windows-only (see `ui::window::BrowserWindow::
+    /// export_tab_as_pdf` and D75) — macOS/Linux answer with a print-status
+    /// message pointing at [`Self::Print`]'s dialog instead.
+    SaveAsPdf,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -597,6 +610,28 @@ pub fn set_find_status_script(total: usize, active: Option<usize>) -> String {
     match active {
         Some(index) => format!("veloxSetFindStatus({total}, {index});"),
         None => format!("veloxSetFindStatus({total}, null);"),
+    }
+}
+
+/// JS snippet that shows (with `Some(message)`) or hides (`None`) the
+/// print/PDF-export status banner (Issue #40, see docs/decisions.md D75) —
+/// shared by a `print_tab` failure and the async
+/// `UserEvent::PdfExportFinished` result, success or failure alike. `message`
+/// is embedded as a JSON string literal, the same [`set_url_script`]-style
+/// pattern (JSON-embed, then [`escape_js_line_terminators`]) every other
+/// dynamic-text script here uses — a page title or a raw COM error string
+/// (`windows::core::Error`'s `Display`) can contain arbitrary characters and
+/// must not be able to break out of the generated script.
+pub fn set_print_status_script(message: Option<&str>) -> String {
+    match message {
+        Some(text) => {
+            let json = serde_json::Value::String(text.to_owned()).to_string();
+            format!(
+                "veloxSetPrintStatus({});",
+                escape_js_line_terminators(&json)
+            )
+        }
+        None => "veloxSetPrintStatus(null);".to_owned(),
     }
 }
 
@@ -1384,6 +1419,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_print_commands() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"print"}"#).unwrap(),
+            ToolbarCommand::Print
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"save_as_pdf"}"#).unwrap(),
+            ToolbarCommand::SaveAsPdf
+        );
+    }
+
+    #[test]
+    fn print_status_script_embeds_message_as_json_or_null() {
+        assert_eq!(
+            set_print_status_script(Some("PDFとして保存しました")),
+            "veloxSetPrintStatus(\"PDFとして保存しました\");"
+        );
+        assert_eq!(set_print_status_script(None), "veloxSetPrintStatus(null);");
+    }
+
+    #[test]
+    fn print_status_script_neutralizes_quotes_and_backslashes() {
+        let script = set_print_status_script(Some(r#""a"\b"#));
+        assert_eq!(script, r#"veloxSetPrintStatus("\"a\"\\b");"#);
+    }
+
+    #[test]
+    fn print_status_script_neutralizes_line_terminators() {
+        // Same D62 hardening every other dynamic-text `set_*_script`
+        // function here applies (see `escape_js_line_terminators`'s doc
+        // comment) — a COM error string or page title could contain either
+        // character.
+        let script = set_print_status_script(Some("foo\u{2028}bar\u{2029}"));
+        assert!(script.contains("\\u2028"), "{script}");
+        assert!(script.contains("\\u2029"), "{script}");
+        assert!(!script.contains('\u{2028}'));
+        assert!(!script.contains('\u{2029}'));
+    }
+
+    #[test]
     fn find_bar_visible_script_embeds_bool_only() {
         assert_eq!(
             set_find_bar_visible_script(true),
@@ -1565,6 +1640,11 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("update_settings"));
         assert!(TOOLBAR_HTML.contains("reset_settings"));
         assert!(TOOLBAR_HTML.contains("settings-toggle"));
+
+        // Print / PDF export (Issue #40, see docs/decisions.md D75).
+        assert!(TOOLBAR_HTML.contains("veloxSetPrintStatus"));
+        assert!(TOOLBAR_HTML.contains("\"print\""));
+        assert!(TOOLBAR_HTML.contains("save_as_pdf"));
     }
 
     /// Issue #31/D71: an explicit Light/Dark theme override must reach the

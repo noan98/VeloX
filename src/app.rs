@@ -22,15 +22,15 @@ use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
-    find, input_history, metrics, navigation, omnibox, persistence, shortcut_reference, site_data,
-    ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore,
-    Favicon, FilterList, HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource,
-    InputHistoryStore, SessionSnapshot, Settings, SiteExceptions, SitePermissionStore, TabId, Tabs,
-    WindowId, Windows,
+    find, input_history, metrics, navigation, omnibox, persistence, print, shortcut_reference,
+    site_data, ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry, DownloadId,
+    DownloadStore, Favicon, FilterList, HistoryBookmarkSource, HistoryEntry, HistoryStore,
+    InputHistorySource, InputHistoryStore, SessionSnapshot, Settings, SiteExceptions,
+    SitePermissionStore, TabId, Tabs, WindowId, Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
-use crate::ui::{BrowserWindow, ContentShortcut, SitePolicies};
+use crate::ui::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};
 
 /// Events forwarded from webview callbacks into the main event loop.
 ///
@@ -184,6 +184,27 @@ pub enum UserEvent {
         window_id: WindowId,
         tab_id: TabId,
         total: usize,
+    },
+    /// The Windows-only headless PDF export (Issue #40, see
+    /// `ui::webview2_print::export_as_pdf` and docs/decisions.md D75)
+    /// finished — `success`/`error` come from WebView2's own
+    /// `PrintToPdfCompletedHandler`, so unlike `ContentShortcut::Print`'s
+    /// `wry::WebView::print()` path this can report a *real* failure (disk
+    /// full, permission denied, ...), not just "could the call be
+    /// dispatched at all". Carries `window_id` for the same reason every
+    /// other per-tab/per-window async result does (Issue #29/D68): the
+    /// window that requested this export may have since closed, or may not
+    /// be the one a stale `TabId` now resolves to in a different window.
+    /// `tab_id` is not currently used to route the result anywhere more
+    /// specific than "that window's shared print-status banner" (there is
+    /// no per-tab export UI), but is kept for parity with every other
+    /// per-tab event and for a future per-tab status display.
+    PdfExportFinished {
+        window_id: WindowId,
+        tab_id: TabId,
+        destination: PathBuf,
+        success: bool,
+        error: Option<String>,
     },
 }
 
@@ -861,7 +882,10 @@ fn record_perf_event(
         // Issue #43's in-page find is not a perf-tracked operation (no
         // `docs/performance-targets.md` budget calls for it) — nothing to
         // log here.
-        | UserEvent::FindMatchesUpdated { .. } => {}
+        | UserEvent::FindMatchesUpdated { .. }
+        // Same for Issue #40's PDF export — no performance budget calls
+        // for it either.
+        | UserEvent::PdfExportFinished { .. } => {}
     }
 }
 
@@ -1458,6 +1482,26 @@ fn handle_user_event(
                 }
             }
         }
+        UserEvent::PdfExportFinished {
+            window_id,
+            tab_id: _,
+            destination,
+            success,
+            error,
+        } => {
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            let message = if success {
+                format!("PDFとして保存しました: {}", destination.display())
+            } else {
+                match error {
+                    Some(reason) => format!("PDFの書き出しに失敗しました: {reason}"),
+                    None => "PDFの書き出しに失敗しました".to_owned(),
+                }
+            };
+            log_failure("show print status", window.set_print_status(Some(&message)));
+        }
     }
 }
 
@@ -1864,6 +1908,10 @@ fn handle_toolbar_command(
             step_find(window, window_id, state, FindDirection::Previous)
         }
         ToolbarCommand::FindClose => close_find_bar(window, window_id, state),
+
+        // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
+        ToolbarCommand::Print => print_active_tab(window, window_id, state),
+        ToolbarCommand::SaveAsPdf => save_active_tab_as_pdf(window, window_id, state, config),
     }
 }
 
@@ -2009,6 +2057,110 @@ fn step_find(
             "highlight find match",
             window.highlight_find_match(tab_id, index),
         );
+    }
+}
+
+// --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
+//
+// `ToolbarCommand::Print`/`ContentShortcut::Print` (Ctrl/Cmd+P, D18/D23's
+// usual dual-channel shortcut delivery, assigned directly here for now
+// rather than through a keybinding-config layer — same "not blocked on
+// Issue #38 yet" reasoning D69 already used for Ctrl/Cmd+F) both call
+// `print_active_tab`. `ToolbarCommand::SaveAsPdf` (a toolbar button only —
+// no keyboard shortcut, see D75) calls `save_active_tab_as_pdf`.
+
+/// Print the active tab's page (Ctrl/Cmd+P, or the toolbar's print button)
+/// via the OS's native print UI — see
+/// `ui::window::BrowserWindow::print_tab`'s doc comment for exactly what
+/// that means on each platform and its one caveat (a real print-job
+/// failure is invisible to wry's `Result`, only a failure to even dispatch
+/// the call is not).
+fn print_active_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let tab_id = tabs_of(state, window_id).active_id();
+    if let Err(err) = window.print_tab(tab_id) {
+        eprintln!("velox: failed to print the active tab: {err}");
+        log_failure(
+            "show print status",
+            window.set_print_status(Some(&format!("印刷を開始できませんでした: {err}"))),
+        );
+    }
+}
+
+/// Export the active tab's page straight to a PDF file with no dialog (the
+/// toolbar's "PDFとして保存" button) — Windows-only
+/// (`ui::window::BrowserWindow::export_tab_as_pdf`, see docs/decisions.md
+/// D75); macOS/Linux answer with a status message pointing at
+/// [`print_active_tab`]'s dialog instead, which itself offers a "save as
+/// PDF" destination on every platform VeloX ships on.
+///
+/// The destination directory reuses `browser::downloads`' existing assets
+/// wholesale — `resolve_download_dir_with_override` (the same
+/// `Config::download_dir_override`/`VELOX_DOWNLOAD_DIR`/platform-default
+/// resolution downloads already use, Issue #16/#30) and
+/// `prepare_destination` (sanitizes the suggested filename, creates the
+/// directory if missing, and avoids clobbering an existing file the same
+/// `report (1).pdf` way a same-named download would) — rather than
+/// re-deriving either.
+fn save_active_tab_as_pdf(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    config: &Config,
+) {
+    let tab_id = tabs_of(state, window_id).active_id();
+    let tab = tabs_of(state, window_id).active();
+    let url = tab.current_url().to_owned();
+    let title = tab.title().map(str::to_owned);
+
+    let Some(dir) =
+        downloads::resolve_download_dir_with_override(config.download_dir_override.as_deref())
+    else {
+        log_failure(
+            "show print status",
+            window.set_print_status(Some("PDF の保存先フォルダを特定できませんでした")),
+        );
+        return;
+    };
+    let raw_name = print::suggest_pdf_filename(title.as_deref(), &url);
+    let destination = match downloads::prepare_destination(&dir, &raw_name) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("velox: failed to prepare the PDF export destination: {err}");
+            log_failure(
+                "show print status",
+                window
+                    .set_print_status(Some(&format!("PDF の保存先を準備できませんでした: {err}"))),
+            );
+            return;
+        }
+    };
+
+    let settings = print::PdfExportSettings::default().sanitize();
+    match window.export_tab_as_pdf(tab_id, destination, &settings) {
+        PdfExportRequest::Started => {
+            // The real result arrives later as `UserEvent::PdfExportFinished`.
+        }
+        PdfExportRequest::NoWebview => {
+            log_failure(
+                "show print status",
+                window.set_print_status(Some("このタブは休止中のため PDF に保存できません")),
+            );
+        }
+        PdfExportRequest::UnsupportedPlatform => {
+            log_failure(
+                "show print status",
+                window.set_print_status(Some(
+                    "この OS では PDF への直接保存に対応していません。印刷 (Ctrl/Cmd+P) \
+                     のダイアログから PDF に保存してください。",
+                )),
+            );
+        }
+        PdfExportRequest::Failed { message } => {
+            log_failure(
+                "show print status",
+                window.set_print_status(Some(&format!("PDF の書き出しに失敗しました: {message}"))),
+            );
+        }
     }
 }
 
@@ -2214,6 +2366,7 @@ fn handle_content_shortcut(
         // `ToolbarCommand::NewWindow` in `handle_toolbar_command`).
         ContentShortcut::NewWindow => {}
         ContentShortcut::OpenFindBar => open_find_bar(window, window_id, state),
+        ContentShortcut::Print => print_active_tab(window, window_id, state),
     }
 }
 
