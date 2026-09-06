@@ -25,6 +25,7 @@ pub mod perf_log;
 pub mod persistence;
 pub mod ranking;
 pub mod site_permissions;
+pub mod subresource;
 pub mod suspension;
 pub mod tab;
 pub mod tabs;
@@ -45,6 +46,7 @@ pub use site_permissions::{
     origin_of, PermissionDecision, PermissionKind, PermissionRecord, Resolution,
     SitePermissionStore,
 };
+pub use subresource::{is_blocked_resource, ResourceType, SiteExceptions};
 pub use suspension::{SuspendReason, SuspensionPolicy};
 pub use tab::{Favicon, InvalidTabTransition, Tab, TabId, TabState};
 pub use tabs::{ActivationEffect, Tabs};
