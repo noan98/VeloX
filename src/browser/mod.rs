@@ -51,9 +51,9 @@ pub use omnibox::{Candidate, CandidateKind, CandidateSource};
 pub use omnibox_candidates::{HistoryBookmarkSource, InputHistorySource};
 pub use session::{SavedTab, SessionSnapshot};
 pub use settings::{
-    shortcut_reference, AdvancedSettings, AppearanceSettings, DownloadsSettings, GeneralSettings,
-    PerformanceSettings, PrivacySettings, SearchSettings, Settings, ShortcutInfo, Theme,
-    SETTINGS_SCHEMA_VERSION,
+    native_window_theme, shortcut_reference, AdvancedSettings, AppearanceSettings,
+    DownloadsSettings, GeneralSettings, PerformanceSettings, PrivacySettings, ResolvedTheme,
+    SearchSettings, Settings, ShortcutInfo, Theme, SETTINGS_SCHEMA_VERSION,
 };
 pub use site_data::ClearOutcome;
 pub use site_permissions::{
