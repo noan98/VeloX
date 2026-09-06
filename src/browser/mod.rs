@@ -2,9 +2,9 @@
 //!
 //! Most of this module is plain Rust state and pure functions, which keeps
 //! it unit-testable without spawning a window: `navigation`, `tab`,
-//! `history`, `bookmarks`, `site_permissions`, `session`, `benchmark`,
-//! `automation`, `suspension` and `find` hold no filesystem or UI
-//! dependency.
+//! `history`, `bookmarks`, `site_permissions`, `session`, `settings`,
+//! `benchmark`, `automation`, `suspension` and `find` hold no filesystem
+//! or UI dependency.
 //! `persistence` and `perf_log` are the exceptions — thin, deliberately
 //! "dumb" IO layers (JSON files for `persistence`; stderr/a file for
 //! `perf_log`'s [`metrics::PerfRecord`] lines); see their module doc
@@ -27,6 +27,7 @@ pub mod perf_log;
 pub mod persistence;
 pub mod ranking;
 pub mod session;
+pub mod settings;
 pub mod site_data;
 pub mod site_permissions;
 pub mod subresource;
@@ -47,6 +48,11 @@ pub use input_history::{InputHistoryEntry, InputHistoryStore};
 pub use omnibox::{Candidate, CandidateKind, CandidateSource};
 pub use omnibox_candidates::{HistoryBookmarkSource, InputHistorySource};
 pub use session::{SavedTab, SessionSnapshot};
+pub use settings::{
+    shortcut_reference, AdvancedSettings, AppearanceSettings, DownloadsSettings, GeneralSettings,
+    PerformanceSettings, PrivacySettings, SearchSettings, Settings, ShortcutInfo, Theme,
+    SETTINGS_SCHEMA_VERSION,
+};
 pub use site_data::ClearOutcome;
 pub use site_permissions::{
     origin_of, PermissionDecision, PermissionKind, PermissionRecord, Resolution,

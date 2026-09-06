@@ -5919,6 +5919,220 @@ WebKitGTK 実装が完了を待たない非同期発火型であることの影�
 macOS の実機検証 (`clear_all_browsing_data` が実際にファイルを消すこと)
 は今回の環境では不可能だった。
 
+## D67: 設定画面と永続設定基盤 (#30) — `browser::settings` に一元化し、
+`Config::apply_settings`/`to_settings` で相互変換、Appearance のみ即時
+反映・他は次回起動反映
+
+**対象**: Issue #30 (関連 #10)。CLAUDE.md「対応 OS の優先度」により
+Windows を最優先の判断基準としたが、実装・実測は本リポジトリの他 Issue
+と同じく Linux (CI・性能計測環境) で行っている。
+
+### 全体設計: 「起動設定 (`Config`)」と「永続ユーザ設定 (`Settings`)」を
+明確に分離する
+
+受け入れ条件の「ConfigとUIが適切に分離される」を、既存のアーキテクチャ
+方針 (`docs/architecture.md` の 4 層分離、テスト可能なロジックは
+`src/browser/` に置く) にそのまま乗せる形で解釈した:
+
+- **`browser::settings::Settings`**(新規、`src/browser/settings.rs`) —
+  UI が変更でき、ディスクに永続化される設定値そのもの。`General` /
+  `Appearance` / `Search` / `Privacy` / `Performance` / `Downloads` /
+  `Advanced` の 7 カテゴリを持つ、serde 駆動のプレーンな構造体群。
+  `browser::session::SessionSnapshot` と同じ形 — UI/エンジン非依存、
+  `sanitize()` で不正値を修復し、単体テストが主戦場。`Security` と
+  `Shortcuts` は永続フィールドを持たず (後述)、設定画面には表示用の
+  読み取り専用タブとしてのみ存在する。
+- **`config::Config`** — 既存どおり「起動時に一度だけ解決される設定」の
+  ままとし、新しいフィールドを増やさない代わりに `Settings` との相互
+  変換を 2 つのメソッドとして持たせた:
+  - `Config::apply_settings(&mut self, settings: &Settings)` — 永続化
+    済みの `Settings` を `Config` の対応フィールドへ一方向にコピーする。
+  - `Config::to_settings(&self) -> Settings` — その逆方向。`search_engine`
+    は 5 つの組み込みプリセットの値と完全一致するかを比較し、一致しなけ
+    れば `"custom"` + name/template として往復させる (プリセット名を
+    保持するフィールドが `Config` 側に無いため、値の完全一致で復元する
+    しかない — 起動時に一度 `VELOX_SEARCH_ENGINE=google` 等で選ばれた
+    ものであれば問題なく `"google"` に戻る)。
+- **`ui::toolbar`/`ui/toolbar.html`** — 設定画面の描画とフォーム入力は
+  完全に UI 層の責務。`ToolbarCommand::UpdateSettings { settings:
+  Box<Settings> }`(サイズの大きいバリアントを避けるため Box 化、
+  clippy `large_enum_variant`)/`ResetSettings` の 2 コマンドで、
+  カテゴリごとの粒度ではなく `Settings` ドキュメント全体を都度置き換える
+  設計にした — 20 個近いフィールドそれぞれに専用 IPC コマンドを作るより、
+  1 つの「保存」ボタンでフォーム全体を JSON にまとめて送る方が
+  IPC プロトコルの複雑度を大きく減らせる (既存の `EditBookmark` 等、
+  複数フィールドを 1 コマンドにまとめる先例に倣った)。
+- **`browser::persistence`** — 既存の `history.json`/`bookmarks.json`
+  などと同じパターンで `settings.json` を追加 (`load_settings`/
+  `save_settings`)。読み込み失敗 (欠落・破損・型不一致) は
+  `load_session` と同じ契約で `None` を返し、呼び出し側
+  (`app::run`)が `Settings::default()`/`Config::to_settings()` に
+  フォールバックする。
+
+### 開発中に見つけた設計バグとその修正: `apply_settings` は
+「`settings.json` が実在するときだけ」呼ぶ
+
+実装の初期版では `app::run` が起動のたびに
+
+```rust
+let settings = load_settings(dir).unwrap_or_default().sanitize();
+config.apply_settings(&settings);
+```
+
+という形で無条件に `apply_settings` を呼んでいた。これは**一見自然だが
+致命的な後退バグ**だった: `settings.json` が存在しない (=まだ設定画面を
+一度も使っていない、フレッシュチェックアウトやテスト環境) 場合、
+`Settings::default()` の「オフ」「未設定」な値が `Config` の対応
+フィールドへ無条件に上書きされ、`Config::from_env_and_args` が直前に
+読んでいた `VELOX_RESTORE_SESSION`/`VELOX_MAX_LIVE_TABS`/
+`VELOX_PERF_METRICS` などの環境変数がすべて無効化されてしまう。
+
+これは本 Issue の統合テストスイート (`tests/integration.rs`) を実行して
+初めて発覚した — 8 本中 6 本が失敗し (`restoring_the_previous_session_
+reopens_its_tabs_across_a_real_relaunch` が `VELOX_RESTORE_SESSION` を、
+`live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them` が
+`VELOX_MAX_LIVE_TABS` を、`startup_completes_and_records_a_startup_event`
+ほか perf 系 3 本が `VELOX_PERF_METRICS`/`VELOX_PERF_FORMAT` をそれぞれ
+握り潰されて失敗していた)、CLAUDE.md がテスト層を分けている理由
+(D46/D47 — ユニットテストだけでは検出できない配線の問題) をまさに体現す
+る形になった。
+
+**修正**: `app::run` は `persistence::load_settings` が `Some` を返した
+とき (=`settings.json` が実在し、パースにも成功したとき) だけ
+`apply_settings` を呼ぶ。`None` のとき (未作成・破損・データディレクトリ
+未解決) は代わりに `Config::to_settings()` で「今まさに有効な `Config`」
+から `Settings` を逆算し、それを `AppState::settings` の初期値として使う
+— 環境変数由来の値を設定画面が黙って上書きすることは無くなり、かつ
+初めて設定画面を開いたときに「今動いている値」がそのまま表示される
+(何も変更せず保存しても挙動が変わらない)。`config::tests::to_settings_
+round_trips_back_through_apply_settings` で `Config -> to_settings ->
+apply_settings` が恒等写像になることを、任意の (デフォルトでない)
+`Config` に対して検証した。
+
+### どのフィールドが「即時反映」でどれが「次回起動反映」か
+
+9 タブすべてを即時反映にするコストは、`browser::blocklist::FilterList`・
+`browser::suspension::SuspensionPolicy`・`PerfLog` 等が軒並み起動時に
+一度だけ構築されウィンドウ/タブのクロージャに焼き込まれている
+(`ui::window::content_webview_builder` 等) 現在のアーキテクチャ全体の
+可変化を要求し、本 Issue のスコープを大きく超えると判断した。代わりに
+以下の 2 段構えとした:
+
+- **`Appearance` タブ (`theme`/`show_bookmark_bar`) だけは即時反映**。
+  どちらも `Config` を経由しない — `theme` は `ui::window::BrowserWindow::
+  set_theme` が `veloxSetTheme(...)` を `evaluate_script` するだけの
+  純粋な CSS 変数切り替え (`:root[data-velox-theme]`、Web ページ本体の
+  `prefers-color-scheme` には一切触れない — wry 0.56 にはその
+  per-webview 上書き手段が無い)。`show_bookmark_bar` は既存の
+  `BrowserWindow::set_bookmark_bar_visible` (Issue #19 由来、
+  `Cell<bool>`) をそのまま呼ぶだけで済んだ。ついでに
+  `docs/architecture.md` に残っていた「ブックマークバーの表示状態は
+  セッションのみで再起動すると消える (#30 待ち)」という既知の制約も、
+  この Issue で実際に解消した (`Settings::appearance::show_bookmark_bar`
+  として永続化し、起動時に `window.set_bookmark_bar_visible` へ反映)。
+- **それ以外 (General/Search/Privacy/Performance/Downloads/Advanced) は
+  次回起動時に反映**。`Config::apply_settings` が起動時に一度だけ呼ばれ、
+  以降そのプロセスの生存期間中は変わらない。設定画面のフッターに
+  「一部の変更は次回起動後に反映されます」という注記を出し、ユーザに
+  誤解させないようにした。
+
+### Downloads タブは実際に配線した (当初は保留を検討したが撤回)
+
+`download_dir_override` は当初「永続化はするが実際の効果は無い」まま
+出す案も検討したが、実装コストが小さく既存パターン (`content_blocking_
+enabled` を `ContentPolicy` 経由で `content_webview_builder` に運ぶのと
+同型) で機械的に済むと分かったため撤回し、実際に配線した:
+`Config::download_dir_override` → `ui::window::BrowserWindow`(生成時に
+1 回コピー) → `ContentPolicy`/トップレベルの `with_download_handlers`
+呼び出し 2 箇所 → `browser::downloads::resolve_download_dir_with_override`
+(新規、`resolve_download_dir` のラッパ。空白のみ/`None` なら既存の
+`VELOX_DOWNLOAD_DIR`/プラットフォーム既定にフォールバック)。
+`app::open_downloads_folder`(「フォルダを開く」ボタン) も同じ関数を
+経由するよう変更した。次回起動後に反映される点は他の非 Appearance
+フィールドと同じ。
+
+### Security タブ・Shortcuts タブは読み取り専用 (永続フィールドを持たない)
+
+Issue の実装内容一覧には Security・Shortcuts も含まれるが、両者は
+「編集可能な新しい永続設定」を追加するのではなく、**既存の状態を見せる
+読み取り専用ビュー**として設定画面に組み込んだ:
+
+- **Security** — `browser::site_permissions::SitePermissionStore`
+  (Issue #24/D60 で実装済み) の内容を、`app::AppState` にも
+  `Arc::clone` した参照を持たせて表示するだけ。D60 が既に指摘している
+  とおり、wry 0.56 の `with_permission_handler` は「オリジン単位の
+  事前登録された allow/block を読む」ことしかできず、動作中に新しい
+  決定を書き込む経路(カスタム許可 UI)自体が無い。設定画面から
+  書き込む口を新設するには、この `Arc`(現在は不変のスナップショット)
+  を可変化した上で `with_permission_handler` 側のクロージャとも
+  共有し直す必要があり、`unsafe` なしで安全にやるなら
+  `Arc<Mutex<...>>` 化が要る — 本 Issue のスコープでは見送り、
+  「表示のみ」に留めた。
+- **Shortcuts** — `browser::settings::shortcut_reference()` という
+  静的なテーブル (アクション名 + キーの組、11 件) を返すだけの純粋関数
+  を追加し、設定画面はそれを一覧表示するのみ。キーバインドの再割り当て
+  機能自体はこの Issue では実装していない — `ui/toolbar.html` の
+  keydown リスナーと `ui::window::ContentShortcut`(D18/D23) の 2 経路に
+  ハードコードされたショートカットをユーザ定義可能にするには、キー
+  コンフリクト検出・両チャンネル (信頼済み toolbar / 非信頼 content)
+  への設定反映など、それ自体で 1 つの Issue になる規模のため。
+
+### テスト・検証
+
+- `browser::settings`: 27 件 (デフォルト値、JSON 往復、前方/後方互換性
+  ―フィールド欠落・未知フィールド・スキーマバージョン、`sanitize` の
+  各カテゴリごとの修復規則、ショートカット一覧の非空性・重複無し
+  チェック、巨大/Unicode 入力でパニックしないこと)。
+- `browser::persistence`: `settings.json` の読み書き往復・欠落・破損・
+  切り詰め・旧バージョン (フィールド欠落) からの読み込みを既存の
+  `history.json` 等と同じテスト形状で追加 (6 件)。
+- `browser::downloads`: `resolve_download_dir_with_override` の
+  上書き優先・トリム・空/未設定時のフォールバックを 3 件追加。
+- `config`: `apply_settings`/`to_settings` の相互変換 (デフォルト値が
+  恒等写像になること、各カテゴリのコピー、サスペンションポリシーの
+  オーバーライド、検索エンジンのプリセット判定・カスタムエンジン往復)
+  を 15 件追加。
+- `ui::toolbar`: 新規 `ToolbarCommand`(`update_settings`/
+  `reset_settings`)のパース、`Panel::Settings` のスクリプト生成、
+  `SettingsView` の JSON シリアライズ、`Theme` の JS 側スクリプト生成を
+  5 件追加、既存の `toolbar_html_declares_expected_hooks` に設定画面の
+  フック文字列を追加。
+- 統合テスト (`tests/integration.rs`) は変更していない (8 本のまま) が、
+  上記の `apply_settings`/`to_settings` バグ修正の検証そのものとして
+  全数グリーンであることを確認した — この Issue が壊しかけた既存機能
+  (env var 駆動の起動設定) を統合テストが実際に検出した実例として、
+  D46/D47 の「ユニットテストだけでは検出できないクラスの回帰がある」
+  という主張を追加で裏付けている。
+
+### 満たせなかった/見送った点
+
+- **キーボードショートカットの再割り当て自体は未実装**(上記 Shortcuts
+  タブの節を参照)。表示のみ。
+- **Security タブからのサイト権限の変更・削除は未実装**。表示のみ。
+- **Appearance 以外のカテゴリはプロセス再起動なしに反映されない**。
+  UI 上はフッターの注記で明示しているが、「保存した瞬間にすべて反映
+  される」ことを期待するユーザには驚きになりうる — 将来的に
+  `browser::blocklist::FilterList`/`SuspensionPolicy` 等を `Cell`/
+  `Arc<AtomicXxx>` 化して真の即時反映にする余地はあるが、既存の
+  `ui::window` の設計 (タブごとのクロージャへ値を焼き込む) を広範に
+  触ることになるため別 Issue とした。
+- **`Settings.performance.auto_suspend_after_ms`(ミリ秒)** のような
+  一部フィールドは UI 上ミリ秒単位のまま表示しており、分/秒単位への
+  変換など UX 上のこなれた表現は行っていない。
+- **Windows/macOS の実機確認は未実施**。`cargo check --target
+  x86_64-pc-windows-msvc --all-targets` による型チェックのみ。設定画面
+  自体は `toolbar.html`(全プラットフォーム共通の HTML/CSS/JS) の変更が
+  主体で、Windows/macOS 固有分岐は今回のフィールド追加 (`ContentPolicy`
+  への `download_dir_override` 追加等) で増えていないため、リスクは
+  低いと考えているが未検証であることは明記する。
+
+**Revisit condition**: (1) Appearance 以外の即時反映化 (上記見送り分)。
+(2) キーボードショートカットの再割り当て機能 (別 Issue 相当の規模)。
+(3) Security タブからのサイト権限編集 (D60 の恒久的な制約 — wry の
+`with_permission_handler` にカスタム UI 差し込み口が無い問題を再調査
+した上でないと着手できない)。(4) Windows/macOS 実機での設定画面の動作
+確認 (Issue #33 の「3 OS リリースビルド検証」の一部として)。
+
 ## D69: ページ内検索 (#43) — 3 エンジンとも自前 JS 実装、ネイティブ find API は Windows を優先する限り使えないと判明
 
 **対象**: Issue #43。Ctrl/Cmd+F・検索 UI・次/前へ移動・件数表示・Esc 終了・

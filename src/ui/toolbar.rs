@@ -21,7 +21,10 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::browser::{BookmarkEntry, BookmarkStore, Candidate, DownloadEntry, HistoryGroup};
+use crate::browser::{
+    BookmarkEntry, BookmarkStore, Candidate, DownloadEntry, HistoryGroup, PermissionRecord,
+    Settings, ShortcutInfo, Theme,
+};
 
 /// The static HTML/CSS/JS that renders the toolbar.
 pub const TOOLBAR_HTML: &str = include_str!("toolbar.html");
@@ -41,6 +44,11 @@ pub enum Panel {
     /// types (`ToolbarCommand::OmniboxInput`/`OmniboxClose`), never via
     /// `TogglePanel`.
     Omnibox,
+    /// The settings screen (Issue #30, see docs/decisions.md D67) — General
+    /// / Appearance / Search / Privacy / Security / Performance / Downloads
+    /// / Shortcuts / Advanced tabs, opened/closed via `TogglePanel` exactly
+    /// like `History`/`Bookmarks`/`Downloads`.
+    Settings,
 }
 
 /// A command sent from the toolbar UI to the browser.
@@ -233,6 +241,25 @@ pub enum ToolbarCommand {
     /// permanent strip, not a dropdown panel (see docs/decisions.md D35).
     ToggleBookmarkBar,
 
+    // --- Settings screen (Issue #30, see docs/decisions.md D67) ---
+    /// The settings screen's "保存" button: replace the persisted settings
+    /// wholesale with `settings` (already validated client-side by the
+    /// form's own input types, but re-sanitized server-side regardless —
+    /// see `browser::settings::Settings::sanitize` — since this is external
+    /// input the same way any other IPC command is). Most fields take
+    /// effect after the next restart; `appearance` is applied immediately —
+    /// see D67.
+    // Boxed: `Settings` is far larger than every other variant here
+    // (clippy's `large_enum_variant`), and this command is sent at most
+    // once per settings-screen "保存" click, never on a hot path.
+    UpdateSettings {
+        settings: Box<Settings>,
+    },
+    /// The settings screen's "初期設定に戻す" button: reset every persisted
+    /// setting to [`crate::browser::settings::Settings::default`] and save
+    /// that. Same apply/persist path as `UpdateSettings`, just with a fixed
+    /// value instead of one read from the form.
+    ResetSettings,
     // --- In-page find (Issue #43, Ctrl/Cmd+F), see docs/decisions.md D69 ---
     /// Open the find bar for the active tab. Sent by the toolbar's own
     /// keydown listener (Ctrl/Cmd+F while toolbar UI has focus); the
@@ -330,6 +357,18 @@ impl<'a> BookmarksView<'a> {
                 .collect(),
         }
     }
+}
+
+/// Everything the settings screen (Issue #30, docs/decisions.md D67) needs
+/// to render every tab at once: the persisted, editable `settings` document
+/// itself, plus the two read-only reference views (Shortcuts, Security) that
+/// are not part of that persisted document — see `browser::settings`'s
+/// module doc comment for why those two are read-only.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SettingsView<'a> {
+    pub settings: &'a Settings,
+    pub shortcuts: &'a [ShortcutInfo],
+    pub site_permissions: &'a [PermissionRecord],
 }
 
 /// Hard ceiling on one IPC message's raw body, in bytes — rejected outright,
@@ -492,6 +531,7 @@ pub fn set_panel_script(panel: Option<Panel>) -> String {
         Some(Panel::Bookmarks) => "\"bookmarks\"",
         Some(Panel::Downloads) => "\"downloads\"",
         Some(Panel::Omnibox) => "\"omnibox\"",
+        Some(Panel::Settings) => "\"settings\"",
         None => "null",
     };
     format!("veloxSetPanel({arg});")
@@ -565,6 +605,27 @@ pub fn set_downloads_script(entries: &[&DownloadEntry]) -> String {
 /// U+2028/U+2029-escaping [`set_url_script`] applies to its own string, and
 /// the same "cannot actually fail for these types, but never panic if it
 /// somehow did" fallback every other `set_*_script` function here uses.
+/// JS snippet that replaces the settings screen's contents (Issue #30, see
+/// [`SettingsView`] and docs/decisions.md D67). Pushed on `ready` and again
+/// after every `update_settings`/`reset_settings` command, so the form
+/// always echoes back what was actually persisted (post-`sanitize`), not
+/// just what the user typed.
+pub fn set_settings_script(view: &SettingsView<'_>) -> String {
+    format!("veloxSetSettings({});", value_to_json(view))
+}
+
+/// JS snippet that applies the chrome (toolbar/tab-strip) theme override
+/// (Issue #30's Appearance tab — see docs/decisions.md D67). Unlike every
+/// other settings field this is pushed immediately on
+/// `update_settings`/`reset_settings`, not only after a restart — it only
+/// ever touches this webview's own `data-velox-theme` attribute (see
+/// `ui/toolbar.html`'s `:root`/`[data-velox-theme]` CSS), never web page
+/// content, which wry 0.56 exposes no per-webview `prefers-color-scheme`
+/// override for.
+pub fn set_theme_script(theme: Theme) -> String {
+    format!("veloxSetTheme(\"{}\");", theme.as_str())
+}
+
 fn entries_to_json<T: Serialize>(entries: &[T]) -> String {
     let json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_owned());
     escape_js_line_terminators(&json)
@@ -1368,6 +1429,66 @@ mod tests {
         assert_eq!(empty, "veloxSetDownloads([]);".to_owned());
     }
 
+    // --- Settings screen (Issue #30, D67) ---
+
+    #[test]
+    fn parses_settings_commands() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"toggle_panel","panel":"settings"}"#).unwrap(),
+            ToolbarCommand::TogglePanel {
+                panel: Panel::Settings
+            }
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"reset_settings"}"#).unwrap(),
+            ToolbarCommand::ResetSettings
+        );
+        let json = format!(
+            r#"{{"cmd":"update_settings","settings":{}}}"#,
+            serde_json::to_string(&crate::browser::Settings::default()).unwrap()
+        );
+        assert_eq!(
+            parse_command(&json).unwrap(),
+            ToolbarCommand::UpdateSettings {
+                settings: Box::new(crate::browser::Settings::default())
+            }
+        );
+    }
+
+    #[test]
+    fn settings_panel_script_names_the_panel() {
+        assert_eq!(
+            set_panel_script(Some(Panel::Settings)),
+            "veloxSetPanel(\"settings\");"
+        );
+    }
+
+    #[test]
+    fn settings_script_embeds_the_view_as_json() {
+        let settings = crate::browser::Settings::default();
+        let shortcuts = crate::browser::shortcut_reference();
+        let view = SettingsView {
+            settings: &settings,
+            shortcuts,
+            site_permissions: &[],
+        };
+        let script = set_settings_script(&view);
+        assert!(script.starts_with("veloxSetSettings({"));
+        assert!(script.contains(r#""schema_version""#));
+        assert!(script.contains(r#""shortcuts""#));
+        assert!(script.contains(r#""site_permissions":[]"#));
+    }
+
+    #[test]
+    fn theme_script_names_each_variant() {
+        assert_eq!(
+            set_theme_script(Theme::System),
+            "veloxSetTheme(\"system\");"
+        );
+        assert_eq!(set_theme_script(Theme::Light), "veloxSetTheme(\"light\");");
+        assert_eq!(set_theme_script(Theme::Dark), "veloxSetTheme(\"dark\");");
+    }
+
     #[test]
     fn toolbar_html_declares_expected_hooks() {
         assert!(TOOLBAR_HTML.contains("veloxSetUrl"));
@@ -1424,5 +1545,11 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("move_bookmark_up"));
         assert!(TOOLBAR_HTML.contains("move_bookmark_down"));
         assert!(TOOLBAR_HTML.contains("toggle_bookmark_bar"));
+        // Settings screen (Issue #30, see docs/decisions.md D67).
+        assert!(TOOLBAR_HTML.contains("veloxSetSettings"));
+        assert!(TOOLBAR_HTML.contains("veloxSetTheme"));
+        assert!(TOOLBAR_HTML.contains("update_settings"));
+        assert!(TOOLBAR_HTML.contains("reset_settings"));
+        assert!(TOOLBAR_HTML.contains("settings-toggle"));
     }
 }
