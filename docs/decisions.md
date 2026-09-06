@@ -4495,6 +4495,152 @@ D57 と同じく、Epic #57 のルール 1 の裏返しとして、測って効�
 タブ (#63 で保護対象にした) が本当にバックグラウンドでも再生を続けるかは、
 この環境に音声デバイスが無いため未検証。
 
+## D60: サイト権限 — wry 0.56 の `with_permission_handler` は存在するが origin もカスタム UI も渡せない、origin 単位ストア + 安全側デフォルトの組み合わせで対応する
+
+**対象**: Issue #24 (「サイト権限と権限要求UI」)。
+
+**先に結論**: D17 (Issue #22、サブリソースブロック) と同様、まず「wry に
+権限要求をフックする API があるか」を憶測せずに調べた。**今回は D17 と違い、
+該当 API は実在する** (`WebViewBuilder::with_permission_handler`)。ただし
+実装を進める中で、この API には設計上の制約が 2 つあり、それが Issue の
+「Allow / Block UI」をそのままの形では実装させない — その制約と、代わりに
+採った設計を記録する。
+
+### 調査: wry 0.56.1 の `with_permission_handler`
+
+ベンダー済みソース (`~/.cargo/registry/src/index.crates.io-*/wry-0.56.1/`)
+を実際に読んだ。
+
+- **API 定義**: `src/lib.rs` の
+  `WebViewBuilder::with_permission_handler<F>(self, handler: F) -> Self`
+  (`F: Fn(PermissionKind) -> PermissionResponse + Send + Sync + 'static`)。
+  `src/permissions.rs` に `PermissionKind` (`#[non_exhaustive]`。
+  `Camera`/`Microphone`/`Geolocation`/`Notifications`/`ClipboardRead`/
+  `DisplayCapture`/`Midi`/`Sensors`/`MediaKeySystemAccess`/`LocalFonts`/
+  `WindowManagement`/`PointerLock`/`AutomaticDownloads`/
+  `FileSystemAccess`/`Autoplay`/`Other`) と `PermissionResponse`
+  (`Allow`/`Deny`/`Default`) が定義されている。
+- **Windows (WebView2)** — `src/webview2/mod.rs`: `attributes.permission_handler`
+  が設定されていれば `ICoreWebView2::add_PermissionRequested` に登録。
+  `COREWEBVIEW2_PERMISSION_KIND_*` を `PermissionKind` に変換してハンドラを
+  呼び、`Allow`→`args.SetState(COREWEBVIEW2_PERMISSION_STATE_ALLOW)`、
+  `Deny`→`...STATE_DENY`、`Default`→ 何もしない (ソースコメント: "Do
+  nothing, let WebView2 show default prompt")。doc コメントは「Windows:
+  Fully supported via WebView2's PermissionRequested event」。
+- **Linux (WebKitGTK)** — `src/webkitgtk/mod.rs`: `WebView::connect_permission_request`
+  に登録。`UserMediaPermissionRequest` (カメラ/マイク/画面共有の複合要求) と
+  `GeolocationPermissionRequest`/`NotificationPermissionRequest`/
+  `PointerLockPermissionRequest` を型で判別してハンドラを呼ぶ。`Default` は
+  そのシグナルハンドラが `false` (未処理) を返すことで WebKitGTK 自身の
+  既定動作に委ねる — `with_permission_handler` の doc コメント
+  (`src/lib.rs`) はこれを明記して「Linux: The default behavior is
+  `Self::Deny`」としている。
+- **macOS/iOS (WKWebView)** — doc コメントは「Fully supported via
+  WKUIDelegate's requestMediaCapturePermission」だが、これは
+  Camera/Microphone のみ。`PermissionKind` 各バリアントの doc コメントを
+  読むと Geolocation/Notifications/ClipboardRead/Midi/Sensors/…はいずれも
+  「macOS / iOS: Not yet supported by platform backends」と明記されており、
+  実質サポートされるのはカメラ・マイクだけ。
+
+### この API がもたらす 2 つの制約
+
+1. **origin/URL がハンドラに渡されない**。`Fn(PermissionKind) ->
+   PermissionResponse` の引数は `PermissionKind` のみで、どのフレーム・
+   どの URL からの要求かという情報が一切無い。origin 単位の許可/拒否
+   (受け入れ条件「許可/拒否がサイト単位で適用される」) を実現するには、
+   呼び出し側 (VeloX) が別途「このタブは今どの origin を表示している
+   か」を追跡し、ハンドラ呼び出し時にそれを引ければならない。
+2. **同期・即時決定のみ、非同期のカスタム UI を挟めない**。
+   `Fn(PermissionKind) -> PermissionResponse` は同期関数で、`wry`/
+   プラットフォームは戻り値を待ってその場で許可/拒否を確定する
+   (`PermissionResponse::Default` を返した場合のみプラットフォーム側が
+   独自にネイティブプロンプトを出す)。VeloX 独自の「このサイトがカメラ
+   へのアクセスを求めています。許可 / ブロック」という画面を表示して
+   ユーザ操作を待ってから答える、という非同期フローはこの関数シグネ
+   チャでは表現できない (`app.rs`「全状態変更はメインスレッドの
+   `UserEvent` ディスパッチに集約」というイベントループ駆動の設計とも
+   相性が悪い — 応答を待つ間イベントループを止めるわけにはいかない)。
+
+### 採った設計
+
+1. **`src/browser/site_permissions.rs`** — `wry`/UI に一切依存しない純粋
+   ロジックとして origin 単位の権限ストア `SitePermissionStore` を実装
+   (`bookmarks.rs`/`history.rs` と同じ形: プレーンな `Vec<PermissionRecord>`
+   + 単体テスト)。永続化は `src/browser/persistence.rs` に既存パターン
+   通りに追加 (`site_permissions.json`。壊れたファイル・欠けたフィール
+   ドはいずれも空ストアへフォールバックし、起動不能にはならない)。
+   - 扱う種類は issue の列挙どおり `Camera` / `Microphone` /
+     `Geolocation` / `Notifications` / `ClipboardRead` の 5 つ。それ以外
+     は `PermissionKind::Other` に丸められ、**レコードの有無に関わらず
+     常に拒否** (`SitePermissionStore::resolve` が最初に弾く)。将来
+     `wry` が新しい種類を追加しても自動的に安全側に倒れる
+     (`#[serde(other)]` により、将来のバージョンが書いた
+     `site_permissions.json` の未知の kind 文字列も `Other` として読め、
+     ファイル全体のパース失敗にはならない)。
+   - 「今後も許可」「今後も拒否」だけが `PermissionDecision::Allow`/
+     `Block` としてディスクに残る唯一の状態。「一度だけ許可」は
+     `PermissionDecision` のバリアントとしては存在させず、「`set` を
+     一切呼ばない」こと自体として扱う (モジュール doc コメント参照) —
+     ストアを 3 状態に増やすより、「保存しない」がそのまま「一度だけ」
+     の意味になる方が安全側に倒しやすい。
+2. **`src/ui/window.rs` の実配線** — `content_webview_builder` に
+   `.with_permission_handler` を追加し、実際に本物の `wry::PermissionKind`
+   を受け取って応答する。制約 1 (origin が来ない) への対処として、各
+   タブの content webview ごとに `Arc<Mutex<Option<String>>>` で「直近の
+   ナビゲーション成功時点の origin」(`site_permissions::origin_of`) を
+   保持し、既存の `with_navigation_handler` (ブロックリスト判定のすぐ
+   後、ブロックされなかった場合のみ) で更新する。`Mutex` を使うのは
+   `with_permission_handler` のクロージャが `Send + Sync` を要求する
+   ため — アプリの他の状態が守っている「メインスレッドの `UserEvent`
+   ディスパッチに集約 (ロックなし)」の原則の例外だが、範囲はこの
+   1 個の `String` キャッシュだけに閉じている (アプリの実データである
+   `SitePermissionStore` 自体は起動時に読み込んだきり不変な
+   `Arc` で共有しており、可変状態としての「ロック」はここには無い)。
+   制約 2 (同期決定のみ、非同期カスタム UI 不可) への対処として:
+   - ストアに明示的な `Allow`/`Block` が既にあれば、それをそのまま
+     `PermissionResponse::Allow`/`Deny` として返す — カスタム UI 無し
+     でも即答できる。
+   - 記録が無い場合 (「未設定」) は `PermissionResponse::Default` を
+     返す。前節の調査どおり、これは **Windows (WebView2) / macOS
+     (WKWebView, カメラ・マイクのみ) ではプラットフォーム純正の
+     Allow/Block プロンプトに処理を委ねる** — つまり VeloX が何も
+     描画しなくても、CLAUDE.md の OS 優先度で最優先とする Windows では
+     ユーザは明示的な許可 UI を見られる (受け入れ条件「権限要求を
+     ユーザーに明示できる」を、Windows についてはネイティブ UI が
+     満たす)。Linux (WebKitGTK) では `Default` は拒否に落ちる — これが
+     そのまま受け入れ条件「不明な権限要求を安全側で処理する」の安全側
+     デフォルトになる。
+   - origin が取得できない要求 (まだ http(s) にナビゲートしていない、
+     あるいは `file:`/`about:`/`data:` など — `origin_of` が `None` を
+     返すケース) は `PermissionKind::Other` と同様、常に拒否
+     (`resolve_permission`)。「サイト単位で保存された何か」を紐付ける
+     先が無い以上、許可しようがないという判断。
+   - マッピング関数 `map_permission_kind`/`resolve_permission` は純粋
+     関数として切り出し、実際の webview を起動せずに単体テストしている
+     (`src/ui/window.rs` の `tests` モジュール)。
+3. **今回やらなかったこと (フォローアップ)**: プラットフォーム純正
+   プロンプトでユーザが実際に何を選んだかを `wry` から観測する手段が
+   無い (`with_permission_handler` の doc コメント自身も「一度永続的に
+   許可/拒否されると、次回以降はこのハンドラ自体が呼ばれずプラット
+   フォームの保存済み設定が使われる」と明記している) ため、その結果を
+   `SitePermissionStore` に書き戻すことはできない。したがって受け入れ
+   条件の「設定から権限変更」「現在サイトの権限状態表示」に対応する
+   VeloX 独自の UI (ツールバーへの新しいパネル、`ToolbarCommand`/
+   `UserEvent` の追加) は本 PR にはまだ無い。`SitePermissionStore` 自体
+   は読み書き両方の API (`set`/`clear`/`clear_origin`/`records_for`) を
+   備えているので、そうした UI を足す土台として設計してある。
+
+### Revisit condition
+
+(1) macOS/Windows 実機での動作は未検証 (この環境は Linux/WebKitGTK の
+CI のみ) — 特に WebView2/WKWebView のネイティブプロンプトが実際に
+origin 単位で永続化されるか、VeloX を再起動しても維持されるかは実機で
+確認が要る (CLAUDE.md の OS 優先度どおり、確認するなら Windows が先)。
+(2) `wry` が将来 origin 付き・非同期対応の権限 API を追加すれば、
+VeloX 独自の Allow/Block プロンプト UI に切り替える価値が生まれる
+(`wry` の CHANGELOG を継続的に見る — D17 の revisit condition と同じ
+運用)。(3) 設定画面/ツールバーへの「現在サイトの権限」表示・変更 UI は
+別途 Issue 化して積み残す。
 
 ## D61: CI に Windows ジョブを追加する — macOS は対象外、統合テストは実行しない
 
