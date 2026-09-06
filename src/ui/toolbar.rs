@@ -248,6 +248,12 @@ pub enum ToolbarCommand {
     /// `ui::window::ContentShortcut::NewWindow`) the request came from. See
     /// docs/decisions.md D68.
     NewWindow,
+    /// Open a new *private* window (Ctrl/Cmd+Shift+N, Issue #27). Exactly
+    /// like `NewWindow` (no id, intercepted before `app.rs` resolves which
+    /// `BrowserWindow` sent it — see `ContentShortcut::NewPrivateWindow` and
+    /// `AutomationCommand::NewPrivateWindow`), except the window it opens is
+    /// private: see docs/decisions.md D74.
+    NewPrivateWindow,
 
     // --- Settings screen (Issue #30, see docs/decisions.md D67) ---
     /// The settings screen's "保存" button: replace the persisted settings
@@ -912,6 +918,10 @@ mod tests {
             parse_command(r#"{"cmd":"new_window"}"#).unwrap(),
             ToolbarCommand::NewWindow
         );
+        assert_eq!(
+            parse_command(r#"{"cmd":"new_private_window"}"#).unwrap(),
+            ToolbarCommand::NewPrivateWindow
+        );
     }
 
     #[test]
@@ -1536,6 +1546,8 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("activate_last_tab"));
         // New window (Ctrl/Cmd+N, Issue #29, see docs/decisions.md D68).
         assert!(TOOLBAR_HTML.contains("new_window"));
+        // New private window (Ctrl/Cmd+Shift+N, Issue #27, D74).
+        assert!(TOOLBAR_HTML.contains("new_private_window"));
         // Downloads (Issue #16, see docs/decisions.md D28).
         assert!(TOOLBAR_HTML.contains("veloxSetDownloads"));
         assert!(TOOLBAR_HTML.contains("open_download"));
