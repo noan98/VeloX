@@ -136,6 +136,11 @@ pub enum ContentShortcut {
     /// of `ui::toolbar::ToolbarCommand::NewWindow` — both are handled by the
     /// same shared function in `app.rs`. See docs/decisions.md D68.
     NewWindow,
+    /// Ctrl/Cmd+Shift+N (Issue #27): open a new private window. The
+    /// content-webview half of
+    /// `ui::toolbar::ToolbarCommand::NewPrivateWindow` — both are handled by
+    /// the same shared function in `app.rs`. See docs/decisions.md D74.
+    NewPrivateWindow,
     /// Ctrl/Cmd+F (Issue #43): open the in-page find bar. The
     /// content-webview half of `ui::toolbar::ToolbarCommand::OpenFindBar` —
     /// both are handled by the same shared function in `app.rs`. See
@@ -178,6 +183,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         ShortcutId::ToggleBookmark => Some(ContentShortcut::ToggleBookmark),
         ShortcutId::ToggleBookmarkBar => Some(ContentShortcut::ToggleBookmarkBar),
         ShortcutId::NewWindow => Some(ContentShortcut::NewWindow),
+        ShortcutId::NewPrivateWindow => Some(ContentShortcut::NewPrivateWindow),
         ShortcutId::OpenFindBar => Some(ContentShortcut::OpenFindBar),
         ShortcutId::ViewSource => Some(ContentShortcut::ViewSource),
         ShortcutId::OpenDevtools => None,
@@ -720,8 +726,14 @@ pub struct BrowserWindow {
     /// [`new_webview_builder`], which is why it lives on `self` rather than
     /// only inside `new`.
     context: Option<WebContext>,
-    /// Whole-app private browsing (see docs/decisions.md D14). Kept so tabs
-    /// opened after startup are built with the same ephemeral data store.
+    /// This window's own private-browsing flag (Issue #27, see
+    /// docs/decisions.md D74 — originally D14's whole-app-only flag; D74
+    /// moved it onto each window individually once multiple windows with
+    /// different privacy could coexist). Set once, from `new`'s `private`
+    /// parameter, and never changes for this window's lifetime. Kept so
+    /// tabs opened after startup (`open_tab`, and `resume_tab` through it)
+    /// are built with the same ephemeral-or-persistent data store this
+    /// window started with.
     private: bool,
     /// Ad/tracker filter rules (see docs/decisions.md D17). Kept — alongside
     /// `content_blocking_enabled` — so every tab's content webview, however
@@ -789,6 +801,17 @@ impl BrowserWindow {
     /// later — or rebuilt on resume from suspension — is built through the
     /// same [`content_webview_builder`] with the same policies as the first
     /// tab.
+    /// `private` decides *this* window's own privacy (Issue #27, D74) —
+    /// deliberately a separate parameter from `config`, not `config.private`
+    /// read directly: `config` is shared by every window `app::run`/
+    /// `app::open_new_window` builds in one process, but a private window
+    /// (Ctrl/Cmd+Shift+N) can coexist with normal ones, so the two must be
+    /// able to disagree with `config.private`. `app::open_new_window`'s
+    /// regular ("new window", Ctrl/Cmd+N) path still passes `config.private`
+    /// through unchanged, which is exactly what made the very first (D68)
+    /// multi-window implementation's behavior correct already: a process
+    /// launched with `--private` keeps every window it opens private.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         event_loop: &EventLoopWindowTarget<UserEvent>,
         id: WindowId,
@@ -797,6 +820,7 @@ impl BrowserWindow {
         initial_tab: TabId,
         initial_url: &str,
         policies: SitePolicies,
+        private: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let SitePolicies {
             blocklist,
@@ -804,9 +828,10 @@ impl BrowserWindow {
             site_permissions,
         } = policies;
         // A window-title suffix is a second, independent tell for private
-        // mode (docs/decisions.md D14): unlike the toolbar badge it survives
-        // being covered by another window in a taskbar/alt-tab switcher.
-        let window_title = if config.private {
+        // mode (docs/decisions.md D14/D74): unlike the toolbar badge it
+        // survives being covered by another window in a taskbar/alt-tab
+        // switcher.
+        let window_title = if private {
             format!("{} — プライベート", config.window_title)
         } else {
             config.window_title.clone()
@@ -875,7 +900,7 @@ impl BrowserWindow {
         // mode only — see docs/decisions.md D49 and `BrowserWindow::context`'s
         // doc comment for why private mode gets `None` instead of a context
         // that `.with_incognito(true)` would just ignore anyway.
-        let mut context = if config.private {
+        let mut context = if private {
             None
         } else {
             Some(WebContext::new(None))
@@ -889,10 +914,10 @@ impl BrowserWindow {
             // tab's favicon is rendered as a plain `<img>` pointed at a
             // page-controlled URL (see docs/decisions.md D22), so in
             // private mode this webview must be just as ephemeral as every
-            // content webview (docs/decisions.md D14/D15) — otherwise a
+            // content webview (docs/decisions.md D14/D15/D74) — otherwise a
             // favicon fetch could persist cookies/cache private browsing is
             // supposed to leave no trace of.
-            .with_incognito(config.private)
+            .with_incognito(private)
             // `id` (`WindowId`) is baked into every event this window's
             // webviews send (docs/decisions.md D68), including the
             // toolbar's own IPC messages — `app.rs` needs it to know which
@@ -913,16 +938,12 @@ impl BrowserWindow {
         // "accept" handler would otherwise win the `decide-destination`
         // signal and VeloX's handler would never run).
         let download_dir_override = config.download_dir_override.clone();
-        let toolbar_builder =
-            match download_handler_host(config.private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
-                DownloadHandlerHost::SharedContext => with_download_handlers(
-                    toolbar_builder,
-                    id,
-                    &proxy,
-                    download_dir_override.clone(),
-                ),
-                DownloadHandlerHost::EachContentWebview => toolbar_builder,
-            };
+        let toolbar_builder = match download_handler_host(private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
+            DownloadHandlerHost::SharedContext => {
+                with_download_handlers(toolbar_builder, id, &proxy, download_dir_override.clone())
+            }
+            DownloadHandlerHost::EachContentWebview => toolbar_builder,
+        };
         let toolbar = attach(toolbar_builder)?;
 
         let content_blocking_enabled = config.content_blocking_enabled;
@@ -933,7 +954,7 @@ impl BrowserWindow {
             content_rect,
             &proxy,
             WebviewIsolation {
-                private: config.private,
+                private,
                 context: context.as_mut(),
                 // The first content webview: nothing to relate to yet. It
                 // starts process group 0, the first group later tabs can
@@ -999,7 +1020,7 @@ impl BrowserWindow {
             next_process_group: 1,
             max_tabs_per_web_process: config.max_tabs_per_web_process,
             context,
-            private: config.private,
+            private,
             blocklist,
             content_blocking_enabled,
             site_exceptions,
@@ -1493,6 +1514,16 @@ impl BrowserWindow {
     pub fn set_private(&self, private: bool) -> wry::Result<()> {
         self.toolbar
             .evaluate_script(&toolbar::set_private_script(private))
+    }
+
+    /// This window's own private-browsing flag, fixed at construction (see
+    /// `new`'s `private` parameter and docs/decisions.md D74). `app.rs`'s
+    /// `ToolbarCommand::Ready` handler reads this — rather than
+    /// `Config::private`, which is process-wide and therefore wrong the
+    /// moment a private and a normal window coexist — to push the correct
+    /// initial state to *this* window's own toolbar via `set_private` above.
+    pub fn is_private(&self) -> bool {
+        self.private
     }
 
     /// Which history/bookmarks panel is currently open, if any.
@@ -2080,7 +2111,8 @@ fn find_clear_script() -> String {
 /// alongside it since the two are directly related — see this struct's
 /// field docs).
 struct WebviewIsolation<'a> {
-    /// Whole-app private browsing (see docs/decisions.md D14).
+    /// This window's own private-browsing flag (see docs/decisions.md D14,
+    /// D74).
     private: bool,
     /// The `WebContext` to build this webview against when `private` is
     /// `false` (docs/decisions.md D49). Ignored — not even read — when
@@ -2395,7 +2427,8 @@ enum DownloadHandlerHost {
 ///
 /// `per_context` is [`DOWNLOAD_HANDLERS_PER_CONTEXT`] in production (a
 /// parameter so the decision table below is unit-testable on every
-/// platform); `private` is whole-app private browsing (D14).
+/// platform); `private` is this window's own private-browsing flag (D14,
+/// D74).
 ///
 /// - `per_context && !private` (WebKitGTK, normal mode): the toolbar and
 ///   every tab share one `WebContext` (D49), and wry appends *each*

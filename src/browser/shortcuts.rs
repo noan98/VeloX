@@ -232,6 +232,7 @@ pub enum ShortcutId {
     ToggleBookmark,
     ToggleBookmarkBar,
     NewWindow,
+    NewPrivateWindow,
     OpenFindBar,
     ViewSource,
     OpenDevtools,
@@ -267,6 +268,7 @@ impl ShortcutId {
             ShortcutId::ToggleBookmark => "velox:toggle-bookmark".to_owned(),
             ShortcutId::ToggleBookmarkBar => "velox:toggle-bookmark-bar".to_owned(),
             ShortcutId::NewWindow => "velox:new-window".to_owned(),
+            ShortcutId::NewPrivateWindow => "velox:new-private-window".to_owned(),
             ShortcutId::OpenFindBar => "velox:open-find-bar".to_owned(),
             ShortcutId::ViewSource => "velox:view-source".to_owned(),
             ShortcutId::OpenDevtools => "velox:open-devtools".to_owned(),
@@ -394,6 +396,11 @@ pub const SHORTCUT_TABLE: &[ShortcutDef] = &[
         id: ShortcutId::NewWindow,
         label: "新しいウィンドウ",
         chords: &[KeyChord::new(Key::Char('n'), Modifiers::PRIMARY)],
+    },
+    ShortcutDef {
+        id: ShortcutId::NewPrivateWindow,
+        label: "新しいプライベートウィンドウ",
+        chords: &[KeyChord::new(Key::Char('n'), Modifiers::PRIMARY_SHIFT)],
     },
     ShortcutDef {
         id: ShortcutId::OpenFindBar,

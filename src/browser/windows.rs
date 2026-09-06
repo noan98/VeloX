@@ -55,6 +55,17 @@ struct WindowEntry {
     /// a time *per window*, tied to whichever tab was active in that window
     /// when it opened.
     find: Option<FindState>,
+    /// Whole-window private browsing (Issue #27, see docs/decisions.md D74).
+    /// Set once, at construction (`push_window`), and never flipped
+    /// afterwards — a window's privacy is decided the moment it opens
+    /// (`Ctrl/Cmd+Shift+N`, `--private`) and stays fixed for its whole
+    /// lifetime, exactly like `Config::private` did for the single-window
+    /// process D14 originally described. `app.rs` reads this via
+    /// [`Windows::is_private`] wherever it used to read a single
+    /// process-wide `AppState::history_enabled` bool (history/input-history
+    /// recording, session persistence) — see D74 for why per-window is
+    /// necessary once two windows with different privacy can coexist.
+    private: bool,
 }
 
 /// An ordered collection of open windows, each with its own [`Tabs`].
@@ -72,13 +83,28 @@ pub struct Windows {
 }
 
 impl Windows {
-    /// Start with a single window, one tab loading `initial_url`.
+    /// Start with a single, non-private window, one tab loading
+    /// `initial_url`. Convenience wrapper around
+    /// [`Self::new_with_privacy`] for every call site that does not care
+    /// about private browsing (nearly every existing test in this module) —
+    /// see that function for the private-launch (`--private`/`VELOX_PRIVATE`)
+    /// case.
     pub fn new(initial_url: impl Into<String>) -> Self {
+        Self::new_with_privacy(initial_url, false)
+    }
+
+    /// Start with a single window, one tab loading `initial_url`, whose
+    /// privacy is `private` (Issue #27, D74). `app::run` calls this for the
+    /// very first window with `config.private` — a process launched with
+    /// `--private`/`VELOX_PRIVATE` still starts private, exactly as D14
+    /// originally specified; this just moves that flag from a whole-process
+    /// setting onto the one window that exists at that point.
+    pub fn new_with_privacy(initial_url: impl Into<String>, private: bool) -> Self {
         let mut windows = Windows {
             entries: Vec::new(),
             next_id: 0,
         };
-        windows.push_window(Tabs::new(initial_url));
+        windows.push_window(Tabs::new(initial_url), private);
         windows
     }
 
@@ -88,31 +114,73 @@ impl Windows {
         id
     }
 
-    fn push_window(&mut self, tabs: Tabs) -> WindowId {
+    fn push_window(&mut self, tabs: Tabs, private: bool) -> WindowId {
         let id = self.take_id();
         self.entries.push(WindowEntry {
             id,
             tabs,
             find: None,
+            private,
         });
         id
     }
 
-    /// Open a brand new window with a single tab at `initial_url` (Ctrl/Cmd+N,
-    /// `ToolbarCommand::NewWindow`/`ContentShortcut::NewWindow`). Returns the
-    /// new window's id, which the caller pairs with a real
-    /// `ui::window::BrowserWindow` built for it.
+    /// Open a brand new, non-private window with a single tab at
+    /// `initial_url` (Ctrl/Cmd+N, `ToolbarCommand::NewWindow`/
+    /// `ContentShortcut::NewWindow`). Convenience wrapper around
+    /// [`Self::open_window_with_privacy`] — see that function's doc comment,
+    /// and docs/decisions.md D74, for why regular Ctrl/Cmd+N does not
+    /// literally always pass `false` here (it passes `config.private`
+    /// through `app::open_new_window`, so a `--private`-launched process's
+    /// windows stay private; only the explicit "false" every test in this
+    /// module wants is hardcoded by this wrapper).
     pub fn open_window(&mut self, initial_url: impl Into<String>) -> WindowId {
-        self.push_window(Tabs::new(initial_url))
+        self.open_window_with_privacy(initial_url, false)
     }
 
-    /// Open a new window whose tabs are restored from a previous session's
-    /// snapshot (Issue #25's `Tabs::restore`, reused as-is). Only ever used
-    /// for the *first* window at startup in this issue's scope — see
-    /// docs/decisions.md D68 for why multi-window session restore is a
-    /// follow-up, not part of #29.
+    /// Open a brand new window with a single tab at `initial_url`, whose
+    /// privacy is `private` (Issue #27, D74) — the general form
+    /// `app::open_new_window` calls for every one of its three trigger paths
+    /// (`ToolbarCommand`/`ContentShortcut`/`AutomationCommand`, each in a
+    /// `NewWindow` and a `NewPrivateWindow` flavor). Returns the new
+    /// window's id, which the caller pairs with a real
+    /// `ui::window::BrowserWindow` built with the same `private` value (see
+    /// `ui::window::BrowserWindow::new`'s `private` parameter) — the two
+    /// must always agree, since this flag is what gates whether that
+    /// window's page visits reach `AppState::history`/`input_history`/
+    /// `session.json` (see [`Self::is_private`]).
+    pub fn open_window_with_privacy(
+        &mut self,
+        initial_url: impl Into<String>,
+        private: bool,
+    ) -> WindowId {
+        self.push_window(Tabs::new(initial_url), private)
+    }
+
+    /// Open a new, non-private window whose tabs are restored from a
+    /// previous session's snapshot (Issue #25's `Tabs::restore`, reused as
+    /// is). Only ever used for the *first* window at startup in #29's scope
+    /// — see docs/decisions.md D68 for why multi-window session restore is a
+    /// follow-up. Always non-private: `app::run` only ever takes this path
+    /// when `config.restore_previous_session && !config.private` already
+    /// held (D14/D65 — a private launch restores nothing), so there is no
+    /// `private` parameter to get wrong here.
     pub fn open_restored_window(&mut self, saved: &[SavedTab], active_index: usize) -> WindowId {
-        self.push_window(Tabs::restore(saved, active_index))
+        self.push_window(Tabs::restore(saved, active_index), false)
+    }
+
+    /// Whether window `id` is private (Issue #27, D74) — `None` for an
+    /// unknown window id, the same "stale id" convention every other
+    /// id-addressed lookup here follows (see [`Self::tabs`]). `app.rs` reads
+    /// this instead of a single process-wide `AppState::history_enabled`
+    /// bool wherever a decision (record a visit, persist the session) needs
+    /// to know *this* window's own privacy, since two windows can now
+    /// disagree.
+    pub fn is_private(&self, id: WindowId) -> Option<bool> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .map(|entry| entry.private)
     }
 
     /// Close window `id`, dropping its `Tabs` (and every tab in it) along
@@ -501,6 +569,87 @@ mod tests {
         // `first` is gone entirely now; querying its (former) find session
         // must behave exactly like any other unknown-id lookup, not panic.
         assert!(windows.find(first).is_none());
+    }
+
+    // --- Per-window private browsing (Issue #27, see docs/decisions.md D74) ---
+
+    #[test]
+    fn a_window_opened_by_new_is_not_private() {
+        let windows = Windows::new("https://example.com/");
+        let id = windows.ids().next().unwrap();
+        assert_eq!(windows.is_private(id), Some(false));
+    }
+
+    #[test]
+    fn new_with_privacy_marks_the_first_window_private() {
+        let windows = Windows::new_with_privacy("https://example.com/", true);
+        let id = windows.ids().next().unwrap();
+        assert_eq!(windows.is_private(id), Some(true));
+    }
+
+    #[test]
+    fn open_window_marks_the_new_window_non_private() {
+        let mut windows = Windows::new("https://a.example/");
+        let second = windows.open_window("https://b.example/");
+        assert_eq!(windows.is_private(second), Some(false));
+    }
+
+    #[test]
+    fn open_window_with_privacy_marks_the_new_window_private() {
+        let mut windows = Windows::new("https://a.example/");
+        let second = windows.open_window_with_privacy("https://b.example/", true);
+        assert_eq!(windows.is_private(second), Some(true));
+    }
+
+    #[test]
+    fn is_private_returns_none_for_an_unknown_window() {
+        let windows = Windows::new("https://example.com/");
+        assert_eq!(windows.is_private(WindowId::from(9999)), None);
+    }
+
+    #[test]
+    fn open_restored_window_is_never_private() {
+        let mut windows = Windows::new("https://home.example/");
+        let saved = vec![SavedTab {
+            url: "https://a.example/".to_owned(),
+            title: None,
+            favicon: None,
+        }];
+        let restored = windows.open_restored_window(&saved, 0);
+        assert_eq!(windows.is_private(restored), Some(false));
+    }
+
+    #[test]
+    fn a_normal_and_a_private_window_sharing_the_same_tab_id_keep_independent_privacy() {
+        // The exact scenario D74/the PR description calls out: a normal
+        // window and a private window opened side by side end up with the
+        // same `TabId` (see `each_window_has_its_own_independent_tab_id_space`
+        // above), so any code path that keyed privacy off `TabId` alone
+        // would confuse the two. `Windows` keys it off `WindowId` instead,
+        // so this must never happen.
+        let mut windows = Windows::new("https://normal.example/");
+        let normal = windows.ids().next().unwrap();
+        let private = windows.open_window_with_privacy("https://private.example/", true);
+
+        let normal_tab = windows.tabs(normal).unwrap().active_id();
+        let private_tab = windows.tabs(private).unwrap().active_id();
+        assert_eq!(
+            normal_tab, private_tab,
+            "test assumes both windows share a TabId value"
+        );
+
+        assert_eq!(windows.is_private(normal), Some(false));
+        assert_eq!(windows.is_private(private), Some(true));
+
+        // Activity in the private window (a second tab, closing it again)
+        // must not flip the normal window's privacy, and vice versa.
+        let extra = windows
+            .tabs_mut(private)
+            .unwrap()
+            .open("https://private2.example/");
+        windows.tabs_mut(private).unwrap().close(extra);
+        assert_eq!(windows.is_private(normal), Some(false));
+        assert_eq!(windows.is_private(private), Some(true));
     }
 
     #[test]
