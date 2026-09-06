@@ -51,8 +51,8 @@ use crate::browser::downloads;
 use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
 use crate::browser::{
-    group_by_date, Candidate, DownloadEntry, FilterList, HistoryEntry, SiteExceptions, TabId,
-    WindowId,
+    group_by_date, parse_sentinel, Candidate, DownloadEntry, FilterList, HistoryEntry, ShortcutId,
+    SiteExceptions, TabId, WindowId, SHORTCUT_TABLE,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel};
@@ -71,51 +71,23 @@ type LogicalRect = (u32, u32, u32, u32);
 /// [`ToolbarCommand`]: crate::ui::toolbar::ToolbarCommand
 const OPEN_DEVTOOLS_MESSAGE: &str = "velox:open-devtools";
 
-// --- Tab-management keyboard shortcuts (see docs/decisions.md D23) ---
+// --- Tab-management keyboard shortcuts (see docs/decisions.md D18/D23/D77) ---
 //
-// Fixed sentinel strings for the content webview's shortcut IPC channel,
-// alongside `OPEN_DEVTOOLS_MESSAGE` above. As with devtools, this channel
-// exists because the content webview is untrusted page content: it can
-// never grow into a second `ToolbarCommand`-style structured-command parser
-// (see docs/decisions.md D18), so every message here is compared by exact
-// string equality only, never deserialized.
-const NEW_TAB_MESSAGE: &str = "velox:new-tab";
-const CLOSE_TAB_MESSAGE: &str = "velox:close-tab";
-const REOPEN_CLOSED_TAB_MESSAGE: &str = "velox:reopen-closed-tab";
-const NEXT_TAB_MESSAGE: &str = "velox:next-tab";
-const PREV_TAB_MESSAGE: &str = "velox:prev-tab";
-const ACTIVATE_LAST_TAB_MESSAGE: &str = "velox:activate-tab-last";
-/// Ctrl/Cmd+L (Issue #15): focus the address bar. See
-/// `ContentShortcut::FocusAddressBar` and docs/decisions.md D26.
-const FOCUS_ADDRESS_BAR_MESSAGE: &str = "velox:focus-address-bar";
-/// Ctrl/Cmd+D (Issue #19): bookmark/unbookmark the current page. See
-/// `ContentShortcut::ToggleBookmark` and docs/decisions.md D35.
-const TOGGLE_BOOKMARK_MESSAGE: &str = "velox:toggle-bookmark";
-/// Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar. See
-/// `ContentShortcut::ToggleBookmarkBar` and docs/decisions.md D35.
-const TOGGLE_BOOKMARK_BAR_MESSAGE: &str = "velox:toggle-bookmark-bar";
-/// Ctrl/Cmd+N (Issue #29): open a new window. See
-/// `ContentShortcut::NewWindow` and docs/decisions.md D68.
-const NEW_WINDOW_MESSAGE: &str = "velox:new-window";
-/// Ctrl/Cmd+Shift+N (Issue #27): open a new private window. See
-/// `ContentShortcut::NewPrivateWindow` and docs/decisions.md D74.
-const NEW_PRIVATE_WINDOW_MESSAGE: &str = "velox:new-private-window";
-/// Prefix shared by the eight `velox:activate-tab-1` .. `velox:activate-tab-8`
-/// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
-/// [`parse_content_shortcut`].
-const ACTIVATE_TAB_MESSAGE_PREFIX: &str = "velox:activate-tab-";
-/// Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
-/// `ContentShortcut::OpenFindBar` and docs/decisions.md D69.
-const OPEN_FIND_BAR_MESSAGE: &str = "velox:open-find-bar";
-/// Ctrl/Cmd+S (Issue #46): save the current page ("名前を付けて保存"). See
-/// `ContentShortcut::SavePage` and docs/decisions.md D76.
-const SAVE_PAGE_MESSAGE: &str = "velox:save-page";
-/// Ctrl/Cmd+P (Issue #40): print the active tab's page. See
-/// `ContentShortcut::Print` and docs/decisions.md D75.
-const PRINT_MESSAGE: &str = "velox:print";
-/// Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
-/// `ContentShortcut::ViewSource` and docs/decisions.md D72.
-const VIEW_SOURCE_MESSAGE: &str = "velox:view-source";
+// The content webview's shortcut IPC channel, alongside
+// `OPEN_DEVTOOLS_MESSAGE` above, exists because the content webview is
+// untrusted page content: it can never grow into a second
+// `ToolbarCommand`-style structured-command parser (see docs/decisions.md
+// D18), so every message on it is compared by exact string equality only,
+// never deserialized.
+//
+// Issue #38 (D77) centralized the fixed sentinel strings themselves —
+// previously one `const` per shortcut here — into
+// `browser::shortcuts::ShortcutId::sentinel()`, read from
+// `browser::shortcuts::SHORTCUT_TABLE`. [`parse_content_shortcut`] and
+// [`tab_shortcut_script`] (via [`tab_shortcut_branches`]) both call it
+// rather than each hand-rolling their own copy of the string table, and
+// this module's tests call it directly instead of naming a
+// module-private `const`.
 
 /// A tab-management keyboard shortcut reported by the content webview's
 /// shortcut IPC channel (see [`parse_content_shortcut`]).
@@ -217,36 +189,41 @@ pub enum PdfExportRequest {
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
-/// that is not an exact match for one of the fixed sentinel strings above —
-/// including, deliberately, any attempt at parsing it as JSON or otherwise
-/// treating it as structured data (see [`ContentShortcut`]'s doc comment and
-/// docs/decisions.md D18/D23).
+/// that is not an exact match for one of the fixed sentinel strings
+/// `browser::shortcuts::SHORTCUT_TABLE` enumerates — including, deliberately,
+/// any attempt at parsing it as JSON or otherwise treating it as structured
+/// data (see [`ContentShortcut`]'s doc comment and docs/decisions.md
+/// D18/D23/D77).
+///
+/// Delegates the actual exact-string lookup to
+/// `browser::shortcuts::parse_sentinel` (Issue #38/D77) rather than
+/// re-matching the sentinel strings here a second time — that function is
+/// the one place the closed set of accepted strings is enumerated; this
+/// function's only remaining job is mapping the resulting
+/// `browser::shortcuts::ShortcutId` onto this module's own
+/// [`ContentShortcut`]. `ShortcutId::OpenDevtools` maps to `None`: devtools
+/// is delivered through the separate, pre-existing
+/// [`OPEN_DEVTOOLS_MESSAGE`]/[`devtools_shortcut_script`] channel (see
+/// docs/decisions.md D18), not through `ContentShortcut` at all.
 fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
-    match body {
-        NEW_TAB_MESSAGE => Some(ContentShortcut::NewTab),
-        CLOSE_TAB_MESSAGE => Some(ContentShortcut::CloseTab),
-        REOPEN_CLOSED_TAB_MESSAGE => Some(ContentShortcut::ReopenClosedTab),
-        NEXT_TAB_MESSAGE => Some(ContentShortcut::NextTab),
-        PREV_TAB_MESSAGE => Some(ContentShortcut::PrevTab),
-        ACTIVATE_LAST_TAB_MESSAGE => Some(ContentShortcut::ActivateLastTab),
-        FOCUS_ADDRESS_BAR_MESSAGE => Some(ContentShortcut::FocusAddressBar),
-        TOGGLE_BOOKMARK_MESSAGE => Some(ContentShortcut::ToggleBookmark),
-        TOGGLE_BOOKMARK_BAR_MESSAGE => Some(ContentShortcut::ToggleBookmarkBar),
-        NEW_WINDOW_MESSAGE => Some(ContentShortcut::NewWindow),
-        NEW_PRIVATE_WINDOW_MESSAGE => Some(ContentShortcut::NewPrivateWindow),
-        OPEN_FIND_BAR_MESSAGE => Some(ContentShortcut::OpenFindBar),
-        SAVE_PAGE_MESSAGE => Some(ContentShortcut::SavePage),
-        PRINT_MESSAGE => Some(ContentShortcut::Print),
-        VIEW_SOURCE_MESSAGE => Some(ContentShortcut::ViewSource),
-        "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
-        "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
-        "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
-        "velox:activate-tab-4" => Some(ContentShortcut::ActivateTabAt(4)),
-        "velox:activate-tab-5" => Some(ContentShortcut::ActivateTabAt(5)),
-        "velox:activate-tab-6" => Some(ContentShortcut::ActivateTabAt(6)),
-        "velox:activate-tab-7" => Some(ContentShortcut::ActivateTabAt(7)),
-        "velox:activate-tab-8" => Some(ContentShortcut::ActivateTabAt(8)),
-        _ => None,
+    match parse_sentinel(body)? {
+        ShortcutId::NewTab => Some(ContentShortcut::NewTab),
+        ShortcutId::CloseTab => Some(ContentShortcut::CloseTab),
+        ShortcutId::ReopenClosedTab => Some(ContentShortcut::ReopenClosedTab),
+        ShortcutId::NextTab => Some(ContentShortcut::NextTab),
+        ShortcutId::PrevTab => Some(ContentShortcut::PrevTab),
+        ShortcutId::ActivateTabAt(position) => Some(ContentShortcut::ActivateTabAt(position)),
+        ShortcutId::ActivateLastTab => Some(ContentShortcut::ActivateLastTab),
+        ShortcutId::FocusAddressBar => Some(ContentShortcut::FocusAddressBar),
+        ShortcutId::ToggleBookmark => Some(ContentShortcut::ToggleBookmark),
+        ShortcutId::ToggleBookmarkBar => Some(ContentShortcut::ToggleBookmarkBar),
+        ShortcutId::NewWindow => Some(ContentShortcut::NewWindow),
+        ShortcutId::NewPrivateWindow => Some(ContentShortcut::NewPrivateWindow),
+        ShortcutId::OpenFindBar => Some(ContentShortcut::OpenFindBar),
+        ShortcutId::ViewSource => Some(ContentShortcut::ViewSource),
+        ShortcutId::Print => Some(ContentShortcut::Print),
+        ShortcutId::SavePage => Some(ContentShortcut::SavePage),
+        ShortcutId::OpenDevtools => None,
     }
 }
 
@@ -279,20 +256,26 @@ fn devtools_shortcut_script() -> String {
 }
 
 /// Initialization script that captures the tab-management keyboard
-/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/L/D/Shift+B/F/S) while
-/// the content webview has focus, forwarding a fixed sentinel string per
-/// shortcut over
-/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/Shift+N) while the content
-/// webview has focus, forwarding a fixed sentinel string per shortcut over
-/// the same untrusted IPC channel devtools uses (see [`ContentShortcut`] and
-/// docs/decisions.md D18/D23 for why this is a separate injected script
-/// rather than a tao-level accelerator).
+/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/...) while the
+/// content webview has focus, forwarding a fixed sentinel string per
+/// shortcut over the same untrusted IPC channel devtools uses (see
+/// [`ContentShortcut`] and docs/decisions.md D18/D23 for why this is a
+/// separate injected script rather than a tao-level accelerator).
 ///
 /// `event.ctrlKey || event.metaKey` accepts both modifiers on every
 /// platform instead of branching on OS (macOS is Cmd, Linux/Windows is
 /// Ctrl) — the simplest way to "handle both", and harmless since Cmd simply
 /// never fires outside macOS and vice versa.
+///
+/// The two `if`/`else if` chains inside (`mod` alone, `mod+Shift`) are built
+/// by [`tab_shortcut_branches`] from `browser::shortcuts::SHORTCUT_TABLE`
+/// (Issue #38/D77) rather than hand-written here — adding a new *plain*
+/// Ctrl/Cmd(+Shift)+key content-webview shortcut now means adding one row to
+/// that table (plus, unavoidably, a new [`ContentShortcut`] variant and
+/// [`parse_content_shortcut`] arm, since those must stay real Rust types —
+/// see docs/decisions.md D77), not hand-editing this JS template too.
 fn tab_shortcut_script() -> String {
+    let (plain_arms, shift_arms) = tab_shortcut_branches();
     format!(
         r#"(() => {{
   "use strict";
@@ -303,41 +286,9 @@ fn tab_shortcut_script() -> String {
     }}
     let message = null;
     if (!event.altKey && !event.shiftKey) {{
-      if (event.key === "t" || event.key === "T") {{
-        message = "{NEW_TAB_MESSAGE}";
-      }} else if (event.key === "w" || event.key === "W") {{
-        message = "{CLOSE_TAB_MESSAGE}";
-      }} else if (event.key === "Tab") {{
-        message = "{NEXT_TAB_MESSAGE}";
-      }} else if (event.key === "9") {{
-        message = "{ACTIVATE_LAST_TAB_MESSAGE}";
-      }} else if (event.key >= "1" && event.key <= "8") {{
-        message = "{ACTIVATE_TAB_MESSAGE_PREFIX}" + event.key;
-      }} else if (event.key === "l" || event.key === "L") {{
-        message = "{FOCUS_ADDRESS_BAR_MESSAGE}";
-      }} else if (event.key === "d" || event.key === "D") {{
-        message = "{TOGGLE_BOOKMARK_MESSAGE}";
-      }} else if (event.key === "n" || event.key === "N") {{
-        message = "{NEW_WINDOW_MESSAGE}";
-      }} else if (event.key === "f" || event.key === "F") {{
-        message = "{OPEN_FIND_BAR_MESSAGE}";
-      }} else if (event.key === "s" || event.key === "S") {{
-        message = "{SAVE_PAGE_MESSAGE}";
-      }} else if (event.key === "p" || event.key === "P") {{
-        message = "{PRINT_MESSAGE}";
-      }} else if (event.key === "u" || event.key === "U") {{
-        message = "{VIEW_SOURCE_MESSAGE}";
-      }}
+      {plain_arms}
     }} else if (event.shiftKey && !event.altKey) {{
-      if (event.key === "t" || event.key === "T") {{
-        message = "{REOPEN_CLOSED_TAB_MESSAGE}";
-      }} else if (event.key === "Tab") {{
-        message = "{PREV_TAB_MESSAGE}";
-      }} else if (event.key === "b" || event.key === "B") {{
-        message = "{TOGGLE_BOOKMARK_BAR_MESSAGE}";
-      }} else if (event.key === "n" || event.key === "N") {{
-        message = "{NEW_PRIVATE_WINDOW_MESSAGE}";
-      }}
+      {shift_arms}
     }}
     if (message === null) {{
       return;
@@ -349,6 +300,49 @@ fn tab_shortcut_script() -> String {
   }}, true);
 }})();"#
     )
+}
+
+/// Build the two `if`/`else if` chains [`tab_shortcut_script`] splices into
+/// its listener — `(mod only, mod+Shift)` — from
+/// `browser::shortcuts::SHORTCUT_TABLE`. `ShortcutId::OpenDevtools` is
+/// skipped: it is delivered through the separate, pre-existing
+/// [`OPEN_DEVTOOLS_MESSAGE`]/[`devtools_shortcut_script`] mechanism (see
+/// docs/decisions.md D18), not through this table-driven content-shortcut
+/// channel.
+///
+/// `debug_assert!`s rather than silently mishandling a future table row that
+/// combines `mod` with `Alt`: no shortcut in scope for this generator uses
+/// `Alt` today (only `ShortcutId::OpenDevtools`'s Cmd+Option+I does, and
+/// that row is skipped above), so this generator only ever builds the two
+/// branches `tab_shortcut_script`'s listener already distinguishes — a
+/// programming-error guard, not attacker-reachable input, since
+/// `SHORTCUT_TABLE` is a fixed compile-time constant.
+fn tab_shortcut_branches() -> (String, String) {
+    let mut plain = Vec::new();
+    let mut shift = Vec::new();
+    for def in SHORTCUT_TABLE {
+        if def.id == ShortcutId::OpenDevtools {
+            continue;
+        }
+        for chord in def.chords {
+            debug_assert!(
+                !chord.modifiers.alt,
+                "tab_shortcut_branches only generates mod/mod+Shift combos; {:?} needs a dedicated branch",
+                def.id
+            );
+            let arm = format!(
+                "if ({}) {{\n        message = \"{}\";\n      }}",
+                chord.key.js_condition(),
+                def.id.sentinel()
+            );
+            if chord.modifiers.shift {
+                shift.push(arm);
+            } else {
+                plain.push(arm);
+            }
+        }
+    }
+    (plain.join(" else "), shift.join(" else "))
 }
 
 /// The VeloX logo, embedded at build time so the binary needs no asset
@@ -3316,93 +3310,115 @@ mod tests {
     fn tab_shortcut_script_captures_expected_combos_in_capture_phase() {
         let script = tab_shortcut_script();
         for message in [
-            NEW_TAB_MESSAGE,
-            CLOSE_TAB_MESSAGE,
-            REOPEN_CLOSED_TAB_MESSAGE,
-            NEXT_TAB_MESSAGE,
-            PREV_TAB_MESSAGE,
-            ACTIVATE_LAST_TAB_MESSAGE,
-            FOCUS_ADDRESS_BAR_MESSAGE,
-            TOGGLE_BOOKMARK_MESSAGE,
-            TOGGLE_BOOKMARK_BAR_MESSAGE,
-            NEW_WINDOW_MESSAGE,
-            NEW_PRIVATE_WINDOW_MESSAGE,
-            OPEN_FIND_BAR_MESSAGE,
-            SAVE_PAGE_MESSAGE,
-            PRINT_MESSAGE,
-            VIEW_SOURCE_MESSAGE,
+            ShortcutId::NewTab.sentinel(),
+            ShortcutId::CloseTab.sentinel(),
+            ShortcutId::ReopenClosedTab.sentinel(),
+            ShortcutId::NextTab.sentinel(),
+            ShortcutId::PrevTab.sentinel(),
+            ShortcutId::ActivateLastTab.sentinel(),
+            ShortcutId::FocusAddressBar.sentinel(),
+            ShortcutId::ToggleBookmark.sentinel(),
+            ShortcutId::ToggleBookmarkBar.sentinel(),
+            ShortcutId::NewWindow.sentinel(),
+            ShortcutId::OpenFindBar.sentinel(),
+            ShortcutId::ViewSource.sentinel(),
         ] {
             assert!(
-                script.contains(message),
+                script.contains(&message),
                 "script is missing sentinel {message:?}"
             );
         }
-        assert!(script.contains(ACTIVATE_TAB_MESSAGE_PREFIX));
+        for n in 1u8..=8 {
+            assert!(script.contains(&ShortcutId::ActivateTabAt(n).sentinel()));
+        }
+        // `OpenDevtools` is deliberately excluded from this table-driven
+        // script — it keeps its own separate delivery mechanism (see
+        // `devtools_shortcut_script`), so its sentinel must NOT show up
+        // here.
+        assert!(!script.contains(&ShortcutId::OpenDevtools.sentinel()));
         assert!(script.contains("event.ctrlKey || event.metaKey"));
         assert!(script.contains("}, true);"));
+    }
+
+    /// Issue #38's explicit acceptance test: the content webview (untrusted
+    /// page content) sending an unrecognized command string — including one
+    /// shaped like a real command name, or a JSON payload mimicking the
+    /// toolbar's trusted `ToolbarCommand` channel — must never be accepted
+    /// as a shortcut. See docs/decisions.md D18/D23/D77: the sentinel set is
+    /// fully enumerated in `browser::shortcuts::SHORTCUT_TABLE`, and nothing
+    /// outside it can ever parse.
+    #[test]
+    fn content_webview_cannot_smuggle_an_unknown_command_through_the_shortcut_channel() {
+        for body in [
+            "velox:quit",
+            "velox:open-devtools-for-toolbar",
+            "velox:clear-site-data",
+            r#"{"cmd":"clear_site_data"}"#,
+            r#"{"cmd":"update_settings","settings":{}}"#,
+            "javascript:alert(1)",
+        ] {
+            assert_eq!(
+                parse_content_shortcut(body),
+                None,
+                "content webview must not be able to trigger {body:?}"
+            );
+        }
     }
 
     #[test]
     fn parse_content_shortcut_matches_every_sentinel_exactly() {
         assert_eq!(
-            parse_content_shortcut(NEW_TAB_MESSAGE),
+            parse_content_shortcut(&ShortcutId::NewTab.sentinel()),
             Some(ContentShortcut::NewTab)
         );
         assert_eq!(
-            parse_content_shortcut(CLOSE_TAB_MESSAGE),
+            parse_content_shortcut(&ShortcutId::CloseTab.sentinel()),
             Some(ContentShortcut::CloseTab)
         );
         assert_eq!(
-            parse_content_shortcut(REOPEN_CLOSED_TAB_MESSAGE),
+            parse_content_shortcut(&ShortcutId::ReopenClosedTab.sentinel()),
             Some(ContentShortcut::ReopenClosedTab)
         );
         assert_eq!(
-            parse_content_shortcut(NEXT_TAB_MESSAGE),
+            parse_content_shortcut(&ShortcutId::NextTab.sentinel()),
             Some(ContentShortcut::NextTab)
         );
         assert_eq!(
-            parse_content_shortcut(PREV_TAB_MESSAGE),
+            parse_content_shortcut(&ShortcutId::PrevTab.sentinel()),
             Some(ContentShortcut::PrevTab)
         );
         assert_eq!(
-            parse_content_shortcut(ACTIVATE_LAST_TAB_MESSAGE),
+            parse_content_shortcut(&ShortcutId::ActivateLastTab.sentinel()),
             Some(ContentShortcut::ActivateLastTab)
         );
         assert_eq!(
-            parse_content_shortcut(FOCUS_ADDRESS_BAR_MESSAGE),
+            parse_content_shortcut(&ShortcutId::FocusAddressBar.sentinel()),
             Some(ContentShortcut::FocusAddressBar)
         );
         assert_eq!(
-            parse_content_shortcut(TOGGLE_BOOKMARK_MESSAGE),
+            parse_content_shortcut(&ShortcutId::ToggleBookmark.sentinel()),
             Some(ContentShortcut::ToggleBookmark)
         );
         assert_eq!(
-            parse_content_shortcut(TOGGLE_BOOKMARK_BAR_MESSAGE),
+            parse_content_shortcut(&ShortcutId::ToggleBookmarkBar.sentinel()),
             Some(ContentShortcut::ToggleBookmarkBar)
         );
         assert_eq!(
-            parse_content_shortcut(NEW_WINDOW_MESSAGE),
+            parse_content_shortcut(&ShortcutId::NewWindow.sentinel()),
             Some(ContentShortcut::NewWindow)
         );
         assert_eq!(
-            parse_content_shortcut(NEW_PRIVATE_WINDOW_MESSAGE),
-            Some(ContentShortcut::NewPrivateWindow)
-        );
-        assert_eq!(
-            parse_content_shortcut(OPEN_FIND_BAR_MESSAGE),
+            parse_content_shortcut(&ShortcutId::OpenFindBar.sentinel()),
             Some(ContentShortcut::OpenFindBar)
         );
         assert_eq!(
-            parse_content_shortcut(SAVE_PAGE_MESSAGE),
-            Some(ContentShortcut::SavePage)
-        );
-        assert_eq!(
-            parse_content_shortcut(PRINT_MESSAGE),
-            Some(ContentShortcut::Print)
-        );
-        assert_eq!(
-            parse_content_shortcut(VIEW_SOURCE_MESSAGE),
+            parse_content_shortcut(&ShortcutId::ViewSource.sentinel()),
             Some(ContentShortcut::ViewSource)
+        );
+        assert_eq!(
+            parse_content_shortcut(&ShortcutId::OpenDevtools.sentinel()),
+            None,
+            "devtools is delivered through its own separate channel, not this one"
         );
         for n in 1u8..=8 {
             assert_eq!(

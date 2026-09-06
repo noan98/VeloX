@@ -3017,9 +3017,14 @@ fn refresh_downloads_panel(window: &BrowserWindow, state: &AppState) {
 /// `update_settings`/`reset_settings`, so the form always echoes back what
 /// was actually persisted.
 fn refresh_settings_panel(window: &BrowserWindow, state: &AppState) {
+    // `shortcut_reference` now renders each row's key label for the current
+    // platform (Issue #38, docs/decisions.md D77) and so returns an owned
+    // `Vec` rather than a `&'static` slice — kept alive in this local for
+    // `SettingsView` to borrow.
+    let shortcuts = shortcut_reference();
     let view = toolbar::SettingsView {
         settings: &state.settings,
-        shortcuts: shortcut_reference(),
+        shortcuts: &shortcuts,
         site_permissions: state.site_permissions.records(),
     };
     log_failure("update settings panel", window.set_settings(&view));

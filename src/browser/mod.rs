@@ -30,6 +30,7 @@ pub mod ranking;
 pub mod save_page;
 pub mod session;
 pub mod settings;
+pub mod shortcuts;
 pub mod site_data;
 pub mod site_permissions;
 pub mod subresource;
@@ -57,6 +58,10 @@ pub use settings::{
     native_window_theme, shortcut_reference, AdvancedSettings, AppearanceSettings,
     DownloadsSettings, GeneralSettings, PerformanceSettings, PrivacySettings, ResolvedTheme,
     SearchSettings, Settings, ShortcutInfo, Theme, SETTINGS_SCHEMA_VERSION,
+};
+pub use shortcuts::{
+    find_conflicts, parse_sentinel, Key, KeyChord, Modifiers, Platform, ShortcutConflict,
+    ShortcutDef, ShortcutId, SHORTCUT_TABLE,
 };
 pub use site_data::ClearOutcome;
 pub use site_permissions::{
