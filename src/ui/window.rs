@@ -715,6 +715,11 @@ pub struct BrowserWindow {
     /// webview, however and whenever it comes into existence, is built
     /// through [`content_webview_builder`] with the same store.
     site_permissions: Arc<SitePermissionStore>,
+    /// `Config::download_dir_override` as of window creation (Issue #30's
+    /// settings screen, see docs/decisions.md D67). Kept alongside
+    /// `blocklist`/`site_permissions` for the same reason: every tab opened
+    /// later must build its download handlers with the same override.
+    download_dir_override: Option<String>,
 }
 
 /// Result of [`BrowserWindow::clear_all_site_data`]: how many webviews were
@@ -871,11 +876,15 @@ impl BrowserWindow {
         // for why the toolbar in particular (wry's default per-webview
         // "accept" handler would otherwise win the `decide-destination`
         // signal and VeloX's handler would never run).
+        let download_dir_override = config.download_dir_override.clone();
         let toolbar_builder =
             match download_handler_host(config.private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
-                DownloadHandlerHost::SharedContext => {
-                    with_download_handlers(toolbar_builder, id, &proxy)
-                }
+                DownloadHandlerHost::SharedContext => with_download_handlers(
+                    toolbar_builder,
+                    id,
+                    &proxy,
+                    download_dir_override.clone(),
+                ),
                 DownloadHandlerHost::EachContentWebview => toolbar_builder,
             };
         let toolbar = attach(toolbar_builder)?;
@@ -899,6 +908,7 @@ impl BrowserWindow {
                 blocklist: Arc::clone(&blocklist),
                 content_blocking_enabled,
                 site_permissions: Arc::clone(&site_permissions),
+                download_dir_override: download_dir_override.clone(),
             },
         );
         let content = attach(content_builder)?;
@@ -958,6 +968,7 @@ impl BrowserWindow {
             content_blocking_enabled,
             site_exceptions,
             site_permissions,
+            download_dir_override,
         })
     }
 
@@ -1064,6 +1075,7 @@ impl BrowserWindow {
                 blocklist: Arc::clone(&self.blocklist),
                 content_blocking_enabled: self.content_blocking_enabled,
                 site_permissions: Arc::clone(&self.site_permissions),
+                download_dir_override: self.download_dir_override.clone(),
             },
         )
         .with_visible(false);
@@ -1620,6 +1632,23 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_downloads_script(entries))
     }
 
+    /// Replace the settings screen's contents (Issue #30, see
+    /// [`toolbar::SettingsView`] and docs/decisions.md D67).
+    pub fn set_settings(&self, view: &toolbar::SettingsView<'_>) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_settings_script(view))
+    }
+
+    /// Apply the chrome (toolbar/tab-strip) theme override (Issue #30's
+    /// Appearance tab). Takes effect immediately — unlike every other
+    /// settings-screen field, this never goes through `Config`/a restart;
+    /// see docs/decisions.md D67. Never touches web page content (wry 0.56
+    /// exposes no per-webview `prefers-color-scheme` override).
+    pub fn set_theme(&self, theme: crate::browser::Theme) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_theme_script(theme))
+    }
+
     /// Asynchronously read `document.title` from tab `tab_id`'s content
     /// webview and report it back as [`UserEvent::PageTitleResolved`] for
     /// the history entry `history_id`.
@@ -1975,6 +2004,9 @@ struct ContentPolicy {
     /// enough; see the doc comment on [`content_webview_builder`]'s
     /// `with_permission_handler` call for why.
     site_permissions: Arc<SitePermissionStore>,
+    /// `Config::download_dir_override` (Issue #30, docs/decisions.md D67),
+    /// threaded through to this tab's `with_download_handlers` call.
+    download_dir_override: Option<String>,
 }
 
 /// Build the `WebViewBuilder` for a tab's content webview: bounds, initial
@@ -2011,6 +2043,7 @@ fn content_webview_builder<'a>(
         blocklist,
         content_blocking_enabled,
         site_permissions,
+        download_dir_override,
     } = policy;
     // Never relate a private webview (see `WebviewIsolation::related`).
     let related = if private { None } else { related };
@@ -2142,7 +2175,9 @@ fn content_webview_builder<'a>(
     // registered once, on the toolbar webview in `BrowserWindow::new` —
     // see `download_handler_host`.
     match download_handler_host(private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
-        DownloadHandlerHost::EachContentWebview => with_download_handlers(builder, own_id, proxy),
+        DownloadHandlerHost::EachContentWebview => {
+            with_download_handlers(builder, own_id, proxy, download_dir_override)
+        }
         DownloadHandlerHost::SharedContext => builder,
     }
 }
@@ -2296,10 +2331,17 @@ fn download_handler_host(private: bool, per_context: bool) -> DownloadHandlerHos
 /// [`content_webview_builder`] uses for content blocking. VeloX always
 /// accepts every download (`true`, matching wry's own default), so this
 /// only ever *redirects* a download, never blocks one.
+///
+/// `download_dir_override` is `Config::download_dir_override` as of window
+/// creation (Issue #30's settings screen, Downloads tab — see
+/// docs/decisions.md D67); `None` keeps the pre-#30 behavior
+/// (`VELOX_DOWNLOAD_DIR`/the platform default, via
+/// `browser::downloads::resolve_download_dir_with_override`).
 fn with_download_handlers<'a>(
     builder: WebViewBuilder<'a>,
     own_id: WindowId,
     proxy: &EventLoopProxy<UserEvent>,
+    download_dir_override: Option<String>,
 ) -> WebViewBuilder<'a> {
     let download_started_proxy = proxy.clone();
     let download_completed_proxy = proxy.clone();
@@ -2309,14 +2351,17 @@ fn with_download_handlers<'a>(
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            // Prefer VeloX's own directory resolution (respects
-            // `VELOX_DOWNLOAD_DIR`, see docs/decisions.md D28) over
-            // whatever default wry already picked; fall back to wry's own
-            // suggested directory only if no environment variable could be
-            // resolved at all, rather than failing the download outright.
-            let dir = downloads::resolve_download_dir()
-                .or_else(|| destination.parent().map(Path::to_path_buf))
-                .unwrap_or_else(|| PathBuf::from("."));
+            // Prefer VeloX's own directory resolution (the settings
+            // screen's override, then `VELOX_DOWNLOAD_DIR`, see
+            // docs/decisions.md D28/D67) over whatever default wry already
+            // picked; fall back to wry's own
+            // suggested directory only if neither the override nor an
+            // environment variable could be resolved at all, rather than
+            // failing the download outright.
+            let dir =
+                downloads::resolve_download_dir_with_override(download_dir_override.as_deref())
+                    .or_else(|| destination.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(|| PathBuf::from("."));
             let final_path = match downloads::prepare_destination(&dir, &suggested_name) {
                 Ok(path) => path,
                 Err(err) => {

@@ -22,10 +22,11 @@ use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
-    find, input_history, metrics, navigation, omnibox, persistence, site_data, ActivationEffect,
-    BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList,
-    HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore,
-    SessionSnapshot, SiteExceptions, TabId, Tabs, WindowId, Windows,
+    find, input_history, metrics, navigation, omnibox, persistence, shortcut_reference, site_data,
+    ActivationEffect, BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore,
+    Favicon, FilterList, HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource,
+    InputHistoryStore, SessionSnapshot, Settings, SiteExceptions, SitePermissionStore, TabId, Tabs,
+    WindowId, Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -256,6 +257,25 @@ struct AppState {
     /// every loop pass would keep suspending tabs before the previous
     /// sweep's effect is even visible in the numbers.
     pending_memory_sample: Option<MemorySample>,
+    /// Persisted, user-editable settings (Issue #30, see
+    /// docs/decisions.md D67) — the settings screen's current, already-
+    /// sanitized value. `Config` was already merged with this once at
+    /// startup (`Config::apply_settings`, in `run` below, before
+    /// `BrowserWindow::new`); this copy is what the settings screen itself
+    /// reads from and writes back to (`refresh_settings_panel`,
+    /// `apply_updated_settings`). Whole-process, like `history_enabled`
+    /// (D14) — every window's settings screen shows and edits the same
+    /// value; see D68's multi-window/#30 integration for why appearance
+    /// changes are pushed to every open window, not just the one whose
+    /// settings screen made the change.
+    settings: Settings,
+    /// Per-origin permission decisions (Issue #24, docs/decisions.md D60),
+    /// the same `Arc` handed to `BrowserWindow`'s `with_permission_handler`
+    /// wiring — kept here too so the settings screen's Security tab can
+    /// display them (read-only; see `browser::settings`'s module doc
+    /// comment for why this issue does not add a write path from the
+    /// settings screen).
+    site_permissions: Arc<SitePermissionStore>,
 }
 
 /// `state.windows.tabs_mut(window_id)`, indexed the same way
@@ -302,7 +322,7 @@ struct PerfContext {
 /// `process_start` is the earliest timestamp the caller could capture
 /// (ideally the top of `main`); it only feeds the startup-timing report and
 /// is otherwise unused when `config.perf_metrics` is off.
-pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>> {
+pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Error>> {
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
     let proxy = event_loop.create_proxy();
     // Cloned before `proxy` is moved into `BrowserWindow::new` below — see
@@ -311,6 +331,36 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
     // Same story for the memory sampler (Issue #63), spawned further down
     // once the config's suspension policy has been read.
     let memory_sampler_proxy = proxy.clone();
+
+    // Issue #30 (D67): the settings screen's persisted, user-editable
+    // settings are loaded and merged onto `config` before anything below
+    // reads it — `blocklist`/`site_exceptions` (Privacy tab),
+    // `startup`/`perf_metrics` (Advanced tab), and `Tabs`/`BrowserWindow`
+    // (General/Performance/Downloads tabs) all consult `config` only once,
+    // at construction time.
+    //
+    // Critically, `apply_settings` only ever runs when a `settings.json`
+    // *actually exists* on disk — a missing one (first run, or the data
+    // directory could not be resolved) or a corrupt one (see
+    // `persistence::load_settings`'s contract) must never be treated as "the
+    // user wants every setting reset to its blind default": that would
+    // silently discard whatever `VELOX_*` environment variable/CLI flag
+    // `Config::from_env_and_args` above just resolved, on every single
+    // launch that has never touched the settings screen. Instead,
+    // `Config::to_settings` seeds `AppState::settings` from `config` as it
+    // already stands (env/CLI included) — see its doc comment, and
+    // docs/decisions.md D67 for the bug this fixed during development
+    // (VELOX_* env vars going silently inert the moment this feature
+    // landed, caught by this project's own integration test suite).
+    let settings_dir = persistence::default_data_dir();
+    let settings = match settings_dir.as_deref().and_then(persistence::load_settings) {
+        Some(loaded) => {
+            let sanitized = loaded.sanitize();
+            config.apply_settings(&sanitized);
+            sanitized
+        }
+        None => config.to_settings(),
+    };
 
     // `.then(...)` short-circuits: when metrics are off, no `Instant` is
     // captured here and `startup` stays `None`, so every checkpoint below
@@ -342,6 +392,10 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
             .map(persistence::load_site_permissions)
             .unwrap_or_default(),
     );
+    // Kept for `AppState` too (Issue #30's settings screen, Security tab —
+    // see docs/decisions.md D67): a read-only view, cloned before the
+    // original moves into `SitePolicies` below.
+    let site_permissions_for_state = Arc::clone(&site_permissions);
 
     // Resolved before `Tabs`/`BrowserWindow` are built (unlike the
     // history/bookmarks/input-history loads below, which only need it once
@@ -435,6 +489,21 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
         startup.mark_window_created(Instant::now());
     }
 
+    // Issue #30 (D67): the bookmark bar's shown/hidden state is now
+    // persisted (previously session-only, resetting on every restart — see
+    // the old note in docs/architecture.md this issue resolves). Applied
+    // once, right after the primary window exists; the toolbar's `ready`
+    // handler later echoes this same value back via
+    // `window.bookmark_bar_visible()`. Every window opened later
+    // (Ctrl/Cmd+N) gets the same treatment in `open_new_window` (Issue
+    // #29/D68) — this setting is whole-process, not per-window.
+    if let Some(primary_window_ui) = ui_windows.get_mut(&primary_id) {
+        log_failure(
+            "apply initial bookmark bar visibility",
+            primary_window_ui.set_bookmark_bar_visible(settings.appearance.show_bookmark_bar),
+        );
+    }
+
     // Built once, shared with the RSS sampler thread and every perf-logging
     // call site in this file via `Arc::clone`; `None` when metrics are off,
     // matching `startup`'s `.then(...)` short-circuit above.
@@ -491,6 +560,8 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
             .map(|log| PerfContext { process_start, log }),
         downloads: DownloadStore::new(),
         pending_memory_sample: None,
+        settings,
+        site_permissions: site_permissions_for_state,
     };
 
     // Everything above (history/bookmarks/input-history load, `AppState`
@@ -1049,6 +1120,16 @@ fn handle_user_event(
                     homepage,
                 );
             }
+            // See this function's doc comment, and `apply_updated_settings`'s:
+            // settings are whole-process (D67), so applying one touches
+            // every open window's chrome, which needs `ui_windows` as a
+            // whole — the same reason `NewWindow` is intercepted here.
+            Ok(ToolbarCommand::UpdateSettings { settings }) => {
+                apply_updated_settings(ui_windows, state, *settings);
+            }
+            Ok(ToolbarCommand::ResetSettings) => {
+                apply_updated_settings(ui_windows, state, Settings::default());
+            }
             Ok(command) => {
                 if let Some(window) = ui_windows.get_mut(&window_id) {
                     handle_toolbar_command(window, window_id, state, config, homepage, command);
@@ -1416,6 +1497,21 @@ fn open_new_window(
         state.site_policies.clone(),
     ) {
         Ok(window) => {
+            // Issue #30/D67, integrated with multi-window in D68: settings
+            // are whole-process (`AppState::settings`), so a window opened
+            // after startup must reflect the *current* saved Appearance
+            // settings from the moment it exists — the same push
+            // `app::run` does once for the primary window, and
+            // `apply_updated_settings` repeats for every open window
+            // whenever the settings screen saves a change.
+            log_failure(
+                "apply theme",
+                window.set_theme(state.settings.appearance.theme),
+            );
+            log_failure(
+                "apply initial bookmark bar visibility",
+                window.set_bookmark_bar_visible(state.settings.appearance.show_bookmark_bar),
+            );
             ui_windows.insert(window_id, window);
             Some(window_id)
         }
@@ -1539,12 +1635,24 @@ fn handle_toolbar_command(
                 "initialize bookmark bar visibility",
                 window.set_bookmark_bar_visible(window.bookmark_bar_visible()),
             );
+            // Issue #30 (D67): the chrome theme override, applied here the
+            // same way `set_private` is above — a one-time push on `ready`,
+            // since it never changes except through the settings screen
+            // (which pushes it again itself via `apply_updated_settings`).
+            // Whole-process (D67/D68): every window's toolbar applies the
+            // same `state.settings`, since the settings screen is not
+            // per-window state.
+            log_failure(
+                "apply theme",
+                window.set_theme(state.settings.appearance.theme),
+            );
             sync_block_count(window, tabs_of(state, window_id));
             let url = tabs_of(state, window_id).active().current_url().to_owned();
             sync_bookmark_star(window, state, &url);
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
             refresh_downloads_panel(window, state);
+            refresh_settings_panel(window, state);
             sync_tab_strip(window, window_id, state);
         }
         ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
@@ -1559,6 +1667,7 @@ fn handle_toolbar_command(
                 Some(Panel::History) => refresh_history_panel(window, state, config),
                 Some(Panel::Bookmarks) => refresh_bookmarks_panel(window, state),
                 Some(Panel::Downloads) => refresh_downloads_panel(window, state),
+                Some(Panel::Settings) => refresh_settings_panel(window, state),
                 // The toolbar's own UI never sends `toggle_panel` for this
                 // variant (it is opened/closed only via
                 // `OmniboxInput`/`OmniboxClose`, which push their own
@@ -1603,7 +1712,9 @@ fn handle_toolbar_command(
             }
         }
         ToolbarCommand::OpenDownload { id } => open_download(state, DownloadId::from(id)),
-        ToolbarCommand::OpenDownloadsFolder => open_downloads_folder(),
+        ToolbarCommand::OpenDownloadsFolder => {
+            open_downloads_folder(config.download_dir_override.as_deref())
+        }
         ToolbarCommand::CancelDownload { id } => {
             cancel_download(state, DownloadId::from(id));
             refresh_downloads_panel(window, state);
@@ -1729,13 +1840,15 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::ToggleBookmarkBar => toggle_bookmark_bar(window),
         // Intercepted in `handle_user_event` before it ever reaches here —
-        // see that function's doc comment for why (opening a window needs
-        // `&mut HashMap<WindowId, BrowserWindow>` as a whole, which conflicts
-        // with the `window: &mut BrowserWindow` entry already borrowed to
-        // get here). Listed explicitly, not folded into a wildcard, so a
-        // future `ToolbarCommand` variant still fails to compile here
-        // instead of silently doing nothing.
+        // see that function's doc comment for why (opening a window, or
+        // applying a settings change to every window, needs `&mut
+        // HashMap<WindowId, BrowserWindow>` as a whole, which conflicts with
+        // the `window: &mut BrowserWindow` entry already borrowed to get
+        // here). Listed explicitly, not folded into a wildcard, so a future
+        // `ToolbarCommand` variant still fails to compile here instead of
+        // silently doing nothing.
         ToolbarCommand::NewWindow => {}
+        ToolbarCommand::UpdateSettings { .. } | ToolbarCommand::ResetSettings => {}
 
         // --- In-page find (Issue #43), see docs/decisions.md D69, and D68's
         //     multi-window integration: every one of these now targets
@@ -2412,6 +2525,64 @@ fn refresh_downloads_panel(window: &BrowserWindow, state: &AppState) {
     log_failure("update downloads panel", window.set_downloads(&entries));
 }
 
+/// Push the settings screen's full contents (Issue #30, see
+/// docs/decisions.md D67): the persisted, editable `Settings` document plus
+/// the two read-only reference views (Shortcuts, Security) — see
+/// [`toolbar::SettingsView`]. Called on `ready` (so the screen has data the
+/// moment it is first opened) and again after every successful
+/// `update_settings`/`reset_settings`, so the form always echoes back what
+/// was actually persisted.
+fn refresh_settings_panel(window: &BrowserWindow, state: &AppState) {
+    let view = toolbar::SettingsView {
+        settings: &state.settings,
+        shortcuts: shortcut_reference(),
+        site_permissions: state.site_permissions.records(),
+    };
+    log_failure("update settings panel", window.set_settings(&view));
+}
+
+/// Apply a new settings document from the settings screen
+/// (`ToolbarCommand::UpdateSettings`/`ResetSettings`, Issue #30): sanitize
+/// it (the same hardening `persistence::load_settings` + `sanitize` already
+/// give a `settings.json` loaded at startup — an IPC payload is external
+/// input the same way, see docs/decisions.md D67), persist it, replace
+/// `state.settings`, and apply the two fields that take effect immediately
+/// (`ui::window::BrowserWindow::set_theme`/`set_bookmark_bar_visible` —
+/// Appearance) before re-rendering the panel. Every other field only takes
+/// effect on the next restart, via `Config::apply_settings` in `run`.
+///
+/// **Multi-window (Issue #29/D68)**: `state.settings` is whole-process, the
+/// same way `history`/`bookmarks` are (see `AppState::settings`'s doc
+/// comment) — a change made from *any* window's settings screen must be
+/// reflected in the chrome of *every* open window immediately, not just the
+/// one that made it, and every open window's own settings screen (if it
+/// happens to be open there too) must echo the same saved value back. This
+/// is why the function takes `ui_windows: &mut HashMap<WindowId,
+/// BrowserWindow>` as a whole and loops over every entry, rather than the
+/// single already-resolved `window: &mut BrowserWindow` most other
+/// `ToolbarCommand` handlers take — see `handle_user_event`'s doc comment
+/// for why `UpdateSettings`/`ResetSettings` are intercepted there, before a
+/// single window is resolved, the same way `NewWindow` is.
+fn apply_updated_settings(
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    settings: Settings,
+) {
+    let sanitized = settings.sanitize();
+    state.settings = sanitized.clone();
+    if let Some(dir) = &state.data_dir {
+        log_io_failure("save settings", persistence::save_settings(dir, &sanitized));
+    }
+    for window in ui_windows.values() {
+        log_failure("apply theme", window.set_theme(sanitized.appearance.theme));
+        log_failure(
+            "apply bookmark bar visibility",
+            window.set_bookmark_bar_visible(sanitized.appearance.show_bookmark_bar),
+        );
+        refresh_settings_panel(window, state);
+    }
+}
+
 /// Open a completed download's file with the OS's default handler
 /// (`ToolbarCommand::OpenDownload`). A no-op — logged, not an error — for
 /// an unknown id or a download that has not reached
@@ -2431,8 +2602,8 @@ fn open_download(state: &AppState, id: DownloadId) {
 /// (`ToolbarCommand::OpenDownloadsFolder`). Creates the directory first
 /// (best-effort) so opening it before anything has ever been downloaded
 /// does not fail with a confusing "no such directory" error.
-fn open_downloads_folder() {
-    let Some(dir) = downloads::resolve_download_dir() else {
+fn open_downloads_folder(download_dir_override: Option<&str>) {
+    let Some(dir) = downloads::resolve_download_dir_with_override(download_dir_override) else {
         eprintln!(
             "velox: open_downloads_folder: could not resolve a downloads directory \
              (no VELOX_DOWNLOAD_DIR/HOME/USERPROFILE)"
@@ -2701,6 +2872,8 @@ mod tests {
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
+            settings: Settings::default(),
+            site_permissions: Arc::new(SitePermissionStore::new()),
         }
     }
 

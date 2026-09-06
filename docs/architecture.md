@@ -1,8 +1,9 @@
 # VeloX Architecture
 
 Status: multiple windows (Issue #29), each with its own multiple tabs, tab
-suspension, visit history, bookmarks, and content blocking. This document
-describes what exists today and where the extension points are.
+suspension, visit history, bookmarks, content blocking, and a persisted
+settings screen. This document describes what exists today and where the
+extension points are.
 
 ## Overall structure
 
@@ -187,9 +188,10 @@ independently rather than treating them as alternatives, and both shrink the
 content webview (D35). Many bookmarks degrade the same way many tabs do —
 shrink, then `overflow-x: auto` scroll (D22) — and a folder opens as a
 dropdown inside the toolbar webview. Visibility is Ctrl/Cmd+Shift+B, wired
-through both shortcut channels (D18/D23) like every other VeloX shortcut,
-and is **session-only**: there is no settings-persistence layer yet, so the
-bar's shown/hidden state resets on restart (see #30).
+through both shortcut channels (D18/D23) like every other VeloX shortcut.
+Its shown/hidden state is now persisted (`Settings::appearance::
+show_bookmark_bar`, Issue #30/D67 — see "Settings screen and persisted
+settings" below) rather than resetting every restart as it used to.
 
 ## Private browsing
 
@@ -824,6 +826,89 @@ section is the quick-reference summary.
   holds structurally: each tab's `WebView` is an independent object behind
   `ui::window`'s per-`TabId` map, and no code path treats one tab's engine
   callbacks as able to reach another tab or the event loop itself.
+
+## Settings screen and persisted settings
+
+Status: implemented (Issue #30, see docs/decisions.md D67 for the full
+design rationale, including a startup-config bug the project's own
+integration test suite caught during development). This section is the
+quick-reference summary.
+
+**Two distinct layers, kept deliberately separate** (the issue's own
+"Config と UI が適切に分離される" acceptance criterion): `config::Config`
+stays exactly what it always was — a plain struct resolved once at startup
+from compiled defaults plus `VELOX_*` environment variables/CLI flags
+(`Config::from_env_and_args`). `browser::settings::Settings` is the new,
+separate layer: UI/engine-independent, serde-derived data covering the
+General / Appearance / Search / Privacy / Performance / Downloads /
+Advanced tabs (Security and Shortcuts are read-only views over data that
+already exists elsewhere, not new persisted fields — see below), shaped
+like `browser::session::SessionSnapshot` (a `sanitize` step repairs bad
+values rather than ever failing outright) and persisted as `settings.json`
+via `browser::persistence::{load,save}_settings`, the same pattern as
+`history.json`/`bookmarks.json`/`session.json`.
+
+**The two layers meet through exactly two `Config` methods**, both
+unit-tested as inverses of each other:
+
+- `Config::apply_settings(&Settings)` copies a persisted `Settings` onto
+  `Config`, called once in `app::run`, before `BrowserWindow::new` — but
+  **only when a `settings.json` actually exists on disk**. Calling it
+  unconditionally (with a blindly-defaulted `Settings` on a fresh
+  checkout) was tried first and turned out to silently discard every
+  `VELOX_*` env var/CLI flag `Config::from_env_and_args` had just resolved
+  — caught by `tests/integration.rs` going red, see D67.
+- `Config::to_settings() -> Settings` is the seam that fixes that: when no
+  `settings.json` exists yet, `app::run` seeds `AppState::settings` from
+  the *already-resolved* `Config` (env vars included) instead of
+  `Settings::default()`, so opening the settings screen before ever saving
+  shows what is actually running, and saving without changing anything is
+  a no-op on the next launch.
+
+**Live vs. restart-effective**: every category except Appearance
+(`theme`/`show_bookmark_bar`) only takes effect starting from the *next*
+process launch — `Config` is read once, at construction time, by
+`BrowserWindow::new`, `FilterList`/`SuspensionPolicy`/`PerfLog`, none of
+which are wired for runtime mutation. Appearance is the one exception:
+`theme` is a pure CSS variable toggle inside the toolbar webview only
+(`ui::window::BrowserWindow::set_theme`, `:root[data-velox-theme]` in
+`ui/toolbar.html` — never web page content, which wry 0.56 exposes no
+per-webview `prefers-color-scheme` override for), and `show_bookmark_bar`
+reuses the existing `BrowserWindow::set_bookmark_bar_visible` (Issue #19).
+The bookmark bar's shown/hidden state was session-only before this issue
+(see the bookmark-bar section above); it is now genuinely persisted.
+
+**Wire format**: `ToolbarCommand::UpdateSettings { settings: Box<Settings> }`
+(boxed — clippy's `large_enum_variant`, `Settings` is far bigger than every
+other command) and `ToolbarCommand::ResetSettings` replace the whole
+document at once rather than one command per field, mirroring how
+`EditBookmark` bundles several fields into one command already.
+`app::apply_updated_settings` sanitizes the incoming value again (an IPC
+payload is external input the same way a settings.json is), persists it,
+replaces `AppState::settings`, applies the two live Appearance fields, and
+pushes `toolbar::SettingsView` (the editable `Settings` plus the two
+read-only reference views) back so the form always echoes what was
+actually stored.
+
+**Security and Shortcuts are read-only**: Security shows
+`browser::site_permissions::SitePermissionStore`'s existing records
+(Issue #24/D60) — D60 already established that wry 0.56's
+`with_permission_handler` has no path to *write* a new decision at
+runtime, so a settings-screen edit affordance was not addable without
+first solving that; Shortcuts shows a static reference table
+(`browser::settings::shortcut_reference`) of the key bindings
+`ui/toolbar.html`'s keydown listener and `ui::window::ContentShortcut`
+(D18/D23) already hardcode — remapping them is out of scope for this
+issue (see D67's "Revisit condition").
+
+**Downloads is genuinely wired, not just persisted**: unlike the rest of
+its restart-effective siblings, `download_dir_override` reaches the actual
+download machinery — `Config::download_dir_override` is threaded through
+`BrowserWindow`/`ContentPolicy` into `ui::window::with_download_handlers`
+and `browser::downloads::resolve_download_dir_with_override` (a thin
+override-then-fallback wrapper around the pre-#30 `resolve_download_dir`),
+and `app::open_downloads_folder` (the settings screen's and the downloads
+panel's "フォルダを開く" buttons) consults the same override.
 
 ## Startup URL
 

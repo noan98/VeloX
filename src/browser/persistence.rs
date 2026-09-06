@@ -21,6 +21,7 @@ use super::bookmarks::BookmarkStore;
 use super::history::HistoryStore;
 use super::input_history::InputHistoryStore;
 use super::session::SessionSnapshot;
+use super::settings::Settings;
 use super::site_permissions::SitePermissionStore;
 
 const HISTORY_FILE: &str = "history.json";
@@ -28,6 +29,7 @@ const BOOKMARKS_FILE: &str = "bookmarks.json";
 const INPUT_HISTORY_FILE: &str = "input_history.json";
 const SESSION_FILE: &str = "session.json";
 const SITE_PERMISSIONS_FILE: &str = "site_permissions.json";
+const SETTINGS_FILE: &str = "settings.json";
 
 /// Resolve the directory VeloX stores its history/bookmarks files in.
 ///
@@ -144,6 +146,26 @@ pub fn load_session(dir: &Path) -> Option<SessionSnapshot> {
 /// supposed to help with.
 pub fn save_session(dir: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
     write_json(dir, &dir.join(SESSION_FILE), snapshot)
+}
+
+/// Load persisted user settings from `dir` (Issue #30 — see
+/// docs/decisions.md D67). `None` for anything that does not parse into a
+/// well-formed [`Settings`] (missing file, unreadable, truncated/corrupt
+/// JSON, or JSON of the wrong shape) — exactly [`load_session`]'s contract.
+/// The caller (`app::run`) falls back to [`Settings::default`] in that case
+/// and always runs the result through [`Settings::sanitize`] besides, so a
+/// well-formed but hostile/out-of-range value never reaches this far either.
+pub fn load_settings(dir: &Path) -> Option<Settings> {
+    read_json(&dir.join(SETTINGS_FILE))
+}
+
+/// Persist `settings` to `dir`, creating the directory if needed. Called
+/// whenever the settings screen's "保存" action succeeds, so a crash or
+/// `kill -9` right after saving still leaves the new value in place next
+/// launch — the same reasoning `save_session` documents for writing on every
+/// change rather than only at exit.
+pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
+    write_json(dir, &dir.join(SETTINGS_FILE), settings)
 }
 
 fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
@@ -529,6 +551,72 @@ mod tests {
         let loaded = load_session(&dir).expect("a large well-formed file should still load");
         assert_eq!(loaded.tabs.len(), 20_000);
         assert_eq!(loaded.active_index, 10_000);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Settings (Issue #30, D67) ---
+
+    #[test]
+    fn missing_settings_file_loads_as_none() {
+        let dir = unique_temp_dir("velox-persist-settings-missing");
+        assert_eq!(load_settings(&dir), None);
+    }
+
+    #[test]
+    fn settings_round_trip_through_disk() {
+        let dir = unique_temp_dir("velox-persist-settings");
+        let mut settings = Settings::default();
+        settings.general.homepage = "https://example.com/".to_owned();
+        settings.privacy.content_blocking_site_exceptions = vec!["example.com".to_owned()];
+
+        save_settings(&dir, &settings).expect("save_settings should succeed");
+        let loaded = load_settings(&dir);
+        assert_eq!(loaded, Some(settings));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn corrupt_settings_file_loads_as_none_not_a_panic() {
+        let dir = unique_temp_dir("velox-persist-settings-corrupt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(SETTINGS_FILE), "not json").unwrap();
+        assert_eq!(load_settings(&dir), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn truncated_settings_file_loads_as_none() {
+        let dir = unique_temp_dir("velox-persist-settings-truncated");
+        fs::create_dir_all(&dir).unwrap();
+        let full = serde_json::to_string(&Settings::default()).unwrap();
+        let truncated = &full[..full.len() / 2];
+        fs::write(dir.join(SETTINGS_FILE), truncated).unwrap();
+        assert_eq!(load_settings(&dir), None);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_settings_file_from_an_older_velox_missing_new_fields_still_loads() {
+        // Simulates upgrading across a version that added a whole new
+        // category (`#[serde(default)]` on every field is what makes this
+        // work) — the issue's own "デフォルト値/マイグレーション" criterion.
+        let dir = unique_temp_dir("velox-persist-settings-old-shape");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(SETTINGS_FILE),
+            r#"{"general":{"homepage":"https://old.example/"}}"#,
+        )
+        .unwrap();
+        let loaded = load_settings(&dir).expect("a partial but valid object should still parse");
+        assert_eq!(loaded.general.homepage, "https://old.example/");
+        assert_eq!(
+            loaded.performance,
+            super::super::settings::PerformanceSettings::default()
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
