@@ -74,8 +74,16 @@ pub fn save_history(dir: &Path, store: &HistoryStore) -> std::io::Result<()> {
 
 /// Load the bookmark store from `dir`. Any failure (missing file,
 /// unreadable, malformed JSON) yields an empty store rather than an error.
+///
+/// Also repairs any entry left with a dangling `folder_id` (a folder id
+/// that does not name a folder actually present in the same file) back to
+/// the root level — see [`BookmarkStore::repair_dangling_folder_ids`] for
+/// why plain deserialization alone cannot be trusted to keep that invariant
+/// (Issue #35, docs/decisions.md D62).
 pub fn load_bookmarks(dir: &Path) -> BookmarkStore {
-    read_json(&dir.join(BOOKMARKS_FILE)).unwrap_or_default()
+    let mut store: BookmarkStore = read_json(&dir.join(BOOKMARKS_FILE)).unwrap_or_default();
+    store.repair_dangling_folder_ids();
+    store
 }
 
 /// Persist the bookmark store to `dir`, creating the directory if needed.
@@ -194,6 +202,145 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(HISTORY_FILE), "not json").unwrap();
         assert_eq!(load_history(&dir), HistoryStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Robustness against a hostile/broken data directory (Issue #35):
+    // every one of `load_history`/`load_bookmarks`/`load_input_history`
+    // must fall back to an empty store rather than panicking, no matter
+    // what is actually on disk. ---
+
+    #[test]
+    fn truncated_json_falls_back_to_an_empty_store_for_every_store() {
+        let dir = unique_temp_dir("velox-persist-truncated");
+        fs::create_dir_all(&dir).unwrap();
+        // A file that starts out as valid-looking JSON but is cut off
+        // mid-value, e.g. by a crash or a full disk during a previous save.
+        fs::write(dir.join(HISTORY_FILE), r#"{"entries":[{"id":1,"url":"#).unwrap();
+        fs::write(dir.join(BOOKMARKS_FILE), r#"{"entries":[{"id":1,"#).unwrap();
+        fs::write(dir.join(INPUT_HISTORY_FILE), r#"{"entries":[{"text":"#).unwrap();
+
+        assert_eq!(load_history(&dir), HistoryStore::new());
+        assert_eq!(load_bookmarks(&dir), BookmarkStore::new());
+        assert_eq!(load_input_history(&dir), InputHistoryStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_empty_file_falls_back_to_an_empty_store() {
+        let dir = unique_temp_dir("velox-persist-empty-file");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(HISTORY_FILE), "").unwrap();
+        assert_eq!(load_history(&dir), HistoryStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn json_of_the_wrong_shape_falls_back_to_an_empty_store() {
+        let dir = unique_temp_dir("velox-persist-wrong-shape");
+        fs::create_dir_all(&dir).unwrap();
+        // Valid JSON, but not the shape any of these stores expect (e.g. a
+        // bare array, or an object missing every required field).
+        fs::write(dir.join(HISTORY_FILE), "[1,2,3]").unwrap();
+        fs::write(dir.join(BOOKMARKS_FILE), r#"{"unexpected":"shape"}"#).unwrap();
+        fs::write(dir.join(INPUT_HISTORY_FILE), "\"just a string\"").unwrap();
+
+        assert_eq!(load_history(&dir), HistoryStore::new());
+        assert_eq!(load_bookmarks(&dir), BookmarkStore::new());
+        assert_eq!(load_input_history(&dir), InputHistoryStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn json_with_wrong_field_types_falls_back_to_an_empty_store() {
+        let dir = unique_temp_dir("velox-persist-wrong-types");
+        fs::create_dir_all(&dir).unwrap();
+        // `id` should be a `u64`, `visited_at` a `u64` — strings/negative
+        // numbers here must fail deserialization cleanly, not panic.
+        fs::write(
+            dir.join(HISTORY_FILE),
+            r#"{"entries":[{"id":"not-a-number","url":"https://example.com/","title":null,"visited_at":-1}],"next_id":2}"#,
+        )
+        .unwrap();
+        assert_eq!(load_history(&dir), HistoryStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deeply_nested_json_does_not_panic() {
+        // Same JSON-bomb shape `ui::toolbar`'s IPC parser is hardened
+        // against — the store loader goes through the same `serde_json`
+        // parser and must be equally immune to a stack overflow.
+        let dir = unique_temp_dir("velox-persist-deep-nesting");
+        fs::create_dir_all(&dir).unwrap();
+        let depth = 100_000;
+        let bomb = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+        fs::write(dir.join(HISTORY_FILE), &bomb).unwrap();
+        assert_eq!(load_history(&dir), HistoryStore::new());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_huge_but_well_formed_history_file_still_loads() {
+        // The inverse of the size-limiting concerns elsewhere in this
+        // issue: a large *legitimate* history file (many entries
+        // accumulated over a long-lived profile) must still load — nothing
+        // here should impose an accidental low ceiling.
+        let dir = unique_temp_dir("velox-persist-huge-legit");
+        let mut store = HistoryStore::new();
+        for i in 0..20_000u64 {
+            store.record_visit(&format!("https://example.com/{i}"), None, i, 0);
+        }
+        save_history(&dir, &store).expect("save_history should succeed");
+        let loaded = load_history(&dir);
+        assert_eq!(loaded.entries().len(), 20_000);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_bookmarks_repairs_a_dangling_folder_id_on_disk() {
+        // End-to-end version of `bookmarks::tests::
+        // repair_dangling_folder_ids_reparents_unknown_folders_to_root` —
+        // confirms `load_bookmarks` (not just the store method in
+        // isolation) actually calls the repair step on a real file (Issue
+        // #35, docs/decisions.md D62).
+        let dir = unique_temp_dir("velox-persist-dangling-folder");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(BOOKMARKS_FILE),
+            r#"{
+                "entries": [
+                    {"id": 1, "url": "https://example.com/", "title": null, "created_at": 100, "folder_id": 999}
+                ],
+                "next_id": 2,
+                "folders": [],
+                "next_folder_id": 1
+            }"#,
+        )
+        .unwrap();
+
+        let store = load_bookmarks(&dir);
+        assert_eq!(store.entries()[0].folder_id, None);
+        assert_eq!(store.entries_in(None).count(), 1);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_null_byte_in_the_json_file_is_handled_without_panicking() {
+        let dir = unique_temp_dir("velox-persist-nul-byte");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(HISTORY_FILE), b"{\"entries\":[]\0,\"next_id\":1}").unwrap();
+        // No expectation on the exact outcome, only that loading a file
+        // containing a stray NUL byte cannot panic.
+        let _ = load_history(&dir);
 
         fs::remove_dir_all(&dir).ok();
     }

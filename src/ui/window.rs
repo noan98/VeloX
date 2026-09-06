@@ -2268,6 +2268,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_content_shortcut_does_not_panic_on_hostile_content_webview_input() {
+        // The content webview loads arbitrary, potentially hostile web
+        // pages (unlike the toolbar webview) — this is the least-trusted
+        // IPC boundary in the app (Issue #35, docs/decisions.md D18/D23/
+        // D62), so it gets the same "malformed/huge input must never
+        // panic" treatment as `ui::toolbar::parse_command`.
+        let huge = "a".repeat(5_000_000);
+        assert_eq!(parse_content_shortcut(&huge), None);
+
+        for hostile in [
+            "\0\0\0",
+            "velox:new-tab\0",
+            "velox:activate-tab-18446744073709551616", // overflows u32/usize
+            "🚀日本語velox:new-tab",
+            "\u{202e}velox:new-tab",
+        ] {
+            assert_eq!(parse_content_shortcut(hostile), None, "{hostile:?}");
+        }
+    }
+
+    #[test]
     fn favicon_script_falls_back_to_a_same_origin_guess() {
         assert!(RESOLVE_FAVICON_SCRIPT.contains("link[rel~=\"icon\"]"));
         assert!(RESOLVE_FAVICON_SCRIPT.contains("/favicon.ico"));
