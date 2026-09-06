@@ -3,7 +3,8 @@
 //! Most of this module is plain Rust state and pure functions, which keeps
 //! it unit-testable without spawning a window: `navigation`, `tab`,
 //! `history`, `bookmarks`, `site_permissions`, `session`, `benchmark`,
-//! `automation` and `suspension` hold no filesystem or UI dependency.
+//! `automation`, `suspension` and `find` hold no filesystem or UI
+//! dependency.
 //! `persistence` and `perf_log` are the exceptions — thin, deliberately
 //! "dumb" IO layers (JSON files for `persistence`; stderr/a file for
 //! `perf_log`'s [`metrics::PerfRecord`] lines); see their module doc
@@ -14,6 +15,7 @@ pub mod benchmark;
 pub mod blocklist;
 pub mod bookmarks;
 pub mod downloads;
+pub mod find;
 pub mod gui_probe;
 pub mod history;
 pub mod input_history;

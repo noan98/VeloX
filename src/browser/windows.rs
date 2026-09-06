@@ -27,17 +27,34 @@
 //! cross the window boundary (`crate::app::UserEvent`'s navigation/load/
 //! title/favicon variants) carries both ids for exactly this reason — see
 //! docs/decisions.md D68.
+//!
+//! **In-page find (Issue #43) is per-window, for the same reason.** Each
+//! window's own find bar (`ui::toolbar.html`, one per toolbar webview) can
+//! have its own session open at once — searching "foo" in one window must
+//! never touch, or be closed by, a search for "bar" in another — so
+//! [`WindowEntry::find`] lives right alongside that window's `tabs`, not as
+//! one global `Option` shared by every window (see docs/decisions.md D68's
+//! "複数ウィンドウ × ページ内検索" section, added when Issue #43 (D69) and
+//! this issue were integrated).
 
+use super::find::FindState;
 use super::session::SavedTab;
 use super::tabs::Tabs;
 use super::window_id::WindowId;
 
-/// One open window's worth of state this layer tracks: its id and its own
-/// independent tab collection.
+/// One open window's worth of state this layer tracks: its id, its own
+/// independent tab collection, and its own independent in-page find session
+/// (if one is currently open).
 #[derive(Debug)]
 struct WindowEntry {
     id: WindowId,
     tabs: Tabs,
+    /// This window's in-page find session (Issue #43), if the find bar is
+    /// currently open in it. `None` whenever it is closed. See
+    /// `browser::find::FindState`'s doc comment: only one session exists at
+    /// a time *per window*, tied to whichever tab was active in that window
+    /// when it opened.
+    find: Option<FindState>,
 }
 
 /// An ordered collection of open windows, each with its own [`Tabs`].
@@ -73,7 +90,11 @@ impl Windows {
 
     fn push_window(&mut self, tabs: Tabs) -> WindowId {
         let id = self.take_id();
-        self.entries.push(WindowEntry { id, tabs });
+        self.entries.push(WindowEntry {
+            id,
+            tabs,
+            find: None,
+        });
         id
     }
 
@@ -123,6 +144,46 @@ impl Windows {
             .iter_mut()
             .find(|entry| entry.id == id)
             .map(|entry| &mut entry.tabs)
+    }
+
+    /// Window `id`'s in-page find session (Issue #43), if it currently has
+    /// one open. `None` for a closed find bar *or* an unknown window id —
+    /// callers that need to tell the two apart already know whether `id` is
+    /// open (see `tabs`/`contains`).
+    pub fn find(&self, id: WindowId) -> Option<&FindState> {
+        self.entries
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.find.as_ref())
+    }
+
+    /// Mutable version of [`Self::find`].
+    pub fn find_mut(&mut self, id: WindowId) -> Option<&mut FindState> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.find.as_mut())
+    }
+
+    /// Open (or replace) window `id`'s find session — `app::open_find_bar`
+    /// starting a fresh search always discards whatever session that window
+    /// had before. A no-op for an unknown window id, the same "stale id is a
+    /// safe no-op" convention every other id-addressed operation here
+    /// follows.
+    pub fn set_find(&mut self, id: WindowId, session: FindState) {
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+            entry.find = Some(session);
+        }
+    }
+
+    /// Close window `id`'s find session, returning it if one was open
+    /// (`None` for an unknown window id *or* one with no session open —
+    /// same shape as `Tabs::reopen_closed`'s `Option`-returning "take").
+    pub fn take_find(&mut self, id: WindowId) -> Option<FindState> {
+        self.entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.find.take())
     }
 
     /// Whether `id` refers to a currently open window.
@@ -323,6 +384,123 @@ mod tests {
             windows.tabs(first).unwrap().active().current_url(),
             "https://a.example/"
         );
+    }
+
+    // --- In-page find (Issue #43) is per-window, not global — see the
+    // module doc comment's "複数ウィンドウ × ページ内検索" note and
+    // docs/decisions.md D68. ---
+
+    #[test]
+    fn a_new_window_has_no_find_session() {
+        let windows = Windows::new("https://example.com/");
+        let id = windows.ids().next().unwrap();
+        assert!(windows.find(id).is_none());
+    }
+
+    #[test]
+    fn find_sessions_are_independent_per_window() {
+        // The exact scenario the multi-window/#43 integration must not get
+        // wrong: two windows whose active tabs happen to share the same
+        // `TabId` (see `each_window_has_its_own_independent_tab_id_space`)
+        // each get their own find session, keyed by `WindowId`, not by the
+        // `TabId` alone.
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let second = windows.open_window("https://b.example/");
+        let first_tab = windows.tabs(first).unwrap().active_id();
+        let second_tab = windows.tabs(second).unwrap().active_id();
+        assert_eq!(
+            first_tab, second_tab,
+            "test assumes both windows share a TabId value"
+        );
+
+        let mut first_session = FindState::new(first_tab);
+        first_session.set_query("foo".to_owned(), false);
+        windows.set_find(first, first_session);
+
+        assert_eq!(windows.find(first).unwrap().query(), "foo");
+        assert!(
+            windows.find(second).is_none(),
+            "opening a find session in one window must not leak into another"
+        );
+
+        let mut second_session = FindState::new(second_tab);
+        second_session.set_query("bar".to_owned(), true);
+        windows.set_find(second, second_session);
+
+        // Both sessions coexist, independently, even though their tab ids
+        // are numerically identical.
+        assert_eq!(windows.find(first).unwrap().query(), "foo");
+        assert!(!windows.find(first).unwrap().case_sensitive());
+        assert_eq!(windows.find(second).unwrap().query(), "bar");
+        assert!(windows.find(second).unwrap().case_sensitive());
+    }
+
+    #[test]
+    fn taking_one_windows_find_session_never_closes_anothers() {
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let second = windows.open_window("https://b.example/");
+        let first_tab = windows.tabs(first).unwrap().active_id();
+        let second_tab = windows.tabs(second).unwrap().active_id();
+
+        windows.set_find(first, FindState::new(first_tab));
+        windows.set_find(second, FindState::new(second_tab));
+
+        let taken = windows.take_find(first);
+        assert!(taken.is_some());
+        assert!(
+            windows.find(first).is_none(),
+            "take_find must remove the session it returned"
+        );
+        assert!(
+            windows.find(second).is_some(),
+            "closing window 1's find bar must not close window 2's"
+        );
+    }
+
+    #[test]
+    fn find_mut_edits_only_the_targeted_windows_session() {
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let second = windows.open_window("https://b.example/");
+        let first_tab = windows.tabs(first).unwrap().active_id();
+        let second_tab = windows.tabs(second).unwrap().active_id();
+
+        windows.set_find(first, FindState::new(first_tab));
+        windows.set_find(second, FindState::new(second_tab));
+
+        windows
+            .find_mut(first)
+            .unwrap()
+            .set_query("only-first".to_owned(), false);
+
+        assert_eq!(windows.find(first).unwrap().query(), "only-first");
+        assert_eq!(windows.find(second).unwrap().query(), "");
+    }
+
+    #[test]
+    fn set_find_take_find_and_find_mut_are_noops_for_an_unknown_window() {
+        let mut windows = Windows::new("https://example.com/");
+        let existing_tab = windows.ids().next().unwrap();
+        let tab_id = windows.tabs(existing_tab).unwrap().active_id();
+        let unknown = WindowId::from(9999);
+        windows.set_find(unknown, FindState::new(tab_id));
+        assert!(windows.find(unknown).is_none());
+        assert!(windows.find_mut(unknown).is_none());
+        assert!(windows.take_find(unknown).is_none());
+    }
+
+    #[test]
+    fn closing_a_window_drops_its_find_session_without_a_panic() {
+        let mut windows = Windows::new("https://a.example/");
+        let first = windows.ids().next().unwrap();
+        let tab = windows.tabs(first).unwrap().active_id();
+        windows.set_find(first, FindState::new(tab));
+        assert!(windows.close_window(first));
+        // `first` is gone entirely now; querying its (former) find session
+        // must behave exactly like any other unknown-id lookup, not panic.
+        assert!(windows.find(first).is_none());
     }
 
     #[test]

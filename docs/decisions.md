@@ -6260,4 +6260,404 @@ webview 発の固定センチネル文字列、D18/D23 の trust boundary) の 2
 グローバル予算/即時反映という追加要件が実際に必要になったら」拾えばよい
 優先度の低い改善として記録するに留める。
 
+### 追記: 複数ウィンドウ × ページ内検索 (#43, D69) の統合
 
+**経緯**: 本 PR (#29) を `main` に merge する時点で、Issue #43(ページ内検索、
+D69、PR #147)が既に `main` にマージ済みだった。#43 は本 Issue が存在しない
+前提 (単一ウィンドウ) で実装されており、`AppState::find: Option<
+browser::find::FindState>` という**プロセス全体で 1 個だけのグローバルな
+検索セッション**を持つ設計だった。`browser::find::FindState` 自体は
+`tab_id: TabId` しか保持していないため、これをそのまま複数ウィンドウ環境に
+持ち込むと、本 D68 が明示している「`TabId` はウィンドウ内でのみ一意」という
+前提により、以下 3 箇所で実際にバグになることが判明した:
+
+1. ウィンドウ B のタブ 0 をナビゲートすると、`state.find.as_ref().is_some_and(|f| f.tab_id() == id)` の `id` 比較がウィンドウ A のタブ 0 と衝突し、
+   無関係なウィンドウ A の検索バーが閉じられる。
+2. `UserEvent::FindMatchesUpdated { tab_id, total }` が `WindowId` を持たない
+   ため、DOM 検索の結果イベントがどのウィンドウ宛てかを区別できず、
+   `window.set_find_status`/`highlight_find_match` が別ウィンドウの
+   `BrowserWindow` に適用されうる。
+3. タブ切替時の `close_find_bar` 呼び出し (`activate_and_refresh`) が
+   `state.find.is_some()` というグローバル判定のため、ウィンドウ B での
+   タブ切替がウィンドウ A の検索バーを閉じてしまう。
+
+**決定: 検索セッションをウィンドウ単位の状態にする** — 本 D68 が既に確立した
+「`browser::Windows` の各 `WindowEntry` がその窓固有の状態を持つ (`tabs:
+Tabs` がその筆頭)」という設計パターンをそのまま踏襲し、`find:
+Option<browser::find::FindState>` を `WindowEntry` に追加した
+(`src/browser/windows.rs`)。`AppState::find` フィールド自体は削除し、
+`Windows` に `find`/`find_mut`/`set_find`/`take_find` という 4 つのアクセサ
+(`tabs`/`tabs_mut` と対になる形) を追加して、`app.rs` からは
+`state.windows.find(window_id)` のように必ず `WindowId` 付きで参照する形に
+した。`FindState` 自体 (`src/browser/find.rs`) は無改修— `TabId` しか
+知らなくてよい、という D69 の設計は変えていない。「global な `Option`
+1 個」ではなく「ウィンドウごとに独立したセッション」を選んだのは、実際の
+ブラウザの挙動 (ウィンドウ A で "foo" を検索している間に、ウィンドウ B で
+別に "bar" を検索できる) に合わせるためで、global な 1 個にすると
+「後から開いた方が必ず前のウィンドウの検索を強制終了させる」という
+D68 の設計原則にもそぐわない挙動になっていた。
+
+`UserEvent::FindMatchesUpdated` にも `window_id: WindowId` を追加した
+(発火元は `ui::window::BrowserWindow::search_in_page` — `self.id` を
+`evaluate_script_with_callback` のクロージャにキャプチャするだけで済んだ)。
+これで上記 3 箇所はすべて次のように解消される:
+
+1. `state.windows.find(window_id).is_some_and(|s| s.tab_id() == id)` —
+   `window_id` が一致する `WindowEntry` の中でしか `tab_id` を比較しない。
+2. `UserEvent::FindMatchesUpdated { window_id, tab_id, total }` を受けた
+   `handle_user_event` がまず `window_id` で `BrowserWindow`/`Tabs` を
+   解決してから `state.windows.find_mut(window_id)` を見るため、結果が
+   別ウィンドウに漏れることがない。
+3. `activate_and_refresh` の判定を `state.windows.find(window_id).is_some()`
+   に変更し、その `window_id` 自身の検索セッションだけを見るようにした。
+
+`open_find_bar`/`close_find_bar`/`update_find_query`/`step_find`
+(いずれも `handle_toolbar_command`/`handle_content_shortcut` から
+`window_id: WindowId` を既に受け取っている呼び出し元を持つ) は全て
+`window_id: WindowId` を追加の引数として受け取るように変更した — 配線
+自体は本 Issue (#29) の側で既に `window_id` を全ハンドラに通していたため、
+届いていなかったのは「`state.find`(グローバル)を見る」というロジックの
+部分だけだった。
+
+**テスト**: `src/browser/windows.rs` に、2 つのウィンドウが偶然同じ
+`TabId` を持つ状況 (`each_window_has_its_own_independent_tab_id_space` と
+同じ前提) で検索セッションが独立していることを検証する単体テストを
+6 件追加した:
+`a_new_window_has_no_find_session`、
+`find_sessions_are_independent_per_window`(本題 — 一方の `set_find` が
+他方に漏れないこと)、
+`taking_one_windows_find_session_never_closes_anothers`(上記 3 番の
+バグの再現)、
+`find_mut_edits_only_the_targeted_windows_session`、
+`set_find_take_find_and_find_mut_are_noops_for_an_unknown_window`、
+`closing_a_window_drops_its_find_session_without_a_panic`。
+`app.rs` 側の統合 (`UserEvent::FindMatchesUpdated`/`activate_and_refresh`
+の分岐) 自体は既存の統合テスト方針 (D47: wry 呼び出し自体は統合テストの
+対象にしない) に従い、`browser::windows` の単体テストでロジックを、
+実際の 2 ウィンドウでの目視相当の検証は行っていない — 見送った検証として
+下記に記録する。
+
+**見送った検証**: 実際に 2 つの `BrowserWindow` を開いて同時に別々の
+検索語で検索し、互いのハイライト/件数表示が混線しないことを実機
+(または統合テスト) で確認することはしていない。`tests/integration.rs`
+は `VELOX_AUTOMATION_SCRIPT` 経由の駆動のみで、ページ内検索の
+`ToolbarCommand`(`OpenFindBar`/`FindQuery`/...) は自動化コマンドの
+対象になっていないため、既存の自動化の仕組みだけでは統合テスト化でき
+ない。将来 #43 側で検索コマンドを自動化スクリプトに追加する機会があれば、
+その時に複数ウィンドウの統合テストも追加するのが自然と考える。
+
+## D69: ページ内検索 (#43) — 3 エンジンとも自前 JS 実装、ネイティブ find API は Windows を優先する限り使えないと判明
+
+**対象**: Issue #43。Ctrl/Cmd+F・検索 UI・次/前へ移動・件数表示・Esc 終了・
+大文字小文字の扱い。依存関係として挙げられている Issue #38 (キーボード
+ショートカット管理) はまだ着手されていないため、今回は既存の D18/D23 と
+同じ「固定の Ctrl/Cmd+F 割り当て」で最小実装し、後から #38 の仕組みに
+載せ替えやすい形にした (後述)。
+
+### 調査: wry 0.56 経由でネイティブ find API に届くか
+
+Issue の指示どおり、自前 JS 実装に踏み切る前に 3 エンジンそれぞれで
+ネイティブの「ページ内検索」API に wry 経由で安全に届くかを実際のソース
+(`~/.cargo/registry/src/.../wry-0.56.1`,
+`webview2-com-sys-0.38.2`, `webkit2gtk-2.0.2`) で確認した — D25/D59/D66 で
+確立した「issue の指示に頼らず実ソースを読む」調査スタイルをそのまま踏襲。
+
+- **WebKitGTK (Linux) — 安全なネイティブ API が実在した。**
+  `webkit2gtk::WebView::find_controller() -> Option<FindController>`
+  (`webkit2gtk-2.0.2/src/auto/web_view.rs` 1019 行目) から
+  `FindControllerExt::{search, search_next, search_previous,
+  count_matches}` と `counted-matches`/`failed-to-find-text` シグナル
+  (`webkit2gtk-2.0.2/src/auto/find_controller.rs`) に届く。到達経路は
+  D66 と全く同じ `wry::WebViewExtUnix::webview()`
+  (`wry-0.56.1/src/lib.rs` 2427/2444 行目) → `webkit2gtk::WebView`。
+  呼び出し側に `unsafe` は要求されない (webkit2gtk クレートが内部で
+  `unsafe extern "C"` 呼び出しをラップ済み — D66 の
+  `clear_all_browsing_data`/`website_data_manager` と同じ形)。**しかし
+  Linux は CLAUDE.md の OS 優先度で最も低い** — ここだけネイティブ実装を
+  作っても Windows/macOS には使えず、後述のとおり Windows 側は全く別の
+  実装 (JS) が必要になるため、1 機能に 2 系統の実装を抱える非対称さが
+  生まれる。
+- **WebView2 (Windows) — API 自体は存在するが、実運用には使えないと判断した。**
+  `webview2-com-sys-0.38.2/src/bindings.rs` に
+  `ICoreWebView2Find`/`ICoreWebView2FindOptions`/
+  `ICoreWebView2FindStartCompletedHandler` 一式が確認できた
+  (`ICoreWebView2_28::Find() -> ICoreWebView2Find`、42531 行目)。しかし
+  これは D59/D66 がこれまで使ってきた `ICoreWebView2_13` (Profile 系) より
+  はるかに新しいインターフェース番号であり、対応する WebView2 Runtime も
+  相応に新しいバージョンを要求する — Evergreen ランタイムは自動更新
+  される前提とはいえ、企業配布端末やオフライン環境では更新が遅れることが
+  珍しくなく、`.cast::<ICoreWebView2_28>()` が失敗しうる実機を否定できない。
+  加えて `Start`/`FindNext`/`FindPrevious`/`Stop` はいずれもコールバック
+  ベースの COM API で、`ICoreWebView2FindStartCompletedHandler`
+  相当のハンドラ実装 (D66 の `ClearBrowsingDataCompletedHandler` より
+  複雑 — マッチ数変化・アクティブマッチ変化の 2 種類のイベント購読も
+  追加で必要) を新たに書く必要があり、**この環境には実機の Windows が無く
+  検証もできない**。「Windows 最優先」という方針は「Windows で動く実装を
+  最初に作る」ことを求めているのであって、「検証できない可能性のある
+  最新 API に賭けて Windows 版だけ作る」ことではないと判断し、見送った。
+- **WKWebView (macOS) — wry のデスクトップ実装に find 相当の公開 API は無い。**
+  `wry-0.56.1/src/wkwebview/mod.rs` (macOS/デスクトップ本体) には
+  find/search 系のメソッドが一切無い。`findString(_:withConfiguration:
+  completionHandler:)` 相当のバインディングは
+  `wry-0.56.1/src/wkwebview/ios/WKWebView.rs` に存在するが、これは **iOS
+  専用ファイル**であり、しかも該当メソッドを囲うフィーチャフラグ
+  (`WKFindConfiguration`/`WKFindResult`) がコメントアウトされたまま
+  ビルドされていない。デスクトップ版 wry から呼べる経路は存在しない。
+
+**結論**: 3 エンジンのうち安全に実装できるのは WebKitGTK (最低優先度) だけ、
+Windows (最優先) は理論上の経路はあるが実機検証不能な最新 API のみ、
+macOS はそもそも経路が無い。「Windows を優先し、そこで動く方式を先に選ぶ」
+という CLAUDE.md の方針に従い、**3 エンジンとも同じ JS ベースの自前実装に
+統一した** — 1 つの実装を 3 OS 共通でテストでき、Windows 版から着手しても
+崩れない。WebKitGTK のネイティブ `FindController` は将来 Linux 向けの
+個別最適化を検討する際の実装ポイントとして下記の Revisit condition に残す。
+
+### 実装: JS インジェクション + Rust 側の純粋な位置管理
+
+- **`browser::find::FindState`** (`src/browser/find.rs`, 新規) が
+  UI/エンジン非依存の純粋ロジックを持つ: クエリ正規化
+  (`normalize_query` — trim して空なら `None`)、現在の検索クエリ・
+  大文字小文字区別フラグ、DOM から報告されたヒット総数、アクティブな
+  マッチの 0-based インデックス、`next_match`/`previous_match` の巡回
+  ロジック (0 件は常に `None`、1 件なら自分自身に留まる、末尾から先頭・
+  先頭から末尾へラップする)。`docs/architecture.md` の 4 層分離のとおり
+  ここは webview を一切知らず、単体テストの主対象 (`src/browser/find.rs`
+  のテストモジュール、17 ケース)。
+- **`ui::window::BrowserWindow`** が実際の DOM 操作を担う 3 つのメソッド:
+  - `search_in_page(tab_id, query, case_sensitive)` — 生成した JS
+    (`find_search_script`) を `evaluate_script_with_callback` でその
+    タブの content webview に流し、`document.body` 配下のテキストノードを
+    `TreeWalker` で走査して一致箇所を `<span class="velox-find-hl">` で
+    包み、件数を `JSON.stringify({ total: N })` として返す。件数は
+    `UserEvent::FindMatchesUpdated { tab_id, total }` で非同期に返る
+    (`fetch_page_title`/`fetch_favicon` と同じ fire-and-forget パターン、
+    D12)。
+  - `highlight_find_match(tab_id, index)` — 直前のアクティブマッチの
+    ハイライトを外し、指定インデックスのマッチに `velox-find-hl-active`
+    クラスを付けて `scrollIntoView({block:"center"})` する。
+  - `clear_find_highlights(tab_id)` — 挿入した `<span>` をすべて元の
+    テキストノードに戻す (`replaceChild` + `normalize()`)。
+  三つとも「未知/休止中タブは黙って no-op」という `fetch_page_title` と
+  同じ契約。
+- **クエリのエスケープ (Issue の指示どおり必須)**: `find_query_literal`
+  が `serde_json::Value::String(query).to_string()` で JSON 文字列化した
+  うえで、`ui::toolbar::escape_js_line_terminators` (D62 で追加済みの
+  U+2028/U+2029 対策) を **そのまま再利用** して `evaluate_script` に渡す
+  — 独自の再実装はしていない。マッチングは常に「リテラル部分文字列」
+  であり、クエリを正規表現として解釈することは絶対にない:
+  `query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")` (MDN 推奨のエスケープ
+  スニペット) でメタ文字を全てエスケープしてから `new RegExp` に渡す。
+  `find_search_script`/`find_query_literal` には、`"`/`\`/U+2028/U+2029/
+  正規表現メタ文字を含むクエリで壊れないことを確認する単体テスト
+  (`find_search_script_neutralizes_quotes_and_script_closing_sequences`,
+  `find_search_script_neutralizes_regex_metacharacters_in_the_query` 等)
+  を追加した — D62 が `set_url_script` 等に対して敷いた「インジェクション
+  耐性をテストで固定化する」流儀をそのままなぞっている。
+- **検索 UI はブックマークバー方式 — `Panel` ではなく独立した加算コンポーネント**。
+  History/Bookmarks/Downloads/Omnibox の `Panel` は `config.panel_height`
+  (既定 320px) 分だけ伸びる大きなドロップダウンで、1 行の検索バーには
+  過大。D35 のブックマークバーが確立した「`toolbar_height` に独立して
+  加算される固定高さの帯」という形をそのまま複製し、`find_bar_height`
+  (既定 34px) と `find_bar_visible: Cell<bool>` を `BrowserWindow` に追加、
+  `effective_toolbar_height` にも第 4 の加算項として組み込んだ (D35 の
+  ときと同じく「パネルやブックマークバーと同時に出ていても構わない」)。
+- **UI ↔ Rust の往復**: `ToolbarCommand` に `OpenFindBar`/`FindQuery{query,
+  case_sensitive}`/`FindNext`/`FindPrevious`/`FindClose` を追加。検索語の
+  入力は 120ms のクライアント側デバウンス (`toolbar.html`) の後に
+  `find_query` を送る (Enter/Shift+Enter を押した瞬間はデバウンスを
+  flush してから `find_next`/`find_previous` を送るので、直前のキー入力
+  が反映されないまま巡回することはない)。DOM 検索が返す件数は
+  `veloxSetFindStatus(total, active)` でトールバーに戻り、`アクティブ+1
+  /総数` の "N/M" 表示になる。
+- **セッションは 1 個・アクティブタブに紐付く (MVP の意図的な単純化)**。
+  `AppState::find: Option<find::FindState>` は同時に 1 タブ分しか持たない
+  — Ctrl/Cmd+F を押した瞬間のアクティブタブに固定され、別タブに切り替える
+  (`activate_and_refresh` 経由のすべてのタブ切替) か、そのタブ自身が
+  ナビゲーションを開始する (`NavigationStarted`/`LoadStarted`) と
+  `close_find_bar` が呼ばれてハイライトを消し検索バーを閉じる —
+  ページが変われば一致位置も無効になるため。バックグラウンドタブごとの
+  独立した検索セッションは持たない (Chrome 等はタブごとに保持するが、
+  今回はスコープ外とし、`FindState` 自体はいつか `HashMap<TabId,
+  FindState>` に載せ替えられる形のまま残している)。
+
+### Ctrl/Cmd+F の割り当てと Issue #38 への申し送り
+
+D18/D23 と全く同じ二重配送 (content webview は固定センチネル文字列
+`"velox:open-find-bar"` → `ContentShortcut::OpenFindBar`、trusted な
+toolbar webview は構造化コマンド `{"cmd":"open_find_bar"}` を直接送信) を
+再利用した。Issue #38 (キーボードショートカット管理) が今後この 2 経路
+すべてに乗ってくる設計になる予定のため、今回は次の点を意識して実装した:
+
+- センチネル文字列・`ContentShortcut::OpenFindBar` 列挙子・
+  `ToolbarCommand::OpenFindBar` はどれも他のショートカット
+  (`ToggleBookmark`, `FocusAddressBar` 等) と全く同じ形で追加しており、
+  キーの割り当てを変える設定層を後から差し込む際、割り込む場所は
+  1 か所 (JS 側でどのキーを監視するか) だけで済む。
+- `app::open_find_bar`/`close_find_bar`/`update_find_query`/`step_find`
+  はショートカットの発火経路 (トールバー/コンテンツ/将来の設定 UI) を
+  一切知らない、純粋な「find バーを開く/閉じる/更新する」関数として
+  切り出してある — #38 が新しいキーバインド管理層を追加しても、
+  呼び出し先はこれらの関数のままで変わらない。
+
+### 既知の制限 (意図的に見送ったもの)
+
+- **一致はテキストノード単位**: `<b>` 等のインライン要素をまたいで
+  分割されたテキストは 1 つの一致として検出できない (ナイーブな
+  テキストノード走査の一般的な制約)。ネイティブブラウザの find は
+  DOM 全体をフラット化して検索するため、この制約を持たない。
+- **非表示要素の除外なし**: `display:none` 等で隠れたテキストも
+  `SCRIPT`/`STYLE`/`NOSCRIPT`/`TEXTAREA`/`INPUT` 以外は検索対象になる
+  (ネイティブブラウザは可視テキストのみを対象にすることが多い)。
+  可視性判定はコストが高いため、スクリプトを単純に保つことを優先した。
+- **正規表現/単語単位検索は無し** — Issue の「大文字小文字/一致方式の
+  検討」に対する結論として、大文字小文字の切替のみを実装し、リテラル
+  部分文字列一致に固定した (前述のとおりセキュリティ上の理由もある)。
+- **Esc は検索入力にフォーカスがあるときのみ閉じる**。ページ本体に
+  フォーカスがある状態からの Esc では閉じない — content webview 側で
+  常時 Escape を捕捉すると、ページ自身が Esc を使う機能 (モーダルを
+  閉じる等) を壊しかねないため、今回は見送った。
+- **検索セッションはタブ 1 つに固定** (前述)。
+
+### テスト
+
+- `src/browser/find.rs`: `FindState`/`normalize_query` の単体テスト
+  12 件 (正規化、巡回、0/1/複数件、リセット挙動)。
+- `src/ui/toolbar.rs`: 新しい `ToolbarCommand` 5 種の IPC パーステスト、
+  `set_find_bar_visible_script`/`set_find_status_script` のテスト。
+- `src/ui/window.rs`: `effective_toolbar_height` の find bar 加算分の
+  テスト、`ContentShortcut::OpenFindBar` のセンチネル解析テスト、
+  `find_search_script`/`find_activate_script`/`find_clear_script`/
+  `find_query_literal` のインジェクション耐性テスト。
+- 単体テスト件数: 700 → 724 (+24、`cargo test --lib -- --list` で計測)。
+  減少なし。
+- 統合テスト (`tests/integration.rs`) は今回変更していない (8 件のまま、
+  全て pass) — find 機能は既存の統合テストが検証する「実プロセス起動・
+  実タブ管理・実ファイル永続化」のいずれとも直接関係しないため、新規の
+  統合テストは追加していない。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` で型
+  レベルの整合は確認したが、実機の Windows/WebView2 での動作確認は
+  できていない (この環境に Windows 実機が無いため) — 特に Ctrl+F が
+  WebView2 自身のネイティブ既定アクセラレータ (Chromium ベースのため
+  存在しうる) と衝突しないかは未検証。F12 (D18) も同種の既定
+  アクセラレータだが `event.preventDefault()` だけで問題なく上書き
+  できている実績があるため恐らく同様に機能すると考えているが、万一
+  WebView2 自身の find UI が併せて出てしまう場合は
+  `ICoreWebView2Settings3::AreBrowserAcceleratorKeysEnabled(false)`
+  (D59/D66 と同じ `WebViewExtWindows::webview()` 経由) で無効化する
+  のが次の一手になる。
+
+**Revisit condition**: (1) Linux 向けにネイティブ `WebKitFindController`
+を使う個別実装 (前述の到達経路がそのまま使える) — ただし優先度は低い。
+(2) WebView2 の `ICoreWebView2Find` (`ICoreWebView2_28`) — 対象ランタイムの
+普及が進み、実機検証できる環境が揃った段階で再検討。(3) テキストノード
+境界をまたぐ一致・非表示要素の除外・正規表現/単語単位検索 — 前述の
+「既知の制限」。(4) タブごとに独立した検索セッションを保持する
+(現在はアクティブタブの 1 セッションのみ)。(5) Ctrl/Cmd+F の割り当てを
+Issue #38 のキーバインド管理層に載せ替える。(6) content webview に
+フォーカスがある状態からの Esc 対応。
+
+
+## D70: リリースパッケージング (#41) — Windows は tag/version 整合チェックを追加、Linux は最小 tarball を新設、macOS は明示的に見送り
+
+**対象**: Issue #41 の受け入れ条件 4 点 (3 OS の release artifact 生成 /
+tag からの再現可能なビルド / GitHub Release への自動公開 / 配布手順の
+docs 記録) を、既存の `release-windows.yml` (D51) と突き合わせて棚卸しした。
+
+### 棚卸し結果 (着手前)
+
+| 受け入れ条件 | 状態 |
+|---|---|
+| 3 OS の release artifact | 未達 — Windows のみ |
+| tag からの再現可能なビルド | 部分達成 (Windows) — `--locked` は使われているが、push したタグと `Cargo.toml` の `version` が一致することを検証していない |
+| GitHub Release への自動公開 | 部分達成 (Windows) — tag push で `softprops/action-gh-release` により実施済み |
+| 配布手順の docs 記録 | 達成 (Windows) — README に手動/tag push の手順あり |
+
+`release-windows.yml` 自体は D51 の設計 (分離した専用 workflow、
+`workflow_dispatch` + `v*` タグ push の 2 起動経路、`--locked`、SHA-256
+チェックサム、スモークテストは「実行ファイルの存在とサイズ」) を既に
+満たしており、**作り直す必要はなかった**。
+
+### 判断: Windows を最優先に直す、Linux は最小 tarball を追加、macOS は見送る
+
+CLAUDE.md の OS 優先度方針 (Windows 最優先、macOS/Linux は「ビルドが通り
+既存機能を壊さない」最低限の整備に留め、3 OS 同時対応を完了条件に据えない)
+と、この Issue が依存する #33 (「3 OS でビルド可能な状態を検証できる」を
+含む CI 品質ゲート epic) が **macOS を含めないまま完了 (closed) 済み**で
+あるという既成事実の 2 点を踏まえ、以下の粒度に決めた。
+
+1. **Windows (`release-windows.yml`)**: 既存の仕組みは維持しつつ、
+   「tag と `Cargo.toml` の version が一致しない状態で Release が
+   作られてしまう」抜けを塞いだ。タグを打つ前に `Cargo.toml` の
+   version を上げ忘れると、GitHub Release のタグ名と zip 内の
+   ファイル名が食い違ったまま公開されてしまう — 「tag からの再現可能な
+   ビルド」の一貫性を損なう実害のある抜けと判断し、tag push 時のみ
+   走る検証ステップ (`tagVersion -ne $cargoVersion` なら `throw`) を
+   ビルド前に追加した。既存のビルド・パッケージ・アップロード・
+   Release 作成ロジックには手を入れていない。
+2. **Linux (`release-linux.yml`, 新設)**: `ci.yml` が既に
+   `libwebkit2gtk-4.1-dev` を入れた `ubuntu-latest` で `cargo build`
+   (debug) を実行しており、release ビルドまでの追加コストが低いこと、
+   かつ CLAUDE.md が Linux を CI/性能計測の実行環境として明示的に
+   引き続き使う対象としていることから、**AppImage/deb 等のネイティブ
+   パッケージ化はせず**、Windows の zip と同じ構成 (velox, velox-bench,
+   README.md, LICENSE) を tar.gz + SHA-256 に固めるだけの最小 workflow を
+   新設した。トリガー・tag/version 整合チェック・成果物検証・Release
+   添付の流れは `release-windows.yml` と揃えた (同じ `v*` タグで両方の
+   workflow が起動し、同じ GitHub Release に zip と tar.gz が並んで
+   添付される)。パッケージスクリプト (バージョン取得 →
+   ディレクトリ構成 → tar.gz → sha256sum) はこのブランチの Linux 環境で
+   実際に `cargo build --release --locked` した成果物を使って手動で
+   一度実行し、生成物の展開・チェックサム検証まで確認済み。
+3. **macOS**: 今回は着手しない。理由は (a) #33 が macOS を含めずに
+   「完了」と判定されており、プロジェクトとして現時点でその判断を
+   覆す情報がないこと、(b) macOS の release ビルド (署名なし `.app`/
+   `.dmg` の作成、`actions/upload-artifact`・`softprops/action-gh-release`
+   との組み合わせ) を検証できる実機/CI 実行環境がこのセッションには
+   無く、動かないワークフローを「動く」体で追加するのは D61 が避けた
+   ("素通りさせて緑にする") のと同じ失敗パターンになること。README に
+   「macOS の release workflow は無い」ことを明記し、将来
+   `release-windows.yml`/`release-linux.yml` と同じパターンで追加できる
+   ことだけ示した。
+
+### 見送ったもの・未検証のもの
+
+- **AppImage / deb** (Issue 本文が調査対象として挙げていたもの):
+  検討の結果、現段階では tar.gz で十分と判断し、実装しなかった。将来
+  ディストリビューションパッケージが必要になった時点で別 Issue とする。
+- **macOS の `.app`/`.dmg` パッケージング、コード署名・notarization**:
+  未着手。コード署名は Windows 分も含め Issue #42 のスコープ
+  (README ロードマップにも「Packaging, code signing and notarization for
+  macOS / Windows」として記載済み)。
+- **実際にタグを打っての公開テスト**: 本 PR ではタグ push を行っていない
+  ため、`release-windows.yml`/`release-linux.yml` が実際に GitHub Release
+  を作成・添付する一連の流れ (2 つの workflow が同じタグで同時に
+  `softprops/action-gh-release` を呼ぶ際の競合を含む) は GitHub Actions
+  上で未検証。YAML の構文チェックと、Linux 側はローカルでのビルド・
+  パッケージスクリプトの動作確認のみ行った。
+- **2 workflow が同じタグに対して同時に Release 作成 API を呼ぶ際の
+  競合**: `softprops/action-gh-release` は対象タグの Release が既に
+  あれば追記する挙動だが、Windows/Linux 両 workflow がほぼ同時に初回
+  作成を試みると、両方が「Release が無い」と判断して作成しに行き、
+  片方が失敗し得る。**対策として、タグ push のときだけ両 workflow が同じ
+  `concurrency.group` (`release-tag-<github.ref>`) を共有し、
+  `cancel-in-progress: false` で直列化した。** キャンセルではなく
+  キューイングさせるため、片方の完了後にもう片方が走り、後発は
+  「既存 Release への添付」になる。group にタグ名 (`github.ref`) を
+  含めているので、別タグのリリース同士は従来どおり並列に走る。
+  なお PR / `workflow_dispatch` では Release を作らないため直列化する
+  理由が無く、むしろ両 workflow の CI が不必要に待たされる (実際に
+  PR #146 で Linux 側の release ジョブが Windows 側の完了待ちになった)。
+  そのため group 名を `startsWith(github.ref, 'refs/tags/v')` で分岐させ、
+  タグ以外では workflow ごとに別 group (`release-windows-*` /
+  `release-linux-*`) にして並列に走らせている。
+  なお GitHub の concurrency は「実行中 1 件 + 待機 1 件」しか保持せず
+  3 件目以降は待機中のものがキャンセルされる仕様だが、同一タグで走る
+  release workflow は 2 つだけなので問題にならない。**この直列化自体は
+  実際のタグ push で未検証**であり、初回リリース時に確認すること。
+
+**Revisit condition**: (1) #33 の macOS 除外判断が変わり、macOS の
+release workflow 追加に着手できる環境が整ったとき。(2) 実際にタグを
+打って Windows/Linux 両方の Release 公開フローを検証したとき (特に
+上記の同時実行競合)。(3) ディストリビューション向けパッケージ
+(AppImage/deb) の要望が具体化したとき。(4) コード署名 (#42) 着手時に
+`release-windows.yml`/`release-linux.yml` の署名ステップを追加する。

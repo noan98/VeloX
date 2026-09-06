@@ -147,6 +147,12 @@ pub struct Config {
     /// showing at once, their heights stack rather than replacing each
     /// other).
     pub bookmark_bar_height: u32,
+    /// Height of the in-page find bar (Issue #43, Ctrl/Cmd+F) when open;
+    /// added to `toolbar_height` the same independent, additive way
+    /// `bookmark_bar_height` is (see docs/decisions.md D69) — a single
+    /// compact row, not the much taller `panel_height` a history/bookmarks
+    /// dropdown needs.
+    pub find_bar_height: u32,
     /// Hard cap on the number of entries kept in the history store. `0`
     /// means unlimited.
     pub history_max_entries: usize,
@@ -222,6 +228,9 @@ impl Default for Config {
             // ui/toolbar.html's #bookmark-bar rule) — enough for one line of
             // bookmark buttons.
             bookmark_bar_height: 30,
+            // Same single-row sizing as `bookmark_bar_height` (see
+            // ui/toolbar.html's #find-bar rule).
+            find_bar_height: 34,
             history_max_entries: 5000,
             history_panel_limit: 200,
             max_tabs_per_web_process: DEFAULT_MAX_TABS_PER_WEB_PROCESS,

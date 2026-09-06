@@ -239,6 +239,52 @@
     border-bottom: 1px solid var(--border);
   }
   #bookmark-bar[hidden] { display: none; }
+
+  /* In-page find bar (Issue #43, Ctrl/Cmd+F, see docs/decisions.md D69): a
+     single compact row, independent of and additive with the bookmark bar
+     above and any open history/bookmarks/downloads panel below (see
+     `ui::window::effective_toolbar_height`) — not a `Panel`, since a panel
+     is much taller and mutually exclusive with the others. */
+  #find-bar {
+    flex: 0 0 34px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 8px;
+    box-sizing: border-box;
+    border-bottom: 1px solid var(--border);
+  }
+  #find-bar[hidden] { display: none; }
+  #find-input {
+    flex: 1;
+    min-width: 0;
+    height: 26px;
+    padding: 0 10px;
+    border: 1px solid var(--border);
+    border-radius: 13px;
+    background: var(--field-bg);
+    color: var(--fg);
+    font-size: 13px;
+    outline: none;
+  }
+  #find-input:focus { border-color: var(--accent); }
+  #find-count {
+    flex: none;
+    min-width: 44px;
+    text-align: center;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--dim-fg);
+  }
+  #find-bar button {
+    width: 26px;
+    height: 26px;
+    font-size: 13px;
+  }
+  #find-case-toggle {
+    font-size: 12px;
+    font-weight: 600;
+  }
   .bookmark-bar-item {
     flex: none;
     display: inline-flex;
@@ -621,12 +667,22 @@
   <span id="block-count" title="Blocked ad/tracker requests" hidden>0</span>
   <button id="devtools" title="Open DevTools (F12)">&#9881;</button>
   <button id="bookmark-star" title="ブックマークに追加/削除 (Ctrl/Cmd+D)">&#9733;</button>
+  <button id="find-toggle" title="ページ内を検索 (Ctrl/Cmd+F)">&#128269;</button>
   <button id="history-toggle" title="履歴">&#128337;</button>
   <button id="bookmarks-toggle" title="ブックマーク一覧">&#128278;</button>
   <button id="bookmark-bar-toggle" title="ブックマークバーの表示切替 (Ctrl/Cmd+Shift+B)">&#9644;</button>
   <button id="downloads-toggle" title="ダウンロード">&#11015;</button>
 </div>
 <div id="bookmark-bar" hidden></div>
+<div id="find-bar" hidden>
+  <input id="find-input" type="text" spellcheck="false" autocomplete="off"
+         placeholder="ページ内を検索" />
+  <span id="find-count">0/0</span>
+  <button id="find-case-toggle" title="大文字と小文字を区別する" aria-pressed="false">Aa</button>
+  <button id="find-prev" title="前を検索 (Shift+Enter)">&#9650;</button>
+  <button id="find-next" title="次を検索 (Enter)">&#9660;</button>
+  <button id="find-close" title="閉じる (Esc)">&#10005;</button>
+</div>
 <div id="panel" hidden>
   <div id="panel-history" class="panel-list">
     <div class="panel-header">
@@ -688,6 +744,10 @@
   const omniboxRowsEl = document.getElementById("omnibox-rows");
   const bookmarkBarEl = document.getElementById("bookmark-bar");
   const newFolderNameEl = document.getElementById("new-folder-name");
+  const findBarEl = document.getElementById("find-bar");
+  const findInputEl = document.getElementById("find-input");
+  const findCountEl = document.getElementById("find-count");
+  const findCaseToggleEl = document.getElementById("find-case-toggle");
 
   /* Omnibox candidate dropdown state (Issue #15): the candidate list Rust
      last pushed via veloxSetCandidates, and which row (if any) Up/Down has
@@ -789,6 +849,52 @@
     }
   });
 
+  /* In-page find (Issue #43, Ctrl/Cmd+F, see docs/decisions.md D69). The
+     case-sensitivity toggle is purely client-side UI state (`findCaseSensitive`
+     below) re-sent alongside every `find_query` message rather than a
+     separate command, so Rust's `browser::find::FindState` never needs to
+     be told about it out of band. A small debounce on the input event keeps
+     a fast typist from re-searching the whole page on every keystroke. */
+  let findCaseSensitive = false;
+  let findDebounceHandle = null;
+  function sendFindQuery() {
+    send({ cmd: "find_query", query: findInputEl.value, case_sensitive: findCaseSensitive });
+  }
+  document.getElementById("find-toggle").addEventListener("click", () => {
+    send({ cmd: "open_find_bar" });
+  });
+  findInputEl.addEventListener("input", () => {
+    if (findDebounceHandle !== null) {
+      clearTimeout(findDebounceHandle);
+    }
+    findDebounceHandle = setTimeout(sendFindQuery, 120);
+  });
+  findInputEl.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      // Flush a pending debounced search first so Enter right after typing
+      // steps through the *current* text's matches, not a stale query.
+      if (findDebounceHandle !== null) {
+        clearTimeout(findDebounceHandle);
+        findDebounceHandle = null;
+        sendFindQuery();
+      }
+      send({ cmd: event.shiftKey ? "find_previous" : "find_next" });
+    } else if (event.key === "Escape") {
+      event.preventDefault();
+      send({ cmd: "find_close" });
+    }
+  });
+  findCaseToggleEl.addEventListener("click", () => {
+    findCaseSensitive = !findCaseSensitive;
+    findCaseToggleEl.setAttribute("aria-pressed", String(findCaseSensitive));
+    findCaseToggleEl.classList.toggle("active", findCaseSensitive);
+    sendFindQuery();
+  });
+  document.getElementById("find-prev").addEventListener("click", () => send({ cmd: "find_previous" }));
+  document.getElementById("find-next").addEventListener("click", () => send({ cmd: "find_next" }));
+  document.getElementById("find-close").addEventListener("click", () => send({ cmd: "find_close" }));
+
   /* Tab-management keyboard shortcuts (see docs/decisions.md D22). This is
      the trusted-webview half: the toolbar (address bar, panels) is our own
      HTML, so it can send structured commands directly through the normal
@@ -828,6 +934,10 @@
       } else if (event.key === "n" || event.key === "N") {
         // Ctrl/Cmd+N (Issue #29): open a new window.
         message = { cmd: "new_window" };
+      } else if (event.key === "f" || event.key === "F") {
+        // Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
+        // docs/decisions.md D69.
+        message = { cmd: "open_find_bar" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {
@@ -881,6 +991,36 @@
     bookmarksPanelEl.hidden = panel !== "bookmarks";
     downloadsPanelEl.hidden = panel !== "downloads";
     omniboxPanelEl.hidden = panel !== "omnibox";
+  };
+
+  /* In-page find (Issue #43, see docs/decisions.md D69). Showing the bar
+     also focuses+selects its input (mirrors `veloxFocusAddressBar`) so
+     Ctrl/Cmd+F is immediately typeable, whether it opened from the toolbar
+     or from the page itself — the page never keeps focus once the bar
+     needs it, which is fine: `browser::find`'s highlight/scroll operations
+     never depend on which webview has focus (see `app::open_find_bar`).
+     Hiding resets the case-sensitivity toggle and clears the input so the
+     next Ctrl/Cmd+F always starts from a clean slate, matching how
+     `app::open_find_bar` always starts a fresh `FindState`. */
+  window.veloxSetFindBarVisible = (visible) => {
+    findBarEl.hidden = !visible;
+    if (visible) {
+      findInputEl.focus();
+      findInputEl.select();
+    } else {
+      findInputEl.value = "";
+      findCaseSensitive = false;
+      findCaseToggleEl.setAttribute("aria-pressed", "false");
+      findCaseToggleEl.classList.remove("active");
+      findCountEl.textContent = "0/0";
+    }
+  };
+
+  /* `active` is the 0-based index `browser::find::FindState::active`
+     reports (`null` when there are no matches) — displayed 1-based here,
+     the only place that +1 happens. */
+  window.veloxSetFindStatus = (total, active) => {
+    findCountEl.textContent = total === 0 ? "0/0" : `${active + 1}/${total}`;
   };
 
   /* Full re-render of the tab strip from the current tab list. Simpler and

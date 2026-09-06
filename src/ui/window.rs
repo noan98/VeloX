@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use serde::Deserialize;
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
 use tao::window::{Icon, Window, WindowBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
@@ -99,6 +100,9 @@ const NEW_WINDOW_MESSAGE: &str = "velox:new-window";
 /// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
 /// [`parse_content_shortcut`].
 const ACTIVATE_TAB_MESSAGE_PREFIX: &str = "velox:activate-tab-";
+/// Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
+/// `ContentShortcut::OpenFindBar` and docs/decisions.md D69.
+const OPEN_FIND_BAR_MESSAGE: &str = "velox:open-find-bar";
 
 /// A tab-management keyboard shortcut reported by the content webview's
 /// shortcut IPC channel (see [`parse_content_shortcut`]).
@@ -148,6 +152,11 @@ pub enum ContentShortcut {
     /// of `ui::toolbar::ToolbarCommand::NewWindow` — both are handled by the
     /// same shared function in `app.rs`. See docs/decisions.md D68.
     NewWindow,
+    /// Ctrl/Cmd+F (Issue #43): open the in-page find bar. The
+    /// content-webview half of `ui::toolbar::ToolbarCommand::OpenFindBar` —
+    /// both are handled by the same shared function in `app.rs`. See
+    /// docs/decisions.md D69.
+    OpenFindBar,
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
@@ -167,6 +176,7 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         TOGGLE_BOOKMARK_MESSAGE => Some(ContentShortcut::ToggleBookmark),
         TOGGLE_BOOKMARK_BAR_MESSAGE => Some(ContentShortcut::ToggleBookmarkBar),
         NEW_WINDOW_MESSAGE => Some(ContentShortcut::NewWindow),
+        OPEN_FIND_BAR_MESSAGE => Some(ContentShortcut::OpenFindBar),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
         "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
@@ -245,6 +255,8 @@ fn tab_shortcut_script() -> String {
         message = "{TOGGLE_BOOKMARK_MESSAGE}";
       }} else if (event.key === "n" || event.key === "N") {{
         message = "{NEW_WINDOW_MESSAGE}";
+      }} else if (event.key === "f" || event.key === "F") {{
+        message = "{OPEN_FIND_BAR_MESSAGE}";
       }}
     }} else if (event.shiftKey && !event.altKey) {{
       if (event.key === "t" || event.key === "T") {{
@@ -353,12 +365,20 @@ fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, L
 /// visible while a panel is also open (both are simple additional rows in
 /// the toolbar webview's own flex column), so their heights are summed, not
 /// treated as alternatives.
+///
+/// The find bar (Issue #43, docs/decisions.md D69) is a *fourth* such
+/// independent, additive row, for the same reason the bookmark bar is: it
+/// is a single compact strip, not a `Panel`-sized dropdown, and there is no
+/// reason it could not stay open while a panel or the bookmark bar is also
+/// showing.
 fn effective_toolbar_height(
     toolbar_height: u32,
     panel_height: u32,
     panel_open: bool,
     bookmark_bar_height: u32,
     bookmark_bar_visible: bool,
+    find_bar_height: u32,
+    find_bar_visible: bool,
 ) -> u32 {
     let mut height = toolbar_height;
     if bookmark_bar_visible {
@@ -366,6 +386,9 @@ fn effective_toolbar_height(
     }
     if panel_open {
         height = height.saturating_add(panel_height);
+    }
+    if find_bar_visible {
+        height = height.saturating_add(find_bar_height);
     }
     height
 }
@@ -627,6 +650,16 @@ pub struct BrowserWindow {
     /// the user has asked for the bar. Interior mutability for the same
     /// `sync_layout` reason as `open_panel`.
     bookmark_bar_visible: Cell<bool>,
+    /// Height of the find bar row when it is visible (Issue #43, see
+    /// docs/decisions.md D69) — added to `toolbar_height` the same
+    /// independent, additive way `bookmark_bar_height` is.
+    find_bar_height: u32,
+    /// Whether the in-page find bar is currently showing. Session-only, the
+    /// same reasoning as `bookmark_bar_visible`: starts `false` so a fresh
+    /// window never grows past `toolbar_height` before Ctrl/Cmd+F is
+    /// pressed. Interior mutability for the same `sync_layout` reason as
+    /// `bookmark_bar_visible`/`open_panel`.
+    find_bar_visible: Cell<bool>,
     /// Kept so panel-driven UI updates (`fetch_page_title`) can send
     /// [`UserEvent`]s back into the event loop after `new` has returned.
     proxy: EventLoopProxy<UserEvent>,
@@ -912,6 +945,8 @@ impl BrowserWindow {
             bookmark_bar_height: config.bookmark_bar_height,
             open_panel: Cell::new(None),
             bookmark_bar_visible: Cell::new(false),
+            find_bar_height: config.find_bar_height,
+            find_bar_visible: Cell::new(false),
             proxy,
             contents,
             active: Some(initial_tab),
@@ -940,6 +975,8 @@ impl BrowserWindow {
             self.open_panel.get().is_some(),
             self.bookmark_bar_height,
             self.bookmark_bar_visible.get(),
+            self.find_bar_height,
+            self.find_bar_visible.get(),
         );
         split_layout(size.width, size.height, toolbar_height)
     }
@@ -1469,6 +1506,113 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_bookmark_bar_visible_script(visible))
     }
 
+    /// Whether the in-page find bar (Issue #43) is currently showing.
+    pub fn find_bar_visible(&self) -> bool {
+        self.find_bar_visible.get()
+    }
+
+    /// Show or hide the find bar: resizes the toolbar webview to make (or
+    /// reclaim) room, the same way [`Self::set_bookmark_bar_visible`] does —
+    /// see docs/decisions.md D69 for why this is its own independent,
+    /// additive row rather than a [`Panel`] variant. Hiding does **not**
+    /// clear any highlight left in a content webview by itself; callers
+    /// that mean "close and clear" call [`Self::clear_find_highlights`]
+    /// first (see `app::close_find_bar`).
+    pub fn set_find_bar_visible(&self, visible: bool) -> wry::Result<()> {
+        self.find_bar_visible.set(visible);
+        self.sync_layout()?;
+        self.toolbar
+            .evaluate_script(&toolbar::set_find_bar_visible_script(visible))
+    }
+
+    /// Push the find bar's "N/M" match counter. `active` is the 0-based
+    /// index `browser::find::FindState::active` reports (`None`/`total: 0`
+    /// both render as "0/0" — see `ui/toolbar.html`'s `veloxSetFindStatus`).
+    pub fn set_find_status(&self, total: usize, active: Option<usize>) -> wry::Result<()> {
+        self.toolbar
+            .evaluate_script(&toolbar::set_find_status_script(total, active))
+    }
+
+    /// Search tab `tab_id`'s content webview's DOM for `query` (already
+    /// normalized by the caller — see `browser::find::normalize_query`) and
+    /// highlight every match, reporting the total back as
+    /// [`UserEvent::FindMatchesUpdated`]. A no-op — not an error — for an
+    /// unknown or currently suspended `tab_id` (nothing to search), the same
+    /// contract [`Self::fetch_page_title`] uses.
+    ///
+    /// See docs/decisions.md D69 for why this is JS run via
+    /// `evaluate_script_with_callback` rather than a native find API: no
+    /// engine wry 0.56 supports exposes one it can safely reach. `query` is
+    /// embedded as a JSON string literal and put through the same
+    /// `escape_js_line_terminators` hardening `ui::toolbar`'s `set_*_script`
+    /// functions use (D62) before it ever reaches [`find_search_script`], so
+    /// a search term containing `"`/`\`/U+2028/U+2029 cannot break out of
+    /// the generated script.
+    pub fn search_in_page(
+        &self,
+        tab_id: TabId,
+        query: &str,
+        case_sensitive: bool,
+    ) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        let script = find_search_script(&find_query_literal(query), case_sensitive);
+        let proxy = self.proxy.clone();
+        let window_id = self.id;
+        webview.evaluate_script_with_callback(&script, move |raw| {
+            let total = extract_js_string_result(&raw)
+                .and_then(|json| serde_json::from_str::<FindSearchResult>(&json).ok())
+                .map(|result| result.total)
+                .unwrap_or(0);
+            let _ = proxy.send_event(UserEvent::FindMatchesUpdated {
+                window_id,
+                tab_id,
+                total,
+            });
+        })
+    }
+
+    /// Highlight the match at `index` (0-based, into the array
+    /// [`Self::search_in_page`] populated) in tab `tab_id`'s content
+    /// webview and scroll it into view, deactivating whichever match was
+    /// previously active. Fire-and-forget — there is nothing to report
+    /// back. A no-op for an unknown/suspended tab.
+    pub fn highlight_find_match(&self, tab_id: TabId, index: usize) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.evaluate_script(&find_activate_script(index))
+    }
+
+    /// Remove every find highlight left in tab `tab_id`'s content webview
+    /// (unwrapping the `<span>` wrappers [`Self::search_in_page`] inserted)
+    /// and clear the DOM-side match bookkeeping. Called when the find bar
+    /// closes, the query is cleared, or the underlying page is about to
+    /// navigate away (`app::close_find_bar`). A no-op for an unknown/
+    /// suspended tab — nothing to clear, e.g. the tab already closed.
+    pub fn clear_find_highlights(&self, tab_id: TabId) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        webview.evaluate_script(&find_clear_script())
+    }
+
     /// Replace the downloads panel's contents (Issue #16, see
     /// docs/decisions.md D28).
     pub fn set_downloads(&self, entries: &[&DownloadEntry]) -> wry::Result<()> {
@@ -1591,6 +1735,196 @@ impl BrowserWindow {
 /// get the actual string `document.title` evaluated to.
 fn extract_js_string_result(raw: &str) -> Option<String> {
     serde_json::from_str::<String>(raw).ok()
+}
+
+// --- In-page find (Issue #43), see docs/decisions.md D69 ---
+
+/// The JSON object [`find_search_script`]'s completion value stringifies —
+/// unwrapped by [`extract_js_string_result`], then this, in
+/// [`BrowserWindow::search_in_page`]'s callback. A missing/malformed value
+/// (should not happen; defensive only) is treated as "zero matches" rather
+/// than panicking or leaving the find bar showing a stale count.
+#[derive(Deserialize)]
+struct FindSearchResult {
+    total: usize,
+}
+
+/// Embeds `query` as a JSON string literal, hardened against
+/// U+2028/U+2029 breaking a JS string literal early exactly the way
+/// `ui::toolbar`'s `set_*_script` functions are (D62) — reused here via
+/// `toolbar::escape_js_line_terminators` rather than a second copy of that
+/// logic, since this splices into a script too (just for the content
+/// webview instead of the toolbar's).
+fn find_query_literal(query: &str) -> String {
+    let json = serde_json::Value::String(query.to_owned()).to_string();
+    toolbar::escape_js_line_terminators(&json)
+}
+
+/// Builds the script [`BrowserWindow::search_in_page`] evaluates in a
+/// content webview: clears any highlight left by a previous search, then
+/// (if `query_literal` is non-empty) walks every text node under
+/// `document.body` — skipping `<script>`/`<style>`/`<noscript>`/
+/// `<textarea>`/`<input>` subtrees — wrapping each literal-substring match
+/// in a `<span class="velox-find-hl">` (`ui/toolbar.html` styles this
+/// class; the toolbar webview and content webview share no CSS, so this
+/// style has to be injected as an inline `<style>` the first time a search
+/// runs — see the script body). The completion value is
+/// `JSON.stringify({ total: N })` — parsed back by [`FindSearchResult`].
+///
+/// `query_literal` must already be a JSON string literal (see
+/// [`find_query_literal`]) — this function does not escape it itself.
+/// Matching is always a literal substring, never a user-supplied regex: the
+/// query is regex-escaped client-side before being handed to `RegExp` so a
+/// search term containing `.`/`*`/`(` etc. is never interpreted as a
+/// pattern (see docs/decisions.md D69's "一致方式" note — regex/whole-word
+/// search is out of scope for this issue).
+///
+/// **Known limitation** (documented, not fixed, in D69): a match cannot
+/// span a text-node boundary, so text broken up by an inline element (e.g.
+/// `<b>` in the middle of a word) will not be found — the same limitation a
+/// naive per-text-node walker always has. Hidden text (`display:none` etc.)
+/// is not specially excluded either, unlike a browser's native find; this
+/// keeps the script simple and fast at the cost of occasionally matching
+/// text a user cannot see.
+fn find_search_script(query_literal: &str, case_sensitive: bool) -> String {
+    let flags = if case_sensitive { "g" } else { "gi" };
+    let mut script = String::new();
+    script.push_str("(() => {\n");
+    script.push_str("  \"use strict\";\n");
+    script.push_str("  const HL_CLASS = \"velox-find-hl\";\n");
+    script.push_str("  const STYLE_ID = \"velox-find-style\";\n");
+    script.push_str("  if (!document.getElementById(STYLE_ID)) {\n");
+    script.push_str("    const style = document.createElement(\"style\");\n");
+    script.push_str("    style.id = STYLE_ID;\n");
+    script.push_str(
+        "    style.textContent = \".velox-find-hl{background:#ffd54f !important;color:#000 !important;}.velox-find-hl-active{background:#ff7043 !important;}\";\n",
+    );
+    script.push_str("    (document.head || document.documentElement).appendChild(style);\n");
+    script.push_str("  }\n");
+    script.push_str("  const prevMatches = window.__veloxFindMatches || [];\n");
+    script.push_str("  for (const el of prevMatches) {\n");
+    script.push_str("    if (!el || !el.parentNode) continue;\n");
+    script.push_str("    const parent = el.parentNode;\n");
+    script.push_str("    parent.replaceChild(document.createTextNode(el.textContent), el);\n");
+    script.push_str("    parent.normalize();\n");
+    script.push_str("  }\n");
+    script.push_str("  window.__veloxFindMatches = [];\n");
+    script.push_str("  window.__veloxFindActiveIndex = -1;\n");
+    script.push_str(&format!("  const query = {query_literal};\n"));
+    script.push_str("  if (!query || !document.body) {\n");
+    script.push_str("    return JSON.stringify({ total: 0 });\n");
+    script.push_str("  }\n");
+    script.push_str("  const escaped = query.replace(/[.*+?^${}()|[\\]\\\\]/g, \"\\\\$&\");\n");
+    script.push_str(&format!("  const flags = {flags:?};\n"));
+    script.push_str("  let re;\n");
+    script.push_str("  try {\n");
+    script.push_str("    re = new RegExp(escaped, flags);\n");
+    script.push_str("  } catch (e) {\n");
+    script.push_str("    return JSON.stringify({ total: 0 });\n");
+    script.push_str("  }\n");
+    script.push_str(
+        "  const SKIP_TAGS = new Set([\"SCRIPT\", \"STYLE\", \"NOSCRIPT\", \"TEXTAREA\", \"INPUT\"]);\n",
+    );
+    script.push_str(
+        "  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {\n",
+    );
+    script.push_str("    acceptNode(node) {\n");
+    script.push_str("      const parent = node.parentElement;\n");
+    script.push_str(
+        "      if (!parent || SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;\n",
+    );
+    script.push_str("      if (!node.nodeValue) return NodeFilter.FILTER_SKIP;\n");
+    script.push_str("      re.lastIndex = 0;\n");
+    script.push_str(
+        "      return re.test(node.nodeValue) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;\n",
+    );
+    script.push_str("    }\n");
+    script.push_str("  });\n");
+    script.push_str("  const nodes = [];\n");
+    script.push_str("  let n;\n");
+    script.push_str("  while ((n = walker.nextNode())) { nodes.push(n); }\n");
+    script.push_str("  const matches = [];\n");
+    script.push_str("  for (const node of nodes) {\n");
+    script.push_str("    const text = node.nodeValue;\n");
+    script.push_str("    re.lastIndex = 0;\n");
+    script.push_str("    let match;\n");
+    script.push_str("    let lastIndex = 0;\n");
+    script.push_str("    let any = false;\n");
+    script.push_str("    const frag = document.createDocumentFragment();\n");
+    script.push_str("    while ((match = re.exec(text)) !== null) {\n");
+    script.push_str("      any = true;\n");
+    script.push_str("      if (match.index > lastIndex) {\n");
+    script.push_str(
+        "        frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));\n",
+    );
+    script.push_str("      }\n");
+    script.push_str("      const span = document.createElement(\"span\");\n");
+    script.push_str("      span.className = HL_CLASS;\n");
+    script.push_str("      span.textContent = match[0];\n");
+    script.push_str("      frag.appendChild(span);\n");
+    script.push_str("      matches.push(span);\n");
+    script.push_str("      lastIndex = match.index + match[0].length;\n");
+    script.push_str(
+        "      if (match[0].length === 0) { re.lastIndex += 1; lastIndex = re.lastIndex; }\n",
+    );
+    script.push_str("    }\n");
+    script.push_str("    if (!any) continue;\n");
+    script.push_str("    if (lastIndex < text.length) {\n");
+    script.push_str("      frag.appendChild(document.createTextNode(text.slice(lastIndex)));\n");
+    script.push_str("    }\n");
+    script.push_str("    node.parentNode.replaceChild(frag, node);\n");
+    script.push_str("  }\n");
+    script.push_str("  window.__veloxFindMatches = matches;\n");
+    script.push_str("  return JSON.stringify({ total: matches.length });\n");
+    script.push_str("})();");
+    script
+}
+
+/// Builds the script [`BrowserWindow::highlight_find_match`] evaluates:
+/// deactivates whichever match `window.__veloxFindActiveIndex` last pointed
+/// at, activates the match at `index`, and scrolls it into view. Assumes
+/// [`find_search_script`] already ran in this page load (harmless no-op via
+/// the `matches[index]` guard if it did not, e.g. a stale index after the
+/// page navigated).
+fn find_activate_script(index: usize) -> String {
+    let mut script = String::new();
+    script.push_str("(() => {\n");
+    script.push_str("  \"use strict\";\n");
+    script.push_str("  const matches = window.__veloxFindMatches || [];\n");
+    script.push_str("  const prevIndex = window.__veloxFindActiveIndex;\n");
+    script.push_str("  if (typeof prevIndex === \"number\" && matches[prevIndex]) {\n");
+    script.push_str("    matches[prevIndex].classList.remove(\"velox-find-hl-active\");\n");
+    script.push_str("  }\n");
+    script.push_str(&format!("  const index = {index};\n"));
+    script.push_str("  const el = matches[index];\n");
+    script.push_str("  if (el) {\n");
+    script.push_str("    el.classList.add(\"velox-find-hl-active\");\n");
+    script.push_str("    el.scrollIntoView({ block: \"center\", inline: \"nearest\" });\n");
+    script.push_str("  }\n");
+    script.push_str("  window.__veloxFindActiveIndex = index;\n");
+    script.push_str("})();");
+    script
+}
+
+/// Builds the script [`BrowserWindow::clear_find_highlights`] evaluates:
+/// unwraps every `<span class="velox-find-hl">` [`find_search_script`]
+/// inserted back into plain text and resets the DOM-side bookkeeping.
+/// Idempotent — safe to call with no search having run (`window.
+/// __veloxFindMatches` is then `undefined`, treated as empty).
+fn find_clear_script() -> String {
+    r#"(() => {
+  "use strict";
+  const prev = window.__veloxFindMatches || [];
+  for (const el of prev) {
+    if (!el || !el.parentNode) continue;
+    const parent = el.parentNode;
+    parent.replaceChild(document.createTextNode(el.textContent), el);
+    parent.normalize();
+  }
+  window.__veloxFindMatches = [];
+  window.__veloxFindActiveIndex = -1;
+})();"#
+        .to_owned()
 }
 
 /// A webview's private-browsing/`WebContext` isolation settings, bundled so
@@ -2324,14 +2658,26 @@ mod tests {
 
     #[test]
     fn effective_height_adds_panel_height_only_when_open() {
-        assert_eq!(effective_toolbar_height(48, 320, false, 30, false), 48);
-        assert_eq!(effective_toolbar_height(48, 320, true, 30, false), 368);
+        assert_eq!(
+            effective_toolbar_height(48, 320, false, 30, false, 34, false),
+            48
+        );
+        assert_eq!(
+            effective_toolbar_height(48, 320, true, 30, false, 34, false),
+            368
+        );
     }
 
     #[test]
     fn effective_height_adds_bookmark_bar_height_only_when_visible() {
-        assert_eq!(effective_toolbar_height(48, 320, false, 30, true), 78);
-        assert_eq!(effective_toolbar_height(48, 320, false, 30, false), 48);
+        assert_eq!(
+            effective_toolbar_height(48, 320, false, 30, true, 34, false),
+            78
+        );
+        assert_eq!(
+            effective_toolbar_height(48, 320, false, 30, false, 34, false),
+            48
+        );
     }
 
     #[test]
@@ -2339,7 +2685,33 @@ mod tests {
         // The bar and a panel are independent, additive components (see
         // docs/decisions.md D35) — not alternatives like `set_panel`'s own
         // variants are.
-        assert_eq!(effective_toolbar_height(48, 320, true, 30, true), 398);
+        assert_eq!(
+            effective_toolbar_height(48, 320, true, 30, true, 34, false),
+            398
+        );
+    }
+
+    #[test]
+    fn effective_height_adds_find_bar_height_only_when_visible() {
+        assert_eq!(
+            effective_toolbar_height(48, 320, false, 30, false, 34, true),
+            82
+        );
+        assert_eq!(
+            effective_toolbar_height(48, 320, false, 30, false, 34, false),
+            48
+        );
+    }
+
+    #[test]
+    fn effective_height_sums_all_four_components_when_all_showing() {
+        // The find bar (Issue #43, docs/decisions.md D69) is independent and
+        // additive too, exactly like the bookmark bar — all four rows can
+        // stack.
+        assert_eq!(
+            effective_toolbar_height(48, 320, true, 30, true, 34, true),
+            432
+        );
     }
 
     #[test]
@@ -2371,6 +2743,7 @@ mod tests {
             TOGGLE_BOOKMARK_MESSAGE,
             TOGGLE_BOOKMARK_BAR_MESSAGE,
             NEW_WINDOW_MESSAGE,
+            OPEN_FIND_BAR_MESSAGE,
         ] {
             assert!(
                 script.contains(message),
@@ -2424,12 +2797,86 @@ mod tests {
             parse_content_shortcut(NEW_WINDOW_MESSAGE),
             Some(ContentShortcut::NewWindow)
         );
+        assert_eq!(
+            parse_content_shortcut(OPEN_FIND_BAR_MESSAGE),
+            Some(ContentShortcut::OpenFindBar)
+        );
         for n in 1u8..=8 {
             assert_eq!(
                 parse_content_shortcut(&format!("velox:activate-tab-{n}")),
                 Some(ContentShortcut::ActivateTabAt(n))
             );
         }
+    }
+
+    // --- In-page find (Issue #43), see docs/decisions.md D69 ---
+
+    #[test]
+    fn find_query_literal_escapes_quotes_and_backslashes() {
+        assert_eq!(find_query_literal(r#""a"\b"#), r#""\"a\"\\b""#.to_owned());
+    }
+
+    #[test]
+    fn find_query_literal_escapes_u2028_and_u2029_line_terminators() {
+        // Same D62 hardening `ui::toolbar`'s `set_*_script` functions apply,
+        // reused here (not duplicated) via `toolbar::escape_js_line_terminators`.
+        let literal = find_query_literal("foo\u{2028}bar\u{2029}");
+        assert!(literal.contains("\\u2028"), "{literal}");
+        assert!(literal.contains("\\u2029"), "{literal}");
+        assert!(!literal.contains('\u{2028}'));
+        assert!(!literal.contains('\u{2029}'));
+    }
+
+    #[test]
+    fn find_search_script_embeds_the_query_literal_and_case_flags() {
+        let script = find_search_script(&find_query_literal("hello"), false);
+        assert!(script.contains("const query = \"hello\";"));
+        assert!(script.contains("\"gi\""));
+        assert!(script.ends_with("})();"));
+
+        let script = find_search_script(&find_query_literal("hello"), true);
+        assert!(script.contains("\"g\""));
+        assert!(!script.contains("\"gi\""));
+    }
+
+    #[test]
+    fn find_search_script_neutralizes_quotes_and_script_closing_sequences() {
+        // A search term is arbitrary text a user typed, potentially copied
+        // from the very (untrusted) page being searched — it must come
+        // through as inert JSON string content embedded in `const query =
+        // ...`, never break out of that statement (D62/D69).
+        let literal = find_query_literal(r#""; document.body.innerHTML = "pwned"; //"#);
+        let script = find_search_script(&literal, false);
+        assert!(script.contains(&format!("const query = {literal};\n")));
+        // The generated script still parses as the single intended
+        // statement shape — the injected quotes/semicolons are backslash-
+        // escaped inside the JSON string, not raw JS syntax.
+        assert!(!script.contains("innerHTML = \"pwned\"; //\";\n"));
+    }
+
+    #[test]
+    fn find_search_script_neutralizes_regex_metacharacters_in_the_query() {
+        // The query is matched as a literal substring, never interpreted as
+        // a regex pattern — the generated script must regex-escape it
+        // client-side rather than splice it into `new RegExp` raw.
+        let script = find_search_script(&find_query_literal("a.b*c"), false);
+        assert!(script.contains("query.replace(/[.*+?^${}()|[\\]\\\\]/g"));
+    }
+
+    #[test]
+    fn find_activate_script_embeds_the_index() {
+        let script = find_activate_script(3);
+        assert!(script.contains("const index = 3;"));
+        assert!(script.contains("scrollIntoView"));
+        assert!(script.ends_with("})();"));
+    }
+
+    #[test]
+    fn find_clear_script_unwraps_previous_highlights() {
+        let script = find_clear_script();
+        assert!(script.contains("__veloxFindMatches"));
+        assert!(script.contains("replaceChild"));
+        assert!(script.ends_with("})();"));
     }
 
     #[test]
