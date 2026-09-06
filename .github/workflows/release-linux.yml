@@ -34,11 +34,16 @@ env:
 permissions:
   contents: write # タグ push 時に GitHub Release へ添付するため
 
-# release-windows.yml と同じ group 名を共有し、同一タグに対する GitHub
-# Release の作成を直列化する (理由は release-windows.yml のコメントと
+# タグ push のときだけ release-windows.yml と同じ group 名 (`release-tag-*`)
+# を共有し、同一タグに対する GitHub Release の作成を直列化する。PR や
+# workflow_dispatch では Release を作らないので、workflow ごとに別 group に
+# して並列に走らせる (理由は release-windows.yml のコメントと
 # docs/decisions.md D70 を参照)。
 concurrency:
-  group: release-${{ github.ref }}
+  group: >-
+    ${{ startsWith(github.ref, 'refs/tags/v')
+    && format('release-tag-{0}', github.ref)
+    || format('release-linux-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:

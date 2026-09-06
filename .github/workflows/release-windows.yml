@@ -37,12 +37,20 @@ permissions:
 # 同じタグに対して release-windows.yml と release-linux.yml が同時に走ると、
 # 両方が `softprops/action-gh-release` で同じ Release を作りに行って競合する
 # (「無ければ作成・あれば更新」という動作のため、ほぼ同時だと両方が
-# 「無い」と判断して作成しに行き、片方が失敗し得る)。両 workflow で同じ
-# group 名を共有し、`cancel-in-progress: false` でキャンセルではなく直列化
-# する。group にタグ名 (github.ref) を含めるので、別タグのリリース同士は
-# 並列に走る (docs/decisions.md D70)。
+# 「無い」と判断して作成しに行き、片方が失敗し得る)。
+#
+# そこで **タグ push のときだけ** release-linux.yml と同じ group 名を共有し、
+# `cancel-in-progress: false` でキャンセルではなく直列化する。group にタグ名
+# を含めるので、別タグのリリース同士は並列に走る。
+#
+# 一方 PR や workflow_dispatch では Release を作らないので直列化する理由が
+# 無い (むしろ両 workflow の CI が不必要に待たされる)。この場合は workflow
+# ごとに別の group 名にして、従来どおり並列に走らせる (docs/decisions.md D70)。
 concurrency:
-  group: release-${{ github.ref }}
+  group: >-
+    ${{ startsWith(github.ref, 'refs/tags/v')
+    && format('release-tag-{0}', github.ref)
+    || format('release-windows-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
