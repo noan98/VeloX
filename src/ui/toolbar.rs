@@ -248,6 +248,12 @@ pub enum ToolbarCommand {
     /// `ui::window::ContentShortcut::NewWindow`) the request came from. See
     /// docs/decisions.md D68.
     NewWindow,
+    /// Open a new *private* window (Ctrl/Cmd+Shift+N, Issue #27). Exactly
+    /// like `NewWindow` (no id, intercepted before `app.rs` resolves which
+    /// `BrowserWindow` sent it — see `ContentShortcut::NewPrivateWindow` and
+    /// `AutomationCommand::NewPrivateWindow`), except the window it opens is
+    /// private: see docs/decisions.md D74.
+    NewPrivateWindow,
 
     // --- Settings screen (Issue #30, see docs/decisions.md D67) ---
     /// The settings screen's "保存" button: replace the persisted settings
@@ -308,6 +314,13 @@ pub enum ToolbarCommand {
     /// routed to the same handler in `app.rs`. Carries no id/URL — like
     /// `CloseActiveTab`, `app.rs` always resolves the *active* tab.
     SavePage,
+    // --- View Source (Issue #45, Ctrl/Cmd+U), see docs/decisions.md D72 ---
+    /// View the active tab's page source in a new tab. Sent by the
+    /// toolbar's own keydown listener (Ctrl/Cmd+U while toolbar UI has
+    /// focus); the content-webview equivalent is
+    /// `ui::window::ContentShortcut::ViewSource` (page has focus). Both
+    /// funnel into the same `app::request_view_source`.
+    ViewSource,
 }
 
 /// One row of the tab strip, as sent to the toolbar JS by [`set_tabs_script`].
@@ -920,6 +933,10 @@ mod tests {
             parse_command(r#"{"cmd":"new_window"}"#).unwrap(),
             ToolbarCommand::NewWindow
         );
+        assert_eq!(
+            parse_command(r#"{"cmd":"new_private_window"}"#).unwrap(),
+            ToolbarCommand::NewPrivateWindow
+        );
     }
 
     #[test]
@@ -1400,6 +1417,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_view_source_command() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"view_source"}"#).unwrap(),
+            ToolbarCommand::ViewSource
+        );
+    }
+
+    #[test]
     fn find_bar_visible_script_embeds_bool_only() {
         assert_eq!(
             set_find_bar_visible_script(true),
@@ -1552,6 +1577,8 @@ mod tests {
         assert!(TOOLBAR_HTML.contains("activate_last_tab"));
         // New window (Ctrl/Cmd+N, Issue #29, see docs/decisions.md D68).
         assert!(TOOLBAR_HTML.contains("new_window"));
+        // New private window (Ctrl/Cmd+Shift+N, Issue #27, D74).
+        assert!(TOOLBAR_HTML.contains("new_private_window"));
         // Downloads (Issue #16, see docs/decisions.md D28).
         assert!(TOOLBAR_HTML.contains("veloxSetDownloads"));
         assert!(TOOLBAR_HTML.contains("open_download"));

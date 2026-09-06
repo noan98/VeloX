@@ -32,6 +32,8 @@
 //! new_window        # open a new window at the homepage; every following
 //!                   # open/switch/close/suspend/navigate targets it instead
 //!                   # (Issue #29, see docs/decisions.md D68)
+//! new_private_window # same as new_window, but the new window is private
+//!                   # (Issue #27, see docs/decisions.md D74)
 //! mark              # mark the start of the measured phase (drops everything logged before it)
 //! navigate <url>    # navigate the active tab
 //! wait <ms>         # sleep before the next command (<= MAX_WAIT_MS)
@@ -90,6 +92,15 @@ pub enum AutomationCommand {
     /// `new_window` (there is none — a script can only ever move forward to
     /// a fresh window, never back to an earlier one).
     NewWindow,
+    /// `new_private_window` — exactly like `NewWindow`, except the new
+    /// window is private (Issue #27, see docs/decisions.md D74): its own
+    /// tab's page visits/typed queries never reach `AppState::history`/
+    /// `input_history`, and its content webviews are built with
+    /// `.with_incognito(true)`. Lets an automation script (and this crate's
+    /// own integration tests) exercise the private-window path end to end,
+    /// the same way `NewWindow` already exercises the plain multi-window
+    /// path.
+    NewPrivateWindow,
     /// `navigate <url>` — navigate the active tab to `url` (already
     /// normalized).
     Navigate { url: String },
@@ -174,6 +185,16 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
                 Err(err(
                     line,
                     format!("new_window は引数を取りません: {rest:?}"),
+                ))
+            }
+        }
+        "new_private_window" => {
+            if rest.is_empty() {
+                Ok(AutomationCommand::NewPrivateWindow)
+            } else {
+                Err(err(
+                    line,
+                    format!("new_private_window は引数を取りません: {rest:?}"),
                 ))
             }
         }
@@ -605,6 +626,21 @@ mod tests {
         let err = parse_script("new_window 3\n").unwrap_err();
         assert_eq!(err.line, 1);
         assert!(err.message.contains("new_window"), "{}", err.message);
+    }
+
+    #[test]
+    fn parses_new_private_window_and_rejects_arguments_on_it() {
+        assert_eq!(
+            parse_script("new_private_window\n").unwrap(),
+            vec![AutomationCommand::NewPrivateWindow]
+        );
+        let err = parse_script("new_private_window 3\n").unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(
+            err.message.contains("new_private_window"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

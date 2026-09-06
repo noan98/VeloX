@@ -7129,6 +7129,256 @@ Window を開くと、toolbar 全体は Light になるのに Private Window の
 ことを確認する。(3) toolbar chrome の `System` 解決を CSS 依存から
 `tao::window::Window::theme()` 起点の明示解決に置き換える方が有利だと
 判明したとき (現状は上記のとおりリスク回避のため見送っている)。
+
+## D72: View Source (#45) — `document.documentElement.outerHTML` を取得し、HTML エスケープ済みテキストとして新規タブに `data:` URL で表示する
+
+**対象**: Issue #45 の受け入れ条件 3 点 (ページソースを表示できる /
+ショートカット (Ctrl/Cmd+U) から起動できる / 現在ページを壊さず新規タブ等で
+表示できる)。依存として挙げられている Issue #38 (キーボードショートカット
+管理) は D69 の時点と同じくまだ着手されていないため、今回も既存の D18/D23/
+D69 と同じ「固定の Ctrl/Cmd+U 割り当て」で最小実装し、後から #38 の仕組みに
+載せ替えやすい形にした (D69 の「Ctrl/Cmd+F の割り当てと Issue #38 への申し
+送り」節と全く同じ構造 — 詳細は後述)。
+
+### この機能で最優先すべきセキュリティ設計: 取得したソースは「テキスト」としてしか描画しない
+
+View Source は「ページの HTML ソースをそのまま画面に出す」機能である以上、
+入力（ページの生ソース）は本質的に信頼できない — ソース自体が
+`<script>` タグや `onerror` 属性を含んでいて当然で、それこそが表示したい
+内容そのものである。**もしこのソースを一度でも「HTML マークアップ」として
+別ページに挿入してしまえば、View Source は事実上「そのページをもう一度
+VeloX の（表示上は新しい、しかし技術的には同じ特権を持つ）タブで実行する」
+機能に成り下がり、閲覧者に "ソースを見せている" つもりが実際にはスクリプト
+を実行させてしまう深刻な脆弱性になる。**
+
+対策は単純かつ徹底している: 取得したソースの**すべてのバイト**を
+`browser::view_source::escape_html` (`&` `<` `>` `"` `'` の 5 文字を実体
+参照に変換する、標準的な HTML テキストエスケープ) に通してから、生成した
+ドキュメントの `<pre>` 要素の**テキストコンテンツとしてのみ**埋め込む。
+これにより、ソースの中身が丸ごとの `<script>...</script>` ブロックであれ、
+`</pre>` を使って囲みタグから抜け出そうとする試みであれ、タグの途中で
+ぶつ切りになった不完全なソースであれ、ブラウザの HTML パーサーには
+「解釈不能な地の文」としてしか見えない。生成するドキュメント自体に
+`<script>` 要素を一切含めていない (実行すべき JS がそもそも無い) ことも
+重ねての設計上の防御になっている — D69/D62 の `escape_js_line_terminators`
+はコンテンツが JS 文字列/正規表現リテラルの中に埋め込まれる前提のエスケープ
+だが、本機能にはそのコンテキストが存在しないため、標準的な HTML エスケープ
+だけで足りる (この違いは `browser::view_source` のモジュールドキュメントに
+明記した)。
+
+**この設計を検証する単体テストを `src/browser/view_source.rs` に用意した**
+(抜粋、全て pass):
+
+- `build_view_source_document_never_reproduces_a_live_script_tag` —
+  ソースに `<script>alert(document.cookie)</script>` を含めても、
+  生成ドキュメントに生の `<script>alert` が現れないこと、代わりに
+  `&lt;script&gt;alert(document.cookie)&lt;/script&gt;` という
+  エスケープ済みテキストとして現れることを確認。
+- `build_view_source_document_is_safe_when_source_is_cut_off_mid_tag` —
+  ソースが `<scr` のようにタグの途中で切れていても、`<` が生のまま
+  残らないことを確認 (Issue の指示にある「閉じタグの途中で切れたソース」
+  のケース)。
+- `build_view_source_document_escapes_an_attempted_pre_closing_tag` —
+  ソースが `</pre><img src=x onerror=alert(1)>` のように、こちらが
+  ソースを包んでいる `<pre>` 自体を早期に閉じて隣に要素を注入しようと
+  しても、生成ドキュメント中の実際の `<pre>`/`</pre>` ペアが 1 組のまま
+  であることを確認。
+- `build_view_source_document_escapes_the_page_url_in_title_and_header` —
+  ページ URL 自体 (ヘッダーと `<title>` に埋め込む) にも同じエスケープを
+  適用していることを確認 (実際の呼び出し元は必ず
+  `navigation::normalize_input` を通過済みの URL しか渡さないが、
+  多重防御として)。
+- `truncate_source_utf8_never_splits_a_multibyte_character` — 打ち切り
+  位置が UTF-8 のマルチバイト文字の途中に来ても panic せず、文字境界まで
+  後退することを確認 (日本語ページのソースを想定)。
+
+### ソース取得方法: `document.documentElement.outerHTML` を JS で取得（生 HTTP 再フェッチはしない）
+
+検討した選択肢は 2 つ:
+
+1. **`document.documentElement.outerHTML` を `evaluate_script_with_callback`
+   で読む**（採用）。`BrowserWindow::fetch_page_title`/`fetch_favicon`
+   (D12) と全く同じ「fire-and-forget な JS 評価 → `UserEvent` で非同期に
+   結果を受け取る」パターンを再利用するだけで済み、3 エンジン
+   (WebKitGTK/WKWebView/WebView2) すべてで無条件に動く — wry 0.56 は
+   `evaluate_script_with_callback` を全プラットフォームでサポートして
+   いるため、D69 のネイティブ find API 調査のような「Windows だけ賭けに
+   出る」判断すら不要だった。**CLAUDE.md の「Windows を最優先」を素直に
+   満たす** (Windows で動く実装を最初に選び、そのまま 3 OS 共通で使える)。
+2. **ページの元 HTTP レスポンスバイト列を再取得する** (見送り)。ブラウザの
+   ネイティブ「View Source」に近い挙動 (JS 実行前の生の応答をそのまま
+   見せる) だが、wry 0.56 はレスポンスボディを取り出せる汎用のネットワーク
+   API を公開していない — D17/D59 で確認済みの「wry はビルダーレベルの
+   main-frame ナビゲーションフックとリクエストブロッキングは持つが、
+   レスポンス本文を読めるフックは持たない」という制約がそのまま当てはまる。
+   別途 HTTP クライアント (例えば `reqwest`) を追加してページを独立に
+   再フェッチする案も検討したが、(a) Cookie・認証状態・User-Agent
+   などをブラウザのセッションと二重管理する必要が生じる、(b)
+   同一 URL に対して 2 回目のリクエストを飛ばすことになり、副作用のある
+   POST 送信後のページ等では意味が変わってしまう、(c) 依存クレートが
+   増える (D6) — というコストに見合わないと判断した。
+
+**採用した方式の既知の限界**: `outerHTML` は「今この瞬間の DOM」のスナップ
+ショットであり、ページ自身の JS が `document.write`/DOM 操作でサーバの
+応答から書き換えた後の状態を返す。つまり「サーバが実際に送ってきたバイト
+列」とは一致しないことがある (SPA 等では顕著)。ブラウザの devtools の
+「View Page Source」相当ではなく「Inspect Element の outerHTML」相当の
+挙動である。実務上ほとんどのページ検証用途 (レイアウト崩れの原因調査、
+メタタグの確認など) は現在の DOM を見たいことが多く、この差異は許容できる
+簡略化と判断したが、正直に記録しておく。
+
+### 表示先: 既存の「新規タブを開く」経路 (`open_new_tab`) にそのまま乗せる `data:` URL
+
+新しいタブとして開くこと自体は Issue の指示どおりで迷いは無かったが、
+「そのタブに何を読み込ませるか」に選択肢があった:
+
+- **カスタム URL スキーム/プロトコルハンドラ (`view-source:` 相当) を実装
+  する** (見送り)。Chrome 等の `view-source:https://example.com/` を模倣
+  できればアドレスバー表示は理想的になるが、wry 0.56 に「エンジンが
+  ロードしようとした任意の URL に対して VeloX 側が代わりにレスポンスを
+  返す」ようなカスタムプロトコルハンドラの公開 API は無く (D18/D59/D69 が
+  積み重ねてきた「wry の実ソースを読んでから機能を選ぶ」調査スタイルの
+  結論)、`browser::navigation::normalize_input` の URL 検証・タブの
+  `current_url`・セッション永続化 (`SessionSnapshot::sanitize`) など
+  複数箇所が前提にしている「`current_url` は実際にエンジンがロードした
+  URL と一致する」という不変条件を壊さずに擬似スキームを割り込ませるのは、
+  P2 の機能 1 つのために見合わないコストと判断した。
+- **`data:text/html` URL として、既存の `app::open_new_tab` にそのまま
+  渡す** (採用)。エスケープ済みドキュメントを組み立てたら、それを
+  `data:` URL にエンコードし、`ToolbarCommand::NewTab`/`Ctrl+T`/
+  `target="_blank"` などが最終的に必ず通る `app::open_new_tab` に、
+  他の呼び出し元と全く同じ形で渡すだけで済む。`data:` は既に
+  `browser::navigation::ALLOWED_SCHEMES` に含まれるスキームであり、
+  タブのプロセス配置 (D54)・アクティブ化・タブ作成レイテンシ計測 (D19)
+  などを一切新設せずにそのまま享受できる。
+
+**この方式が生む、正直に記録すべき既知の制限**:
+
+- **アドレスバーには `view-source:https://example.com/` のような読みやすい
+  疑似 URL ではなく、`data:text/html;charset=utf-8;base64,....` という
+  長い文字列がそのまま表示される。** Issue の受け入れ条件「現在ページの
+  URL を正しく扱う」は、(a) ソース取得元のタブ・URL を取り違えない
+  (`BrowserWindow::fetch_page_source` が `page_url` を要求時点で捕捉し、
+  非同期の結果に一貫して紐付ける — `fetch_favicon` の `page_url` 引数と
+  同じ設計)、(b) 取得元の URL を生成ドキュメントのヘッダー/`<title>` に
+  明示表示する、の 2 点では満たしているが、**アドレスバー表示の見た目に
+  関しては満たせていない**。`Tab::current_url`/`on_navigation_started`/
+  `on_load_finished` は「エンジンが実際にロードした URL」を無条件に
+  正としてタブストリップ・セッション永続化に反映する設計であり (D20)、
+  ここに「表示用の別 URL」を割り込ませるには `Tab` に新しいフィールドを
+  足すか、ナビゲーションイベントハンドラに view-source 用の特別扱いを
+  複数箇所へ差し込む必要がある — D20 が守ってきた「`current_url` は常に
+  真実」という前提を、この 1 機能のためだけに壊すコストに見合わないと
+  判断し、見送った。**この受け入れ条件は文字どおりには満たせていない**
+  ことをここに明記する。
+- **`data:` URL はそのタブの `current_url` としてタブの生存期間中
+  保持され続け、`app::sync_tab_strip` が触れるたびに (`TabSummary`/
+  `veloxSetTabs` の JSON として) トールバー webview へ再送され、
+  `app::persist_session` が呼ばれるたびに `session.json` にも書き出される。
+  1 回きりのペイロードではなく、以後のほぼ全イベントで繰り返し
+  シリアライズされる「アンビエントな状態」になる。** これが
+  `browser::view_source::MAX_SOURCE_BYTES` を意図的に 300,000 バイトと
+  かなり保守的な値に抑えた理由そのものである — 数 MB 級のソースをそのまま
+  許すと、無関係なタブの開閉やタブ切替のたびに数 MB の `evaluate_script`
+  呼び出しとセッションファイル書き込みが発生しかねない。300 KB であれば
+  base64 化後 (約 1.33 倍) でも数百 KB に収まる。上限を超えたソースは
+  `browser::view_source::truncate_source_utf8` が文字境界を尊重して
+  切り詰め、生成ドキュメントに切り詰め済みである旨の通知
+  (`.velox-notice`) を表示する。
+- **セッション復元・履歴への影響**: `data:` URL は
+  `browser::navigation::ALLOWED_SCHEMES` に含まれるため、
+  `SessionSnapshot::sanitize` は View Source タブの `current_url` を
+  そのまま (拒否せず) 通す — 次回起動時のセッション復元が有効なら、
+  そのタブは古いソースのスナップショットのまま復元される (実害はないが、
+  やや直感に反する)。一方、履歴 (`HistoryStore`) には**意図的に**記録
+  されないよう `app::handle_user_event` の `LoadFinished` 処理に
+  `url.starts_with("data:")` の除外を 1 箇所追加した — でなければ、
+  ページを閲覧するたびに数百 KB の base64 文字列が visit history と
+  オムニボックスの候補に紛れ込むことになり、これは実用上明確な UX
+  劣化だと判断したため。タイトル/favicon の取得 (`fetch_page_title`/
+  `fetch_favicon`) は除外していない — `fetch_page_title` が読む
+  `document.title` は生成ドキュメント自身の `<title>ソースを表示: ...`
+  なので、タブストリップに「ソースを表示: https://example.com/」という
+  読める見出しが出るのはこの経路によるものであり、あえて残した。
+- **再読み込み (リロード)** はスナップショット時点の内容を再表示する
+  だけで、元ページを再取得しない (`data:` URL はエンジンにとって
+  「その場で完結した」ページであるため)。
+- **閉じたタブの再オープン (Ctrl/Cmd+Shift+T)**: `browser::tabs::
+  ClosedTabs` (D24) は URL 文字列をそのまま LIFO に積むだけなので、
+  View Source タブを閉じた直後に再オープンすると理屈の上では元の
+  `data:` URL が復元されるはずだが、専用のテストは追加していない
+  (優先度の低いエッジケースと判断)。
+
+### ショートカット (Ctrl/Cmd+U) の実装: D18/D23/D69 と全く同じ二重配送
+
+`ContentShortcut::ViewSource` (固定センチネル文字列
+`"velox:view-source"`、`ui::window::tab_shortcut_script` に追加) と
+`ToolbarCommand::ViewSource` (`{"cmd":"view_source"}`、`toolbar.html` の
+キーダウンリスナーに追加) の 2 経路を、D18/D23/D69 と寸分違わぬパターンで
+追加した。どちらも `app::request_view_source` という 1 つの共有関数に
+収束する — Issue #38 (キーボードショートカット管理) が今後この 2 経路
+すべてに乗ってくる設計になったとき、変更が必要な箇所は「JS 側でどのキーを
+監視するか」の 1 か所だけで済むよう、D69 と同じ配慮を踏襲した。
+`browser::settings::shortcut_reference` (Issue #30/D67 の Shortcuts タブ)
+にも「ページのソースを表示 — Ctrl/Cmd+U」の行を追加し、発見可能性を確保
+した (なお Ctrl/Cmd+F は D69 実装時にこの一覧への追加が漏れていたことに
+気づいたが、本 Issue のスコープ外のため今回は手を付けていない)。
+
+### 実装の全体像
+
+- **`browser::view_source`** (`src/browser/view_source.rs`、新規) —
+  UI/エンジン非依存の純粋ロジック一式:
+  `escape_html`/`truncate_source_utf8`/`build_view_source_document`/
+  `base64_encode`/`to_data_url`。依存クレートを増やさず (D6)、base64
+  エンコーダは RFC 4648 の固定アルゴリズム (~20 行、セキュリティ上の
+  難しい判断を要さない) を自前実装し、RFC のテストベクタで単体テスト
+  済み。`docs/architecture.md` の 4 層分離のとおりここは webview を
+  一切知らず、単体テストの主対象 (24 ケース)。
+- **`ui::window::BrowserWindow::fetch_page_source`** — 実際の DOM 読み取り
+  を担う唯一のメソッド。`fetch_page_title`/`fetch_favicon` と同じ
+  「不明/休止中タブは黙って no-op」「fire-and-forget、結果は
+  `UserEvent` で非同期に返る」契約 (D12)。
+- **`app::request_view_source`**/**`app::open_view_source_tab`** —
+  前者がショートカット発火時にアクティブタブの `page_url` を捕捉して
+  取得をキックし、後者が `UserEvent::ViewSourceReady` を受けて
+  ドキュメントを組み立て `data:` URL 化し、`open_new_tab` に渡す。
+
+### テスト
+
+- `src/browser/view_source.rs`: 24 件 (エスケープ・打ち切り・ドキュメント
+  組み立て・XSS 耐性・base64・data URL のそれぞれ)。
+- `src/ui/toolbar.rs`: `ToolbarCommand::ViewSource` の IPC パーステスト
+  1 件を追加。
+- `src/ui/window.rs`: `parse_content_shortcut`/`tab_shortcut_script` に
+  `ViewSource`/`VIEW_SOURCE_MESSAGE` を追加した既存テストの拡張、および
+  `VIEW_SOURCE_FETCH_SCRIPT` の内容検証テスト 1 件を追加。
+- 単体テスト件数: 776 → 799 (+23、`cargo test --lib -- --list` で計測)。
+  減少なし。
+- 統合テスト (`tests/integration.rs`) は今回変更していない (8 件のまま、
+  全て pass) — D69 のときと同じ判断で、View Source は既存の統合テストが
+  検証する「実プロセス起動・実タブ管理・実ファイル永続化」のいずれとも
+  直接関係しないため、新規の統合テストは追加していない。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` で型
+  レベルの整合は確認したが、実機の Windows/WebView2 での動作確認は
+  できていない (この環境に Windows 実機が無いため) — 特に
+  `evaluate_script_with_callback` が数百 KB 級の文字列を問題なく
+  往復できるか、Ctrl+U が WebView2 自身の既定アクセラレータと衝突しないか
+  (D69 の F12/Ctrl+F と同じ懸念) は未検証。
+
+**満たせなかった／部分的にしか満たせなかった受け入れ条件**:
+「現在ページの URL を正しく扱う」— 取得元 URL の取り違え防止と
+ドキュメント内表示は満たしているが、**アドレスバーの表示** (生の `data:`
+URL が見える) は満たせていない。上記「表示先」の節に理由を記録した。
+
+**Revisit condition**: (1) Issue #38 のキーバインド管理層への Ctrl/Cmd+U
+の載せ替え。(2) `Tab`/`TabState` にビュー専用の表示 URL を持たせる設計が
+別の必要性 (例えば他の内部ページ) から生まれた場合、View Source の
+アドレスバー表示もそれに乗せる。(3) 巨大ページの全文表示が本当に必要に
+なった場合、`data:` URL 方式を専用スキーム/プロトコルハンドラに置き換える
+(前述のとおり現状は見送り)。(4) 実機 Windows での動作確認
+(`evaluate_script_with_callback` の大きな文字列、Ctrl+U のアクセラレータ
+衝突)。(5) 閉じた View Source タブの再オープン専用のテスト追加。
+
 ## D73: コード署名 (#42) — 証明書が無いため「有効化可能な仕組み」に留め、実際の署名は見送り
 
 **対象**: Issue #42 の受け入れ条件 4 点 (macOS 署名/notarize、Windows 署名、
@@ -7220,6 +7470,286 @@ Secrets/Variables を設定するだけで `release-windows.yml` の署名が有
 着手するとき、合わせて Developer ID 署名 + notarization を実装する。
 (3) Azure Trusted Signing の適格性要件 (地域・事業年数) が緩和されたとき。
 (4) 他ベンダーのクラウド署名サービスへの切り替えを検討するとき。
+
+## D74: プライベートブラウジング、残りスコープ (#27) — Private Window を別ウィンドウとして開けるようにする。分離は D14/D15 の既存メカニズムのまま、per-window 化だけを行う
+
+**対象**: Issue #27。Epic #53 の言葉を借りれば「大半は #7 (D14) で実装済み。
+残りは『Private Window を別に開く』のみで、#29 (D68, PR #150) が前提」。
+その #29 は本 Issue 着手時点で既に `main` にマージ済みで、D68 の末尾
+「Issue #27 が実装すべきこと」の節に (a)(b)(c) の 3 点として実装方針が
+具体的に書き残されていた。本項はその棚卸しの確認と、実際の実装・検証の
+記録である。
+
+### 棚卸し: #7 (D14/D15) と #29 (D68) で既に何ができていたか
+
+着手前に `docs/decisions.md` の D14/D15/D68/D71、`src/config/mod.rs`
+(`Config::private`)、`src/ui/window.rs`、`src/browser/windows.rs`、
+`src/app.rs` の `open_new_window`/`AppState` を読んだ。Issue #27 の受け入れ
+条件 4 点のうち、**ゼロから作る必要があったのは 1 点目だけ**だった:
+
+- **「Private Windowを通常ウィンドウとは別に開ける」— 未実装だった。** 本 PR
+  の主題。詳細は後述。
+- **「閲覧履歴がアプリ側に残らない」— D14 のロジック (`record_visit_if_enabled`
+  などの `history_enabled` ゲート) はそのまま使えたが、`history_enabled` が
+  プロセス全体で 1 個の `bool` だったため、複数ウィンドウが混在する状況
+  (通常ウィンドウ + Private Window が同一プロセス内に共存) では**そのまま
+  では正しく動かない**ことが分かった。D68 が既に予告していた通り、
+  per-window 化が必要だった (後述)。
+- **「通常セッションのCookie/Storageを共有しない」— D14/D15 の
+  `.with_incognito(true)` + `context: None` の分離メカニズムは
+  `ui::window::BrowserWindow::new` 内で完結しており、ウィンドウが複数に
+  増えても仕組み自体は無改修で使い回せることを D68 が確認済み
+  (「D14 が既に書いていた『複数ウィンドウが実現したときの拡張路線』が
+  そのまま使える形で残っている」)。今回の実装で実際にその通りだったことを
+  確認した (後述の「データストア分離の検証」)。
+- **「Private状態を明確に識別できる」— `--private-badge`・ウィンドウ
+  タイトルの `— プライベート` 接尾辞・D71 で修正済みの `--private-*` CSS
+  変数のテーマ追従は、いずれも「1 個の `bool` を `BrowserWindow::new`
+  構築時に渡す」形で既に実装されており、その `bool` の出どころを
+  `config.private` からウィンドウごとの値に差し替えるだけで済んだ。
+
+### 実装したもの: D68 が示した (a)(b)(c) をそのまま実装
+
+D68 の該当節がほぼ実装レシピそのものだったので、方針を変える理由は
+見当たらず、そのまま採用した:
+
+1. **(a) `browser::windows::WindowEntry` にウィンドウごとの `private: bool`
+   を追加**。`Windows::new`/`open_window` は互換維持のため据え置き (常に
+   `private: false` に委譲)、新たに `Windows::new_with_privacy`/
+   `Windows::open_window_with_privacy` を追加して呼び分ける形にした
+   (`Windows` 自身のテストを 1 件も壊さずに済む形を優先した)。新設の
+   `Windows::is_private(id) -> Option<bool>` が `app.rs` 側の唯一の参照点。
+2. **(b) `app::open_new_window` が `Config::private` の代わりにそのフラグを
+   見て `BrowserWindow::new` を呼ぶ**。実際には「新しい
+   `open_private_window`」を別関数として作るのではなく、`open_new_window`
+   自体に `private: bool` 引数を 1 つ追加する形にした — 呼び出し元が
+   `config.private`(既存の Ctrl/Cmd+N 系 3 経路) か `true`(新設の
+   Ctrl/Cmd+Shift+N 系 3 経路) のどちらを渡すかだけが違い、実装は 1 箇所の
+   ままで済む。`ui::window::BrowserWindow::new` にも同じ `private: bool`
+   引数を追加し、関数内部の 7 箇所の `config.private` 参照をすべて
+   この引数に差し替えた — `config: &Config` はプロセス全体で 1 個の
+   共有参照のため、これを直接見ている限り「通常ウィンドウとプライベート
+   ウィンドウが同一プロセスに共存する」ことは原理的に表現できなかった。
+3. **(c) Ctrl/Cmd+Shift+N を、#29 が作った 3 経路と同じパターンで追加**。
+   `ToolbarCommand::NewPrivateWindow`(`{"cmd":"new_private_window"}`)/
+   `ContentShortcut::NewPrivateWindow`(センチネル `velox:new-private-window`)/
+   `AutomationCommand::NewPrivateWindow`(`new_private_window` コマンド、
+   引数なし) の 3 つを、既存の `NewWindow` 系と完全に同じ場所・同じ理由
+   (「`ui_windows` 全体への `&mut` が要る = `handle_toolbar_command`/
+   `handle_content_shortcut` の中では処理できず `handle_user_event` で
+   横取りする」という D68 の借用上の制約) で追加した。`toolbar.html`/
+   `tab_shortcut_script`(content webview 側) の両方の keydown リスナに
+   Ctrl/Cmd+Shift+N を追加している。
+
+`AppState::history_enabled`(プロセス全体で 1 個の `bool`) は完全に廃止し、
+`record_visit_if_enabled`/`record_input_history_if_enabled`/
+`persist_session` はすべて新設のヘルパー `window_is_private(state,
+window_id)`(`state.windows.is_private(window_id).unwrap_or(true)` —
+不明なウィンドウは安全側の `true` = 記録しない扱い) を通す形に書き換えた。
+`ToolbarCommand::Ready` が押していた `window.set_private(config.private)`
+も `window.set_private(window.is_private())`(ウィンドウ自身が構築時に
+覚えている自分の `private` フラグ — 新設の `BrowserWindow::is_private()`)
+に差し替えた。`config.private` を直接見ていたこの 1 箇所を放置すると、
+通常ウィンドウの Ready ハンドラがプロセス起動時の `config.private`(= 常に
+`false`、通常起動の場合) をそのまま押してしまい、逆に `--private` 起動中に
+開いた「通常」の 2 枚目のウィンドウ (Ctrl+N, 後述) のバッジも常に
+`config.private` の値になってしまうところだった。
+
+**`--private`/`VELOX_PRIVATE` 起動フラグ (D14) 自体は変更していない**:
+`app::run` は最初のウィンドウを `Windows::new_with_privacy(homepage,
+config.private)` で開き、`BrowserWindow::new` にも `config.private` を渡す
+— プロセス全体を Private にして起動する挙動は従来どおり。**Ctrl/Cmd+N
+(無印) は今回も `config.private` を渡す**ようにした — つまり
+`--private` で起動したプロセスで Ctrl+N を押すと、今までどおり
+新しいウィンドウも Private になる (D68 が「今回は変更していない」と
+書いていた挙動をそのまま維持)。Ctrl/Cmd+Shift+N だけが常に `true` を渡す
+新経路で、`--private` 起動でも通常起動でも「明示的に Private Window を
+1 枚追加する」という一貫した意味を持つ。
+
+### データストア分離の検証: wry 0.56.1 の実ソースを 3 プラットフォームぶん確認した
+
+指示の通り、「分離されているつもりで実は分離されていない」を最も警戒す
+べき点として、`~/.cargo/registry/src/.../wry-0.56.1/src/` を実際に読んで
+確認した (以下、確認した具体的なコード箇所を引用する)。
+
+- **WebKitGTK (Linux, CI 環境)** — `src/webkitgtk/mod.rs` の
+  `new_gtk`:
+  ```rust
+  let web_context = if attributes.incognito {
+    default_context = WebContext::new_ephemeral();
+    &mut default_context
+  } else { /* ... 共有 WebContext ... */ };
+  ```
+  `.with_incognito(true)` を付けた `WebViewBuilder::build_*` 呼び出しは
+  **呼ばれるたびに** `WebContext::new_ephemeral()`(インメモリ、非永続) を
+  新規に作る。VeloX 側は toolbar/content 双方の webview 構築に
+  `.with_incognito(private)` を渡しており (`ui::window::BrowserWindow::new`)、
+  Private Window とは別に開いた通常ウィンドウの `WebContext::new(None)`
+  (D66 の実測どおりアプリ名ベースの永続ディレクトリを指す) とは完全に別の
+  オブジェクトになる。**確認できたこと**: Private Window の webview が
+  通常ウィンドウの永続ストアに触れることはない。**同時に判明した限界
+  (D15 が既に書いていた事実の再確認)**: `.with_incognito(true)` は呼ぶ
+  たびに新しい ephemeral context を作るため、同じ Private Window 内の
+  toolbar と各タブ、さらに複数の Private Window どうしも、互いに
+  Cookie を共有しない (実ブラウザの「同一シークレットセッション内の
+  タブはセッションを共有する」という一般的な期待からは外れる)。これは
+  #7/D15 の時点から存在する制約で、本 Issue が新たに悪化させたものでは
+  ない — 通常ウィンドウとの分離という本質的な要件は満たしている。
+- **WKWebView (macOS)** — `src/wkwebview/mod.rs`:
+  `(true, _, _) => WKWebsiteDataStore::nonPersistentDataStore(mtm)` —
+  Apple のドキュメント上 `nonPersistentDataStore()` は呼び出すたびに新しい
+  非永続ストアのインスタンスを返す (`.default()` が返す永続シングルトンとは
+  対照的)。WebKitGTK と同じ「呼ぶたびに新規・非永続」という構造。
+- **WebView2 (Windows, 最優先 OS)** — `src/webview2/mod.rs`:
+  `controller_opts.SetIsInPrivateModeEnabled(incognito)` は
+  `ICoreWebView2ControllerOptions3` 経由で個々の `Controller` に対して
+  設定される。ここで **1 点、実機検証できていない構造上の懸念**を記録して
+  おく: `env`(`ICoreWebView2Environment`) 自体は `create_environment` が
+  `attributes.context.as_deref().and_then(|c| c.data_directory())` から
+  導いた `data_directory` で作られ、VeloX は Private Window 用に
+  `context: None` を渡す (`ui::window.rs` の `context` 変数) ため、
+  Private Window の `env` は `data_directory` 未指定 (空文字列、
+  `CreateCoreWebView2EnvironmentWithOptions` の既定 = 実行ファイル隣接の
+  既定フォルダ) で作られる。これは Microsoft の公開ドキュメントが述べる
+  「`IsInPrivateModeEnabled` の Controller はインメモリの非永続プロファイル
+  を使う (基になる `Environment`/`data_directory` が何であれ、書き込みは
+  ディスクに永続化されない)」という仕様に依拠しており、wry のソース自体
+  からは「Private Window どうし・通常ウィンドウとの間でディスク上の
+  `data_directory` が数値として同じ既定値に揃いうる」ことまでしか確認
+  できない (＝ディスクに何か書かれるかどうかの最終防御線は WebView2 側の
+  InPrivate 実装そのものに委ねている)。**この開発環境は Linux 専用
+  (D61) で WebView2 を実行できないため、Windows 実機でこの分離を目視/
+  ファイルシステム上で検証することはできていない** — CLAUDE.md の
+  「Windows 最優先」の判断基準に従い、実装 (`.with_incognito(private)` を
+  toolbar/content 双方に渡す、D15 の時点から変更なし) はそのまま維持しつつ、
+  この限界を正直に記録する。
+
+**アプリ自身のデータ (履歴/入力履歴/セッション) の分離は、統合テストで
+実際に検証した** (wry/webview2 のようなブラックボックスに頼らない、
+VeloX 自身が書き込むファイルでの検証): `tests/integration.rs` に新設した
+`a_private_windows_page_visit_never_reaches_history_json` が、実際に
+`velox` プロセスを起動し、通常ウィンドウで 1 ページ訪問した後
+`new_private_window` で Private Window を開いて別の 1 ページを訪問し、
+`quit` 後の `history.json` を `persistence::load_history` で読み返して
+「通常ウィンドウの 2 件だけが記録され、Private Window の訪問は一切
+含まれない」ことをアサートしている。ユニットテストの
+`record_visit_if_enabled` 単体の正しさに加えて、`app::open_new_window`
+(`private: true` での `BrowserWindow` 構築) → 実際のページ読み込み →
+`UserEvent::LoadFinished` → `record_visit_if_enabled` という配線全体が
+実機 (Xvfb 上の WebKitGTK) で意図通り動くことを確認できた、数少ない
+「見送っていない」実地検証である。
+
+### 見つけた/見送った既知のギャップ
+
+- **オムニボックスの候補が通常ウィンドウの履歴を Private Window に
+  漏らす**: `ToolbarCommand::OmniboxInput` は `state.history`/
+  `state.bookmarks`/`state.input_history` をウィンドウの private 状態に
+  関わらず読む (D39 の「書き込みは止めるが読み込みは妨げない」という
+  既存方針をそのまま踏襲)。D14 の「プロセス全体が Private」という前提
+  では、同時に走っている通常ウィンドウが存在しえないためこれは無害
+  だったが、本 Issue で通常ウィンドウと Private Window が同一プロセスに
+  共存できるようになった結果、**Private Window のアドレスバーに、
+  同じセッション中に通常ウィンドウで実際に訪問した URL や打った検索語が
+  候補として出うる**、という新しいギャップが生まれた。これは履歴が
+  「ディスクに残る」問題ではなく「同一プロセス内の別ウィンドウに一時的に
+  見える」問題であり、Issue #27 の 4 つの受け入れ条件には直接該当しない
+  が、実ブラウザの Private/incognito モードの直感 (通常ウィンドウの閲覧を
+  Private Window から見えなくする) には反する。修正には
+  `omnibox::build_candidates` 系に `window_id`(または呼び出し元の
+  private フラグ) を通す設計変更が必要で、かつ「Private Window の候補は
+  ブックマークだけ見せるべきか、何も見せないべきか」という仕様判断も
+  要るため、本 Issue のスコープでは修正せず、ここに明示的に残す。
+- **`DownloadStore` はプロセス全体で 1 個の共有ストアのまま
+  (D28/D68 変更なし)**: Private Window でのダウンロードも同じダウンロード
+  パネル一覧に載る。ダウンロードしたファイル自体は (実ブラウザでも同様)
+  ディスクに残る操作なので Private モードでも隠しようがないが、
+  「そのダウンロードが Private Window で行われた」という一覧上の記録は
+  通常ウィンドウのパネルからも見えてしまう。D68 が既に「頻度の低いパス」
+  として見送っていたスコープで、本 Issue でも同様に見送った。
+- **`SitePermissionStore`/`FilterList`/`SiteExceptions` は D68 の設計通り
+  全ウィンドウ共有のまま**: Private Window で許可したサイト権限
+  (カメラ/位置情報など) は通常ウィンドウにも残る。実ブラウザでも
+  Private/incognito のサイト権限は「そのセッションの間だけ」揮発する
+  実装が多いが、VeloX は元々 D60 の設計で「サイト権限はアプリ全体で
+  1 つ」となっており、本 Issue はこれを変更していない — 変更するには
+  `SitePermissionStore` 自体をウィンドウ (または private/non-private)
+  スコープに分割する設計が必要で、スコープ超過と判断した。
+
+### テスト・検証
+
+- `browser::windows`: 7 件追加 (`a_window_opened_by_new_is_not_private`、
+  `new_with_privacy_marks_the_first_window_private`、
+  `open_window_marks_the_new_window_non_private`、
+  `open_window_with_privacy_marks_the_new_window_private`、
+  `is_private_returns_none_for_an_unknown_window`、
+  `open_restored_window_is_never_private`、そして本題の
+  `a_normal_and_a_private_window_sharing_the_same_tab_id_keep_independent_privacy`
+  — #29 統合時に実際に 3 件のバグが見つかった「同じ `TabId` を持つ 2 つの
+  ウィンドウが干渉しないか」という指示を、`private` フラグについて検証)。
+- `browser::automation`: `new_private_window` のパース
+  (`parses_new_private_window_and_rejects_arguments_on_it`) を追加。
+- `ui::toolbar`: `{"cmd":"new_private_window"}` のパース、
+  `toolbar_html_declares_expected_hooks` に `new_private_window` の
+  存在確認を追加。
+- `ui::window`: `tab_shortcut_script_captures_expected_combos_in_capture_phase`/
+  `parse_content_shortcut_matches_every_sentinel_exactly` に新センチネル
+  `velox:new-private-window`/`ContentShortcut::NewPrivateWindow` を追加。
+- `app`: 2 件追加。
+  `a_private_window_records_no_visit_while_a_normal_window_with_the_same_tab_id_still_does`
+  (本題 — 同じ `TabId` を共有する通常/Private ウィンドウで
+  `record_visit_if_enabled`/`record_input_history_if_enabled` が
+  正しく独立して動くことの単体テスト) と
+  `persist_session_skips_a_private_primary_window_but_writes_a_normal_one`
+  (セッション永続化側の同型テスト、実ファイルシステムに対して)。
+- `tests/integration.rs`(新規 1 件):
+  `a_private_windows_page_visit_never_reaches_history_json` — 上述の
+  「データストア分離の検証」参照。実際に `velox` を起動し、Private Window
+  経由の訪問が `history.json` に一切現れないことを確認する、本 Issue の
+  最も重要な受け入れ条件に対する実地証拠。
+- テスト件数: `cargo test --lib` は着手前 800 件 → 着手後 810 件 (+10)。
+  `xvfb-run` + `dbus-run-session` 経由の `cargo test --test integration`
+  は着手前 9 件 → 着手後 10 件 (+1)。既存テストの削除・スキップ化は
+  行っていない。
+- `cargo fmt --check`/`cargo clippy --all-targets -- -D warnings` は
+  警告ゼロ (`ui::window::BrowserWindow::new` の引数が 8 個になった分は
+  `#[allow(clippy::too_many_arguments)]` を明示的に付与 — `app.rs` の
+  `handle_user_event` 等、既存の同種関数と同じパターン)。
+  `cargo check --target x86_64-pc-windows-msvc --all-targets` も型検査の
+  みだが通過を確認した — CLAUDE.md D61 の通りリンク・実行はしておらず、
+  上記「データストア分離の検証」の WebView2 に関する懸念は Windows 実機
+  でのみ最終確認できる。
+
+### 満たせなかった/検証できていない点 (正直な棚卸し)
+
+- **Windows (WebView2) 実機でのデータストア分離の目視/ファイル検証は
+  行っていない** — 開発環境が Linux 専用のため。上記のとおり、
+  wry のソースと Microsoft の公開仕様からの推論に留まる。CLAUDE.md の
+  「Windows 最優先」の判断基準は、実装の設計判断 (D15 から変更なしの
+  `.with_incognito` 呼び出し) には反映したが、実機検証そのものは今回も
+  できていない。
+- **macOS 実機でのデータストア分離の検証も同様に未実施**(D71 と同じ理由)。
+- **オムニボックス候補の cross-window リーク**(上記) は既知のまま未修正。
+- **`DownloadStore`/`SitePermissionStore`/`FilterList`/`SiteExceptions`
+  の全ウィンドウ共有は D68/D60/D28 の設計を維持したまま**、Private
+  Window 導入後の具体的な意味合い (上記) を記録したのみで、分割は
+  行っていない。
+- **Private Window 内の複数タブ/複数 Private Window 間で Cookie が
+  共有されない**(WebKitGTK/WKWebView の `.with_incognito(true)` が
+  呼び出しごとに新規ストアを作る構造上の制約、D15 由来) — 実ブラウザの
+  一般的な incognito 挙動 (同一シークレットセッション内では共有) との
+  差異だが、#7 の時点からの既存の制約であり本 Issue のスコープでは
+  修正していない。
+
+**Revisit condition**: (1) Windows/macOS 実機でデータストア分離を検証
+できる環境が整ったとき (D61/D71 と同じ制約)。(2) オムニボックス候補の
+cross-window リークを修正する Issue に着手するとき — `window_id` を
+`omnibox::build_candidates` 系まで通す設計と、「Private Window の候補に
+何を出すか」という仕様判断が必要になる。(3) ダウンロード/サイト権限/
+フィルタ設定をウィンドウ (または private/non-private) スコープに分割する
+価値が実際に求められたとき (D68 の「見送ったもの」と同じ優先度判断)。
+(4) WebKitGTK/WKWebView 側で「Private Window 内はタブ間で共有し、通常
+ウィンドウとは分離する」ような、呼び出し単位でない共有 ephemeral
+context を wry が公開するようになったとき。
 
 ## D76: 名前を付けて保存 (#46) — Windows は WebView2 の `CallDevToolsProtocolMethod` で MHTML 保存 + ネイティブ Save-As ダイアログ、macOS/Linux は outerHTML の素の保存に留める
 

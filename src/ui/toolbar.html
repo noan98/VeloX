@@ -1249,6 +1249,10 @@
         // Ctrl/Cmd+S (Issue #46): save the current page. See
         // docs/decisions.md D76.
         message = { cmd: "save_page" };
+      } else if (event.key === "u" || event.key === "U") {
+        // Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
+        // docs/decisions.md D72.
+        message = { cmd: "view_source" };
       }
     } else if (event.shiftKey && !event.altKey) {
       if (event.key === "t" || event.key === "T") {
@@ -1258,6 +1262,9 @@
       } else if (event.key === "b" || event.key === "B") {
         // Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar.
         message = { cmd: "toggle_bookmark_bar" };
+      } else if (event.key === "n" || event.key === "N") {
+        // Ctrl/Cmd+Shift+N (Issue #27): open a new private window.
+        message = { cmd: "new_private_window" };
       }
     }
     if (message === null) {

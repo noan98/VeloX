@@ -595,6 +595,10 @@ pub fn shortcut_reference() -> &'static [ShortcutInfo] {
             action: "ページを保存",
             keys: "Ctrl/Cmd+S",
         },
+        ShortcutInfo {
+            action: "ページのソースを表示",
+            keys: "Ctrl/Cmd+U",
+        },
     ]
 }
 

@@ -97,6 +97,9 @@ const TOGGLE_BOOKMARK_BAR_MESSAGE: &str = "velox:toggle-bookmark-bar";
 /// Ctrl/Cmd+N (Issue #29): open a new window. See
 /// `ContentShortcut::NewWindow` and docs/decisions.md D68.
 const NEW_WINDOW_MESSAGE: &str = "velox:new-window";
+/// Ctrl/Cmd+Shift+N (Issue #27): open a new private window. See
+/// `ContentShortcut::NewPrivateWindow` and docs/decisions.md D74.
+const NEW_PRIVATE_WINDOW_MESSAGE: &str = "velox:new-private-window";
 /// Prefix shared by the eight `velox:activate-tab-1` .. `velox:activate-tab-8`
 /// messages (Ctrl/Cmd+1..8); see [`tab_shortcut_script`] and
 /// [`parse_content_shortcut`].
@@ -107,6 +110,9 @@ const OPEN_FIND_BAR_MESSAGE: &str = "velox:open-find-bar";
 /// Ctrl/Cmd+S (Issue #46): save the current page ("名前を付けて保存"). See
 /// `ContentShortcut::SavePage` and docs/decisions.md D76.
 const SAVE_PAGE_MESSAGE: &str = "velox:save-page";
+/// Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
+/// `ContentShortcut::ViewSource` and docs/decisions.md D72.
+const VIEW_SOURCE_MESSAGE: &str = "velox:view-source";
 
 /// A tab-management keyboard shortcut reported by the content webview's
 /// shortcut IPC channel (see [`parse_content_shortcut`]).
@@ -156,6 +162,11 @@ pub enum ContentShortcut {
     /// of `ui::toolbar::ToolbarCommand::NewWindow` — both are handled by the
     /// same shared function in `app.rs`. See docs/decisions.md D68.
     NewWindow,
+    /// Ctrl/Cmd+Shift+N (Issue #27): open a new private window. The
+    /// content-webview half of
+    /// `ui::toolbar::ToolbarCommand::NewPrivateWindow` — both are handled by
+    /// the same shared function in `app.rs`. See docs/decisions.md D74.
+    NewPrivateWindow,
     /// Ctrl/Cmd+F (Issue #43): open the in-page find bar. The
     /// content-webview half of `ui::toolbar::ToolbarCommand::OpenFindBar` —
     /// both are handled by the same shared function in `app.rs`. See
@@ -166,6 +177,11 @@ pub enum ContentShortcut {
     /// both are handled by the same shared function in `app.rs`. See
     /// docs/decisions.md D76.
     SavePage,
+    /// Ctrl/Cmd+U (Issue #45): view the active tab's page source. The
+    /// content-webview half of `ui::toolbar::ToolbarCommand::ViewSource` —
+    /// both are handled by the same shared function in `app.rs`. See
+    /// docs/decisions.md D72.
+    ViewSource,
 }
 
 /// Parse one content-webview shortcut IPC message body. `None` for anything
@@ -185,8 +201,10 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
         TOGGLE_BOOKMARK_MESSAGE => Some(ContentShortcut::ToggleBookmark),
         TOGGLE_BOOKMARK_BAR_MESSAGE => Some(ContentShortcut::ToggleBookmarkBar),
         NEW_WINDOW_MESSAGE => Some(ContentShortcut::NewWindow),
+        NEW_PRIVATE_WINDOW_MESSAGE => Some(ContentShortcut::NewPrivateWindow),
         OPEN_FIND_BAR_MESSAGE => Some(ContentShortcut::OpenFindBar),
         SAVE_PAGE_MESSAGE => Some(ContentShortcut::SavePage),
+        VIEW_SOURCE_MESSAGE => Some(ContentShortcut::ViewSource),
         "velox:activate-tab-1" => Some(ContentShortcut::ActivateTabAt(1)),
         "velox:activate-tab-2" => Some(ContentShortcut::ActivateTabAt(2)),
         "velox:activate-tab-3" => Some(ContentShortcut::ActivateTabAt(3)),
@@ -231,6 +249,8 @@ fn devtools_shortcut_script() -> String {
 /// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/L/D/Shift+B/F/S) while
 /// the content webview has focus, forwarding a fixed sentinel string per
 /// shortcut over
+/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/Shift+N) while the content
+/// webview has focus, forwarding a fixed sentinel string per shortcut over
 /// the same untrusted IPC channel devtools uses (see [`ContentShortcut`] and
 /// docs/decisions.md D18/D23 for why this is a separate injected script
 /// rather than a tao-level accelerator).
@@ -270,6 +290,8 @@ fn tab_shortcut_script() -> String {
         message = "{OPEN_FIND_BAR_MESSAGE}";
       }} else if (event.key === "s" || event.key === "S") {{
         message = "{SAVE_PAGE_MESSAGE}";
+      }} else if (event.key === "u" || event.key === "U") {{
+        message = "{VIEW_SOURCE_MESSAGE}";
       }}
     }} else if (event.shiftKey && !event.altKey) {{
       if (event.key === "t" || event.key === "T") {{
@@ -278,6 +300,8 @@ fn tab_shortcut_script() -> String {
         message = "{PREV_TAB_MESSAGE}";
       }} else if (event.key === "b" || event.key === "B") {{
         message = "{TOGGLE_BOOKMARK_BAR_MESSAGE}";
+      }} else if (event.key === "n" || event.key === "N") {{
+        message = "{NEW_PRIVATE_WINDOW_MESSAGE}";
       }}
     }}
     if (message === null) {{
@@ -710,8 +734,14 @@ pub struct BrowserWindow {
     /// [`new_webview_builder`], which is why it lives on `self` rather than
     /// only inside `new`.
     context: Option<WebContext>,
-    /// Whole-app private browsing (see docs/decisions.md D14). Kept so tabs
-    /// opened after startup are built with the same ephemeral data store.
+    /// This window's own private-browsing flag (Issue #27, see
+    /// docs/decisions.md D74 — originally D14's whole-app-only flag; D74
+    /// moved it onto each window individually once multiple windows with
+    /// different privacy could coexist). Set once, from `new`'s `private`
+    /// parameter, and never changes for this window's lifetime. Kept so
+    /// tabs opened after startup (`open_tab`, and `resume_tab` through it)
+    /// are built with the same ephemeral-or-persistent data store this
+    /// window started with.
     private: bool,
     /// Ad/tracker filter rules (see docs/decisions.md D17). Kept — alongside
     /// `content_blocking_enabled` — so every tab's content webview, however
@@ -779,6 +809,17 @@ impl BrowserWindow {
     /// later — or rebuilt on resume from suspension — is built through the
     /// same [`content_webview_builder`] with the same policies as the first
     /// tab.
+    /// `private` decides *this* window's own privacy (Issue #27, D74) —
+    /// deliberately a separate parameter from `config`, not `config.private`
+    /// read directly: `config` is shared by every window `app::run`/
+    /// `app::open_new_window` builds in one process, but a private window
+    /// (Ctrl/Cmd+Shift+N) can coexist with normal ones, so the two must be
+    /// able to disagree with `config.private`. `app::open_new_window`'s
+    /// regular ("new window", Ctrl/Cmd+N) path still passes `config.private`
+    /// through unchanged, which is exactly what made the very first (D68)
+    /// multi-window implementation's behavior correct already: a process
+    /// launched with `--private` keeps every window it opens private.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         event_loop: &EventLoopWindowTarget<UserEvent>,
         id: WindowId,
@@ -787,6 +828,7 @@ impl BrowserWindow {
         initial_tab: TabId,
         initial_url: &str,
         policies: SitePolicies,
+        private: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let SitePolicies {
             blocklist,
@@ -794,9 +836,10 @@ impl BrowserWindow {
             site_permissions,
         } = policies;
         // A window-title suffix is a second, independent tell for private
-        // mode (docs/decisions.md D14): unlike the toolbar badge it survives
-        // being covered by another window in a taskbar/alt-tab switcher.
-        let window_title = if config.private {
+        // mode (docs/decisions.md D14/D74): unlike the toolbar badge it
+        // survives being covered by another window in a taskbar/alt-tab
+        // switcher.
+        let window_title = if private {
             format!("{} — プライベート", config.window_title)
         } else {
             config.window_title.clone()
@@ -865,7 +908,7 @@ impl BrowserWindow {
         // mode only — see docs/decisions.md D49 and `BrowserWindow::context`'s
         // doc comment for why private mode gets `None` instead of a context
         // that `.with_incognito(true)` would just ignore anyway.
-        let mut context = if config.private {
+        let mut context = if private {
             None
         } else {
             Some(WebContext::new(None))
@@ -879,10 +922,10 @@ impl BrowserWindow {
             // tab's favicon is rendered as a plain `<img>` pointed at a
             // page-controlled URL (see docs/decisions.md D22), so in
             // private mode this webview must be just as ephemeral as every
-            // content webview (docs/decisions.md D14/D15) — otherwise a
+            // content webview (docs/decisions.md D14/D15/D74) — otherwise a
             // favicon fetch could persist cookies/cache private browsing is
             // supposed to leave no trace of.
-            .with_incognito(config.private)
+            .with_incognito(private)
             // `id` (`WindowId`) is baked into every event this window's
             // webviews send (docs/decisions.md D68), including the
             // toolbar's own IPC messages — `app.rs` needs it to know which
@@ -903,16 +946,12 @@ impl BrowserWindow {
         // "accept" handler would otherwise win the `decide-destination`
         // signal and VeloX's handler would never run).
         let download_dir_override = config.download_dir_override.clone();
-        let toolbar_builder =
-            match download_handler_host(config.private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
-                DownloadHandlerHost::SharedContext => with_download_handlers(
-                    toolbar_builder,
-                    id,
-                    &proxy,
-                    download_dir_override.clone(),
-                ),
-                DownloadHandlerHost::EachContentWebview => toolbar_builder,
-            };
+        let toolbar_builder = match download_handler_host(private, DOWNLOAD_HANDLERS_PER_CONTEXT) {
+            DownloadHandlerHost::SharedContext => {
+                with_download_handlers(toolbar_builder, id, &proxy, download_dir_override.clone())
+            }
+            DownloadHandlerHost::EachContentWebview => toolbar_builder,
+        };
         let toolbar = attach(toolbar_builder)?;
 
         let content_blocking_enabled = config.content_blocking_enabled;
@@ -923,7 +962,7 @@ impl BrowserWindow {
             content_rect,
             &proxy,
             WebviewIsolation {
-                private: config.private,
+                private,
                 context: context.as_mut(),
                 // The first content webview: nothing to relate to yet. It
                 // starts process group 0, the first group later tabs can
@@ -989,7 +1028,7 @@ impl BrowserWindow {
             next_process_group: 1,
             max_tabs_per_web_process: config.max_tabs_per_web_process,
             context,
-            private: config.private,
+            private,
             blocklist,
             content_blocking_enabled,
             site_exceptions,
@@ -1485,6 +1524,16 @@ impl BrowserWindow {
             .evaluate_script(&toolbar::set_private_script(private))
     }
 
+    /// This window's own private-browsing flag, fixed at construction (see
+    /// `new`'s `private` parameter and docs/decisions.md D74). `app.rs`'s
+    /// `ToolbarCommand::Ready` handler reads this — rather than
+    /// `Config::private`, which is process-wide and therefore wrong the
+    /// moment a private and a normal window coexist — to push the correct
+    /// initial state to *this* window's own toolbar via `set_private` above.
+    pub fn is_private(&self) -> bool {
+        self.private
+    }
+
     /// Which history/bookmarks panel is currently open, if any.
     pub fn open_panel(&self) -> Option<Panel> {
         self.open_panel.get()
@@ -1964,6 +2013,49 @@ impl BrowserWindow {
         }
     }
 
+    /// Asynchronously read tab `tab_id`'s full page markup
+    /// (`document.documentElement.outerHTML`) and report it back as
+    /// [`UserEvent::ViewSourceReady`] for View Source (Issue #45, see
+    /// docs/decisions.md D72). `page_url` is the page this source belongs
+    /// to, captured by the caller *before* the async round trip — same
+    /// reasoning as [`Self::fetch_favicon`]'s `page_url` parameter: if
+    /// `tab_id` has already navigated elsewhere by the time this resolves,
+    /// the result is attributed to the page it was actually requested for,
+    /// not whatever loaded next (an accepted raciness, same class as every
+    /// other `evaluate_script_with_callback` fetch here — see
+    /// docs/decisions.md D12). All escaping/truncation of the returned
+    /// markup happens afterwards, in pure Rust (`browser::view_source`) —
+    /// this method only ever hands back the page's raw, **unescaped**
+    /// source; nothing here renders it.
+    ///
+    /// A no-op — not an error — for an unknown or currently suspended
+    /// `tab_id` (no webview to read from), the same contract every other
+    /// `fetch_*`/`search_in_page` method above uses.
+    pub fn fetch_page_source(&self, tab_id: TabId, page_url: String) -> wry::Result<()> {
+        let webview = match self
+            .contents
+            .get(&tab_id)
+            .and_then(|tab| tab.webview.as_ref())
+        {
+            Some(webview) => webview,
+            None => return Ok(()),
+        };
+        let proxy = self.proxy.clone();
+        // Issue #29/D68: carry this window's id so the resulting View Source
+        // tab opens in the window the request came from — a `tab_id` alone
+        // cannot say which window, since two windows can share the same
+        // `TabId` value. Same reason `search_in_page` above captures it.
+        let window_id = self.id;
+        webview.evaluate_script_with_callback(VIEW_SOURCE_FETCH_SCRIPT, move |raw| {
+            let html = extract_js_string_result(&raw).unwrap_or_default();
+            let _ = proxy.send_event(UserEvent::ViewSourceReady {
+                window_id,
+                page_url: page_url.clone(),
+                html,
+            });
+        })
+    }
+
     /// This window's own id (Issue #29). Stable for the window's whole
     /// lifetime — see the `id` field's doc comment.
     pub fn id(&self) -> WindowId {
@@ -1980,6 +2072,29 @@ impl BrowserWindow {
         self.window.id()
     }
 }
+
+/// Reads the current page's full markup for View Source (Issue #45, see
+/// docs/decisions.md D72): `document.documentElement.outerHTML`, the same
+/// value a page's own devtools "View Page Source" reproduces. Wrapped in
+/// try/catch like [`RESOLVE_FAVICON_SCRIPT`]: a document in a state this
+/// cannot be read from (should not normally happen) yields an empty string
+/// rather than propagating a JS exception into the
+/// `evaluate_script_with_callback` result.
+///
+/// Deliberately a *live-DOM* snapshot, not a second network fetch of the
+/// original response bytes — see docs/decisions.md D72 for the alternatives
+/// considered (a raw HTTP re-fetch would need a whole separate networking
+/// path wry does not expose, and would show different markup for JS-authored
+/// pages than what is actually on screen) and its accepted trade-off (a page
+/// that mutated its own DOM after load shows the *current* DOM, not the
+/// bytes the server originally sent).
+const VIEW_SOURCE_FETCH_SCRIPT: &str = r#"(() => {
+  try {
+    return document.documentElement.outerHTML;
+  } catch (err) {
+    return "";
+  }
+})();"#;
 
 /// `WebView::evaluate_script_with_callback` hands back the JS result
 /// serialized as a JSON string (see wry's `eval`); unwrap that one layer to
@@ -2184,7 +2299,8 @@ fn find_clear_script() -> String {
 /// alongside it since the two are directly related — see this struct's
 /// field docs).
 struct WebviewIsolation<'a> {
-    /// Whole-app private browsing (see docs/decisions.md D14).
+    /// This window's own private-browsing flag (see docs/decisions.md D14,
+    /// D74).
     private: bool,
     /// The `WebContext` to build this webview against when `private` is
     /// `false` (docs/decisions.md D49). Ignored — not even read — when
@@ -2499,7 +2615,8 @@ enum DownloadHandlerHost {
 ///
 /// `per_context` is [`DOWNLOAD_HANDLERS_PER_CONTEXT`] in production (a
 /// parameter so the decision table below is unit-testable on every
-/// platform); `private` is whole-app private browsing (D14).
+/// platform); `private` is this window's own private-browsing flag (D14,
+/// D74).
 ///
 /// - `per_context && !private` (WebKitGTK, normal mode): the toolbar and
 ///   every tab share one `WebContext` (D49), and wry appends *each*
@@ -3060,8 +3177,10 @@ mod tests {
             TOGGLE_BOOKMARK_MESSAGE,
             TOGGLE_BOOKMARK_BAR_MESSAGE,
             NEW_WINDOW_MESSAGE,
+            NEW_PRIVATE_WINDOW_MESSAGE,
             OPEN_FIND_BAR_MESSAGE,
             SAVE_PAGE_MESSAGE,
+            VIEW_SOURCE_MESSAGE,
         ] {
             assert!(
                 script.contains(message),
@@ -3116,12 +3235,20 @@ mod tests {
             Some(ContentShortcut::NewWindow)
         );
         assert_eq!(
+            parse_content_shortcut(NEW_PRIVATE_WINDOW_MESSAGE),
+            Some(ContentShortcut::NewPrivateWindow)
+        );
+        assert_eq!(
             parse_content_shortcut(OPEN_FIND_BAR_MESSAGE),
             Some(ContentShortcut::OpenFindBar)
         );
         assert_eq!(
             parse_content_shortcut(SAVE_PAGE_MESSAGE),
             Some(ContentShortcut::SavePage)
+        );
+        assert_eq!(
+            parse_content_shortcut(VIEW_SOURCE_MESSAGE),
+            Some(ContentShortcut::ViewSource)
         );
         for n in 1u8..=8 {
             assert_eq!(
@@ -3245,6 +3372,18 @@ mod tests {
     fn favicon_script_falls_back_to_a_same_origin_guess() {
         assert!(RESOLVE_FAVICON_SCRIPT.contains("link[rel~=\"icon\"]"));
         assert!(RESOLVE_FAVICON_SCRIPT.contains("/favicon.ico"));
+    }
+
+    // --- View Source (Issue #45), see docs/decisions.md D72 ---
+
+    #[test]
+    fn view_source_fetch_script_reads_outer_html_and_is_exception_safe() {
+        assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("document.documentElement.outerHTML"));
+        // Wrapped in try/catch, like RESOLVE_FAVICON_SCRIPT, so a page whose
+        // DOM cannot be read from yields "" instead of propagating a JS
+        // exception through `evaluate_script_with_callback`.
+        assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("try {"));
+        assert!(VIEW_SOURCE_FETCH_SCRIPT.contains("catch"));
     }
 
     /// The embedded logo must stay decodable into the 8-bit RGBA layout the
