@@ -5919,4 +5919,214 @@ WebKitGTK 実装が完了を待たない非同期発火型であることの影�
 macOS の実機検証 (`clear_all_browsing_data` が実際にファイルを消すこと)
 は今回の環境では不可能だった。
 
+## D69: ページ内検索 (#43) — 3 エンジンとも自前 JS 実装、ネイティブ find API は Windows を優先する限り使えないと判明
+
+**対象**: Issue #43。Ctrl/Cmd+F・検索 UI・次/前へ移動・件数表示・Esc 終了・
+大文字小文字の扱い。依存関係として挙げられている Issue #38 (キーボード
+ショートカット管理) はまだ着手されていないため、今回は既存の D18/D23 と
+同じ「固定の Ctrl/Cmd+F 割り当て」で最小実装し、後から #38 の仕組みに
+載せ替えやすい形にした (後述)。
+
+### 調査: wry 0.56 経由でネイティブ find API に届くか
+
+Issue の指示どおり、自前 JS 実装に踏み切る前に 3 エンジンそれぞれで
+ネイティブの「ページ内検索」API に wry 経由で安全に届くかを実際のソース
+(`~/.cargo/registry/src/.../wry-0.56.1`,
+`webview2-com-sys-0.38.2`, `webkit2gtk-2.0.2`) で確認した — D25/D59/D66 で
+確立した「issue の指示に頼らず実ソースを読む」調査スタイルをそのまま踏襲。
+
+- **WebKitGTK (Linux) — 安全なネイティブ API が実在した。**
+  `webkit2gtk::WebView::find_controller() -> Option<FindController>`
+  (`webkit2gtk-2.0.2/src/auto/web_view.rs` 1019 行目) から
+  `FindControllerExt::{search, search_next, search_previous,
+  count_matches}` と `counted-matches`/`failed-to-find-text` シグナル
+  (`webkit2gtk-2.0.2/src/auto/find_controller.rs`) に届く。到達経路は
+  D66 と全く同じ `wry::WebViewExtUnix::webview()`
+  (`wry-0.56.1/src/lib.rs` 2427/2444 行目) → `webkit2gtk::WebView`。
+  呼び出し側に `unsafe` は要求されない (webkit2gtk クレートが内部で
+  `unsafe extern "C"` 呼び出しをラップ済み — D66 の
+  `clear_all_browsing_data`/`website_data_manager` と同じ形)。**しかし
+  Linux は CLAUDE.md の OS 優先度で最も低い** — ここだけネイティブ実装を
+  作っても Windows/macOS には使えず、後述のとおり Windows 側は全く別の
+  実装 (JS) が必要になるため、1 機能に 2 系統の実装を抱える非対称さが
+  生まれる。
+- **WebView2 (Windows) — API 自体は存在するが、実運用には使えないと判断した。**
+  `webview2-com-sys-0.38.2/src/bindings.rs` に
+  `ICoreWebView2Find`/`ICoreWebView2FindOptions`/
+  `ICoreWebView2FindStartCompletedHandler` 一式が確認できた
+  (`ICoreWebView2_28::Find() -> ICoreWebView2Find`、42531 行目)。しかし
+  これは D59/D66 がこれまで使ってきた `ICoreWebView2_13` (Profile 系) より
+  はるかに新しいインターフェース番号であり、対応する WebView2 Runtime も
+  相応に新しいバージョンを要求する — Evergreen ランタイムは自動更新
+  される前提とはいえ、企業配布端末やオフライン環境では更新が遅れることが
+  珍しくなく、`.cast::<ICoreWebView2_28>()` が失敗しうる実機を否定できない。
+  加えて `Start`/`FindNext`/`FindPrevious`/`Stop` はいずれもコールバック
+  ベースの COM API で、`ICoreWebView2FindStartCompletedHandler`
+  相当のハンドラ実装 (D66 の `ClearBrowsingDataCompletedHandler` より
+  複雑 — マッチ数変化・アクティブマッチ変化の 2 種類のイベント購読も
+  追加で必要) を新たに書く必要があり、**この環境には実機の Windows が無く
+  検証もできない**。「Windows 最優先」という方針は「Windows で動く実装を
+  最初に作る」ことを求めているのであって、「検証できない可能性のある
+  最新 API に賭けて Windows 版だけ作る」ことではないと判断し、見送った。
+- **WKWebView (macOS) — wry のデスクトップ実装に find 相当の公開 API は無い。**
+  `wry-0.56.1/src/wkwebview/mod.rs` (macOS/デスクトップ本体) には
+  find/search 系のメソッドが一切無い。`findString(_:withConfiguration:
+  completionHandler:)` 相当のバインディングは
+  `wry-0.56.1/src/wkwebview/ios/WKWebView.rs` に存在するが、これは **iOS
+  専用ファイル**であり、しかも該当メソッドを囲うフィーチャフラグ
+  (`WKFindConfiguration`/`WKFindResult`) がコメントアウトされたまま
+  ビルドされていない。デスクトップ版 wry から呼べる経路は存在しない。
+
+**結論**: 3 エンジンのうち安全に実装できるのは WebKitGTK (最低優先度) だけ、
+Windows (最優先) は理論上の経路はあるが実機検証不能な最新 API のみ、
+macOS はそもそも経路が無い。「Windows を優先し、そこで動く方式を先に選ぶ」
+という CLAUDE.md の方針に従い、**3 エンジンとも同じ JS ベースの自前実装に
+統一した** — 1 つの実装を 3 OS 共通でテストでき、Windows 版から着手しても
+崩れない。WebKitGTK のネイティブ `FindController` は将来 Linux 向けの
+個別最適化を検討する際の実装ポイントとして下記の Revisit condition に残す。
+
+### 実装: JS インジェクション + Rust 側の純粋な位置管理
+
+- **`browser::find::FindState`** (`src/browser/find.rs`, 新規) が
+  UI/エンジン非依存の純粋ロジックを持つ: クエリ正規化
+  (`normalize_query` — trim して空なら `None`)、現在の検索クエリ・
+  大文字小文字区別フラグ、DOM から報告されたヒット総数、アクティブな
+  マッチの 0-based インデックス、`next_match`/`previous_match` の巡回
+  ロジック (0 件は常に `None`、1 件なら自分自身に留まる、末尾から先頭・
+  先頭から末尾へラップする)。`docs/architecture.md` の 4 層分離のとおり
+  ここは webview を一切知らず、単体テストの主対象 (`src/browser/find.rs`
+  のテストモジュール、17 ケース)。
+- **`ui::window::BrowserWindow`** が実際の DOM 操作を担う 3 つのメソッド:
+  - `search_in_page(tab_id, query, case_sensitive)` — 生成した JS
+    (`find_search_script`) を `evaluate_script_with_callback` でその
+    タブの content webview に流し、`document.body` 配下のテキストノードを
+    `TreeWalker` で走査して一致箇所を `<span class="velox-find-hl">` で
+    包み、件数を `JSON.stringify({ total: N })` として返す。件数は
+    `UserEvent::FindMatchesUpdated { tab_id, total }` で非同期に返る
+    (`fetch_page_title`/`fetch_favicon` と同じ fire-and-forget パターン、
+    D12)。
+  - `highlight_find_match(tab_id, index)` — 直前のアクティブマッチの
+    ハイライトを外し、指定インデックスのマッチに `velox-find-hl-active`
+    クラスを付けて `scrollIntoView({block:"center"})` する。
+  - `clear_find_highlights(tab_id)` — 挿入した `<span>` をすべて元の
+    テキストノードに戻す (`replaceChild` + `normalize()`)。
+  三つとも「未知/休止中タブは黙って no-op」という `fetch_page_title` と
+  同じ契約。
+- **クエリのエスケープ (Issue の指示どおり必須)**: `find_query_literal`
+  が `serde_json::Value::String(query).to_string()` で JSON 文字列化した
+  うえで、`ui::toolbar::escape_js_line_terminators` (D62 で追加済みの
+  U+2028/U+2029 対策) を **そのまま再利用** して `evaluate_script` に渡す
+  — 独自の再実装はしていない。マッチングは常に「リテラル部分文字列」
+  であり、クエリを正規表現として解釈することは絶対にない:
+  `query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")` (MDN 推奨のエスケープ
+  スニペット) でメタ文字を全てエスケープしてから `new RegExp` に渡す。
+  `find_search_script`/`find_query_literal` には、`"`/`\`/U+2028/U+2029/
+  正規表現メタ文字を含むクエリで壊れないことを確認する単体テスト
+  (`find_search_script_neutralizes_quotes_and_script_closing_sequences`,
+  `find_search_script_neutralizes_regex_metacharacters_in_the_query` 等)
+  を追加した — D62 が `set_url_script` 等に対して敷いた「インジェクション
+  耐性をテストで固定化する」流儀をそのままなぞっている。
+- **検索 UI はブックマークバー方式 — `Panel` ではなく独立した加算コンポーネント**。
+  History/Bookmarks/Downloads/Omnibox の `Panel` は `config.panel_height`
+  (既定 320px) 分だけ伸びる大きなドロップダウンで、1 行の検索バーには
+  過大。D35 のブックマークバーが確立した「`toolbar_height` に独立して
+  加算される固定高さの帯」という形をそのまま複製し、`find_bar_height`
+  (既定 34px) と `find_bar_visible: Cell<bool>` を `BrowserWindow` に追加、
+  `effective_toolbar_height` にも第 4 の加算項として組み込んだ (D35 の
+  ときと同じく「パネルやブックマークバーと同時に出ていても構わない」)。
+- **UI ↔ Rust の往復**: `ToolbarCommand` に `OpenFindBar`/`FindQuery{query,
+  case_sensitive}`/`FindNext`/`FindPrevious`/`FindClose` を追加。検索語の
+  入力は 120ms のクライアント側デバウンス (`toolbar.html`) の後に
+  `find_query` を送る (Enter/Shift+Enter を押した瞬間はデバウンスを
+  flush してから `find_next`/`find_previous` を送るので、直前のキー入力
+  が反映されないまま巡回することはない)。DOM 検索が返す件数は
+  `veloxSetFindStatus(total, active)` でトールバーに戻り、`アクティブ+1
+  /総数` の "N/M" 表示になる。
+- **セッションは 1 個・アクティブタブに紐付く (MVP の意図的な単純化)**。
+  `AppState::find: Option<find::FindState>` は同時に 1 タブ分しか持たない
+  — Ctrl/Cmd+F を押した瞬間のアクティブタブに固定され、別タブに切り替える
+  (`activate_and_refresh` 経由のすべてのタブ切替) か、そのタブ自身が
+  ナビゲーションを開始する (`NavigationStarted`/`LoadStarted`) と
+  `close_find_bar` が呼ばれてハイライトを消し検索バーを閉じる —
+  ページが変われば一致位置も無効になるため。バックグラウンドタブごとの
+  独立した検索セッションは持たない (Chrome 等はタブごとに保持するが、
+  今回はスコープ外とし、`FindState` 自体はいつか `HashMap<TabId,
+  FindState>` に載せ替えられる形のまま残している)。
+
+### Ctrl/Cmd+F の割り当てと Issue #38 への申し送り
+
+D18/D23 と全く同じ二重配送 (content webview は固定センチネル文字列
+`"velox:open-find-bar"` → `ContentShortcut::OpenFindBar`、trusted な
+toolbar webview は構造化コマンド `{"cmd":"open_find_bar"}` を直接送信) を
+再利用した。Issue #38 (キーボードショートカット管理) が今後この 2 経路
+すべてに乗ってくる設計になる予定のため、今回は次の点を意識して実装した:
+
+- センチネル文字列・`ContentShortcut::OpenFindBar` 列挙子・
+  `ToolbarCommand::OpenFindBar` はどれも他のショートカット
+  (`ToggleBookmark`, `FocusAddressBar` 等) と全く同じ形で追加しており、
+  キーの割り当てを変える設定層を後から差し込む際、割り込む場所は
+  1 か所 (JS 側でどのキーを監視するか) だけで済む。
+- `app::open_find_bar`/`close_find_bar`/`update_find_query`/`step_find`
+  はショートカットの発火経路 (トールバー/コンテンツ/将来の設定 UI) を
+  一切知らない、純粋な「find バーを開く/閉じる/更新する」関数として
+  切り出してある — #38 が新しいキーバインド管理層を追加しても、
+  呼び出し先はこれらの関数のままで変わらない。
+
+### 既知の制限 (意図的に見送ったもの)
+
+- **一致はテキストノード単位**: `<b>` 等のインライン要素をまたいで
+  分割されたテキストは 1 つの一致として検出できない (ナイーブな
+  テキストノード走査の一般的な制約)。ネイティブブラウザの find は
+  DOM 全体をフラット化して検索するため、この制約を持たない。
+- **非表示要素の除外なし**: `display:none` 等で隠れたテキストも
+  `SCRIPT`/`STYLE`/`NOSCRIPT`/`TEXTAREA`/`INPUT` 以外は検索対象になる
+  (ネイティブブラウザは可視テキストのみを対象にすることが多い)。
+  可視性判定はコストが高いため、スクリプトを単純に保つことを優先した。
+- **正規表現/単語単位検索は無し** — Issue の「大文字小文字/一致方式の
+  検討」に対する結論として、大文字小文字の切替のみを実装し、リテラル
+  部分文字列一致に固定した (前述のとおりセキュリティ上の理由もある)。
+- **Esc は検索入力にフォーカスがあるときのみ閉じる**。ページ本体に
+  フォーカスがある状態からの Esc では閉じない — content webview 側で
+  常時 Escape を捕捉すると、ページ自身が Esc を使う機能 (モーダルを
+  閉じる等) を壊しかねないため、今回は見送った。
+- **検索セッションはタブ 1 つに固定** (前述)。
+
+### テスト
+
+- `src/browser/find.rs`: `FindState`/`normalize_query` の単体テスト
+  12 件 (正規化、巡回、0/1/複数件、リセット挙動)。
+- `src/ui/toolbar.rs`: 新しい `ToolbarCommand` 5 種の IPC パーステスト、
+  `set_find_bar_visible_script`/`set_find_status_script` のテスト。
+- `src/ui/window.rs`: `effective_toolbar_height` の find bar 加算分の
+  テスト、`ContentShortcut::OpenFindBar` のセンチネル解析テスト、
+  `find_search_script`/`find_activate_script`/`find_clear_script`/
+  `find_query_literal` のインジェクション耐性テスト。
+- 単体テスト件数: 700 → 724 (+24、`cargo test --lib -- --list` で計測)。
+  減少なし。
+- 統合テスト (`tests/integration.rs`) は今回変更していない (8 件のまま、
+  全て pass) — find 機能は既存の統合テストが検証する「実プロセス起動・
+  実タブ管理・実ファイル永続化」のいずれとも直接関係しないため、新規の
+  統合テストは追加していない。
+- `cargo check --target x86_64-pc-windows-msvc --all-targets` で型
+  レベルの整合は確認したが、実機の Windows/WebView2 での動作確認は
+  できていない (この環境に Windows 実機が無いため) — 特に Ctrl+F が
+  WebView2 自身のネイティブ既定アクセラレータ (Chromium ベースのため
+  存在しうる) と衝突しないかは未検証。F12 (D18) も同種の既定
+  アクセラレータだが `event.preventDefault()` だけで問題なく上書き
+  できている実績があるため恐らく同様に機能すると考えているが、万一
+  WebView2 自身の find UI が併せて出てしまう場合は
+  `ICoreWebView2Settings3::AreBrowserAcceleratorKeysEnabled(false)`
+  (D59/D66 と同じ `WebViewExtWindows::webview()` 経由) で無効化する
+  のが次の一手になる。
+
+**Revisit condition**: (1) Linux 向けにネイティブ `WebKitFindController`
+を使う個別実装 (前述の到達経路がそのまま使える) — ただし優先度は低い。
+(2) WebView2 の `ICoreWebView2Find` (`ICoreWebView2_28`) — 対象ランタイムの
+普及が進み、実機検証できる環境が揃った段階で再検討。(3) テキストノード
+境界をまたぐ一致・非表示要素の除外・正規表現/単語単位検索 — 前述の
+「既知の制限」。(4) タブごとに独立した検索セッションを保持する
+(現在はアクティブタブの 1 セッションのみ)。(5) Ctrl/Cmd+F の割り当てを
+Issue #38 のキーバインド管理層に載せ替える。(6) content webview に
+フォーカスがある状態からの Esc 対応。
+
 

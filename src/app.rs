@@ -20,7 +20,7 @@ use crate::browser::navigation::Intent;
 use crate::browser::perf_log::PerfLog;
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
-    input_history, metrics, navigation, omnibox, persistence, site_data, ActivationEffect,
+    find, input_history, metrics, navigation, omnibox, persistence, site_data, ActivationEffect,
     BookmarkStore, ClearOutcome, DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList,
     HistoryBookmarkSource, HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore,
     SessionSnapshot, SiteExceptions, TabId, Tabs,
@@ -142,6 +142,13 @@ pub enum UserEvent {
     /// `AppState::pending_memory_sample` and consumed by exactly one
     /// `sweep_tabs` pass, so the memory signal acts once per sample.
     MemorySampled(MemorySample),
+    /// The in-page find bar's DOM search finished in tab `tab_id`'s content
+    /// webview (Issue #43, see `ui::window::BrowserWindow::search_in_page`
+    /// and docs/decisions.md D69), reporting `total` matches. A `tab_id`
+    /// that no longer matches `AppState::find`'s session (the find bar
+    /// closed, or moved to a different tab, while the DOM search was still
+    /// running) is a safe no-op — a stale result simply never applies.
+    FindMatchesUpdated { tab_id: TabId, total: usize },
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -184,6 +191,13 @@ struct AppState {
     /// every loop pass would keep suspending tabs before the previous
     /// sweep's effect is even visible in the numbers.
     pending_memory_sample: Option<MemorySample>,
+    /// The in-page find bar's session (Issue #43, Ctrl/Cmd+F), if it is
+    /// currently open. `None` whenever the bar is closed. See
+    /// docs/decisions.md D69: only one session exists at a time, tied to
+    /// whichever tab was active when it opened — `close_find_bar` is called
+    /// whenever that tab switches away or navigates (see `activate_and_refresh`
+    /// and the `NavigationStarted`/`LoadStarted` handler below).
+    find: Option<find::FindState>,
 }
 
 /// What tab-latency logging needs: where to write records, and the epoch
@@ -346,6 +360,7 @@ pub fn run(config: Config, process_start: Instant) -> Result<(), Box<dyn Error>>
             .map(|log| PerfContext { process_start, log }),
         downloads: DownloadStore::new(),
         pending_memory_sample: None,
+        find: None,
     };
 
     // Everything above (history/bookmarks/input-history load, `AppState`
@@ -561,7 +576,11 @@ fn record_perf_event(
         // Suspensions the sample leads to are logged by `sweep_tabs`
         // (`record_tab_suspend`); the sample itself is not a perf event
         // (the perf RSS sampler already logs `rss` on its own schedule).
-        | UserEvent::MemorySampled(_) => {}
+        | UserEvent::MemorySampled(_)
+        // Issue #43's in-page find is not a perf-tracked operation (no
+        // `docs/performance-targets.md` budget calls for it) — nothing to
+        // log here.
+        | UserEvent::FindMatchesUpdated { .. } => {}
     }
 }
 
@@ -776,6 +795,13 @@ fn handle_user_event(
             if let Some(tab) = state.tabs.get_mut(id) {
                 tab.on_navigation_started(&url);
             }
+            // Issue #43/D69: the page under an open find session is about to
+            // change, so its matches/highlights are about to become stale —
+            // close it rather than keep showing a count (or an active-match
+            // highlight) for content that no longer exists.
+            if state.find.as_ref().is_some_and(|f| f.tab_id() == id) {
+                close_find_bar(window, state);
+            }
             if id == state.tabs.active_id() {
                 log_failure("update address bar", window.set_url_display(&url));
                 log_failure("show loading state", window.set_loading(true));
@@ -944,6 +970,22 @@ fn handle_user_event(
             // runs after every event), not here: the sweep is the one
             // place that combines all three signals.
             state.pending_memory_sample = Some(sample);
+        }
+        UserEvent::FindMatchesUpdated { tab_id, total } => {
+            // A session for a *different* tab (the find bar moved on, or
+            // closed, while this DOM search was still running) means this
+            // result is stale — see this variant's doc comment.
+            if let Some(session) = state.find.as_mut().filter(|s| s.tab_id() == tab_id) {
+                session.set_total(total);
+                let active = session.active();
+                log_failure("update find status", window.set_find_status(total, active));
+                if let Some(index) = active {
+                    log_failure(
+                        "highlight find match",
+                        window.highlight_find_match(tab_id, index),
+                    );
+                }
+            }
         }
     }
 }
@@ -1248,6 +1290,16 @@ fn handle_toolbar_command(
             }
         }
         ToolbarCommand::ToggleBookmarkBar => toggle_bookmark_bar(window),
+
+        // --- In-page find (Issue #43), see docs/decisions.md D69 ---
+        ToolbarCommand::OpenFindBar => open_find_bar(window, state),
+        ToolbarCommand::FindQuery {
+            query,
+            case_sensitive,
+        } => update_find_query(window, state, query, case_sensitive),
+        ToolbarCommand::FindNext => step_find(window, state, FindDirection::Next),
+        ToolbarCommand::FindPrevious => step_find(window, state, FindDirection::Previous),
+        ToolbarCommand::FindClose => close_find_bar(window, state),
     }
 }
 
@@ -1271,6 +1323,114 @@ fn toggle_current_bookmark(window: &mut BrowserWindow, state: &mut AppState) {
 fn toggle_bookmark_bar(window: &mut BrowserWindow) {
     let next = !window.bookmark_bar_visible();
     log_failure("toggle bookmark bar", window.set_bookmark_bar_visible(next));
+}
+
+// --- In-page find (Issue #43, Ctrl/Cmd+F), see docs/decisions.md D69 ---
+//
+// `ToolbarCommand::OpenFindBar`/`ContentShortcut::OpenFindBar` (D18/D23's
+// usual dual-channel shortcut delivery — Ctrl/Cmd+F assigned directly here
+// for now rather than through a keybinding-config layer, since Issue #38
+// (keyboard shortcut management) has not landed yet; see this issue's PR for
+// what makes this easy to move under #38 later) both call `open_find_bar`.
+// `FindQuery`/`FindNext`/`FindPrevious`/`FindClose` call the other three
+// helpers below; `UserEvent::FindMatchesUpdated` (the DOM search's async
+// result) is handled directly in `handle_user_event`.
+
+/// Open the find bar for the active tab: starts a fresh
+/// `browser::find::FindState` session (discarding any previous one — e.g.
+/// re-pressing Ctrl/Cmd+F while already open just resets to an empty query,
+/// matching mainstream browsers), shows the bar, and resets the "N/M"
+/// counter to blank. The bar's own JS focuses/selects its input as soon as
+/// it becomes visible (`veloxSetFindBarVisible`), so nothing else to do here.
+fn open_find_bar(window: &mut BrowserWindow, state: &mut AppState) {
+    let tab_id = state.tabs.active_id();
+    state.find = Some(find::FindState::new(tab_id));
+    log_failure("show find bar", window.set_find_bar_visible(true));
+    log_failure("reset find status", window.set_find_status(0, None));
+}
+
+/// Close the find bar: clears any DOM highlight left in the session's tab
+/// (a no-op if that tab has since closed — `clear_find_highlights` already
+/// handles an unknown id), drops the session, and hides the bar. A no-op if
+/// the find bar was not open.
+fn close_find_bar(window: &mut BrowserWindow, state: &mut AppState) {
+    let Some(session) = state.find.take() else {
+        return;
+    };
+    log_failure(
+        "clear find highlights",
+        window.clear_find_highlights(session.tab_id()),
+    );
+    log_failure("hide find bar", window.set_find_bar_visible(false));
+}
+
+/// The find bar's input changed, or its case-sensitivity toggle flipped
+/// (`ToolbarCommand::FindQuery`). A no-op if the find bar is not open (the
+/// bar's own JS should never send this then, but a stray/racy message must
+/// not panic). An empty/whitespace-only `query`
+/// (`browser::find::normalize_query` returns `None`) clears any existing
+/// highlight instead of asking the DOM to search for nothing.
+fn update_find_query(
+    window: &mut BrowserWindow,
+    state: &mut AppState,
+    query: String,
+    case_sensitive: bool,
+) {
+    let Some(session) = state.find.as_mut() else {
+        return;
+    };
+    let tab_id = session.tab_id();
+    match find::normalize_query(&query) {
+        Some(normalized) => {
+            session.set_query(normalized.clone(), case_sensitive);
+            log_failure("reset find status", window.set_find_status(0, None));
+            log_failure(
+                "search in page",
+                window.search_in_page(tab_id, &normalized, case_sensitive),
+            );
+        }
+        None => {
+            session.set_query(String::new(), case_sensitive);
+            log_failure(
+                "clear find highlights",
+                window.clear_find_highlights(tab_id),
+            );
+            log_failure("reset find status", window.set_find_status(0, None));
+        }
+    }
+}
+
+/// Which direction `step_find` moves — kept as a tiny enum rather than a
+/// `bool` so the two `ToolbarCommand` call sites below read as `Next`/
+/// `Previous`, not `true`/`false`.
+enum FindDirection {
+    Next,
+    Previous,
+}
+
+/// "▼"/"▲" in the find bar, or Enter/Shift+Enter in its input
+/// (`ToolbarCommand::FindNext`/`FindPrevious`). A no-op if the find bar is
+/// not open or its query is empty (nothing searched for yet).
+fn step_find(window: &mut BrowserWindow, state: &mut AppState, direction: FindDirection) {
+    let Some(session) = state.find.as_mut() else {
+        return;
+    };
+    if session.query().is_empty() {
+        return;
+    }
+    let tab_id = session.tab_id();
+    let active = match direction {
+        FindDirection::Next => session.next_match(),
+        FindDirection::Previous => session.previous_match(),
+    };
+    let total = session.total();
+    log_failure("update find status", window.set_find_status(total, active));
+    if let Some(index) = active {
+        log_failure(
+            "highlight find match",
+            window.highlight_find_match(tab_id, index),
+        );
+    }
 }
 
 /// Resolve an already-classified [`Intent`] to a loadable URL: a URL intent
@@ -1462,6 +1622,7 @@ fn handle_content_shortcut(
         ContentShortcut::FocusAddressBar => focus_address_bar(window, state),
         ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, state),
         ContentShortcut::ToggleBookmarkBar => toggle_bookmark_bar(window),
+        ContentShortcut::OpenFindBar => open_find_bar(window, state),
     }
 }
 
@@ -1587,6 +1748,13 @@ fn activate_and_refresh(
     id: TabId,
     effect: ActivationEffect,
 ) {
+    // Issue #43/D69: the find bar is tied to whichever tab was active when
+    // it opened (see `browser::find::FindState`'s doc comment) — any tab
+    // switch invalidates that, so close it rather than let it keep showing
+    // stale highlights/counts for a tab that is no longer on screen.
+    if state.find.is_some() {
+        close_find_bar(window, state);
+    }
     let result = match effect {
         ActivationEffect::Resume => window.resume_tab(
             id,
@@ -2012,6 +2180,7 @@ mod tests {
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
+            find: None,
         }
     }
 
