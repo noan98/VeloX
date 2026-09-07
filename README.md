@@ -2,14 +2,16 @@
 
 A fast, lightweight web browser built with Rust.
 
-VeloX is an early-stage OSS desktop browser. The current goal is a minimal
-but genuinely working foundation — a browser that starts, renders real web
-pages and navigates — structured so that speed and features can be built on
-top of it, not bolted on.
+VeloX is an OSS desktop browser. It started as a minimal but genuinely
+working foundation — a browser that starts, renders real web pages and
+navigates — and now covers the everyday browsing surface, structured so that
+speed can be built on top of it rather than bolted on.
 
 ## Features
 
-- [x] Basic browser window (toolbar + content area)
+### Browsing
+
+- [x] Browser window (toolbar + content area), multiple windows (`Ctrl`/`Cmd`+`N`)
 - [x] URL navigation (typed input, `example.com` is auto-completed to `https://example.com`)
 - [x] Back / Forward / Reload
 - [x] Tabs (create, switch, close, suspend & resume)
@@ -17,14 +19,45 @@ top of it, not bolted on.
 - [x] History UI (search, delete)
 - [x] Bookmarks (bookmark bar, folders, inline editing)
 - [x] Downloads (list, open the download folder)
-- [x] Ad & tracker blocking — top-level navigation only; subresource
-      blocking is not possible with the current engine API
-      (see docs/decisions.md D17)
-- [x] Private browsing — whole-app, via `--private` / `VELOX_PRIVATE`;
-      a separate private *window* needs multi-window support first
-- [x] Tab suspension driven by idle time, tab count and a memory budget
-- [x] Performance instrumentation and a benchmark suite (`velox-bench`)
+- [x] Session restore — reopens the previous window's tabs on launch
+      (crash *detection* is not possible: wry 0.56 exposes no such hook,
+      see docs/decisions.md D65)
+- [x] Find in page, view source, save page, print / save as PDF
+- [x] Context menu (back/forward/reload, copy/paste, search selection,
+      open link in new tab or window)
+- [x] Settings screen, dark mode, keyboard shortcut listing
 - [x] DevTools (F12)
+
+### Privacy & security
+
+- [x] Private windows — opened as separate windows, each with its own
+      isolated storage (`--private` / `VELOX_PRIVATE` still open the whole
+      app in private mode)
+- [x] Ad & tracker blocking for top-level navigation (all platforms). The
+      parser understands EasyList / EasyPrivacy rule syntax, but no list data
+      is bundled or downloaded — VeloX ships only a small built-in list
+      (docs/decisions.md D64)
+- [x] **Subresource** ad/tracker blocking — **Windows (WebView2) only**.
+      wry 0.56 exposes no request-interception hook for WebKitGTK or
+      WKWebView, so macOS/Linux stay at top-level blocking
+      (docs/decisions.md D17 / D59)
+- [x] Site permissions (origin-scoped store with safe-by-default answers)
+- [x] Cookie & site data clearing (whole-profile; per-origin clearing is
+      asymmetric across the three engines and was deliberately skipped —
+      docs/decisions.md D66)
+
+### Performance
+
+- [x] Tab suspension driven by idle time, tab count and a memory budget
+      (off by default)
+- [x] Performance instrumentation and a benchmark suite (`velox-bench`),
+      including IPC volume/latency accounting
+- [x] Performance regression gate in CI, and a dashboard that tracks results
+      over time (`scripts/dashboard/`)
+
+Per-platform gaps are recorded in [docs/decisions.md](docs/decisions.md)
+rather than left implicit — Windows is the priority platform, and macOS /
+Linux are kept at "builds, doesn't break existing features" for now.
 
 ## Development
 
@@ -34,9 +67,24 @@ VeloX is plain `cargo` — no extra build system.
 |---|---|
 | `cargo build` | build |
 | `cargo run` | build & launch the browser |
-| `cargo test` | run unit tests (URL handling, tab state, IPC protocol) |
+| `cargo test` | run unit tests (URL handling, tab state, IPC protocol) plus the integration tests, which launch the real binary |
 | `cargo clippy --all-targets -- -D warnings` | lint |
 | `cargo fmt --check` | formatting |
+
+The integration tests spawn the real `velox` binary, so they need a display
+(and, on Linux, a D-Bus session bus — WebKitGTK's web process will not start
+without one). Without those they print why and self-skip, which keeps
+`cargo test` green on a headless developer machine. To actually run them
+the way CI does:
+
+```sh
+xvfb-run -a --server-args="-screen 0 1280x900x24" \
+  dbus-run-session -- cargo test
+```
+
+See docs/decisions.md D46 / D47 for why the skip is a runtime check rather
+than `#[ignore]`, and how CI is made to fail loudly if that setup ever breaks
+instead of silently skipping.
 
 ## Build
 
@@ -151,8 +199,11 @@ Web engine (wry → WebKitGTK / WKWebView / WebView2)
 
 - `src/ui/` — window, layout, toolbar (the toolbar is a small HTML page in a
   dedicated webview, isolated from page content)
-- `src/browser/` — engine-independent logic: URL normalization, tab state,
-  history, bookmarks, downloads, block list, suspension policy, metrics
+- `src/browser/` — engine-independent logic and the main target of the unit
+  tests: URL normalization, tab and window state, history, bookmarks,
+  downloads, block lists, site permissions and site data, session
+  persistence, settings, shortcuts, context menus, find, print, save page,
+  view source, suspension policy, metrics and benchmarking
 - `src/app.rs` — event loop wiring
 - `src/config/` — startup configuration
 - `assets/logo/` — the VeloX logo; `assets/icon/` — the app icon derived
@@ -161,28 +212,66 @@ Web engine (wry → WebKitGTK / WKWebView / WebView2)
 
 See [docs/architecture.md](docs/architecture.md) for the full design and
 [docs/decisions.md](docs/decisions.md) for why wry was chosen over embedding
-Servo directly.
+Servo directly — and for every subsequent design decision, including the
+per-platform gaps deliberately left open.
+
+Performance work has its own documentation:
+
+| Document | Contents |
+|---|---|
+| [docs/performance-targets.md](docs/performance-targets.md) | measurement environment, targets T1–T4, and every result measured so far |
+| [docs/benchmarking.md](docs/benchmarking.md) | how to run `velox-bench`, and the pitfalls that invalidate a measurement |
+| [docs/profiling.md](docs/profiling.md) | perf / heaptrack workflows |
+| [docs/memory-analysis.md](docs/memory-analysis.md) | where the memory actually goes |
+| [docs/performance-dashboard.md](docs/performance-dashboard.md) | tracking results over time |
 
 ## Roadmap
 
-The first roadmap is done (it is the Features list above). What is
-being worked on next:
+The first two roadmaps are largely done (they are the Features list above).
 
-**Performance** (Phase 3)
+### Performance (Phase 3)
 
-- Startup, tab creation/switching and page load optimization
-- Memory footprint reduction and leak/lifetime auditing
-- Background tab CPU and network throttling
-- IPC / serialization overhead reduction
-- Competitive benchmarks against Chrome / Firefox, and regression detection in CI
+Phase 3 is about *proving* what VeloX is fast at, not just asserting it, so
+several of its items ended in a measured conclusion rather than a code
+change. All numbers below were measured on **Linux (WebKitGTK)** — Windows
+(WebView2) figures do not exist yet.
 
-**Browser features** (Phase 2, still open)
+Measured and settled:
 
-- Subresource ad/tracker blocking, EasyList / EasyPrivacy list updates
-- Site permissions UI, cookie & storage management
-- Multiple windows, private windows, session restore and crash recovery
-- Settings UI, dark mode, keyboard shortcut management, context menus
-- Find in page, view source, save page, print / save as PDF
+- **Tab switching** — 0.40ms with 20 tabs, two orders of magnitude under the
+  100ms target. The cost of tab work is dominated by spawning a web process,
+  not by tab count (docs/decisions.md D57)
+- **Startup** — the bottleneck is tao/GTK init and WebKitGTK webview
+  creation; VeloX's own work is ~0.1ms, so there is nothing here for VeloX
+  to shorten (D43)
+- **Background tab CPU** — already suppressed ~99.4% by the engine; no
+  VeloX-side throttling was added (D58)
+- **Background tab network** — measured: ordinary polling intervals are *not*
+  throttled when a tab is backgrounded (only sub-second timers are). Full
+  suppression only comes from tab suspension (D80)
+- **IPC** — measurement added, and one real find fixed: the history panel was
+  re-sent on every page event even while closed (-98.5%). The tab strip's
+  full re-send was left alone at a measured worst case of 3.5ms (D81)
+- **Memory** — the leak audit found and fixed an unbounded map, and long-run
+  growth under repeated tab churn is bounded (D79). Footprint at 20 tabs is
+  **+245% versus Chromium with the default settings**, dropping to **+20%
+  once tab suspension is enabled** — still short of the +10% target either
+  way. Suspension being off by default is exactly why that gap is still open
+  (D48 / D56)
+
+Still open:
+
+- Browser state / event dispatch, serialization / allocation, and page load
+  optimization
+- Whether tab suspension should be **on** by default (it cuts 20-tab memory
+  by 65%, but is off today)
+- Windows performance measurement — no runner is set up for it yet
+
+### Remaining browser features (Phase 2)
+
+- Download progress and mid-transfer cancellation
+- Session restore across *multiple* windows
+- Reassigning keyboard shortcuts from the settings screen
 - Packaging, code signing and notarization for macOS / Windows
 
 Progress is tracked in the Phase 2 (#53) and Phase 3 (#57) epics.
