@@ -71,12 +71,30 @@ winresource = "0.1"
 #   API every native Windows app uses for Open/Save dialogs — not a
 #   WebView2-specific type — so it needs no generation gate the way
 #   `ICoreWebView2_NN` does.
+# Issue #136 (docs/decisions.md D88) adds three more feature flags, all
+# plain Win32 APIs (no COM/WinRT generation involved) used by
+# `browser::metrics`'s Windows `sample_process_tree_rss` implementation:
+# - `Win32_Foundation`: `HANDLE`/`FILETIME`/`CloseHandle`.
+# - `Win32_System_Diagnostics_ToolHelp`: `CreateToolhelp32Snapshot` +
+#   `Process32First/NextW` walk the process tree (PID/PPID), the Windows
+#   equivalent of iterating `/proc` on Linux.
+# - `Win32_System_ProcessStatus` / (`Win32_System_Threading` below):
+#   `GetProcessMemoryInfo` (RSS via `WorkingSetSize`) and `GetProcessTimes`
+#   (CPU time) per process, both needing an `OpenProcess` handle.
+# No new crate: this project already depends on `windows` for D59/D76
+# above, so Issue #136 only turns on more of its existing feature flags
+# rather than adding `windows-sys` or another crate (CLAUDE.md "依存クレート
+# は必要最小限に保つ").
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.38"
 windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
 ] }
 
 [profile.release]

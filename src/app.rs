@@ -443,9 +443,10 @@ impl PerfContext {
 }
 
 /// In-flight page-load timers, one per open tab across every window
-/// (`NavigationStarted` inserts/restarts an entry, `LoadFinished` consumes
-/// and removes it) — keyed by `(WindowId, TabId)`, not `TabId` alone, since a
-/// `TabId` is only unique within its own window (Issue #29/D68).
+/// (`NavigationStarted` inserts/restarts an entry, `LoadStarted` marks its
+/// mid-checkpoint — Issue #69 — `LoadFinished` consumes and removes it) —
+/// keyed by `(WindowId, TabId)`, not `TabId` alone, since a `TabId` is only
+/// unique within its own window (Issue #29/D68).
 ///
 /// **Lifetime (Issue #62).** Every entry must be removed once it stops being
 /// useful, or this map grows without bound for the life of the process: both
@@ -1110,6 +1111,16 @@ fn record_perf_event(
                 .or_default()
                 .start(Instant::now());
         }
+        // Issue #69: the mid-checkpoint that splits `page_load_ms` into a
+        // VeloX-side dispatch portion and an engine (black-box, Epic #57
+        // rule 3) portion — see `metrics::PageLoadTimer`'s doc comment.
+        // Listed before the catch-all arm below, which used to cover this
+        // variant as a no-op.
+        UserEvent::LoadStarted(window_id, id, _) => {
+            if let Some(timer) = page_load_timers.get_mut(&(*window_id, *id)) {
+                timer.mark_load_started(Instant::now());
+            }
+        }
         UserEvent::LoadFinished(window_id, id, url) => {
             let now = Instant::now();
             // Removed, not just looked up (Issue #62/D79): once this load
@@ -1119,13 +1130,13 @@ fn record_perf_event(
             // "finished" entry behind here was the dominant leak this map
             // had: `WindowId`/`TabId` never repeat, so every tab that ever
             // finished loading a page left one entry behind forever.
-            if let Some(duration) = page_load_timers
+            if let Some(outcome) = page_load_timers
                 .remove(&(*window_id, *id))
                 .and_then(|mut timer| timer.finish(now))
             {
                 let elapsed = now.saturating_duration_since(process_start);
                 perf_log.write(
-                    &metrics::PerfRecord::page_load(url.as_str(), duration),
+                    &metrics::PerfRecord::page_load(url.as_str(), outcome.total, outcome.engine),
                     elapsed,
                 );
             }
@@ -1148,8 +1159,7 @@ fn record_perf_event(
             let elapsed = Instant::now().saturating_duration_since(process_start);
             perf_log.write(&metrics::PerfRecord::measure_start(), elapsed);
         }
-        UserEvent::LoadStarted(..)
-        | UserEvent::NavigationBlocked(..)
+        UserEvent::NavigationBlocked(..)
         | UserEvent::SubresourceBlocked(..)
         | UserEvent::PageTitleResolved { .. }
         | UserEvent::FaviconResolved { .. }
@@ -1299,10 +1309,15 @@ fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Insta
 /// once per process and would put a multi-process browser "over budget"
 /// on shared library pages alone). Where PSS is unavailable the RSS total
 /// is used instead — an over-estimate, so a budget tuned for PSS will
-/// suspend slightly earlier there; documented in D56. On a platform where
-/// neither can be read (Windows today, `RssError::Unsupported`), the
-/// failure is logged once and the thread exits: the memory signal is
-/// simply inert, and the idle/tab-count signals keep working.
+/// suspend slightly earlier there; documented in D56. This is the normal
+/// case on Windows (Issue #136, D88: RSS is read via
+/// `GetProcessMemoryInfo`, but PSS has no Windows equivalent and is not
+/// attempted, so `total_pss_bytes` is always `None` there — same as the
+/// non-Linux Unix `ps` fallback). On a platform where RSS itself cannot be
+/// read either (`RssError::Unsupported` — today, any OS other than Linux,
+/// other Unix, or Windows), the failure is logged once and the thread
+/// exits: the memory signal is simply inert, and the idle/tab-count
+/// signals keep working.
 ///
 /// Exits when the event loop is gone (`send_event` fails), like
 /// `spawn_automation`.
@@ -4432,6 +4447,64 @@ mod tests {
              session ever navigates leaks one entry for the life of the process (TabId/WindowId \
              are never reused)"
         );
+    }
+
+    #[test]
+    fn load_started_between_navigation_started_and_load_finished_splits_the_page_load_record() {
+        // Issue #69: `LoadStarted` marks the mid-checkpoint that splits
+        // `page_load`'s `duration_ms` into `engine_duration_ms` (the
+        // black-box portion, Epic #57 rule 3) and `dispatch_duration_ms`
+        // (VeloX's own event handling). End-to-end through
+        // `record_perf_event`, asserting on the actual JSON line a
+        // `velox-bench` trial would parse.
+        let mut page_load_timers: PageLoadTimers = HashMap::new();
+        let mut startup = None;
+        let path = unique_temp_file("velox-app-page-load-stages");
+        let _ = std::fs::remove_file(&path);
+        let log = PerfLog::to_file(metrics::PerfFormat::Json, &path).expect("open perf log file");
+        let process_start = Instant::now();
+        let window_id = test_window_id();
+        let id = TabId::from(0);
+
+        record_perf_event(
+            &mut startup,
+            &mut page_load_timers,
+            &log,
+            process_start,
+            &UserEvent::NavigationStarted(window_id, id, "https://example.com/".to_owned()),
+        );
+        record_perf_event(
+            &mut startup,
+            &mut page_load_timers,
+            &log,
+            process_start,
+            &UserEvent::LoadStarted(window_id, id, "https://example.com/".to_owned()),
+        );
+        record_perf_event(
+            &mut startup,
+            &mut page_load_timers,
+            &log,
+            process_start,
+            &UserEvent::LoadFinished(window_id, id, "https://example.com/".to_owned()),
+        );
+        assert!(
+            page_load_timers.is_empty(),
+            "finish must still remove the entry"
+        );
+        drop(log);
+
+        let contents = std::fs::read_to_string(&path).expect("read perf log file");
+        let _ = std::fs::remove_file(&path);
+        let page_load_line = contents
+            .lines()
+            .find(|line| line.contains("\"event\":\"page_load\""))
+            .expect("a page_load record must have been written");
+        let value: serde_json::Value = serde_json::from_str(page_load_line).expect("valid JSON");
+        assert!(
+            !value["engine_duration_ms"].is_null(),
+            "LoadStarted fired before LoadFinished, so engine_duration_ms must be a number, got {value}"
+        );
+        assert!(!value["dispatch_duration_ms"].is_null(), "got {value}");
     }
 
     #[test]

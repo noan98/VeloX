@@ -9988,3 +9988,357 @@ tab/window lookup の`Vec`線形走査を再検証すること。(2) `state_writ
 広げる必要がある。(3) 本節の数値はすべて Linux/WebKitGTK — Windows
 (WebView2) でのディスク I/O コストは NTFS のメタデータ操作コストが
 異なるため未計測 (Epic #57 ルール 5)。
+## D87: ページロードの段階計測 (#69) — `NavigationStarted → LoadStarted → LoadFinished` に分解。DNS/接続/TLS timing は wry に無い、VeloX 側の追加最適化も見送り
+
+Issue #69 (Epic #57 Phase 3)。「ページロード経路を分解し、VeloX 側で制御
+可能なボトルネックを改善する」という課題に対して、**#59/#66 と同じやり方
+で臨んだ**: まず既存の計測点を1段階分解して実測し、その数値だけで
+「VeloX 側に短縮余地があるか」を判断した。数値・再現手順は
+`docs/performance-targets.md` §20、使い方は `docs/benchmarking.md` を
+参照。ここには設計判断とその理由、および調査結果だけを残す。
+
+### 何を分解したか — 既存の `page_load` イベントに1つチェックポイントを足した
+
+Issue #13 からこの方、`page_load` イベントは `NavigationStarted` →
+`LoadFinished` の1本の `duration_ms` しか持っていなかった。wry の
+`WebViewBuilder` は `with_on_page_load_handler` で `PageLoadEvent::
+Started`/`Finished` の2値を渡してくる — `app.rs` は既に両方を
+`UserEvent::LoadStarted`/`LoadFinished` として受け取っていたが、
+`LoadStarted` は UI 同期 (`sync_tab_strip` 等、`NavigationStarted` と
+同じ match アーム) にしか使われておらず、計測には使われていなかった。
+`metrics::PageLoadTimer` に `mark_load_started` という新しい任意
+チェックポイントを足し、`finish` の戻り値を `Duration` から
+`PageLoadOutcome { total, engine: Option<Duration> }` に変えた
+(`engine` は `dispatch()` で `total - engine` も導出できる)。`page_load`
+イベントの JSON に `engine_duration_ms`/`dispatch_duration_ms` を
+**追加**した (既存の `duration_ms`/`url` は変更なし、text 形式も
+`format_page_load` の出力に追記するだけ — #59/D42/D43 と同じ「既存の
+scraper を壊さない」流儀)。`browser::benchmark::MetricKey` にも
+`PageLoadEngineMs`/`PageLoadDispatchMs` を追加し、`velox-bench` の
+`aggregate`/`gate` にそのまま乗るようにした。`LoadStarted` が来なかった
+ロード (中断されたロード等) は `engine`/`dispatch` とも `None` — 0 を
+捏造しない、`total_pss_bytes` (D42) と同じ規約。
+
+### **重要な但し書き: `dispatch` は「VeloX のコスト」ではない**
+
+`PageLoadEvent::Started` は wry の3バックエンドすべてで「ロードが
+commit された」タイミングにマップされている (**ソースで確認**):
+
+- WebKitGTK: `webview.connect_load_changed` の `LoadEvent::Committed`
+  (`wry-0.56.1/src/webkitgtk/mod.rs:481`)
+- WebView2: `ContentLoadingEventHandler` (`.../src/webview2/mod.rs:713-718`)
+- WKWebView (macOS/iOS): `didCommitNavigation`
+  (`.../src/wkwebview/navigation.rs:17-26`)
+
+つまり `LoadStarted` は「ロードが始まった瞬間」ではなく「エンジンが
+接続・リクエスト送信・レスポンス受信開始まで済ませた後」に発火する。
+`NavigationStarted` (`with_navigation_handler`、ロード許可の意思決定
+ポイント) は逆にネットワーク作業が始まる**前**に発火する。したがって
+`dispatch = NavigationStarted → LoadStarted` の区間には VeloX 自身の
+イベント処理 (`app::record_perf_event`、`sync_tab_strip` 等) だけでなく
+**エンジン側の接続・リクエスト送受信の待ち時間も含まれる**。実測でも
+これは裏付けられた — loopback HTTP サーバ (DNS 無し、TLS 無し) の
+`minimal.html` に対してすら `dispatch` の中央値 (4.65〜4.7ms) が
+`engine` の中央値 (1.4〜1.65ms) を上回った (§20.2)。これを「VeloX の
+オーバーヘッドが半分以上」と読むのは誤りで、Epic #57 の最重要注意点
+「レンダリングエンジンそのものの性能と VeloX 側のオーバーヘッドを
+混同しない」にまさに抵触する読み方になる。#66 (D81) が実測した
+IPC の Rust 側コスト (`out` イベント、`sync_tab_strip` を含む
+`evaluate_script` 呼び出し) が worst case でも 3.5ms、中央値 0.000ms
+だったことを踏まえると、`dispatch` の大半はエンジン側のネットワーク
+待ち (今回の環境ではループバック接続の確立・往復) であり、VeloX 自身の
+Rust コードは `dispatch` の一部でしかない。ソースコードのコメント
+(`metrics::PageLoadTimer`/`MetricKey::PageLoadDispatchMs`) にこの但し
+書きを明記した。
+
+重い固定ページ (`dom_heavy.html`) で計測すると、この解釈が裏付けられる:
+`dispatch` の中央値は 12.65ms (`minimal.html` の 4.65ms よりやや大きいが
+オーダーは同じ) で、ページの重さに依らずほぼ一定に見える一方、`engine`
+の中央値は 72.0ms までページの重さに比例して伸びる (§20.2)。「ページが
+重いほど支配的になるのは engine 側」という、Epic #57 が前提とする構造
+と整合する結果になった。
+
+### DNS/connection/TLS timing は取得可能か — wry native API には無い。JS 標準 API は動くが、この環境では意味のある数値が取れない
+
+wry 0.56.1 のソースを3バックエンドとも確認したが (`grep -rniE
+"dns|tls|resource_load|timing" src/*.rs src/{webkitgtk,webview2,wkwebview}/
+*.rs`)、`WebViewBuilder` にはナビゲーションの許可可否
+(`with_navigation_handler`) とロード完了2値
+(`with_on_page_load_handler`) しか無く、**DNS/接続/TLS のタイムスタンプ
+を返す API は存在しない**。resource-load 単位のフックも無い。
+
+一方、標準の `PerformanceNavigationTiming` (`performance.
+getEntriesByType('navigation')[0]`) は WebKitGTK 2.52.6 で実際に動作する
+ことを確認した — 本 Issue の作業ディレクトリ外、`/tmp` スクラッチ上に
+`wry`/`tao` (VeloX と同じ 0.56.1/0.37.0) だけに依存する最小 PoC バイナリ
+を作り、`scripts/bench/pages/minimal.html` を `http://127.0.0.1:8731/`
+経由で読み込んで `window.ipc.postMessage` 経由で結果を回収した:
+
+```
+NAV_TIMING_RESULT: {"entryType":"navigation","domainLookupStart":1,
+"domainLookupEnd":1,"connectStart":1,"connectEnd":1,
+"secureConnectionStart":0,"requestStart":1,"responseStart":2,
+"responseEnd":14,"fetchStart":1,"startTime":0,"protocol":"http/1.0"}
+```
+
+`domainLookupStart`/`domainLookupEnd`/`connectStart`/`connectEnd` の
+フィールド自体は存在し、値も返ってくる (ここではすべて 1ms 付近 — ループ
+バック接続に実質的な DNS/TCP コストが無いため)。`secureConnectionStart`
+は 0 (HTTP なので TLS 無し)。**同じ PoC を `file://` で開くと、`load`
+イベント後の `window.ipc.postMessage` 自体が届かなかった** (タイムアウト
+2件、原因未特定 — WebKitGTK が `file://` オリジンで IPC ブリッジを
+制限している可能性があるが、深追いはしていない)。
+
+結論:
+
+1. **wry のネイティブ API (Rust 側) に DNS/接続/TLS の hook は無い** —
+   ソースで確認済み、3バックエンドとも同様。
+2. **エンジンの JS 標準 API (`PerformanceNavigationTiming`) 経由でなら
+   理論上は取得できる** — WebKitGTK での動作を実機で確認した。ただし
+   これは `evaluate_script` を挟んだ IPC 往復が必要な追加コストであり、
+   かつ取得できる値はエンジン (JS エンジン + ネットワークスタック) が
+   計測したものであって VeloX 側の処理ではない — Epic #57 ルール3の
+   ブラックボックス原則に照らせば「VeloX が見える窓」ではあっても
+   「VeloX が制御できる区間」ではない。
+3. **この検証環境では意味のある DNS/TLS 数値は取れない。** 本 Issue の
+   制約 (外向きネットワークはプロキシ経由に制限、計測は `file://` か
+   ローカル HTTP サーバに限定) の下では、実際の DNS 解決や TLS ハンド
+   シェイクを伴うページを読み込めない。ループバック接続では
+   `domainLookupStart`/`End` や `connectStart`/`End` の差がほぼ 0 に
+   潰れ、`secureConnectionStart` も常に 0 になる。実際の DNS/TLS コスト
+   を見るには外部 HTTPS サイトへの到達性が要る (本 Issue のスコープ外)。
+4. **したがって本 Issue では `PerformanceNavigationTiming` を計測に
+   組み込むコードは追加していない。** 追加しても (a) この環境では
+   検証できない、(b) 得られる数値がエンジン管轄でありEpic #57 の枠内で
+   VeloX 側から縮められる区間ではない、の2点から、ベンチマークなしの
+   計装追加は Epic #57 ルール1に反すると判断した。PoC は再現用に
+   `docs/performance-targets.md` §20.4 にスクリプトの要旨を残す
+   (PoC 自体は作業ディレクトリの外、`/tmp` スクラッチに置いたため
+   リポジトリには含まれていない)。
+
+### 「unnecessary UI/IPC work during navigation」の再確認 — #66 の結論を `navigation` シナリオで裏付け、新しい削減は見つからなかった
+
+`NavigationStarted`/`LoadStarted` が同じ match アーム
+(`sync_tab_strip` 等を呼ぶ) を共有していることに気付き、「1回のナビ
+ゲーションで `set_tabs` が実は #66 が数えた以上に多く送られているの
+では」という仮説を立てたが、`navigation` シナリオ (3回ナビゲーション +
+起動時ロード = 4ロード) で `velox-bench ipc-summary` を実測したところ
+`set_tabs` は 14 件 (4ロードあたり 3.5 件、`duration_ms` 中央値
+0.000ms・p95 1.175ms) — #66 が既に報告していた比率 (「120 件 / 約 34
+回のタブ影響操作」≈3.5) とオーダーが一致し、コストも sub-millisecond
+のまま。**新しい無駄は見つからなかった** — #66 の「タブストリップの
+複数回送信は意図的でコストは無視できる」という結論を、ページロード
+経路に特化した本 Issue でも裏付けただけに終わった。`tab.
+on_navigation_started(&url)` が `NavigationStarted`/`LoadStarted` の
+両方で (同じ内容を) 2回呼ばれる点は気付いたが (`app.rs` の共有アーム)、
+`String` の再代入程度のコストで、IPC 計測が sub-millisecond と示して
+いる以上ベンチマーク上の実害が無く、Epic #57 ルール1に従い変更しな
+かった。
+
+### `preload`/`preconnect` と cache 戦略 — VeloX 側から動かせるレバーが無い
+
+wry 0.56.1 のソースを確認した限り、`WebViewBuilder` に preconnect/
+prefetch/DNS prefetch 相当の API は存在しない
+(`webkitgtk/mod.rs`: `settings.set_enable_page_cache(true)` を無条件に
+呼ぶのみで、キャッシュサイズ/戦略を変更する builder メソッドも無い)。
+ページ自身が `<link rel="preconnect">` 等を書けばエンジンがそれを解釈
+するが、それはページ側の関与であって VeloX (ブラウザ chrome 側) の
+コードが増減させる話ではない。オムニボックス入力から先読み的に
+`preconnect` する、といった「VeloX 独自の速度対策」も検討したが、
+(a) wry にはそもそも「特定オリジンへ接続だけ張っておく」API が無く、
+(b) 実装するなら別プロセス/別ソケットで疑似的にウォームアップ接続を
+張るような迂回策になり検証コストが高い、(c) この環境では実 DNS/TLS
+すら検証できないため効果を測る手段が無い、の3点から見送った。
+**「VeloX 側で制御可能な cache/preconnect レバーは (wry 0.56.1 の API
+範囲では) 存在しない」ということ自体が本 Issue の調査結果である。**
+
+### OS/WebView 差分の記録
+
+`PageLoadEvent::Started`/`Finished` の意味づけ (`Started` = commit 後、
+`Finished` = ロード完了) は wry のソース上 **3 バックエンドで同一**
+であることを確認した (上記)。したがって `dispatch`/`engine` という
+分解の**構造**は Windows (WebView2) / macOS (WKWebView) でも同じ意味を
+持つ。ただし **実際のミリ秒の数値はすべて Linux/WebKitGTK 2.52.6 +
+Xvfb (GPU なし) でのみ計測した** (`docs/performance-targets.md` §1)。
+Windows が最優先対応 OS である (CLAUDE.md) にもかかわらず本 Issue では
+Windows 実機での計測を行っていない — この環境に Windows 実機/WebView2
+が無いため。Windows での再計測は Revisit condition に残す。
+
+### なぜ「最適化」と呼べる変更を一切加えなかったか
+
+#59 (D43)・#66 (D81) と同じ形の結論になった: **計測を1段階細かくした
+結果、支配的なコストが VeloX 自身のコードではなくエンジン/ネットワーク
+側だと分かった。** `dispatch` バケットの大半はエンジンの接続・リクエ
+スト待ちであり (上記)、その中で唯一 VeloX 自身が支配できる部分 (IPC
+ディスパッチ) は #66 の時点で既に sub-millisecond と実測済みで、今回
+`navigation` シナリオで再確認してもコストは変わっていない。`engine`
+バケットは定義上ブラックボックス。preconnect/cache チューニングは
+wry に API が無い。**したがって「VeloX 側で安全かつ実測に裏付けられた
+形で縮められるページロードのコストは、本 Issue の調査時点では見つから
+なかった」というのが、本 Issue の正直な結論である。**
+
+### Revisit condition
+
+(1) Windows (WebView2) 実機での `page_load_engine_ms`/
+`page_load_dispatch_ms` 計測 — この節の数値はすべて Linux。(2) 実際の
+DNS/TLS を伴う外部サイトへの到達性がある環境が用意できれば、
+`PerformanceNavigationTiming` を使った DNS/TLS 実測に再挑戦する価値が
+ある (ただし Epic #57 ルール3により「エンジン管轄」という結論は変わら
+ない可能性が高い)。(3) `file://` ページで `PerformanceNavigationTiming`
+の PoC が `window.ipc.postMessage` を返さなかった件は原因未特定のまま
+残した — VeloX 本体のコードパスではない (PoC 独自の問題の可能性がある)
+ため優先度は低いが、`file://` の IPC ブリッジに何か制約があるなら
+別 Issue の調査対象になりうる。(4) `tab.on_navigation_started` が
+`NavigationStarted`/`LoadStarted` の両方で呼ばれる件 (重複呼び出し) は
+実害なしと判断して変更していないが、将来 `Tab` の状態更新が重くなる
+場合はここも見直し対象になる。
+## D88: Windows で性能を実測できるようにする (#136) — `sample_process_tree_rss` に Toolhelp32/PSAPI 実装を追加し、PSS 相当は「実装しない」と結論。`perf-windows.yml` (`workflow_dispatch` 限定) を追加
+
+**Scope**: Issue #136。#57 (Phase 3 Epic) の絶対ルール5「OS ごとに結果を分ける」を
+守るには Windows 側の実測手段が要るが、`browser::metrics::sample_process_tree_rss`
+は Windows で `RssError::Unsupported` を返すだけで RSS すら取得できていなかった
+(D42 が PSS を追加した時点でも Windows 側は「Windows has neither」のまま)。この
+Issue は (1) Windows で RSS/CPU を取得できるようにする実装、(2) PSS 相当の取得
+可否を調査して結論を出すこと、(3) `windows-latest` 上で `velox-bench` を手動実行
+できる workflow、の 3 つを扱う。
+
+**この環境の決定的な制約**: 作業は Linux コンテナ上で行っており、Windows 実機は
+無い。検証手段は `cargo check --target x86_64-pc-windows-msvc --all-targets`
+(D61 が明記するとおりリンクを伴わない型チェックのみ) と、OS 非依存な純粋ロジック
+の `cargo test` だけ。**Windows 上で実際に RSS/CPU が正しい値を返すことは、この
+セッションでは一切確認できていない。** `perf-windows.yml` を実際に CI (windows
+-latest ランナー) 上で走らせて検証するのは、この PR がマージ経路に乗ってから
+(親セッション以降) になる。
+
+### RSS/CPU の実装方針
+
+**API**: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` + `Process32First/NextW`
+でプロセスツリー (PID/PPID) を走査する — Linux 版が `/proc` を読むのと同じ役割。
+各プロセスの RSS は `GetProcessMemoryInfo` の `WorkingSetSize`、CPU 時間は
+`GetProcessTimes` の kernel+user `FILETIME` から取る。いずれも `OpenProcess` で
+得たハンドルが要る。
+
+**候補の比較**: Issue 本文が挙げた 3 候補のうち `CreateToolhelp32Snapshot` は
+プロセスツリー走査に必須 (これ以外にプロセス一覧+親子関係を取る標準的な手段が無
+い)。`GetProcessMemoryInfo` の `WorkingSetSize` は RSS 相当として最も素直で公式
+に文書化された値であり、`QueryWorkingSetEx` を自前でページ単位に集計するより
+遥かに単純・低リスクなので RSS はこちらを採用した。
+
+**依存クレート**: 新規追加なし。本リポジトリは D59/D76 で既に
+`[target.'cfg(windows)'.dependencies] windows = "0.61"` に依存しているため (COM
+の `ICoreWebView2`/Shell ダイアログ用)、`windows-sys` を新たに足すのではなく、
+同じ `windows` クレートのフィーチャーフラグを 4 つ有効化するだけで済ませた
+(`Win32_Foundation` / `Win32_System_Diagnostics_ToolHelp` /
+`Win32_System_ProcessStatus` / `Win32_System_Threading`)。いずれも純粋な Win32
+API で COM/WinRT の生成を伴わないため、既存フィーチャーとの相互作用のリスクも
+無い。CLAUDE.md「依存クレートは必要最小限に保つ」に沿い、クレート数を増やさず
+既存依存の適用範囲を広げる形を選んだ。
+
+**`unsafe` の使用**: `src/browser/metrics.rs` の `#[cfg(target_os = "windows")]
+mod imp` に 6 箇所 (`CreateToolhelp32Snapshot`/`Process32FirstW`/
+`Process32NextW`/`OpenProcess`/`GetProcessMemoryInfo`/`GetProcessTimes` の各
+FFI 呼び出し、および `Drop` 内の `CloseHandle`)。すべて `windows` クレートが
+`unsafe fn` として公開している薄い FFI ラッパーの呼び出しで、各箇所に「何を保証
+しているか」を `// SAFETY:` コメントで明記した — 具体的には (a) 呼び出し先に渡す
+バッファはすべてスタック上に正しいサイズ・`dwSize`/`cb` で確保されていること、
+(b) ハンドルは呼び出し時点でまだ有効 (`OwnedHandle` という RAII ガードを導入し、
+`CreateToolhelp32Snapshot`/`OpenProcess` が返すハンドルを即座にラップして
+`Drop` で必ず 1 回だけ `CloseHandle` する — 早期 `return`/`?` を含むどの経路でも
+リークしない)。`OpenProcess` は `PROCESS_QUERY_LIMITED_INFORMATION |
+PROCESS_VM_READ` のみを要求し、`PROCESS_ALL_ACCESS` は使わない (最小権限)。
+VeloX は通常権限で動く前提であり、より高い権限のプロセス (システムプロセス等)
+を `OpenProcess` できない場合はエラーではなく「そのプロセスの RSS/CPU を単に
+含めない」扱いとした — Linux 側の `/proc/<pid>/status` が読めないプロセスを
+スキップする既存方針とそろえている。
+
+**Windows 版の失敗時挙動**: プロセスの `OpenProcess`/`GetProcessMemoryInfo`/
+`GetProcessTimes` いずれかが失敗しても、そのプロセスは PID/PPID のみでツリーに
+残り (RSS 0、CPU `None`)、サンプル全体は失敗しない。`CreateToolhelp32Snapshot`
+自体が失敗した場合のみ `RssError::Io` を返す (Linux 版が `/proc` 自体を開けない
+場合に倣った)。
+
+### PSS 相当の取得可否 — 調査した上で「実装しない」と結論
+
+Issue が挙げた候補は「`QueryWorkingSetEx` でページごとの `Shared`/`ShareCount` を
+取得し、共有ページを共有プロセス数で割って合算する」という自前計算。**これを
+検討した上で、今回は実装しないことにした。** 理由:
+
+1. **正確な PSS には「対象プロセスだけでなく、その共有ページを持つ全プロセスの
+   ワーキングセット」を横断的に見る必要がある。** `QueryWorkingSetEx` の
+   `VM_COUNTERS_EX`/`PSAPI_WORKING_SET_EX_INFORMATION` は「このプロセスの
+   ワーキングセット中のこのページが何個のプロセスで共有されているか
+   (`ShareCount`)」までは返すが、Linux の `smaps_rollup`/`Pss:` のようにカーネル
+   側で計算済みの値ではない — `ShareCount` を使って `1/ShareCount` を足し上げる
+   近似は Issue 本文も「要検証」と明記しているとおり、Windows のページ共有モデル
+   (プロトタイプ PTE、AWE、メモリマップドファイル等) に対してどこまで正確かが
+   自明ではない。
+2. **実機で検証する手段がこのセッションには無い。** 型チェック
+   (`cargo check --target x86_64-pc-windows-msvc`) は API 呼び出しのシグネチャが
+   合っていることしか保証せず、`QueryWorkingSetEx` が実際に返す値の妥当性は
+   Windows 実機でしか確認できない。検証できない計算式をそのまま実装として残す
+   ことは、CLAUDE.md が求める「検証できていないことを検証できていないと明記
+   する」誠実さの要件と相容れない — 「動くはず」の実装を残すより、「実装しない」
+   という判断とその理由を明記する方が、後で実際に Windows 上で必要になったとき
+   に再検討しやすい。
+3. **RSS が既に取れている。** PSS が無くても `total_rss_bytes` は
+   `GetProcessMemoryInfo` から確実に取得できるため (Issue も「PSS 相当は無理に
+   実装しなくて構わない」と明記)、Windows でも「何も測れない」状態からは脱却
+   できる。
+
+結果として、Windows 版の `RssSample::total_pss_bytes` は非 Linux Unix (macOS/
+*BSD の `ps` フォールバック) と同じく常に `None`。将来 Windows 上でメモリ最適化
+の効果を細かく見る必要が生じ、RSS だけでは Chromium/Edge との比較 (D41 が示した
+「RSS 合計はプロセス数の多いブラウザを不当に不利にする」問題) が避けられなく
+なった時点で、`QueryWorkingSetEx` アプローチを実機で検証しながら再挑戦するのが
+妥当。
+
+> ⚠️ **将来 Windows で PSS 相当を実装したとしても、Linux の PSS
+> (`smaps_rollup` の `Pss:`) と直接比較してはならない。** 算出方法が全く異なる
+> ため、OS をまたいだ数値比較は成立しない。Windows 上で Chromium/Edge と横並び
+> に測る用途に限られる。`docs/performance-targets.md` にも同じ注意を記載した。
+
+### `perf-windows.yml` (`workflow_dispatch` 限定)
+
+`.github/workflows/perf-windows.yml` を新規作成。`release-windows.yml`
+(`workflow_dispatch` + Windows ビルドの先例) に倣い、`on:` は
+`workflow_dispatch` (シナリオ/試行回数/URL を入力パラメータ化) に加えて、
+**この workflow 自身を変更する PR に限り** `pull_request: paths:
+.github/workflows/perf-windows.yml` を付けた — `workflow_dispatch` は main に
+マージされるまで Actions タブに現れないため、workflow 自身の変更を検証する唯一
+の手段としている (`release-windows.yml` が採用済みの同じパターン)。PR ごとの
+自動実行や性能回帰ゲートとしては使わない (Linux の `perf-gate.yml` が既に担保
+しており、Issue のスコープ外)。
+
+`cargo build --release` の後、既定では `scripts/bench/pages/` の固定ページを
+loopback (`python -m http.server`) で配信し `--url` に渡す (Linux の
+`perf-gate.yml`/`docs/benchmarking.md` と同じ「ネットワーク非依存の固定ページ
+で測る」方針) — `workflow_dispatch` の `url` 入力を明示的に指定すればそちらを
+使う。結果 JSON は Actions Artifact として保存し (`velox-bench aggregate`/
+`compare`/`gate` に後からかけられる形式そのまま)、実行環境の情報 (OS ビルド
+番号・CPU・メモリ・WebView2 Runtime バージョン) を `Get-CimInstance`/レジストリ
+照会でログと Job Summary に残す (`docs/performance-targets.md` §1 の「測定環境を
+固定して記録する」要件)。
+
+**最大のリスク (`windows-latest` で GUI/WebView2 ウィンドウが起動できるか) は
+未解決のまま**。Linux は Xvfb で仮想ディスプレイを用意しているが、Windows
+ランナーには同種の仕組みが無く、GitHub ホスト型 Windows ランナーが GUI プロセス
+を起動できる対話セッションを持っているかはこのセッションでは検証できない。
+workflow には `velox.exe` を直接起動してプロセス一覧・perf ログの有無を確認する
+診断ステップ (`continue-on-error: true`、Linux 側 `perf-gate.yml` の
+"Diagnose VeloX under Xvfb" ステップと同じ形) を含めたが、**これが実際に機能する
+かどうかはこの PR が CI 上で走って初めて分かる。** 起動できなかった場合は
+「何を試して、どう失敗したか」を記録し、セルフホストランナー等の方式再検討が
+必要という結論を残すのが正しい進め方であり、この時点で無理に通そうとしていない
+(#59 が同じ形で結論づけたのと同様)。
+
+**このセッションで確認できたこと / できていないこと**:
+- 確認できた: `cargo fmt --check` / `cargo clippy --all-targets -D warnings` /
+  `xvfb-run ... dbus-run-session -- cargo test` (972 件、Windows 実装追加前の
+  969 件 + `filetime_ticks_to_seconds` の単体テスト 3 件) / `cargo build` /
+  `cargo check --target x86_64-pc-windows-msvc --all-targets` はすべて green。
+  Linux 側の `sample_process_tree_rss`/既存テストの挙動は変更していない。
+- 確認できていない: Windows 実機/CI 上での実際の RSS/CPU 値の妥当性、
+  `windows-latest` ランナーでの VeloX (WebView2) ウィンドウ起動可否、
+  `velox-bench run` の完走、結果 JSON の実際の中身。`docs/performance-targets.md`
+  §21 には Windows の数値をまだ書けないため、CI 実行後に埋めるプレースホルダの
+  みを記載した。
