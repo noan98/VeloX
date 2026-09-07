@@ -1017,6 +1017,139 @@ target/release/velox-bench ipc-summary --input $S/session.jsonl \
   --output $S/ipc-summary.json
 ```
 
+## 19. Browser State / Event Dispatch の計測結果 (Issue #67, 2026-09-07)
+
+**設計判断は `docs/decisions.md` D86 を参照。** ここでは実測データと
+結論だけを記録する。この節の数値はすべて §1 の環境 (Ubuntu 24.04.4 /
+WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、**Windows
+(WebView2) の実力値ではない**。
+
+### 19.1 何を計測できるようにしたか
+
+`metrics::PerfRecord::StateWrite`(Issue #67)が `persistence::save_*`
+(`session`/`history`/`bookmarks`/`input_history`)の呼び出しを 1 回ごとに
+記録する。§18 の `PerfRecord::Ipc`が計測する「プロセス内 IPC
+(`evaluate_script`呼び出し)」とは別物で、こちらは**実際の同期ディスク
+I/O**(`fs::create_dir_all` + `serde_json::to_string_pretty` +
+`fs::write`)のコストを計測する。同じ `VELOX_PERF_OUTPUT`ログに
+`event=state_write`として混在するので、§18.6 と同じログファイルから
+`event=="state_write"`の行を抜き出すだけで見える。
+
+### 19.2 セッション実測
+
+§18.2 と同じ「20 タブセッション」「3 タブセッション」を、`persist_
+session`の冗長書き込み削減 (D86) の前後でそれぞれ実行した (各 1〜2
+試行、再現手順は 19.5)。
+
+**20 タブセッション、`state_write name=session`**:
+
+| 指標 | 修正前 | 修正後 (試行1) | 修正後 (試行2) |
+| --- | ---: | ---: | ---: |
+| 件数 | 150 | 82 | 82 |
+| duration_ms 合計 | 50.7 | 16.7 | 51.7 |
+| duration_ms 中央値 | 0.100 | 0.100 | 0.100 |
+| duration_ms p95 | 0.300 | 0.200 | 0.300 |
+| duration_ms 最悪値 | 10.8 | 4.2 | 38.2 |
+
+件数は **150 → 82 (-45.3%)** — 2 回の修正後試行でどちらも 82 と完全に
+一致した (自動操作スクリプトが決定的で、削減対象が制御フローそのもの
+であり、タイマー由来のジッタではないため)。`duration_ms`の合計は
+試行によって振れる (試行2 は 38.2ms の外れ値 1 件に支配されている —
+共有 VM 上のスケジューリング揺らぎとみられ、§10 のセッション間ノイズと
+同種) が、**中央値・p95 は前後でほぼ不変**。つまり削減されたのは
+「1 回あたりの書き込み速度」ではなく「書き込みが呼ばれる回数」である。
+
+**3 タブセッション、`state_write name=session`**:
+
+| 指標 | 修正前 | 修正後 |
+| --- | ---: | ---: |
+| 件数 | 39 | 22 |
+| duration_ms 合計 | 8.6 | 3.2 |
+
+件数は **39 → 22 (-43.6%)**、20 タブセッションと同傾向。
+
+**対照 (変更していない `persist_history`)**: 同じセッションで
+`state_write name=history`の件数は 20 タブで **69 → 69**、3 タブで
+**18 → 18**、まったく変化なし — 削減が意図した `persist_session`
+だけに効いていることの裏付け。
+
+### 19.3 tab lookup / lock contention
+
+いずれも計測を組む前の設計調査だけで「本 Issue の対象外」と判断した。
+理由と根拠は D86 を参照 (要約: lock contention は
+`docs/architecture.md`の「全状態はメインスレッドの `UserEvent`
+ディスパッチに集約、ロックなし」という既存設計そのものにより発生し
+えない。tab/window lookup の `Vec` 線形走査は、走査対象が構造的に小さい
+〔タブ数は重量級シナリオでも上限 20〜50、ウィンドウ数は実運用でまず
+1〜3〕上に、その全走査を伴う `sync_tab_strip`の `set_tabs`構築コストが
+§18 で既に sub-millisecond と実測済みであり、追加のマイクロベンチマークを
+組んでも実測ノイズに埋もれる可能性が高いと判断した)。
+
+### 19.4 結論
+
+- **state-write の計測を継続的に行える仕組み**: `metrics::PerfRecord::
+  StateWrite` + `app::record_state_write`。#68 はこのまま使える
+  (D86 の Revisit condition 参照)。
+- **見つかった唯一の redundant update**: `sync_tab_strip`から無条件に
+  呼ばれていた `persist_session`(セッションスナップショットの全件
+  ディスク書き込み)。`SessionSnapshot`が保持しない`loading`フラグの
+  変化だけでも書き込みが走っていた。
+- **実施した削減**: 直近に書き込んだスナップショットと比較し、一致
+  すれば書き込みをスキップ (§19.2 参照)。batching は導入していない —
+  「送るか送らないか」の判断で完結しており、複数書き込みを 1 回に
+  まとめる必要が生じる規模のボトルネックではなかった。
+- **削減しなかった箇所**: `persist_history`/`persist_bookmarks`/
+  `persist_input_history`(実際の内容変更ごとに呼ばれており冗長では
+  ない。20 タブセッションで合計 8.3ms、削減を要する規模ではない)。
+  `write_json`内の`fs::create_dir_all`(呼び出しごとの stat 相当の
+  syscall だが、実測 (中央値 0.1ms) の範囲では埋没している)。tab/
+  window lookup、event routing の `match`ディスパッチ、lock
+  contention (§19.3)。
+- **Regression check**: `velox-bench gate --scenario cold_startup`
+  (baseline=修正前コミット、candidate=修正後、各 8 試行 × 2 回) は
+  総合判定 OK (`rss_total_bytes`が 1 回だけ WARN を出したが、修正前
+  バイナリ同士の比較でも `page_load_ms`が -46.9% 振れるなど同程度の
+  ノイズが再現し、かつ `persist_session`はコールドスタート経路では
+  一切呼ばれないため、この変更に起因するものではないと判断した — 直後
+  の再試行 2 回はいずれも総合判定 OK)。`--scenario tab_create_20`
+  (baseline/candidate 各 5 試行 × 2 回) も総合判定 OK。
+  `cargo test`は変更後も全件成功 (972 ユニットテスト + 11 統合テスト、
+  xvfb-run + dbus-run-session)。
+
+### 19.5 再現手順
+
+§18.6 と同じ環境構築 (HTTP サーバ、`velox`/`velox-bench`のビルド) の後:
+
+```sh
+S=/path/to/scratch
+cat > $S/session.txt << 'SCRIPT'
+open http://127.0.0.1:8731/minimal.html
+wait 300
+(... open/wait を計 20 回 (最初の 1 回を含む) ...)
+mark
+(... switch 0..19 を 10 回、switch+navigate を 2 回、close を 2 回 ...)
+quit
+SCRIPT
+
+$XV env VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json \
+  VELOX_PERF_OUTPUT=$S/session.jsonl \
+  VELOX_DATA_DIR=$S/data \
+  VELOX_HOMEPAGE=http://127.0.0.1:8731/minimal.html \
+  VELOX_AUTOMATION_SCRIPT=$S/session.txt \
+  target/release/velox
+
+python3 -c "
+import json
+from collections import defaultdict
+rows = defaultdict(list)
+for line in open('$S/session.jsonl'):
+    d = json.loads(line)
+    if d.get('event') == 'state_write':
+        rows[d['name']].append(d['duration_ms'])
+for name, vals in rows.items():
+    print(name, 'count', len(vals), 'sum_ms', round(sum(vals), 3))
+"
+```
 ## 20. ページロードの段階計測 (Issue #69, 2026-09-07)
 
 **設計判断・調査の経緯は `docs/decisions.md` D87 を参照。** ここでは

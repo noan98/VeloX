@@ -9795,6 +9795,199 @@ event` の競合状態) は本 Issue で解消済み。(2) (ダウンロード�
 ずつ順に処理して次のコマンドへ進む前に必ず解消を待つ設計なので、依然
 1 枠で足りている。
 
+## D86: Browser State / Event Dispatch 最適化 (#67) — `persist_session` の無条件ディスク書き込みを唯一の削減対象として特定し、直前スナップショットとの比較でスキップする形にした。tab/window lookup と lock contention は実測前の設計調査だけで「対象外」と判断した
+
+Issue #67 (Epic #57 Phase 3、依存元 #66 の後続)。「Browser/Tab state
+更新と event dispatch をプロファイリングし、不要な state 変更・clone・
+再描画を削減する」という課題に対して、#66 (D81) と同じ手順 — まず計測を
+足し、その実測データだけで削減判断をする — を踏んだ。数値・再現手順は
+`docs/performance-targets.md` §19 を参照。**この節の数値はすべて Linux
+(WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、Windows (WebView2)
+の実力値ではない** (Epic #57 ルール 5)。
+
+### 対象範囲の絞り込み — 「lock contention」は設計上該当しない
+
+Issue 本文が挙げる 6 項目 (state mutation / tab lookup / event routing /
+lock contention / redundant updates / UI synchronization) のうち、
+**lock contention は計測するまでもなく対象外と判断した**:
+`docs/architecture.md` の "Event flow" 節が明記するとおり、全状態
+(`AppState`/`Tabs`/`Windows`) はメインスレッドの `UserEvent` ディスパッチ
+一本に集約されており、ロックを一切持たない設計 (`app::handle_user_event`
+の呼び出し木の外で状態を触るコードは存在しない)。`grep -rn "Mutex\|
+RwLock" src/` で見つかった 2 箇所はどちらもこの状態機械の外側にある:
+`ui::window`内の 1 つは `with_permission_handler`(`wry` の trait 境界が
+`Send + Sync` を要求するだけで、実際には常にメインスレッドから読み書き
+される 1 origin 文字列のロック — コード自身のコメントが既にこの理由を
+説明している)、もう 1 つは `browser::perf_log::PerfLog`(計測ログの
+書き込みを直列化する `Mutex<Sink>` — `VELOX_PERF_METRICS=1` のときだけ
+存在し、`spawn_rss_sampler` のバックグラウンドスレッドとメインスレッドが
+競合しうる唯一の箇所だが、対象は診断用ログ出力であって browser state
+そのものではない)。**どちらも本 Issue が探すべき「state mutation の
+ホットパスを塞ぐロック」ではない** — Issue 本文の項目立ては pthread/
+Mutex ベースのブラウザ実装を念頭に置いた一般的なチェックリストであり、
+本アーキテクチャ (シングルスレッド state machine) には当てはまらない
+ことをここに記録する。
+
+### tab lookup / window lookup — 実測未満、構造的に無視できる規模と判断した
+
+`browser::tabs::Tabs::get`/`get_mut`/`position`(`src/browser/tabs.rs`)と
+`browser::windows::Windows`の同種メソッド (`src/browser/windows.rs`) は
+いずれも `Vec` の線形走査 (`iter().find(|t| t.id() == id)`)。ベンチマーク
+までは組まなかった — 判断できる理由が実測を待たずに揃っていたため:
+
+- 走査対象がそもそも小さい。`Tabs`(1 ウィンドウのタブ数) は
+  `docs/performance-targets.md` の重量級シナリオでも上限 20〜50、
+  `Windows`(開いているウィンドウ数) は実運用でまず 1〜3。`u64`
+  (`TabId`/`WindowId`) の等値比較を数十回行うコストは、#66 (D81) が
+  実測した「20 タブでの `set_tabs` 構築 (この線形走査を伴う)」が
+  sub-millisecond (中央値 0.000ms) だったことに既に織り込まれている —
+  `sync_tab_strip` は `tabs.iter()` で全タブを舐めて `TabSummary` を
+  組み立てており、この Issue が疑う lookup コストと同じ処理を #66 が
+  既に計測済みだった。
+  `HashMap<TabId, Tab>` へ切り替えても、この規模では定数倍の違いが
+  測定ノイズに埋もれる可能性が高く、しかも表示順序 (`Tabs::iter`が
+  タブストリップの並び順そのもの) を別に保持する必要が生じてコードは
+  複雑になる — 得られる見返りが実測抜きでも小さいと判断できた。
+- `Windows`も同型の設計で、`WindowEntry`を`Vec`で持つ理由は
+  `docs/decisions.md` D68 (「なぜ `Tabs` 自体に複数ウィンドウを教えない
+  か」) に既に記録されている。
+- 万一この判断が誤りだったとしても実害は限定的: `tabs_of`/`Windows::
+  tabs`が返す`&mut`参照は呼び出し側で 1 回解決されるだけで (ループの
+  内側で毎回再解決される設計ではない — `tabs_of`のドキュメントコメント
+  参照)、1 イベントあたりの lookup 回数はおおむね定数。
+
+**Revisit condition**: 将来 1 ウィンドウが数百タブを持つユースケースが
+本気で検討されるなら (現状のロードマップにはない)、この判断は再検証が
+要る。
+
+### state mutation / redundant updates — 実測して見つかった唯一の対象:
+### `persist_session` の無条件ディスク書き込み
+
+`sync_tab_strip`(`app.rs`) は `NavigationStarted`/`LoadFinished`/
+`FaviconResolved`/タブの open・close・switch・activate など、ほぼ
+すべてのタブ変化イベントから呼ばれ、その末尾で無条件に `persist_session`
+を呼んでいた (Issue #25/D65)。`persist_session` は
+`persistence::save_session`経由で**実際の同期ディスク I/O**
+(`fs::create_dir_all` + `serde_json::to_string_pretty` +
+`fs::write`) を行う — #66 (D81) が計測した `set_tabs` などの IPC
+(プロセス内の `evaluate_script` 呼び出し) とは性質が違い、コストの
+桁が 1 つ上がりうる箇所だと仮説を立てた (Epic #57 ルール 1 の
+Hypothesis)。
+
+**計測基盤**: `metrics::PerfRecord::StateWrite`(`name`/`duration`)を
+新設し、`app::record_state_write`(`record_tab_latency`と同型、
+`state.perf`が`None`なら`Instant::now()`すら呼ばない) から
+`persist_session`/`persist_history`/`persist_bookmarks`/
+`persist_input_history`の 4 箇所すべてに配線した — #66 の
+`PerfRecord::Ipc`と同じ「単一 choke point に 1 行ずつ」方針。
+`event=state_write`として同じ perf ログ (`VELOX_PERF_OUTPUT`) に
+混在するので、既存の `velox-bench ipc-summary`が読む同じログファイルから
+`jq`等で `event=="state_write"`を抜き出すだけで集計でき、専用の
+CLI サブコマンドは追加しなかった (`summarize_ipc`と違い、name の
+種類が 4 つ固定で組み合わせ爆発しないため、都度のアドホック集計で
+十分と判断した)。
+
+**Baseline (計測結果、20 タブ自動操作セッション、修正前)**: 20 タブを
+順に開き、mark 後に 10 回切替 + 2 回ナビゲーション + 2 回クローズを行う
+セッション (§19.2 に再現手順) で `state_write name=session`が **150 回**
+発生し、その `duration_ms`合計は **50.7ms**(中央値 0.100ms、p95
+0.300ms、最悪値 10.8ms)。3 タブの軽量セッションでも **39 回 / 8.6ms**。
+`SessionSnapshot`が保持するのは url/title/favicon のみ (`loading`フラグ
+は含まない) にもかかわらず、`NavigationStarted`(URL 変化なし・
+loading フラグのみ変化) のような呼び出しでも `sync_tab_strip`経由で
+無条件に書き込みが走っていた — これが唯一実測で見つかった「本当に
+不要な state 変更の反映」だった。
+
+**削減の実装**: `AppState`に`last_persisted_session: Option<
+SessionSnapshot>`を追加し (直近に書き込んだ内容のキャッシュ)、
+`persist_session`が新しく組み立てたスナップショットをこれと比較して
+一致すれば `save_session`呼び出し自体を丸ごとスキップするようにした
+— #66 の `refresh_history_panel_if_open`(パネルが閉じていれば
+`set_history`送信そのものをスキップした) と同じ形の「送るか送らないか」
+判断で、batching やタイマー・デバウンスは一切持ち込んでいない (Epic
+#57 ルール 1 に照らし、計測上必要と分かった分だけの変更にとどめた)。
+書き込みが成功したときだけキャッシュを更新するので (`save_session`が
+失敗した回はスキップ判定に使われない)、ディスクへの反映漏れは生じない。
+private window / データディレクトリ未解決時の既存の早期 return は
+そのまま維持している。
+
+**After (同一セッションでの再測定、2 試行)**: 20 タブセッションで
+`state_write name=session`の回数が **150 → 82 (-45.3%)**、これは 2 回の
+再測定でどちらも 82 回とまったく同じ値になった (自動操作スクリプトが
+決定的で、削減対象がタイマー由来のジッタではなく制御フローそのものの
+ため)。`duration_ms`合計は 1 回目 16.7ms、2 回目 51.7ms — 後者は 1 件の
+外れ値 (38.2ms、共有 VM 上のスケジューリング揺らぎとみられる) に
+支配されており、**中央値 (0.1ms)・p95 (0.2〜0.3ms) は前後でほぼ不変**
+(削減されたのは「呼ばれる回数」であって「1 回あたりの速さ」ではない、
+という点は #66 の `set_tabs`の結論と同じ形)。3 タブセッションでも
+**39 → 22 (-43.6%)**、同傾向。並行して計測した `state_write
+name=history`(`persist_history`) は本 Issue で手を入れていないので
+前後とも 69 回 / 18 回のまま変化なし — 削減が意図した箇所だけに効いて
+いることの裏付けとして記録しておく。
+
+**`persist_history`/`persist_bookmarks`/`persist_input_history`は
+削減しなかった。** これらは実際の内容変更 (訪問記録・タイトル確定・
+favicon 確定・削除・クリア) の都度呼ばれており、同じ内容を 2 回書く
+という意味での「冗長」は起きていない (1 回のページ読み込みで最大 3 回
+`persist_history`が呼ばれるのは、訪問記録・タイトル確定・favicon 確定
+という 3 つの異なる時点の異なる内容を反映しているためで、`persist_
+session`の場合とは事情が違う)。実測でも 20 タブセッションの合計
+8.3ms (69 回) と、削減を要する規模ではなかった。3 イベントを 1 回の
+書き込みにまとめるバッチ化は着手時点で検討したが、計測上の必要性が
+無い状態で複雑さ (ステイル状態のリスクを持つタイマー/デバウンス) を
+持ち込むことになるため見送った — Epic #57 ルール 1 通りの判断。
+
+**`write_json`の`fs::create_dir_all`が呼び出しごとに stat 相当の
+syscall を発生させている**点も調査中に気づいたが、これも実測 (中央値
+0.1ms) の範囲では埋没しており、単独では最適化を正当化する規模ではない
+— ディレクトリキャッシュを持ち込むと「起動後にデータディレクトリが
+削除された場合に復旧できなくなる」という新しい失敗モードを増やす
+リスクもあるため、見送った。
+
+### event routing / UI synchronization — 追加の削減対象は見つからなかった
+
+`handle_user_event`/`handle_toolbar_command`/`handle_content_shortcut`/
+`handle_automation_command`(`app.rs`)のディスパッチは `match`文 1 段
+(コンパイラがジャンプテーブルに落とす)であり、これ自体を疑う実測上の
+根拠は無かった。UI synchronization (`BrowserWindow`への `set_*`呼び出し
+群) は #66 (D81) が `eval_toolbar`という単一 choke point に既に集約・
+計測済みで、本 Issue で新たに見つかった冗長呼び出しは無い —
+`persist_session`(本節で削減した箇所) はディスク書き込みであって
+`eval_toolbar`経由の IPC ではないため、#66 の計測範囲の外にあった、
+という位置づけになる。
+
+### なぜ `unwrap`/`expect` を増やさずに実装できたか
+
+`record_state_write`は`record_tab_latency`と同じ形 (`state.perf`が
+`None`なら即 return、失敗しうる処理は無い) なので、呼び出し側に
+`unwrap`/`expect`は増えていない。`persist_session`の`&AppState`→
+`&mut AppState`シグネチャ変更は、唯一の呼び出し元 `sync_tab_strip`が
+既に`&mut AppState`を受け取っていたため、呼び出し側の変更は不要だった
+(`ui::toolbar`からの`PageTitleResolved`直接呼び出し 1 箇所も同様)。
+
+### 後続 Issue (#68) が使えるもの
+
+- `metrics::PerfRecord::StateWrite`/`StateWriteKind`
+  (`session`/`history`/`bookmarks`/`input_history`) — `persistence::
+  save_*`のディスク書き込みコストを継続的に計測できる。#68
+  (Serialization/Allocation Optimization) が`serde_json::to_string_
+  pretty`のアロケーションコストを見るときも、同じイベントの
+  `duration_ms`が土台になる (現状は create_dir_all を含めた総コストで
+  分離していない点は #68 側で必要なら切り分けを追加できる)。
+- `AppState::last_persisted_session`という「直近に書いた内容と比較して
+  スキップする」パターン — 他の `persist_*`が将来ホットパス化した場合に
+  同じ形をそのまま適用できる。
+
+### Revisit condition
+
+(1) 1 ウィンドウが数百タブになるユースケースが検討され始めたら、
+tab/window lookup の`Vec`線形走査を再検証すること。(2) `state_write`の
+`duration`は`write_json`全体 (`create_dir_all`+ シリアライズ + 書き込み)
+の合算であり、内訳を分けていない — #68 がシリアライズコストだけを
+見たくなったら、`persistence.rs`側に計測を移すか`write_json`の返り値を
+広げる必要がある。(3) 本節の数値はすべて Linux/WebKitGTK — Windows
+(WebView2) でのディスク I/O コストは NTFS のメタデータ操作コストが
+異なるため未計測 (Epic #57 ルール 5)。
 ## D87: ページロードの段階計測 (#69) — `NavigationStarted → LoadStarted → LoadFinished` に分解。DNS/接続/TLS timing は wry に無い、VeloX 側の追加最適化も見送り
 
 Issue #69 (Epic #57 Phase 3)。「ページロード経路を分解し、VeloX 側で制御
