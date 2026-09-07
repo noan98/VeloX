@@ -106,6 +106,18 @@ wait_load [timeout_ms]  # アクティブタブの読み込み中のページロ
                   # 指定時も上限は wait と同じ MAX_WAIT_MS。超過すると
                   # 何を待っていたかを stderr に出してタイムアウトし、次の
                   # コマンドへ進む (ハングしない)
+wait_startup [timeout_ms]  # `startup` perf レコードが書き込まれるまで待つ
+                  # (Issue #173、docs/decisions.md D85)。`wait_load` が
+                  # 見るのは 1 タブの読み込み完了だけだが、`startup`
+                  # レコードはそれに加えてツールバー Webview 独自の
+                  # `ready` ハンドシェイクも揃わないと書かれない
+                  # (`app::mark_startup`/`metrics::StartupTimestamps::
+                  # report`) — このコマンドはその全体を待つ。既に書き込み
+                  # 済みなら即座に次へ進む。引数・デフォルト・上限・
+                  # タイムアウト時の挙動 (ハングしない) は `wait_load` と
+                  # 同じ。パフォーマンス計測が無効 (`VELOX_PERF_METRICS`
+                  # 未設定) だと `startup` レコード自体が書かれないため、
+                  # 待っても何も起きず必ずタイムアウトする
 quit              # アプリケーションを終了する
 ```
 

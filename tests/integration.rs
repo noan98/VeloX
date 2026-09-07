@@ -12,11 +12,12 @@
 //! **Driving mechanism**: `VELOX_AUTOMATION_SCRIPT` (Issue #112,
 //! docs/decisions.md D44) — the file-driven automation hook `velox-bench`
 //! already uses. These tests write their own small scripts in the
-//! documented `open`/`switch`/`close`/`navigate`/`wait`/`wait_load`/`quit`
-//! format and hand them to `velox` the exact same way. No new control
-//! channel is introduced — see D44 for why a listening socket/RPC server
-//! was deliberately rejected as VeloX's automation mechanism, and D47 for
-//! why these tests reuse it rather than inventing a second one.
+//! documented `open`/`switch`/`close`/`navigate`/`wait`/`wait_load`/
+//! `wait_startup`/`quit` format and hand them to `velox` the exact same
+//! way. No new control channel is introduced — see D44 for why a listening
+//! socket/RPC server was deliberately rejected as VeloX's automation
+//! mechanism, and D47 for why these tests reuse it rather than inventing a
+//! second one.
 //!
 //! **`wait_load`, not a fixed `wait <ms>`, for "let the page finish
 //! loading" (Issue #169, D84)**: every `wait <ms>` below that used to stand
@@ -31,15 +32,25 @@
 //! — see each test's own comment for that history) because a slower
 //! runner's load simply did not finish inside whatever margin the constant
 //! happened to encode; `wait_load` removes that margin as a variable
-//! entirely. A handful of waits are deliberately left as plain `wait <ms>`
-//! — either because they are not about a page load at all (settling after
-//! a `close`/`suspend`), or because what they wait for is broader than one
-//! tab's `LoadFinished`, which is all `wait_load` promises: two `navigate`s
-//! that trigger a file download rather than a normal page load (see
-//! `downloads_with_several_tabs_open_are_handled_exactly_once`'s own
-//! comment) and the very first wait of all, which also needs the toolbar
-//! webview's independent `ready` handshake (see
-//! `startup_completes_and_records_a_startup_event`'s own comment).
+//! entirely.
+//!
+//! **`wait_startup`, not `wait_load`, for "let the whole `startup` perf
+//! record land" (Issue #173, D85)**: `startup_completes_and_records_a_
+//! startup_event`'s single wait used to stay a fixed `wait 1500` even after
+//! #169, because what it waits for is broader than one tab's
+//! `LoadFinished` — `app::mark_startup` only writes the `startup` record
+//! once the toolbar webview's own independent `ready` handshake has *also*
+//! landed (see that test's own comment, and D85). `wait_startup` closes
+//! that gap the same way `wait_load` closed the page-load one: it blocks
+//! until `mark_startup` has actually written the record, or times out with
+//! a stderr message, never hangs.
+//!
+//! One pair of waits is still deliberately left as plain `wait <ms>`: the
+//! two `navigate`s in
+//! `downloads_with_several_tabs_open_are_handled_exactly_once` that trigger
+//! a file download rather than a normal page load — see that test's own
+//! comment for what was actually measured about whether `LoadFinished`
+//! fires for those (D85).
 //!
 //! **Preflight / skipping**: every test starts by calling
 //! `skip_without_gui!()`, which checks the real process environment
@@ -321,23 +332,22 @@ fn startup_completes_and_records_a_startup_event() {
     let perf_output = dir.join("perf.jsonl");
     let data_dir = dir.join("data");
     let homepage = fixture_url("minimal.html");
-    // Deliberately *not* `wait_load` here (unlike almost everywhere else in
-    // this file — see the module doc comment): this test's assertion needs
-    // the `startup` perf record, which `mark_startup` only writes once
-    // *every* checkpoint has landed — the content tab's `LoadFinished`
-    // *and* the toolbar webview's own `ready` handshake
-    // (`ToolbarCommand::Ready`, a separate webview `wait_load` knows
-    // nothing about). Converting this to `wait_load` was tried while
-    // verifying this issue's changes and intermittently failed the
-    // assertion below under the same kind of load the rest of this file's
-    // conversions were fixing — not because `wait_load` misbehaved, but
+    // `wait_startup`, not `wait_load` (Issue #173, docs/decisions.md D85):
+    // this test's assertion needs the `startup` perf record, which
+    // `mark_startup` only writes once *every* checkpoint has landed — the
+    // content tab's `LoadFinished` *and* the toolbar webview's own `ready`
+    // handshake (`ToolbarCommand::Ready`, a separate webview `wait_load`
+    // knows nothing about). Plain `wait_load` was tried here first (while
+    // verifying Issue #169's changes) and intermittently failed the
+    // assertion below under load — not because `wait_load` misbehaved, but
     // because it faithfully returns the moment the *page* is done, which
     // can be before the toolbar's independent JS init finishes on a loaded
-    // runner. That is a real, pre-existing race in `mark_startup`, outside
-    // this primitive's scope (Issue #169 only ever promised to wait for a
-    // page load) — left as `wait <ms>` on purpose rather than papered over
-    // with a bigger timeout.
-    let script_path = write_script(&dir, "wait 1500\nquit\n");
+    // runner. `wait_startup` closes that gap directly: it blocks until
+    // `mark_startup` has actually written the `startup` record (or times
+    // out with a stderr message, never hangs), so this test no longer
+    // depends on a fixed real-time guess at how long that race takes to
+    // resolve on whatever runner happens to execute it.
+    let script_path = write_script(&dir, "wait_startup\nquit\n");
 
     let launch = launch_and_wait(
         &perf_output,
@@ -896,13 +906,27 @@ fn downloads_with_several_tabs_open_are_handled_exactly_once() {
     // The two `open`s and the middle `navigate {homepage}` load an actual
     // page, so those waits use `wait_load` (Issue #169/D84) like everywhere
     // else in this file. The two `navigate {download_page}` waits stay a
-    // fixed `wait <ms>`, deliberately: that navigation gets intercepted by
-    // `with_download_started_handler` (D28) and diverted into a download
-    // rather than rendered, and whether WebKitGTK still fires this tab's
-    // ordinary `LoadFinished` for a navigation resolved that way is not
-    // something this change verified — `wait_load` blocking on an event
-    // that might never come is exactly the kind of hang Issue #169 exists
-    // to prevent, not reintroduce, so this pair is left as-is on purpose.
+    // fixed `wait <ms>`, deliberately — **measured**, not guessed (Issue
+    // #173/D85): `download.html` itself is an ordinary page (see its own
+    // comment), so `LoadFinished` for *that* navigation does fire — a
+    // `VELOX_DEBUG=1` trace confirms it, and `with_download_started_handler`
+    // (D28) never intercepts it; only the *second*, JS-triggered navigation
+    // to the `data:` URL the page's `download`-attributed link points at is
+    // diverted into `DownloadStarted`/`DownloadCompleted`, with no
+    // `LoadFinished` of its own (correctly — it never renders a page). So
+    // `wait_load` here would not hang. It would, however, resolve *before*
+    // that download actually finishes: `DownloadStarted`/`DownloadCompleted`
+    // land asynchronously, well after the `LoadFinished` `wait_load` would
+    // return on, and with nothing after the second `navigate` but `quit`,
+    // swapping its `wait 2500` for a bare `wait_load` measurably drops the
+    // second download — replaying this exact script (two downloads, no
+    // trailing settle after the second) 10 times reproduced it twice (files:
+    // 8/10 runs both `velox-test.txt` and `velox-test (1).txt`, 2/10 runs
+    // only the first). `wait_load`/`wait_startup` only ever promise "a page
+    // finished loading" / "the startup record was written" — neither covers
+    // "a download finished", a third condition of its own that this issue
+    // did not ask for a primitive to wait on, so this pair is left as a
+    // fixed `wait <ms>` rather than papered over with `wait_load`.
     let script = format!(
         "open {homepage}\nwait_load\nopen {homepage}\nwait_load\n\
          navigate {download_page}\nwait 2500\n\

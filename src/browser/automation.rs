@@ -44,6 +44,17 @@
 //!                   # MAX_WAIT_MS like `wait`) before giving up and moving
 //!                   # on — never hangs, but times out with a stderr
 //!                   # message naming what it was waiting for.
+//! wait_startup [timeout_ms]  # wait for the `startup` perf record to be
+//!                   # written (Issue #173) — every checkpoint in
+//!                   # `metrics::StartupTimestamps` (window creation, the
+//!                   # toolbar webview's own `ready` handshake, *and* the
+//!                   # first page load), not just one tab's `LoadFinished`
+//!                   # like `wait_load`. Returns immediately if the record
+//!                   # has already been written. Same optional-argument/
+//!                   # default/cap/timeout-message shape as `wait_load`.
+//!                   # Meaningless (and will simply time out) when perf
+//!                   # metrics are off (`VELOX_PERF_METRICS` unset) — no
+//!                   # `startup` record is ever written to wait for.
 //! quit              # exit the application
 //! ```
 //!
@@ -72,6 +83,14 @@ pub const MAX_WAIT_MS: u64 = 120_000;
 /// (the common case) never actually sleeps this long, so a generous default
 /// costs nothing when things are healthy and only matters when something
 /// is actually stuck.
+///
+/// Also `wait_startup`'s default (Issue #173) — kept as one constant rather
+/// than a second one with the same value: both commands share the same
+/// "generous headroom, not a tuned deadline" reasoning, and `wait_startup`
+/// waits for a superset of what `wait_load` waits for (every
+/// `metrics::StartupTimestamps` checkpoint, one of which *is* a page load),
+/// so the same default is if anything slightly more conservative there, not
+/// less.
 pub const DEFAULT_WAIT_LOAD_TIMEOUT_MS: u64 = 10_000;
 
 /// One parsed automation command. Carries no line number itself —
@@ -143,6 +162,22 @@ pub enum AutomationCommand {
     /// the wait itself is implemented without blocking the main event
     /// loop.
     WaitLoad { timeout_ms: u64 },
+    /// `wait_startup [timeout_ms]` (Issue #173) — wait for the `startup`
+    /// perf record to be written, instead of a fixed `wait <ms>` guess at
+    /// how long that takes. Unlike [`AutomationCommand::WaitLoad`], which
+    /// only ever waits on one tab's `LoadFinished`, the `startup` record is
+    /// written by `app::mark_startup` only once *every*
+    /// `metrics::StartupTimestamps` checkpoint has landed — including the
+    /// toolbar webview's own independent `ready` handshake, a separate
+    /// webview `wait_load` knows nothing about (see Issue #173). Resolves
+    /// immediately if the record has already been written by the time this
+    /// command runs. Same default/cap as `wait_load` —
+    /// [`DEFAULT_WAIT_LOAD_TIMEOUT_MS`] when `timeout_ms` is omitted, never
+    /// more than [`MAX_WAIT_MS`] (enforced at parse time). Has nothing to
+    /// wait for (and will simply time out) when performance metrics are
+    /// off, since no `startup` record is ever written in that case; see
+    /// `app::AutomationWaitState` for the wait mechanics.
+    WaitStartup { timeout_ms: u64 },
     /// `quit` — exit the application.
     Quit,
 }
@@ -231,7 +266,10 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
             ms: parse_wait(line, rest)?,
         }),
         "wait_load" => Ok(AutomationCommand::WaitLoad {
-            timeout_ms: parse_wait_load(line, rest)?,
+            timeout_ms: parse_optional_wait(line, "wait_load", rest)?,
+        }),
+        "wait_startup" => Ok(AutomationCommand::WaitStartup {
+            timeout_ms: parse_optional_wait(line, "wait_startup", rest)?,
         }),
         "mark" => {
             if rest.is_empty() {
@@ -291,25 +329,27 @@ fn parse_wait(line: usize, rest: &str) -> Result<u64, AutomationError> {
     Ok(ms)
 }
 
-/// `wait_load`'s argument is optional, unlike `wait`'s — an empty `rest`
-/// means "use [`DEFAULT_WAIT_LOAD_TIMEOUT_MS`]", not an error. When given,
-/// it is validated exactly like `wait`'s `ms` (non-negative integer,
-/// `<= MAX_WAIT_MS`), sharing the same cap so a script cannot use
-/// `wait_load` to sidestep the ceiling `wait` is bound by.
-fn parse_wait_load(line: usize, rest: &str) -> Result<u64, AutomationError> {
+/// `wait_load`/`wait_startup`'s argument is optional, unlike `wait`'s — an
+/// empty `rest` means "use [`DEFAULT_WAIT_LOAD_TIMEOUT_MS`]", not an error.
+/// When given, it is validated exactly like `wait`'s `ms` (non-negative
+/// integer, `<= MAX_WAIT_MS`), sharing the same cap so a script cannot use
+/// either command to sidestep the ceiling `wait` is bound by. `keyword` is
+/// only for the error message (`"wait_load"`/`"wait_startup"`), so a
+/// mistake in one command's script line is not misreported as the other's.
+fn parse_optional_wait(line: usize, keyword: &str, rest: &str) -> Result<u64, AutomationError> {
     if rest.is_empty() {
         return Ok(DEFAULT_WAIT_LOAD_TIMEOUT_MS);
     }
     let ms: u64 = rest.parse().map_err(|_| {
         err(
             line,
-            format!("wait_load の timeout_ms は非負整数で指定してください: {rest:?}"),
+            format!("{keyword} の timeout_ms は非負整数で指定してください: {rest:?}"),
         )
     })?;
     if ms > MAX_WAIT_MS {
         return Err(err(
             line,
-            format!("wait_load は最大 {MAX_WAIT_MS}ms までです (指定値: {ms}ms)"),
+            format!("{keyword} は最大 {MAX_WAIT_MS}ms までです (指定値: {ms}ms)"),
         ));
     }
     Ok(ms)
@@ -654,6 +694,7 @@ mod tests {
             navigate https://example.com/other\n\
             wait 500\n\
             wait_load 3000\n\
+            wait_startup 4000\n\
             quit\n";
         let commands = parse_script(script).unwrap();
         assert_eq!(
@@ -670,6 +711,7 @@ mod tests {
                 },
                 AutomationCommand::Wait { ms: 500 },
                 AutomationCommand::WaitLoad { timeout_ms: 3000 },
+                AutomationCommand::WaitStartup { timeout_ms: 4000 },
                 AutomationCommand::Quit,
             ]
         );
@@ -1026,6 +1068,59 @@ mod tests {
         assert_eq!(
             commands,
             vec![AutomationCommand::WaitLoad {
+                timeout_ms: MAX_WAIT_MS
+            }]
+        );
+    }
+
+    // -- wait_startup (Issue #173) -----------------------------------------
+
+    #[test]
+    fn wait_startup_without_an_argument_uses_the_default_timeout() {
+        let commands = parse_script("wait_startup\n").unwrap();
+        assert_eq!(
+            commands,
+            vec![AutomationCommand::WaitStartup {
+                timeout_ms: DEFAULT_WAIT_LOAD_TIMEOUT_MS
+            }]
+        );
+    }
+
+    #[test]
+    fn wait_startup_with_an_argument_uses_it() {
+        let commands = parse_script("wait_startup 2500\n").unwrap();
+        assert_eq!(
+            commands,
+            vec![AutomationCommand::WaitStartup { timeout_ms: 2500 }]
+        );
+    }
+
+    #[test]
+    fn wait_startup_with_a_non_numeric_argument_is_rejected() {
+        let err = parse_script("wait_startup abc\n").unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("wait_startup"), "{}", err.message);
+    }
+
+    #[test]
+    fn wait_startup_with_a_negative_argument_is_rejected() {
+        let err = parse_script("wait_startup -1\n").unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn wait_startup_beyond_the_cap_is_rejected() {
+        let err = parse_script(&format!("wait_startup {}\n", MAX_WAIT_MS + 1)).unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
+    }
+
+    #[test]
+    fn wait_startup_exactly_at_the_cap_is_accepted() {
+        let commands = parse_script(&format!("wait_startup {MAX_WAIT_MS}\n")).unwrap();
+        assert_eq!(
+            commands,
+            vec![AutomationCommand::WaitStartup {
                 timeout_ms: MAX_WAIT_MS
             }]
         );
