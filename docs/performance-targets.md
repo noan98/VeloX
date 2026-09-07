@@ -1303,13 +1303,27 @@ target/release/velox-bench ipc-summary --input $S/nav_session.jsonl \
 ```
 ## 21. Windows (WebView2) の実測 (Issue #136)
 
-**設計判断・実装方針は `docs/decisions.md` D88 を参照。** この節は Windows
-側の実測結果を記録する場所として用意した — **現時点ではまだ 1 つも数値が
-入っていない。** 理由は D88 のとおり: この節を書いている環境は Linux
-コンテナで Windows 実機が無く、`.github/workflows/perf-windows.yml`
-(`workflow_dispatch` 限定) を実際に `windows-latest` ランナー上で実行して
-初めて数値が取れる。以下は**その実行後に埋めるプレースホルダ**であり、
-架空の数値は一切書いていない。
+**設計判断・実装方針は `docs/decisions.md` D88 を参照。**
+`.github/workflows/perf-windows.yml` の初回実行
+(run [`34127310212`](https://github.com/noan98/VeloX/actions/runs/34127310212)、
+ジョブ `velox-bench run (windows-latest)`、job id `101758900568`、
+2026-09-07) が `windows-latest` ランナー上で success で完走し、この節に
+Windows 側の実測値を記録できるようになった (Issue #180)。
+
+**この初回実行は `workflow_dispatch` (手動実行) ではない。** `perf-windows.yml`
+は `workflow_dispatch` に加えて「`perf-windows.yml` 自身を変更する PR」でだけ
+`pull_request` トリガーでも走る (D88。`workflow_dispatch` は `main` にマージ
+されるまで Actions タブに現れず手動実行できないため、workflow 自身の検証手段
+として付けてある)。run 34127310212 はまさにその経路で、`perf-windows.yml` を
+新規追加した PR #179 に対する `pull_request` トリガーの自動実行として走った
+(ジョブログの checkout は `refs/remotes/pull/179/merge`、run のイベント種別も
+`pull_request`)。**したがって「手動実行された初回の計測」ではなく、
+「workflow 追加 PR 上での初回の検証実行」である。** 以後シナリオや試行回数を
+変えて測る場合は、`main` にマージ済みの `workflow_dispatch` から実行する。D88 が「最大の
+リスク」としていた `windows-latest` 上での GUI/WebView2 ウィンドウの起動
+可否は、この実行により**起動できた**で決着している (詳細は §21.3)。数値は
+すべて run 34127310212 のジョブログ・Actions Artifact に実在するものだけを
+転記しており、推定値・補間値は含まない。
 
 > ⚠️ **この節の数値を、§1〜§20 の Linux (WebKitGTK/Xvfb) の数値と直接比較
 > しないこと。** OS が異なれば WebView 実装 (WebView2 vs WebKitGTK) も
@@ -1320,40 +1334,97 @@ target/release/velox-bench ipc-summary --input $S/nav_session.jsonl \
 > としても、Linux の PSS (`smaps_rollup` 由来) とは算出方法が全く異なるため
 > 直接比較してはならない (D88 参照)。
 
-### 21.1 測定環境 (`perf-windows.yml` 実行後に記入)
+### 21.1 測定環境
+
+**run 34127310212 の「Record environment info (OS build / CPU / memory /
+WebView2 Runtime)」ステップ (2026-09-07 13:25:58〜13:26:00 UTC) のログから
+転記。** 数値の捏造・推定はしていない。
 
 | 項目 | 値 |
 | --- | --- |
-| ランナー | `windows-latest` (GitHub-hosted) |
-| OS ビルド番号 | *(TBD — `perf-windows.yml` の「実行環境の情報を記録」ステップのログ参照)* |
-| CPU | *(TBD)* |
-| メモリ | *(TBD)* |
-| WebView2 Runtime バージョン | *(TBD)* |
-| rustc | *(TBD)* |
-| VeloX ビルド | `cargo build --release` (`velox.exe` / `velox-bench.exe`) |
-| ディスプレイ | GitHub-hosted Windows ランナーの対話セッション (Xvfb 相当の仕組みは無い。GUI/WebView2 ウィンドウが起動できるか自体が未検証 — D88 参照) |
+| ランナー | `windows-latest` (**GitHub-hosted の共有・仮想化ランナー。Windows 実機の実力値ではない** — CPU が 2 論理コアしか無く他ジョブと共有される仮想環境で、ばらつきも実機より大きく出うる) |
+| OS | Microsoft Windows Server 2025 Datacenter |
+| OS ビルド番号 | 26100 |
+| CPU | AMD EPYC 9V74 80-Core Processor (2 論理コア) |
+| メモリ (物理) | 7.99 GiB |
+| WebView2 Runtime バージョン | 151.0.4129.101 |
+| rustc | 1.98.1 (48a229cea 2026-09-01) |
+| VeloX ビルド | `cargo build --release` (`velox.exe` / `velox-bench.exe`)、commit `b92dc6825c65edda116a021390513f2fba12daf9` |
+| ディスプレイ | GitHub-hosted Windows ランナーの対話セッション (Xvfb 相当の仕組みは無いが、§21.3 のとおり GUI/WebView2 ウィンドウは実際に起動できることを確認した) |
+| 実行元 | [run 34127310212](https://github.com/noan98/VeloX/actions/runs/34127310212) / job `101758900568` (`velox-bench run (windows-latest)`) |
+| 実行トリガー | `pull_request` (PR #179 = `perf-windows.yml` を追加した PR)。**`workflow_dispatch` による手動実行ではない** — 節冒頭の説明を参照 |
 
-### 21.2 シナリオ別の結果 (`perf-windows.yml` 実行後に記入)
+### 21.2 シナリオ別の結果
 
-`velox-bench run` の `--scenario`/`--trials`/`--url` を workflow_dispatch の
-入力パラメータとして指定した実行結果を、シナリオごとに追記していく。形式は
-§4/§13 等の既存の節にならい、`velox-bench` の `metrics` キー
-(`docs/benchmarking.md` 「計測される生データとの対応」表) をそのまま使う。
+`velox-bench run --scenario cold_startup --trials 10 --url
+http://127.0.0.1:8731/minimal.html` (`scripts/bench/pages/minimal.html` を
+loopback の `python -m http.server` で配信、§1 と同じくネットワーク非依存の
+固定ページ) を実行した結果。形式は §4/§13/§20 の既存の節にならい、
+`velox-bench` の `metrics` キー (`docs/benchmarking.md` 「計測される生データ
+との対応」表) をそのまま使う。
 
-*(まだ実行結果が無いため、表は未作成。初回実行後、このセクションに
-`cold_startup` を最初のシナリオとして追記する想定。)*
+```
+scenario=cold_startup os=windows cpu=2 trials=10 commit=b92dc6825c65edda116a021390513f2fba12daf9
+```
 
-### 21.3 GUI 起動可否の検証結果 (`perf-windows.yml` 実行後に記入)
+| メトリクス | n | median | p95 | mean | min | max | stddev |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `page_load_dispatch_ms` | 10 | 5.35 | 65.04 | 17.80 | 0.90 | 73.10 | 25.74 |
+| `page_load_engine_ms` | 10 | 32.05 | 51.16 | 36.23 | 23.20 | 51.20 | 11.60 |
+| `page_load_ms` | 10 | 54.10 | 93.70 | 54.06 | 24.20 | 100.50 | 25.16 |
+| `pss_process_count` | 10 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `rss_process_count` | 10 | 8.00 | 9.10 | 8.20 | 8.00 | 10.00 | 0.63 |
+| `rss_total_bytes` | 10 | 385329152.00 | 405977497.60 | 385506918.40 | 368803840.00 | 419270656.00 | 14101030.53 |
+| `startup_first_load_ms` | 10 | 716.70 | 743.58 | 720.61 | 699.70 | 750.60 | 15.13 |
+| `startup_rust_setup_done_ms` | 10 | 645.30 | 664.39 | 647.60 | 628.70 | 672.40 | 11.10 |
+| `startup_toolbar_ready_ms` | 10 | 646.00 | 665.75 | 648.48 | 629.50 | 673.40 | 11.17 |
+| `startup_toolbar_script_started_ms` | 10 | 645.90 | 665.69 | 648.39 | 629.50 | 673.30 | 11.16 |
+| `startup_window_created_ms` | 10 | 644.05 | 662.91 | 646.15 | 627.80 | 670.20 | 11.05 |
 
-D88 が「最大のリスク」と位置付けた、`windows-latest` ランナー上で VeloX
-(WebView2 ウィンドウ) が起動できるかどうかの結果をここに記録する。
-`perf-windows.yml` の診断ステップ (`velox.exe` を直接起動し、プロセス一覧と
-perf ログの有無を確認する) の結果を貼ること。
+**`pss_process_count` が全 10 試行で 0 なのは異常ではなく想定どおりの挙動。**
+D88 のとおり Windows では PSS 相当を実装していないため
+(`total_pss_bytes`/`pss_process_count` は Windows の結果では常に欠損として
+扱われる)、この節でメモリを見る指標は `rss_total_bytes` のみになる。
 
-- 起動できた場合: 何回目の実行で確認できたか、`startup` perf レコードが
-  実際に書けたかを記録する。
-- 起動できなかった場合: 何を試して、どう失敗したか (プロセスが即終了した/
-  ハングした/perf レコードが 1 件も書けなかった、等) を記録し、セルフホスト
-  ランナー等の方式再検討が必要という結論をここに残す。**無理に通そうとした
-  形跡 (数値の捏造・失敗の隠蔽) を残さないこと** — D88 および #59 が同じ
-  方針を採っている。
+結果 JSON (`cold_startup-windows.json`) は Actions Artifact
+[`velox-perf-windows-cold_startup`](https://github.com/noan98/VeloX/actions/runs/34127310212/artifacts/10020756565)
+(Artifact ID `10020756565`、保持期限 30 日) として run 34127310212 に保存
+されている。上表の値はこの Artifact およびジョブログの標準出力
+(`velox-bench run` の集計表・JSON 両方) と一致する。
+
+> Linux (§1〜§20) の数値とは比較しないこと。前掲の警告ブロックのとおり。
+
+### 21.3 GUI 起動可否の検証結果
+
+**起動できた。** D88 が「最大のリスク」と位置付けていた、`windows-latest`
+ランナー上で VeloX (WebView2 ウィンドウ) が起動できるかどうかは、この初回
+実行で解消した。
+
+`perf-windows.yml` の診断ステップ (`velox.exe --homepage
+http://127.0.0.1:8731/minimal.html` を直接起動し 8 秒待ってから、プロセス
+一覧と perf ログの有無を確認する) の実際の出力:
+
+```
+--- process snapshot ---
+
+  Id ProcessName    MainWindowTitle
+  -- -----------    ---------------
+2948 msedgewebview2
+6440 msedgewebview2
+7072 msedgewebview2
+7104 msedgewebview2
+7248 msedgewebview2
+7392 msedgewebview2
+8316 msedgewebview2
+6120 velox          VeloX
+
+--- perf log ---
+records: 34
+```
+
+プロセス構成は `velox.exe` 1 + `msedgewebview2.exe` 7 で、`velox.exe`
+(PID 6120) の `MainWindowTitle` は `VeloX` になっていた — ウィンドウが実際に
+作られ、タイトルも設定されている証拠。perf ログ (`VELOX_PERF_OUTPUT`) にも
+実際に 34 件のレコードが書けている。続く `velox-bench run --scenario
+cold_startup --trials 10` も 10/10 試行すべてで各 32 件のレコードを取得して
+完走した (§21.2 の結果はこの 10 試行から集計したもの)。

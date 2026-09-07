@@ -475,7 +475,15 @@ in   ready                           1           15      0.000      0.000
 
 **Windows (WebView2) 側の性能実測は、この Actions workflow を手動実行
 (`workflow_dispatch`) することで行う。** 設計判断は `docs/decisions.md`
-D88、実測結果 (取れ次第) は `docs/performance-targets.md` §21 を参照。
+D88、実測結果は `docs/performance-targets.md` §21 を参照 — 初回実行
+(run [`34127310212`](https://github.com/noan98/VeloX/actions/runs/34127310212)、
+2026-09-07、Issue #180) が `windows-latest` ランナー上で success で完走し、
+`cold_startup` の実測値と GUI 起動可否 (起動できた) が記録済み。
+
+なおこの初回実行だけは `workflow_dispatch` ではなく、`perf-windows.yml` を
+追加した PR #179 に対する `pull_request` トリガー (後述の「`perf-windows.yml`
+自身を変更する PR でのみ検証目的で動く」経路) で走ったものである。`main` に
+マージされた現在は、下記のとおり `workflow_dispatch` で手動実行できる。
 
 これまでの節 (`run`/`aggregate`/`compare`/`gate`/`ipc-summary`) はすべて
 `velox-bench` のサブコマンド自体は OS を問わず同じであり、Linux 向けに
@@ -742,14 +750,15 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   1ms 未満なのは、このコンテナではソフトウェアレンダリングの初回描画待ちが
   ボトルネックにならない (既にレンダリング済みの背景タブへの切り替えは
   ほぼ即時) ためで、実機の GPU レンダリングでも同程度かは未確認。
-- **Windows (`perf-windows.yml`, Issue #136): この節に書ける実測結果は
-  まだ無い。** `sample_process_tree_rss` の Windows 実装
-  (`docs/decisions.md` D88) は `cargo check --target x86_64-pc-windows-msvc`
-  による型チェックのみを通しており、Windows 実機/CI 上で実際に正しい
-  RSS/CPU 値を返すかは未検証。`velox-bench run` が `windows-latest`
-  ランナー上で完走するか (GUI/WebView2 ウィンドウが起動できるか自体を含む)
-  も未検証 — D88・上記「7. Windows で実行する」節を参照。実測できた結果は
-  `docs/performance-targets.md` §21 に追記する。
+- **Windows (`perf-windows.yml`, Issue #136 / #180): `cold_startup` の初回
+  実測結果は `docs/performance-targets.md` §21 に記録済み。**
+  `windows-latest` ランナー上での GUI/WebView2 ウィンドウ起動 (Issue #136
+  時点では未検証だった) と `velox-bench run` の完走はいずれも確認できた
+  (run `34127310212`)。ただし `sample_process_tree_rss` の Windows 実装
+  (`docs/decisions.md` D88) が返す RSS 値が Windows **実機**上でも同じ精度
+  かは未検証のまま — 今回確認できたのは GitHub-hosted (共有・仮想化) ランナー
+  上の値であり、Windows 実機の実力値ではない。他シナリオ (`tab_create_N` 等)
+  の実測は #180 のスコープ外 — 上記「7. Windows で実行する」節を参照。
 
 ## 既知の制約・将来の拡張
 
