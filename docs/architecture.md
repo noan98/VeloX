@@ -1142,7 +1142,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
 
     | `event`      | fields |
     |--------------|--------|
-    | `startup`    | `window_created_ms`, `rust_setup_done_ms`, `toolbar_script_started_ms`, `toolbar_ready_ms`, `first_load_ms` (float ms) |
+    | `startup`    | `event_loop_ms`, `pre_window_setup_ms`, `native_window_ms`, `toolbar_webview_ms` (float ms or `null` — Issue #182, see D92), `window_created_ms`, `rust_setup_done_ms`, `toolbar_script_started_ms`, `toolbar_ready_ms`, `first_load_ms` (float ms). All are elapsed time from process start, so a *segment* is the difference between two adjacent ones — but `toolbar_ready_ms` and `first_load_ms` are independent and can arrive in either order (D92), so that particular pair is not a segment |
     | `page_load`  | `url` (string), `duration_ms` (float ms), `engine_duration_ms`/`dispatch_duration_ms` (float ms or `null` — Issue #69, see D87) |
     | `tab_create` | `tab_id` (uint), `duration_ms` (float ms) |
     | `tab_switch` | `tab_id` (uint), `duration_ms` (float ms) |
@@ -1152,6 +1152,14 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     | `cpu`        | `percent` (float) — CPU used by the whole process tree between the two most recent `rss` samples, as a percentage of one core (Issue #64). A rate, so the first sample of a run emits none |
     | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint), `total_cpu_seconds` (float or `null`) |
     | `ipc`        | `direction` (string: `in` / `out`), `name` (string — a `ToolbarCommand`'s `cmd` tag for `in`, an `eval_toolbar` call-site label like `set_tabs` for `out`), `bytes` (uint — raw JSON payload size), `duration_ms` (float ms — Rust-side `parse_command`/`evaluate_script` cost only, never JS execution; Issue #66) |
+
+    `event_loop_ms`/`pre_window_setup_ms`/`native_window_ms`/
+    `toolbar_webview_ms` were added by Issue #182 (D92) to split
+    `window_created_ms` — 644ms of Windows' 717ms time-to-first-page
+    (`docs/performance-targets.md` §21) — into toolkit initialization,
+    VeloX's own Rust setup, the native window, and the engine's first
+    webview. They follow the same "present, possibly `null`" rule as
+    `total_pss_bytes` below, and for the same reason.
 
     `total_pss_bytes`/`pss_process_count` were added by Issue #108 (D42).
     `total_pss_bytes` is the PSS counterpart to `total_rss_bytes` — see
@@ -1168,7 +1176,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
 
     Example lines:
     ```json
-    {"event":"startup","first_load_ms":120.0,"toolbar_ready_ms":45.6,"ts_ms":120.0,"window_created_ms":12.3}
+    {"event":"startup","event_loop_ms":2.0,"first_load_ms":120.0,"native_window_ms":5.0,"pre_window_setup_ms":2.1,"toolbar_ready_ms":45.6,"toolbar_webview_ms":11.8,"ts_ms":120.0,"window_created_ms":12.3}
     {"event":"page_load","duration_ms":250.0,"ts_ms":5310.2,"url":"https://example.com/"}
     {"event":"tab_create","duration_ms":15.2,"tab_id":3,"ts_ms":8420.9}
     {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"total_pss_bytes":188978790,"pss_process_count":5,"ts_ms":10000.0}
