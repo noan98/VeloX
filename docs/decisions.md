@@ -8751,3 +8751,147 @@ Windows の `ICoreWebView2_11::ContextMenuRequested` を将来
 だけで、経路自体は本項で調査・記録済み)。(6) `<input>`/`<textarea>`
 内部の選択テキストを拾えるようにする。(7) メニューセッションをタブごとに
 複数持てるようにする。
+
+## D81: IPC 計測基盤 (#66) — `PerfRecord::Ipc` で JS ↔ Rust を両方向計測し、実測に基づいて「タブストリップ全件再送信は意図的」「履歴パネルの無条件再送信は不要」と切り分けた
+
+Issue #66 (Epic #57 Phase 3)。「WebView ↔ Rust の IPC コストを計測し、
+不要な通信と payload を削減する」という課題に対して、**まず継続的に
+計測できる仕組みを作り、その実測データだけで削減判断をした** — Epic #57
+ルール 1 (ベンチマークなしの最適化をしない) を、#60/#64 と同じやり方で
+守った。数値・再現手順は `docs/performance-targets.md` §16、使い方は
+`docs/benchmarking.md` §6 を参照。ここには設計判断とその理由だけを残す。
+
+### 計測をどこに追加したか — 既存の1本の choke point ずつに載せた
+
+新しい IPC チャネルや新しいラッパー層は作らず、**既存の「全メッセージが
+必ず通る場所」2 箇所にそれぞれ 1 行ずつ計測を差し込んだ**:
+
+1. **JS → Rust (`direction=in`)**: `window.ipc.postMessage` は
+   `ui::window::BrowserWindow`の `with_ipc_handler` → 唯一の
+   `UserEvent::ToolbarMessage(window_id, body)` を経由し、
+   `app::record_perf_event` がこれを既に (メトリクス ON 時のみ) 見ている。
+   ここに `metrics::PerfRecord::ipc(IpcDirection::In, name, body.len(),
+   started)` を 1 回書くだけで、**すべての `ToolbarCommand` を計測対象に
+   できた** — 個々のコマンドの型ごとに計測コードを足す必要はない。
+   `name` は `ui::toolbar::command_name` という新関数が担う: `body` を
+   `serde_json::Value` として浅くパースし `"cmd"` フィールドだけ読む
+   (実際のバリデーションは既存の `parse_command` に任せる)。**あえて
+   `parse_command(body).ok().map(...)` にしなかった理由**: `parse_command`
+   が失敗するボディ (未知の `cmd`、型不一致) でも `command_name` はタグを
+   読めるため、「壊れたメッセージが飛んできたことそのもの」が計測ログに
+   残る — サイレントに欠測させない設計を優先した。
+2. **Rust → JS (`direction=out`)**: `ui::window::BrowserWindow` の
+   `set_*`/`focus_address_bar`/`set_panel` はすべて最終的に
+   `self.toolbar.evaluate_script(...)` を呼んでいた (19 箇所)。これを
+   1 つの private メソッド `eval_toolbar(&self, name: &'static str,
+   script: &str)` に集約し、19 箇所すべてをこの呼び出しに置き換えた。
+   計測 (`Instant::now()` を挟んで `evaluate_script` を呼び、
+   `IpcLog::record` へ渡す) は `eval_toolbar` の中の 1 箇所だけに書いた。
+   **`duration` が測れるのは Rust 側のコスト (JSON 文字列の構築 + FFI
+   呼び出し) だけ**であり、`evaluate_script` はコールバックを取らない
+   fire-and-forget 呼び出しなので、生成された JS の実行時間・DOM 更新
+   コストは測れない (Epic #57 ルール 3、WebView をブラックボックスとして
+   扱う、を計測設計そのものに反映した)。content webview 向けの
+   `evaluate_script` (find/view-source/favicon 取得など) はここに含めて
+   いない — トールバー IPC チャネル (`docs/architecture.md` が
+   "IPC protocol (JSON)" として明示している対象) にスコープを絞った。
+
+### `BrowserWindow` への配線 — 新しい `pub` 型を 1 つだけ増やした
+
+`app::PerfContext` (既存、`Arc<PerfLog>` + `process_start` のペア、
+`app.rs` 内 private) と同じ形をもう 1 つ `browser::perf_log::IpcLog`
+として `pub` で用意した。**`PerfContext` を `pub` にして使い回さなかった
+理由**: `docs/architecture.md` の層構造 (`ui::` は UI ツールキット層、
+`app.rs` はそれより上のイベントディスパッチ層) では `ui::window` が
+`app` に依存できない。`PerfContext`はその依存を逆転させてしまうため、
+構造的に同じでも別の `pub` 型として `perf_log.rs` (`browser::` 側、
+既に IO を担う「意図的に汚れている」モジュール) に置いた。
+`BrowserWindow::new` に `Option<IpcLog>` を追加パラメータとして渡す
+(`config.perf_metrics` が off なら `None` — 既存の
+`Option::is_none` 一発チェックで済むパターンを踏襲)。呼び出し元は 2 つ:
+`app::run`(最初のウィンドウ) と `app::open_new_window`(Ctrl/Cmd+N)。
+前者のために `perf_log`/`ipc_log` の構築を `AppState` 構築より前
+(元は後、RSS サンプラを起動する直前だった) に前倒しした。後者は
+`state.perf`(既存フィールド) から `PerfContext::to_ipc_log()` という
+1 メソッドで作る — `state.perf` と新しいウィンドウの `ipc_log` が
+別々の `PerfLog`/`process_start` を指してしまう (ログが分裂する) 事故を
+型で防ぐためのアダプタメソッドである。
+
+### 集計・可視化 — `browser::benchmark::summarize_ipc` + `velox-bench ipc-summary`
+
+計測イベントを吐くだけでは「継続的に見える化」にならないため、
+`benchmark.rs` (純粋 Rust、既存の `aggregate_trials`/`compare`/
+`evaluate_gate` と同じファイル) に `summarize_ipc` を追加した:
+`ipc` イベントを `(direction, name)` ごとにグルーピングし、件数・合計
+バイト数・`duration_ms` の `Stats` (既存の `compute_stats` を再利用) を
+返す。`total_bytes` 降順ソートなのは「このチャネルの通信量を支配して
+いるのは何か」が Issue #66 の"高頻度イベントを特定"の核心だから。
+`velox-bench` に `ipc-summary` サブコマンドを追加し、IO 層 (`--input`
+複数ファイル読み込み、表示、`--output` への JSON 保存) を担わせた。
+**`aggregate`/`gate` のように `BenchmarkResult`/回帰ゲートは作らなかった**
+— IPC トラフィックは「シナリオの 1 メトリクス」ではなく「セッション
+全体の通信内訳」を見る診断ツールという性格が異なるため、既存の
+シナリオ前提の型に無理に押し込めるより独立コマンドにする方が素直だと
+判断した。後続 Issue が回帰ゲートに載せたくなった場合は、`IpcSummary`
+の特定の `name` (例えば `set_tabs` の `total_bytes`) を新しい
+`MetricKey` として追加すれば `evaluate_gate` の枠組みにそのまま乗る。
+
+### 実測して分かったこと・下した判断 (数値は §16)
+
+- `set_tabs` (タブストリップ全件再送信) が量・回数とも最大だが、20 タブ
+  という最も重いケースでも Rust 側コストは sub-millisecond (中央値
+  0.000ms、120 件中の最悪値でも 3.5ms)。タブストリップは常時表示 UI
+  であり、1 回のタブ操作につき最大 3 回 (読込開始/読込完了/favicon
+  解決) 送るのも実際に変化した状態を反映しているだけ — **削減もバッチ
+  化もしなかった。** 計測上のボトルネックが無い状態でタイマー/デバウンス
+  ロジックを持ち込むことは Epic #57 ルール 1 に反する。
+- `set_history` (履歴パネル全件再送信、既定 200 件上限) は
+  `LoadFinished`/`PageTitleResolved`/`FaviconResolved` の 3 箇所から
+  **履歴パネルが閉じていても**無条件に呼ばれていた — 唯一実測で見つかった
+  「本当に不要なイベント」。`app::refresh_history_panel_if_open`
+  (`window.open_panel() == Some(Panel::History)` を確認してから
+  `refresh_history_panel` を呼ぶ薄いラッパー) を追加し、上記 3 箇所を
+  これに差し替えた。パネルを開く操作 (`TogglePanel`) は既存のまま
+  無条件に更新するので、**パネルを開いた瞬間の表示内容は変わらない**。
+  同一の自動操作スクリプトでの before/after 実測 (§16.4): 20 タブ
+  セッションで `set_history` 67→1 件 (-98.5%)、15,723→555 bytes
+  (-96.5%)、ipc イベント総数は 502→430 件 (-14.3%)。
+- **batching は導入しなかった。** 上記 2 点とも、削減判断は「送るか
+  送らないか」で完結しており、複数イベントを 1 回の `evaluate_script`
+  呼び出しにまとめる必要が生じる規模のボトルネックが見つからなかった。
+- **`direction=in` の実測範囲には限界がある。** `browser::automation`
+  の `open`/`switch`/`navigate`/`close`/`suspend` は `AutomationCommand`
+  として `app.rs` のハンドラを直接呼ぶ設計 (Issue #112, D44) であり、
+  実際の `window.ipc.postMessage` を経由しない。そのため自動操作
+  スクリプトで `in` 側を測ると `ready`/`script_started` (起動時
+  ハンドシェイク、1 回だけ) しか出てこない。オムニボックスの
+  1 キー入力ごとの `omnibox_input` 往復のような、実際のキー入力でしか
+  発火しない高頻度 `in` パスは **本 Issue では未計測のまま残した**。
+  `ui::toolbar::ToolbarCommand` の定義から、typical な `in` メッセージが
+  数十バイトの固定形状 JSON であることはソースコード上明らかであり、
+  `out` 側で実測した「同程度サイズは sub-millisecond」から類推して
+  ボトルネックである可能性は低いと考えているが、これは実測ではなく
+  推論であることを明記する。
+
+### なぜ `unwrap`/`expect` を避けつつ計測コードを 2 箇所（`app.rs`/`window.rs`）に分散させたか
+
+計測は「失敗しても機能に影響してはならない」という既存方針
+(`PerfLog::write` がエラーを `eprintln!` に落とすだけで伝搬しない、D16)
+をそのまま受け継いだ。`IpcLog::record`/`PerfRecord::ipc` はどちらも
+`Result` を返さない (失敗しうる処理が無い — シリアライズ失敗は
+`PerfRecord::to_json_line` 側の既存フォールバックが吸収する) ため、
+呼び出し側に `unwrap`/`expect` は一切増えていない。
+
+### Revisit condition
+
+(1) `browser::automation` に `type`(オムニボックス入力) 相当のコマンドを
+足す機会があれば、`omnibox_input`/`omnibox_close` の `in` 側実測を追加
+する。(2) `IpcSummary` の特定行を `MetricKey` に昇格し、`gate` の回帰
+検知に載せる (#68 が対象にしうる)。(3) content webview 側の
+`evaluate_script`(find/view-source/favicon 取得など) は今回計測対象外に
+した — 頻度・サイズとも `ToolbarCommand` チャネルより明らかに小さいと
+判断したが、実測はしていない。差が疑わしくなったら同じ `eval_toolbar`
+パターンで計測を足せる。(4) Windows (WebView2) での実測は未実施 — この
+節の数値はすべて Linux/WebKitGTK。`evaluate_script`/`with_ipc_handler`
+は wry の共通 API だが、実際のディスパッチコストは OS ごとの WebView
+実装に依存するため、Windows 実機での再計測が必要。

@@ -467,6 +467,34 @@ pub fn parse_command(body: &str) -> Result<ToolbarCommand, ParseCommandError> {
     serde_json::from_str(body).map_err(ParseCommandError::Json)
 }
 
+/// Best-effort `"cmd"` tag extraction from a raw toolbar IPC body, for
+/// performance-metric labeling only (Issue #66, `metrics::PerfRecord::Ipc`)
+/// — never used to decide behavior, and never a substitute for
+/// [`parse_command`]. Cheaper than a full parse because it does not
+/// validate any variant's fields against [`ToolbarCommand`]'s shape, so a
+/// body that would fail [`parse_command`] (unknown `cmd`, missing field,
+/// wrong type) can still be labeled here — useful precisely because a
+/// metrics consumer wants to see *that* a malformed message arrived, not
+/// just silently miss it. Does not enforce [`MAX_IPC_PAYLOAD_BYTES`] itself
+/// (the caller already has the body's `len()` for the `bytes` field
+/// regardless of what this returns); `serde_json::from_str` still bounds
+/// its own work by the body's actual size. Falls back to `"invalid"` for a
+/// body that is not a JSON object with a string `"cmd"` field at all (not
+/// realistically reachable from `TOOLBAR_HTML`'s own JS, but IPC bodies are
+/// still untrusted input by construction — see [`MAX_IPC_PAYLOAD_BYTES`]'s
+/// doc comment).
+pub fn command_name(body: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "invalid".to_owned())
+}
+
 /// Escape U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) in an
 /// already-serialized JSON document before splicing it into JS source via
 /// `evaluate_script`.
@@ -887,6 +915,38 @@ mod tests {
             // types, so it must parse successfully and never panic.
             assert!(parse_command(body).is_ok(), "{body}");
         }
+    }
+
+    // --- `command_name` (Issue #66, IPC metrics labeling) ---
+
+    #[test]
+    fn command_name_reads_the_cmd_tag() {
+        assert_eq!(
+            command_name(r#"{"cmd":"navigate","input":"example.com"}"#),
+            "navigate"
+        );
+        assert_eq!(command_name(r#"{"cmd":"back"}"#), "back");
+    }
+
+    #[test]
+    fn command_name_falls_back_to_invalid_for_unparseable_or_shapeless_bodies() {
+        assert_eq!(command_name("not json"), "invalid");
+        assert_eq!(command_name("[]"), "invalid");
+        assert_eq!(command_name(r#"{"no_cmd_field":1}"#), "invalid");
+        assert_eq!(command_name(r#"{"cmd":123}"#), "invalid");
+    }
+
+    #[test]
+    fn command_name_reads_the_tag_even_when_the_rest_of_the_body_is_invalid() {
+        // Unlike `parse_command`, an unknown `cmd` or a missing/mistyped
+        // field elsewhere in the body must not stop `command_name` from
+        // reporting the tag — a metrics consumer wants to see that this
+        // (malformed) message arrived, not have it silently swallowed.
+        assert_eq!(
+            command_name(r#"{"cmd":"not_a_real_command"}"#),
+            "not_a_real_command"
+        );
+        assert_eq!(command_name(r#"{"cmd":"navigate"}"#), "navigate");
     }
 
     #[test]

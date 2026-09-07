@@ -16,10 +16,10 @@
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Mutex;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use super::metrics::{PerfFormat, PerfRecord};
+use super::metrics::{IpcDirection, PerfFormat, PerfRecord};
 
 /// Where perf lines actually go.
 enum Sink {
@@ -81,6 +81,48 @@ impl PerfLog {
         if let Err(err) = result {
             eprintln!("velox: failed to write perf log line: {err}");
         }
+    }
+}
+
+/// Where to send IPC-traffic records (Issue #66): a [`PerfLog`] sink plus
+/// the epoch its `ts_ms` timestamps are relative to, bundled so a caller
+/// only has to hold and clone one `Option<IpcLog>` field. `Clone`-able
+/// (`Arc`-backed `PerfLog`, `Copy` `Instant`) so both `app::AppState` (via
+/// `PerfContext::to_ipc_log`) and every open `ui::window::BrowserWindow`
+/// can hold their own copy pointing at the same underlying log.
+///
+/// Structurally identical to `app::PerfContext` (also a `Arc<PerfLog>` +
+/// `Instant` pair, for tab-latency logging) — kept as a separate `pub` type
+/// rather than reusing that one because `PerfContext`'s fields are private
+/// to `app.rs` and `ui::window` cannot depend on `app` (docs/architecture.md
+/// layers UI toolkit code below `app.rs`'s event dispatch, not above it).
+#[derive(Clone)]
+pub struct IpcLog {
+    log: Arc<PerfLog>,
+    process_start: Instant,
+}
+
+impl IpcLog {
+    pub fn new(log: Arc<PerfLog>, process_start: Instant) -> Self {
+        Self { log, process_start }
+    }
+
+    /// Record one IPC message. `started` is when the caller began the
+    /// Rust-side work being measured (`Instant::now()` right before
+    /// `parse_command`/`evaluate_script`) — mirrors
+    /// `PerfRecord::ipc`/`PerfRecord::tab_latency`'s "caller only brackets a
+    /// clock read" contract.
+    pub fn record(
+        &self,
+        direction: IpcDirection,
+        name: impl Into<String>,
+        bytes: usize,
+        started: Instant,
+    ) {
+        self.log.write(
+            &PerfRecord::ipc(direction, name, bytes, started),
+            self.process_start.elapsed(),
+        );
     }
 }
 
@@ -193,5 +235,29 @@ mod tests {
             .join("nested")
             .join("log.jsonl");
         assert!(PerfLog::to_file(PerfFormat::Text, &path).is_err());
+    }
+
+    #[test]
+    fn ipc_log_writes_an_ipc_record() {
+        use crate::browser::metrics::IpcDirection;
+        use std::time::Instant;
+
+        let path = temp_path("ipc.jsonl");
+        let _ = fs::remove_file(&path);
+
+        let log = Arc::new(PerfLog::to_file(PerfFormat::Json, &path).expect("open perf log file"));
+        let ipc = IpcLog::new(Arc::clone(&log), Instant::now());
+        ipc.record(IpcDirection::In, "navigate", 17, Instant::now());
+        drop(log);
+
+        let contents = fs::read_to_string(&path).expect("read perf log file");
+        let line = contents.lines().next().expect("one ipc line written");
+        let value: serde_json::Value = serde_json::from_str(line).expect("valid JSON");
+        assert_eq!(value["event"], "ipc");
+        assert_eq!(value["direction"], "in");
+        assert_eq!(value["name"], "navigate");
+        assert_eq!(value["bytes"], 17);
+
+        let _ = fs::remove_file(&path);
     }
 }

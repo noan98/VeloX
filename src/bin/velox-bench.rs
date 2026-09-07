@@ -51,8 +51,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use velox::browser::automation;
 use velox::browser::benchmark::scenario::Scenario;
 use velox::browser::benchmark::{
-    self, BenchmarkResult, ComparisonReport, GateThresholds, MemorySampleConfidence, MetricDiff,
-    RunEnvironment, Severity,
+    self, BenchmarkResult, ComparisonReport, GateThresholds, IpcSummary, MemorySampleConfidence,
+    MetricDiff, RunEnvironment, Severity,
 };
 
 fn main() {
@@ -66,6 +66,7 @@ fn main() {
         Some("aggregate") => cmd_aggregate(&rest),
         Some("compare") => cmd_compare(&rest),
         Some("gate") => cmd_gate(&rest),
+        Some("ipc-summary") => cmd_ipc_summary(&rest),
         Some(other) => Err(format!("未知のサブコマンドです: {other}\n\n{USAGE}")),
         None => Err(USAGE.to_owned()),
     };
@@ -85,7 +86,8 @@ const USAGE: &str = "使い方:\n\
   velox-bench aggregate --scenario <id> --output <path> --input <path> [--input <path> ...] [--git-commit <sha>]\n\
   velox-bench compare --baseline <path> --candidate <path> [--threshold-pct <pct>] [--output <path>]\n\
   velox-bench gate --baseline <path> --candidate <path> [--candidate <path> ...] \\\n\
-      [--warn-pct <pct>] [--fail-pct <pct>] [--output <path>] [--markdown-output <path>]\n\n\
+      [--warn-pct <pct>] [--fail-pct <pct>] [--output <path>] [--markdown-output <path>]\n\
+  velox-bench ipc-summary --input <path> [--input <path> ...] [--output <path>]\n\n\
 gate の終了コード: 0=OK, 1=FAIL (CIをブロックすべき), 3=WARN (非ブロッキング、要確認)。\n\
 それ以外の引数エラー等は 2。詳細は docs/benchmarking.md を参照してください。";
 
@@ -513,6 +515,97 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
         return Ok(1);
     }
     Ok(0)
+}
+
+// ---------------------------------------------------------------------
+// ipc-summary (Issue #66)
+// ---------------------------------------------------------------------
+
+/// Aggregate `ipc` events (`metrics::PerfRecord::Ipc`) out of one or more
+/// `VELOX_PERF_OUTPUT` JSON Lines files and print a per-`(direction, name)`
+/// traffic table — count, total bytes, and the `duration_ms` distribution
+/// (`benchmark::summarize_ipc`, the pure half this is the IO layer around).
+/// Unlike `aggregate`, this is not scenario-shaped and does not build a
+/// `BenchmarkResult`/run a regression gate: it is the diagnostic step Issue
+/// #66 asks for ("IPCの回数・サイズ・時間を計測", "高頻度イベントを特定"),
+/// meant to be re-run against any real perf log — a manual session, a
+/// `velox-bench run` trial, or a future scenario built for this — to keep
+/// answering "which toolbar IPC messages dominate, by count and by bytes"
+/// as the codebase changes. See docs/benchmarking.md for a worked example.
+fn cmd_ipc_summary(args: &[String]) -> Result<i32, String> {
+    let flags = Flags::parse(args)?;
+    let inputs = flags.many("input");
+    if inputs.is_empty() {
+        return Err("--input を少なくとも 1 つ指定してください".to_owned());
+    }
+
+    let mut events = Vec::new();
+    let mut read_failures = 0usize;
+    for input in &inputs {
+        match fs::read_to_string(input) {
+            Ok(text) => events.extend(benchmark::parse_jsonl(&text)),
+            Err(err) => {
+                read_failures += 1;
+                eprintln!("velox-bench: {input} を読み込めませんでした: {err}");
+            }
+        }
+    }
+    if read_failures == inputs.len() {
+        return Err("読み込めた --input が 1 つもありません".to_owned());
+    }
+
+    let rows = benchmark::summarize_ipc(&events);
+    print_ipc_summary(&rows);
+
+    if let Some(output_path) = flags.one("output") {
+        let json = serde_json::to_string_pretty(&rows)
+            .map_err(|err| format!("結果のシリアライズに失敗しました: {err}"))?;
+        if let Some(parent) = Path::new(output_path).parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
+        fs::write(output_path, json)
+            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+        println!("velox-bench: {output_path} に書き込みました");
+    }
+
+    if read_failures > 0 {
+        eprintln!("velox-bench: 警告: {read_failures} 件の --input を読み込めませんでした");
+    }
+    if rows.is_empty() {
+        eprintln!(
+            "velox-bench: 警告: ipc イベントが見つかりませんでした \
+             (VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json で採取したログか確認してください)"
+        );
+        return Ok(1);
+    }
+    Ok(0)
+}
+
+fn print_ipc_summary(rows: &[IpcSummary]) {
+    if rows.is_empty() {
+        println!("(ipc イベントはありません)");
+        return;
+    }
+    println!(
+        "{:<4} {:<24} {:>8} {:>12} {:>10} {:>10}",
+        "dir", "name", "count", "total_bytes", "median_ms", "p95_ms"
+    );
+    for row in rows {
+        println!(
+            "{:<4} {:<24} {:>8} {:>12} {:>10.3} {:>10.3}",
+            row.direction,
+            row.name,
+            row.count,
+            row.total_bytes,
+            row.duration_ms.median,
+            row.duration_ms.p95,
+        );
+    }
+    let total_count: usize = rows.iter().map(|row| row.count).sum();
+    let total_bytes: u64 = rows.iter().map(|row| row.total_bytes).sum();
+    println!("\n合計: {total_count} 件 / {total_bytes} bytes");
 }
 
 // ---------------------------------------------------------------------

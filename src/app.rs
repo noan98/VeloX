@@ -19,7 +19,7 @@ use tao::event_loop::{
 use crate::browser::automation::{self, AutomationCommand};
 use crate::browser::downloads;
 use crate::browser::navigation::Intent;
-use crate::browser::perf_log::PerfLog;
+use crate::browser::perf_log::{IpcLog, PerfLog};
 use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
 use crate::browser::{
     context_menu, find, input_history, metrics, navigation, omnibox, persistence, print,
@@ -411,6 +411,20 @@ struct PerfContext {
     log: Arc<PerfLog>,
 }
 
+impl PerfContext {
+    /// Adapt this context to the shape `ui::window::BrowserWindow` needs
+    /// for its own Rust → JS IPC instrumentation (Issue #66) — same
+    /// `(Arc<PerfLog>, Instant)` pair, wrapped in the `pub` type `ui::window`
+    /// can actually depend on (see `IpcLog`'s doc comment for why this is
+    /// not just `PerfContext` reused directly). Called from
+    /// `open_new_window`, which only has `state.perf` (not the `ipc_log`
+    /// local `run` built before `state` existed) to build a new window's
+    /// own `ipc_log` from.
+    fn to_ipc_log(&self) -> IpcLog {
+        IpcLog::new(Arc::clone(&self.log), self.process_start)
+    }
+}
+
 /// Build the window and run the event loop. Only returns on setup failure;
 /// once running, the process exits with the event loop.
 ///
@@ -463,6 +477,17 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     let mut startup = config
         .perf_metrics
         .then(|| metrics::StartupTimestamps::new(process_start));
+
+    // Built once, shared with the RSS sampler thread, every perf-logging
+    // call site in this file, and (Issue #66) every `BrowserWindow`'s
+    // Rust → JS IPC instrumentation, via `Arc::clone`/`IpcLog::clone`.
+    // `None` when metrics are off, matching `startup`'s `.then(...)`
+    // short-circuit above. Built here — before `BrowserWindow::new` below —
+    // rather than where it used to sit (right before the RSS sampler is
+    // spawned) specifically so the primary window's own construction can
+    // already pass its `ipc_log` in.
+    let perf_log: Option<Arc<PerfLog>> = config.perf_metrics.then(|| build_perf_log(&config));
+    let ipc_log = perf_log.clone().map(|log| IpcLog::new(log, process_start));
 
     let blocklist = Arc::new(build_blocklist(&config));
     let site_exceptions = Arc::new(build_site_exceptions(&config));
@@ -565,6 +590,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         &initial_url,
         site_policies.clone(),
         config.private,
+        ipc_log.clone(),
     )?;
     // Every open native window, keyed by the same `browser::WindowId`
     // `windows: Windows` above uses for its logical (tab-owning) half — see
@@ -599,11 +625,6 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
             primary_window_ui.set_bookmark_bar_visible(settings.appearance.show_bookmark_bar),
         );
     }
-
-    // Built once, shared with the RSS sampler thread and every perf-logging
-    // call site in this file via `Arc::clone`; `None` when metrics are off,
-    // matching `startup`'s `.then(...)` short-circuit above.
-    let perf_log: Option<Arc<PerfLog>> = config.perf_metrics.then(|| build_perf_log(&config));
 
     if let (Some(interval), Some(log)) = (config.perf_rss_interval, perf_log.clone()) {
         spawn_rss_sampler(interval, log, process_start);
@@ -879,25 +900,51 @@ fn record_perf_event(
     event: &UserEvent,
 ) {
     match event {
-        UserEvent::ToolbarMessage(_, body) => match toolbar::parse_command(body) {
-            Ok(ToolbarCommand::ScriptStarted) => {
-                mark_startup(
-                    startup,
-                    perf_log,
-                    process_start,
-                    metrics::StartupTimestamps::mark_toolbar_script_started,
-                );
+        UserEvent::ToolbarMessage(_, body) => {
+            // Issue #66: every toolbar IPC message (JS → Rust), regardless
+            // of what it is, is counted/sized/timed here — the one choke
+            // point every `window.ipc.postMessage` call already funnels
+            // through (`UserEvent::ToolbarMessage`), so this needs no new
+            // call site anywhere else. `command_name` is a second, shallow
+            // parse of `body` (see its doc comment for why it is not just
+            // `parse_command(body).ok().map(...)`): it still labels a
+            // message that fails the real parse below, which a metrics
+            // consumer wants to see rather than silently lose. Gated by the
+            // same `perf_log.is_some()` check every other branch below
+            // already runs under (`app::run`'s event loop), so this never
+            // reads a clock or allocates on the metrics-off path.
+            let started = Instant::now();
+            let name = toolbar::command_name(body);
+            let parsed = toolbar::parse_command(body);
+            // `PerfRecord::ipc`'s `Instant::elapsed()` call happens here,
+            // after both the shallow tag read above and the real parse
+            // below — so `duration` reflects the full Rust-side cost of
+            // turning this message into a `ToolbarCommand`, matching
+            // `PerfRecord::Ipc`'s doc comment.
+            perf_log.write(
+                &metrics::PerfRecord::ipc(metrics::IpcDirection::In, name, body.len(), started),
+                started.saturating_duration_since(process_start),
+            );
+            match parsed {
+                Ok(ToolbarCommand::ScriptStarted) => {
+                    mark_startup(
+                        startup,
+                        perf_log,
+                        process_start,
+                        metrics::StartupTimestamps::mark_toolbar_script_started,
+                    );
+                }
+                Ok(ToolbarCommand::Ready) => {
+                    mark_startup(
+                        startup,
+                        perf_log,
+                        process_start,
+                        metrics::StartupTimestamps::mark_toolbar_ready,
+                    );
+                }
+                _ => {}
             }
-            Ok(ToolbarCommand::Ready) => {
-                mark_startup(
-                    startup,
-                    perf_log,
-                    process_start,
-                    metrics::StartupTimestamps::mark_toolbar_ready,
-                );
-            }
-            _ => {}
-        },
+        }
         UserEvent::NavigationStarted(window_id, id, _) => {
             page_load_timers
                 .entry((*window_id, *id))
@@ -1400,7 +1447,7 @@ fn handle_user_event(
                 };
                 if history_id.is_some() {
                     persist_history(state);
-                    refresh_history_panel(window, state, config);
+                    refresh_history_panel_if_open(window, state, config);
                 }
                 // Title/favicon are tab-strip state, independent of whether
                 // this visit was recorded to history — private mode (no
@@ -1451,7 +1498,7 @@ fn handle_user_event(
             if state.history.update_title(history_id, title) {
                 persist_history(state);
                 if let Some(window) = ui_windows.get(&window_id) {
-                    refresh_history_panel(window, state, config);
+                    refresh_history_panel_if_open(window, state, config);
                 }
             }
         }
@@ -1476,7 +1523,7 @@ fn handle_user_event(
             if state.history.update_favicon(history_id, url.clone()) {
                 persist_history(state);
                 if let Some(window) = ui_windows.get(&window_id) {
-                    refresh_history_panel(window, state, config);
+                    refresh_history_panel_if_open(window, state, config);
                 }
             }
             // Issue #19/D34: a bookmarked page's favicon updates the same
@@ -1872,6 +1919,7 @@ fn open_new_window(
         url,
         state.site_policies.clone(),
         private,
+        state.perf.as_ref().map(PerfContext::to_ipc_log),
     ) {
         Ok(window) => {
             // Issue #30/D67, integrated with multi-window in D68: settings
@@ -3180,11 +3228,45 @@ fn sync_bookmark_star(window: &BrowserWindow, state: &AppState, url: &str) {
     );
 }
 
+/// [`refresh_history_panel`], but only when the history panel is actually
+/// open (Issue #66).
+///
+/// `refresh_history_panel` always builds and pushes the full
+/// (`config.history_panel_limit`-capped, up to 200 entries by default)
+/// history list — exactly right while the panel is open, where it is what
+/// makes a newly recorded visit show up live, but the panel is closed the
+/// overwhelming majority of a browsing session, and every one of
+/// `LoadFinished`/`PageTitleResolved`/`FaviconResolved` (each firing at
+/// least once per page visit, sometimes all three for one visit) called it
+/// unconditionally regardless — real IPC traffic measured with `velox-bench
+/// ipc-summary` showed `set_history` among the largest Rust → JS payloads
+/// in an ordinary session even though the panel was never opened (see
+/// docs/performance-targets.md §16). This is the one place this issue found
+/// real, safe-to-cut redundant traffic (the tab strip's equally frequent
+/// `set_tabs` push is *not* gated this way — see §16 for why that one is
+/// intentional: the tab strip, unlike this panel, is always visible).
+///
+/// Opening the panel (`ToolbarCommand::TogglePanel`) already refreshes it
+/// immediately on its own (see that handler below), so skipping the push
+/// while closed changes no visible behavior: a closed panel was never
+/// rendering these pushes to begin with, and the moment it opens it gets
+/// current data regardless of how long it had been closed.
+fn refresh_history_panel_if_open(window: &BrowserWindow, state: &AppState, config: &Config) {
+    if window.open_panel() == Some(Panel::History) {
+        refresh_history_panel(window, state, config);
+    }
+}
+
 /// Push the most recent `config.history_panel_limit` history entries to the
 /// toolbar, newest first, grouped into date sections (see
 /// `browser::history::group_by_date` / docs/decisions.md D29) relative to
 /// "now". Also the fallback the panel returns to when the search box is
-/// cleared (see `ToolbarCommand::SearchHistory` below).
+/// cleared (see `ToolbarCommand::SearchHistory` below). Unconditional —
+/// callers on the "closed the overwhelming majority of the time" path
+/// (`LoadFinished`/`PageTitleResolved`/`FaviconResolved`) go through
+/// [`refresh_history_panel_if_open`] instead; every other caller here
+/// (`Ready`, `TogglePanel` opening the panel, an edit made *through* the
+/// open panel itself) is a point where a push is always correct.
 fn refresh_history_panel(window: &BrowserWindow, state: &AppState, config: &Config) {
     let entries: Vec<&HistoryEntry> = state
         .history

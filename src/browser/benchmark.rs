@@ -392,6 +392,95 @@ fn measured_phase(trial: &[Value]) -> &[Value] {
 }
 
 // ---------------------------------------------------------------------
+// IPC traffic summary (Issue #66)
+// ---------------------------------------------------------------------
+
+/// One `(direction, name)` pair's aggregated `ipc` events (Issue #66,
+/// `metrics::PerfRecord::Ipc`): how many messages, how many total raw JSON
+/// bytes, and the distribution of `duration_ms` (the Rust-side
+/// `parse_command`/`evaluate_script` cost only — never JS execution or DOM
+/// work; see `PerfRecord::Ipc`'s doc comment). Built by [`summarize_ipc`],
+/// printed as a table (or saved as JSON) by `velox-bench ipc-summary` — see
+/// docs/benchmarking.md.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IpcSummary {
+    /// `"in"` (JS → Rust, a `ToolbarCommand`) or `"out"` (Rust → JS, one
+    /// `ui::window::BrowserWindow::eval_toolbar` call site).
+    pub direction: String,
+    /// The `ToolbarCommand`'s `cmd` tag (`In`) or the `eval_toolbar` call
+    /// site's label, e.g. `"set_tabs"` (`Out`).
+    pub name: String,
+    pub count: usize,
+    pub total_bytes: u64,
+    pub duration_ms: Stats,
+}
+
+/// Aggregate every `ipc` event in `events` (already-flattened
+/// [`parse_jsonl`] output — pass `.chain`ed/`.extend`ed events from as many
+/// perf-log files as needed; unlike [`aggregate_trials`] there is no
+/// per-trial warm-up cut here, since a message a real user's IPC traffic
+/// includes is not "warm-up" the way a benchmark scenario's setup tabs
+/// are) into one [`IpcSummary`] row per `(direction, name)` pair.
+///
+/// Sorted by `total_bytes` descending, then `count` descending: "what
+/// dominates this channel's *traffic*" is the question this exists to
+/// answer, ahead of a single message's worst-case size (already visible
+/// per row as `duration_ms.max`) or an alphabetical listing that hides
+/// which rows actually matter — the "高頻度イベントの特定" acceptance
+/// criterion Issue #66 asks for.
+///
+/// Pure and unit-tested like the rest of this module — no process
+/// spawning, no filesystem, no WebView. `velox-bench ipc-summary` is the IO
+/// layer around this (reads `--input` files, prints/saves the table).
+pub fn summarize_ipc(events: &[Value]) -> Vec<IpcSummary> {
+    let mut by_key: BTreeMap<(String, String), (usize, u64, Vec<f64>)> = BTreeMap::new();
+    for event in events {
+        if event.get("event").and_then(Value::as_str) != Some("ipc") {
+            continue;
+        }
+        let direction = event
+            .get("direction")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_owned();
+        let name = event
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .to_owned();
+        let bytes = event.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+        let duration_ms = event
+            .get("duration_ms")
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0);
+        let entry = by_key
+            .entry((direction, name))
+            .or_insert((0, 0, Vec::new()));
+        entry.0 += 1;
+        entry.1 += bytes;
+        entry.2.push(duration_ms);
+    }
+    let mut rows: Vec<IpcSummary> = by_key
+        .into_iter()
+        .filter_map(|((direction, name), (count, total_bytes, durations))| {
+            compute_stats(&durations).map(|duration_ms| IpcSummary {
+                direction,
+                name,
+                count,
+                total_bytes,
+                duration_ms,
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        b.total_bytes
+            .cmp(&a.total_bytes)
+            .then_with(|| b.count.cmp(&a.count))
+    });
+    rows
+}
+
+// ---------------------------------------------------------------------
 // Memory-scenario sample-count confidence (Issue #119, D50)
 // ---------------------------------------------------------------------
 
@@ -1798,6 +1887,72 @@ mod tests {
         // Not a panic and not a silent fallback to the warm-up numbers:
         // the metric is simply absent.
         assert!(!aggregate_trials(&[trial]).contains_key("tab_create_ms"));
+    }
+
+    // -- summarize_ipc (Issue #66) ------------------------------------------
+
+    #[test]
+    fn summarize_ipc_groups_by_direction_and_name_and_sums_bytes_and_count() {
+        let events = vec![
+            event(
+                r#"{"event":"ipc","direction":"in","name":"navigate","bytes":40,"duration_ms":0.5}"#,
+            ),
+            event(
+                r#"{"event":"ipc","direction":"in","name":"navigate","bytes":42,"duration_ms":0.7}"#,
+            ),
+            event(
+                r#"{"event":"ipc","direction":"out","name":"set_tabs","bytes":500,"duration_ms":1.0}"#,
+            ),
+        ];
+        let rows = summarize_ipc(&events);
+        assert_eq!(rows.len(), 2);
+
+        let navigate = rows.iter().find(|r| r.name == "navigate").unwrap();
+        assert_eq!(navigate.direction, "in");
+        assert_eq!(navigate.count, 2);
+        assert_eq!(navigate.total_bytes, 82);
+        assert_eq!(navigate.duration_ms.count, 2);
+        assert_eq!(navigate.duration_ms.median, 0.6);
+
+        let set_tabs = rows.iter().find(|r| r.name == "set_tabs").unwrap();
+        assert_eq!(set_tabs.direction, "out");
+        assert_eq!(set_tabs.count, 1);
+        assert_eq!(set_tabs.total_bytes, 500);
+    }
+
+    #[test]
+    fn summarize_ipc_ignores_non_ipc_events() {
+        let events = vec![
+            event(r#"{"event":"tab_create","tab_id":1,"duration_ms":2.0}"#),
+            event(r#"{"event":"ipc","direction":"in","name":"back","bytes":12,"duration_ms":0.1}"#),
+        ];
+        let rows = summarize_ipc(&events);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "back");
+    }
+
+    #[test]
+    fn summarize_ipc_of_no_ipc_events_is_empty() {
+        let events = vec![event(r#"{"event":"startup","ts_ms":1.0}"#)];
+        assert!(summarize_ipc(&events).is_empty());
+    }
+
+    #[test]
+    fn summarize_ipc_sorts_by_total_bytes_descending() {
+        let events = vec![
+            event(
+                r#"{"event":"ipc","direction":"in","name":"small","bytes":10,"duration_ms":0.1}"#,
+            ),
+            event(
+                r#"{"event":"ipc","direction":"out","name":"big","bytes":9000,"duration_ms":0.1}"#,
+            ),
+            event(
+                r#"{"event":"ipc","direction":"in","name":"medium","bytes":500,"duration_ms":0.1}"#,
+            ),
+        ];
+        let rows = summarize_ipc(&events);
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["big", "medium", "small"]);
     }
 
     #[test]
