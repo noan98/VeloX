@@ -188,6 +188,8 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | `startup_toolbar_ready_ms` | `startup` | `toolbar_ready_ms` |
 | `startup_first_load_ms` | `startup` | `first_load_ms` |
 | `page_load_ms` | `page_load` | `duration_ms` |
+| `page_load_engine_ms` | `page_load` | `engine_duration_ms` (`LoadStarted → LoadFinished`。black-box、Epic #57 ルール3。Issue #69) |
+| `page_load_dispatch_ms` | `page_load` | `dispatch_duration_ms` (`NavigationStarted → LoadStarted`。**VeloX 自身のコストではない** — `docs/decisions.md` D87 参照。Issue #69) |
 | `tab_create_ms` | `tab_create` | `duration_ms` |
 | `tab_switch_ms` | `tab_switch` | `duration_ms` |
 | `tab_resume_ms` | `tab_resume` | `duration_ms` (休止タブへの切替 = webview の再構築。Issue #63) |

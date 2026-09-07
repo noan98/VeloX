@@ -9795,6 +9795,210 @@ event` の競合状態) は本 Issue で解消済み。(2) (ダウンロード�
 ずつ順に処理して次のコマンドへ進む前に必ず解消を待つ設計なので、依然
 1 枠で足りている。
 
+## D87: ページロードの段階計測 (#69) — `NavigationStarted → LoadStarted → LoadFinished` に分解。DNS/接続/TLS timing は wry に無い、VeloX 側の追加最適化も見送り
+
+Issue #69 (Epic #57 Phase 3)。「ページロード経路を分解し、VeloX 側で制御
+可能なボトルネックを改善する」という課題に対して、**#59/#66 と同じやり方
+で臨んだ**: まず既存の計測点を1段階分解して実測し、その数値だけで
+「VeloX 側に短縮余地があるか」を判断した。数値・再現手順は
+`docs/performance-targets.md` §20、使い方は `docs/benchmarking.md` を
+参照。ここには設計判断とその理由、および調査結果だけを残す。
+
+### 何を分解したか — 既存の `page_load` イベントに1つチェックポイントを足した
+
+Issue #13 からこの方、`page_load` イベントは `NavigationStarted` →
+`LoadFinished` の1本の `duration_ms` しか持っていなかった。wry の
+`WebViewBuilder` は `with_on_page_load_handler` で `PageLoadEvent::
+Started`/`Finished` の2値を渡してくる — `app.rs` は既に両方を
+`UserEvent::LoadStarted`/`LoadFinished` として受け取っていたが、
+`LoadStarted` は UI 同期 (`sync_tab_strip` 等、`NavigationStarted` と
+同じ match アーム) にしか使われておらず、計測には使われていなかった。
+`metrics::PageLoadTimer` に `mark_load_started` という新しい任意
+チェックポイントを足し、`finish` の戻り値を `Duration` から
+`PageLoadOutcome { total, engine: Option<Duration> }` に変えた
+(`engine` は `dispatch()` で `total - engine` も導出できる)。`page_load`
+イベントの JSON に `engine_duration_ms`/`dispatch_duration_ms` を
+**追加**した (既存の `duration_ms`/`url` は変更なし、text 形式も
+`format_page_load` の出力に追記するだけ — #59/D42/D43 と同じ「既存の
+scraper を壊さない」流儀)。`browser::benchmark::MetricKey` にも
+`PageLoadEngineMs`/`PageLoadDispatchMs` を追加し、`velox-bench` の
+`aggregate`/`gate` にそのまま乗るようにした。`LoadStarted` が来なかった
+ロード (中断されたロード等) は `engine`/`dispatch` とも `None` — 0 を
+捏造しない、`total_pss_bytes` (D42) と同じ規約。
+
+### **重要な但し書き: `dispatch` は「VeloX のコスト」ではない**
+
+`PageLoadEvent::Started` は wry の3バックエンドすべてで「ロードが
+commit された」タイミングにマップされている (**ソースで確認**):
+
+- WebKitGTK: `webview.connect_load_changed` の `LoadEvent::Committed`
+  (`wry-0.56.1/src/webkitgtk/mod.rs:481`)
+- WebView2: `ContentLoadingEventHandler` (`.../src/webview2/mod.rs:713-718`)
+- WKWebView (macOS/iOS): `didCommitNavigation`
+  (`.../src/wkwebview/navigation.rs:17-26`)
+
+つまり `LoadStarted` は「ロードが始まった瞬間」ではなく「エンジンが
+接続・リクエスト送信・レスポンス受信開始まで済ませた後」に発火する。
+`NavigationStarted` (`with_navigation_handler`、ロード許可の意思決定
+ポイント) は逆にネットワーク作業が始まる**前**に発火する。したがって
+`dispatch = NavigationStarted → LoadStarted` の区間には VeloX 自身の
+イベント処理 (`app::record_perf_event`、`sync_tab_strip` 等) だけでなく
+**エンジン側の接続・リクエスト送受信の待ち時間も含まれる**。実測でも
+これは裏付けられた — loopback HTTP サーバ (DNS 無し、TLS 無し) の
+`minimal.html` に対してすら `dispatch` の中央値 (4.65〜4.7ms) が
+`engine` の中央値 (1.4〜1.65ms) を上回った (§20.2)。これを「VeloX の
+オーバーヘッドが半分以上」と読むのは誤りで、Epic #57 の最重要注意点
+「レンダリングエンジンそのものの性能と VeloX 側のオーバーヘッドを
+混同しない」にまさに抵触する読み方になる。#66 (D81) が実測した
+IPC の Rust 側コスト (`out` イベント、`sync_tab_strip` を含む
+`evaluate_script` 呼び出し) が worst case でも 3.5ms、中央値 0.000ms
+だったことを踏まえると、`dispatch` の大半はエンジン側のネットワーク
+待ち (今回の環境ではループバック接続の確立・往復) であり、VeloX 自身の
+Rust コードは `dispatch` の一部でしかない。ソースコードのコメント
+(`metrics::PageLoadTimer`/`MetricKey::PageLoadDispatchMs`) にこの但し
+書きを明記した。
+
+重い固定ページ (`dom_heavy.html`) で計測すると、この解釈が裏付けられる:
+`dispatch` の中央値は 12.65ms (`minimal.html` の 4.65ms よりやや大きいが
+オーダーは同じ) で、ページの重さに依らずほぼ一定に見える一方、`engine`
+の中央値は 72.0ms までページの重さに比例して伸びる (§20.2)。「ページが
+重いほど支配的になるのは engine 側」という、Epic #57 が前提とする構造
+と整合する結果になった。
+
+### DNS/connection/TLS timing は取得可能か — wry native API には無い。JS 標準 API は動くが、この環境では意味のある数値が取れない
+
+wry 0.56.1 のソースを3バックエンドとも確認したが (`grep -rniE
+"dns|tls|resource_load|timing" src/*.rs src/{webkitgtk,webview2,wkwebview}/
+*.rs`)、`WebViewBuilder` にはナビゲーションの許可可否
+(`with_navigation_handler`) とロード完了2値
+(`with_on_page_load_handler`) しか無く、**DNS/接続/TLS のタイムスタンプ
+を返す API は存在しない**。resource-load 単位のフックも無い。
+
+一方、標準の `PerformanceNavigationTiming` (`performance.
+getEntriesByType('navigation')[0]`) は WebKitGTK 2.52.6 で実際に動作する
+ことを確認した — 本 Issue の作業ディレクトリ外、`/tmp` スクラッチ上に
+`wry`/`tao` (VeloX と同じ 0.56.1/0.37.0) だけに依存する最小 PoC バイナリ
+を作り、`scripts/bench/pages/minimal.html` を `http://127.0.0.1:8731/`
+経由で読み込んで `window.ipc.postMessage` 経由で結果を回収した:
+
+```
+NAV_TIMING_RESULT: {"entryType":"navigation","domainLookupStart":1,
+"domainLookupEnd":1,"connectStart":1,"connectEnd":1,
+"secureConnectionStart":0,"requestStart":1,"responseStart":2,
+"responseEnd":14,"fetchStart":1,"startTime":0,"protocol":"http/1.0"}
+```
+
+`domainLookupStart`/`domainLookupEnd`/`connectStart`/`connectEnd` の
+フィールド自体は存在し、値も返ってくる (ここではすべて 1ms 付近 — ループ
+バック接続に実質的な DNS/TCP コストが無いため)。`secureConnectionStart`
+は 0 (HTTP なので TLS 無し)。**同じ PoC を `file://` で開くと、`load`
+イベント後の `window.ipc.postMessage` 自体が届かなかった** (タイムアウト
+2件、原因未特定 — WebKitGTK が `file://` オリジンで IPC ブリッジを
+制限している可能性があるが、深追いはしていない)。
+
+結論:
+
+1. **wry のネイティブ API (Rust 側) に DNS/接続/TLS の hook は無い** —
+   ソースで確認済み、3バックエンドとも同様。
+2. **エンジンの JS 標準 API (`PerformanceNavigationTiming`) 経由でなら
+   理論上は取得できる** — WebKitGTK での動作を実機で確認した。ただし
+   これは `evaluate_script` を挟んだ IPC 往復が必要な追加コストであり、
+   かつ取得できる値はエンジン (JS エンジン + ネットワークスタック) が
+   計測したものであって VeloX 側の処理ではない — Epic #57 ルール3の
+   ブラックボックス原則に照らせば「VeloX が見える窓」ではあっても
+   「VeloX が制御できる区間」ではない。
+3. **この検証環境では意味のある DNS/TLS 数値は取れない。** 本 Issue の
+   制約 (外向きネットワークはプロキシ経由に制限、計測は `file://` か
+   ローカル HTTP サーバに限定) の下では、実際の DNS 解決や TLS ハンド
+   シェイクを伴うページを読み込めない。ループバック接続では
+   `domainLookupStart`/`End` や `connectStart`/`End` の差がほぼ 0 に
+   潰れ、`secureConnectionStart` も常に 0 になる。実際の DNS/TLS コスト
+   を見るには外部 HTTPS サイトへの到達性が要る (本 Issue のスコープ外)。
+4. **したがって本 Issue では `PerformanceNavigationTiming` を計測に
+   組み込むコードは追加していない。** 追加しても (a) この環境では
+   検証できない、(b) 得られる数値がエンジン管轄でありEpic #57 の枠内で
+   VeloX 側から縮められる区間ではない、の2点から、ベンチマークなしの
+   計装追加は Epic #57 ルール1に反すると判断した。PoC は再現用に
+   `docs/performance-targets.md` §20.4 にスクリプトの要旨を残す
+   (PoC 自体は作業ディレクトリの外、`/tmp` スクラッチに置いたため
+   リポジトリには含まれていない)。
+
+### 「unnecessary UI/IPC work during navigation」の再確認 — #66 の結論を `navigation` シナリオで裏付け、新しい削減は見つからなかった
+
+`NavigationStarted`/`LoadStarted` が同じ match アーム
+(`sync_tab_strip` 等を呼ぶ) を共有していることに気付き、「1回のナビ
+ゲーションで `set_tabs` が実は #66 が数えた以上に多く送られているの
+では」という仮説を立てたが、`navigation` シナリオ (3回ナビゲーション +
+起動時ロード = 4ロード) で `velox-bench ipc-summary` を実測したところ
+`set_tabs` は 14 件 (4ロードあたり 3.5 件、`duration_ms` 中央値
+0.000ms・p95 1.175ms) — #66 が既に報告していた比率 (「120 件 / 約 34
+回のタブ影響操作」≈3.5) とオーダーが一致し、コストも sub-millisecond
+のまま。**新しい無駄は見つからなかった** — #66 の「タブストリップの
+複数回送信は意図的でコストは無視できる」という結論を、ページロード
+経路に特化した本 Issue でも裏付けただけに終わった。`tab.
+on_navigation_started(&url)` が `NavigationStarted`/`LoadStarted` の
+両方で (同じ内容を) 2回呼ばれる点は気付いたが (`app.rs` の共有アーム)、
+`String` の再代入程度のコストで、IPC 計測が sub-millisecond と示して
+いる以上ベンチマーク上の実害が無く、Epic #57 ルール1に従い変更しな
+かった。
+
+### `preload`/`preconnect` と cache 戦略 — VeloX 側から動かせるレバーが無い
+
+wry 0.56.1 のソースを確認した限り、`WebViewBuilder` に preconnect/
+prefetch/DNS prefetch 相当の API は存在しない
+(`webkitgtk/mod.rs`: `settings.set_enable_page_cache(true)` を無条件に
+呼ぶのみで、キャッシュサイズ/戦略を変更する builder メソッドも無い)。
+ページ自身が `<link rel="preconnect">` 等を書けばエンジンがそれを解釈
+するが、それはページ側の関与であって VeloX (ブラウザ chrome 側) の
+コードが増減させる話ではない。オムニボックス入力から先読み的に
+`preconnect` する、といった「VeloX 独自の速度対策」も検討したが、
+(a) wry にはそもそも「特定オリジンへ接続だけ張っておく」API が無く、
+(b) 実装するなら別プロセス/別ソケットで疑似的にウォームアップ接続を
+張るような迂回策になり検証コストが高い、(c) この環境では実 DNS/TLS
+すら検証できないため効果を測る手段が無い、の3点から見送った。
+**「VeloX 側で制御可能な cache/preconnect レバーは (wry 0.56.1 の API
+範囲では) 存在しない」ということ自体が本 Issue の調査結果である。**
+
+### OS/WebView 差分の記録
+
+`PageLoadEvent::Started`/`Finished` の意味づけ (`Started` = commit 後、
+`Finished` = ロード完了) は wry のソース上 **3 バックエンドで同一**
+であることを確認した (上記)。したがって `dispatch`/`engine` という
+分解の**構造**は Windows (WebView2) / macOS (WKWebView) でも同じ意味を
+持つ。ただし **実際のミリ秒の数値はすべて Linux/WebKitGTK 2.52.6 +
+Xvfb (GPU なし) でのみ計測した** (`docs/performance-targets.md` §1)。
+Windows が最優先対応 OS である (CLAUDE.md) にもかかわらず本 Issue では
+Windows 実機での計測を行っていない — この環境に Windows 実機/WebView2
+が無いため。Windows での再計測は Revisit condition に残す。
+
+### なぜ「最適化」と呼べる変更を一切加えなかったか
+
+#59 (D43)・#66 (D81) と同じ形の結論になった: **計測を1段階細かくした
+結果、支配的なコストが VeloX 自身のコードではなくエンジン/ネットワーク
+側だと分かった。** `dispatch` バケットの大半はエンジンの接続・リクエ
+スト待ちであり (上記)、その中で唯一 VeloX 自身が支配できる部分 (IPC
+ディスパッチ) は #66 の時点で既に sub-millisecond と実測済みで、今回
+`navigation` シナリオで再確認してもコストは変わっていない。`engine`
+バケットは定義上ブラックボックス。preconnect/cache チューニングは
+wry に API が無い。**したがって「VeloX 側で安全かつ実測に裏付けられた
+形で縮められるページロードのコストは、本 Issue の調査時点では見つから
+なかった」というのが、本 Issue の正直な結論である。**
+
+### Revisit condition
+
+(1) Windows (WebView2) 実機での `page_load_engine_ms`/
+`page_load_dispatch_ms` 計測 — この節の数値はすべて Linux。(2) 実際の
+DNS/TLS を伴う外部サイトへの到達性がある環境が用意できれば、
+`PerformanceNavigationTiming` を使った DNS/TLS 実測に再挑戦する価値が
+ある (ただし Epic #57 ルール3により「エンジン管轄」という結論は変わら
+ない可能性が高い)。(3) `file://` ページで `PerformanceNavigationTiming`
+の PoC が `window.ipc.postMessage` を返さなかった件は原因未特定のまま
+残した — VeloX 本体のコードパスではない (PoC 独自の問題の可能性がある)
+ため優先度は低いが、`file://` の IPC ブリッジに何か制約があるなら
+別 Issue の調査対象になりうる。(4) `tab.on_navigation_started` が
+`NavigationStarted`/`LoadStarted` の両方で呼ばれる件 (重複呼び出し) は
+実害なしと判断して変更していないが、将来 `Tab` の状態更新が重くなる
+場合はここも見直し対象になる。
 ## D88: Windows で性能を実測できるようにする (#136) — `sample_process_tree_rss` に Toolhelp32/PSAPI 実装を追加し、PSS 相当は「実装しない」と結論。`perf-windows.yml` (`workflow_dispatch` 限定) を追加
 
 **Scope**: Issue #136。#57 (Phase 3 Epic) の絶対ルール5「OS ごとに結果を分ける」を

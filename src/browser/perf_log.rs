@@ -171,7 +171,7 @@ mod tests {
 
         let log = PerfLog::to_file(PerfFormat::Text, &path).expect("open perf log file");
         log.write(
-            &PerfRecord::page_load("https://example.com/", Duration::from_millis(250)),
+            &PerfRecord::page_load("https://example.com/", Duration::from_millis(250), None),
             Duration::ZERO,
         );
         log.write(
