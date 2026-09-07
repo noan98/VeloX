@@ -469,6 +469,51 @@ in   ready                           1           15      0.000      0.000
   いう限界を D81 に明記した。実測データと結論は
   `docs/performance-targets.md` §18 を参照。
 
+### 7. Windows で実行する (`.github/workflows/perf-windows.yml`, Issue #136)
+
+**Windows (WebView2) 側の性能実測は、この Actions workflow を手動実行
+(`workflow_dispatch`) することで行う。** 設計判断は `docs/decisions.md`
+D88、実測結果 (取れ次第) は `docs/performance-targets.md` §21 を参照。
+
+これまでの節 (`run`/`aggregate`/`compare`/`gate`/`ipc-summary`) はすべて
+`velox-bench` のサブコマンド自体は OS を問わず同じであり、Linux 向けに
+書かれた例の `xvfb-run -a ... dbus-run-session -- ...` の部分だけが
+Windows では不要になる (Windows には Xvfb/D-Bus セッションバスに相当する
+仕組みが無く、`velox`/`velox-bench` を素のまま起動する)。**Windows
+ローカルで手元実行する場合**は、`--velox-bin` を `velox.exe` に、`--output`
+のパス区切りを適宜読み替えるだけで、上記 1〜6 の手順がそのまま使える。
+
+**CI (`windows-latest` ランナー) 上で実行する場合**は、GitHub の Actions
+タブから `perf-windows.yml` を選び「Run workflow」を押す (`workflow_dispatch`
+はブランチを問わず実行できるが、main にマージされるまでタブに現れない —
+`release-windows.yml` と同じ制約)。入力パラメータ:
+
+| 入力 | 意味 | 既定 |
+| --- | --- | --- |
+| `scenario` | `velox-bench list-scenarios` の一覧から選ぶシナリオ ID | `cold_startup` |
+| `trials` | 試行回数 | `10` |
+| `url` | 計測対象ページの URL。空欄なら `scripts/bench/pages/` の固定ページ (`minimal.html`) を loopback 配信して使う (Linux の `perf-gate.yml` と同じ「ネットワーク非依存の固定ページで測る」方針) | (空、固定ページを使用) |
+
+実行が終わると、結果 JSON (`velox-bench run --output` の出力そのもの、
+`aggregate`/`compare`/`gate` にそのままかけられる形式) と実行環境の情報
+(OS ビルド番号・CPU・メモリ・WebView2 Runtime バージョン) を記録した
+テキストが Actions の Artifact として残る。
+
+**⚠️ この workflow は `windows-latest` ランナー上で VeloX (WebView2)
+のウィンドウが実際に起動できるかどうかが最大の未知数である。** Linux は
+Xvfb で仮想ディスプレイを用意しているが、Windows ランナーには同種の仕組みが
+無く、GitHub がホストする Windows ランナーが GUI プロセスを起動できる対話
+セッションを提供しているかは D88 の時点では未検証だった。**「Windows で
+動くはず」と決めつけず**、まずこの workflow を実際に走らせて結果を見ること
+— 起動できなければ workflow の Job Summary / 診断ステップのログに失敗の
+様子が残るので、そこからセルフホストランナー等の代替を検討する
+(`docs/decisions.md` D88、Issue #59 が起動時間の調査で採った進め方と同じ)。
+
+**PR ごとの自動実行や性能回帰ゲートとしては使わない** — Windows は
+`workflow_dispatch` 限定 (加えて `perf-windows.yml` 自身を変更する PR でのみ
+検証目的で動く)。性能回帰の CI ブロッキング判定は引き続き Linux の
+`perf-gate.yml` (§10) が担う。
+
 ## 結果ファイルのフォーマット
 
 `velox-bench run` / `aggregate` が書き出す JSON (`BenchmarkResult`) の例:
@@ -695,6 +740,14 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   1ms 未満なのは、このコンテナではソフトウェアレンダリングの初回描画待ちが
   ボトルネックにならない (既にレンダリング済みの背景タブへの切り替えは
   ほぼ即時) ためで、実機の GPU レンダリングでも同程度かは未確認。
+- **Windows (`perf-windows.yml`, Issue #136): この節に書ける実測結果は
+  まだ無い。** `sample_process_tree_rss` の Windows 実装
+  (`docs/decisions.md` D88) は `cargo check --target x86_64-pc-windows-msvc`
+  による型チェックのみを通しており、Windows 実機/CI 上で実際に正しい
+  RSS/CPU 値を返すかは未検証。`velox-bench run` が `windows-latest`
+  ランナー上で完走するか (GUI/WebView2 ウィンドウが起動できるか自体を含む)
+  も未検証 — D88・上記「7. Windows で実行する」節を参照。実測できた結果は
+  `docs/performance-targets.md` §21 に追記する。
 
 ## 既知の制約・将来の拡張
 

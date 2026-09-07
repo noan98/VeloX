@@ -1,0 +1,270 @@
+name: Performance (Windows, manual)
+
+# Issue #136。VeloX の性能実測はこれまで全て Linux (WebKitGTK/Xvfb、
+# perf-gate.yml/docs/performance-targets.md) のものしかなく、CLAUDE.md
+# 「対応 OS の優先度」が最優先と定める Windows (WebView2) の数値が
+# 1 つも無かった。この workflow はそれを埋めるための **手動実行専用**
+# ジョブ。
+#
+# **手動実行 (workflow_dispatch) 限定。PR ごとの自動実行や性能回帰ゲート
+# ではない** (Issue #136 のスコープ外。回帰ゲートは Linux の
+# perf-gate.yml が引き続き担う):
+#   - 性能回帰ゲートは Linux 側 (perf-gate.yml) で担保済みであり、
+#     二重化する必要が無い。
+#   - GUI アプリを CI 上で起動する構成は不安定になりやすく、PR を無用に
+#     ブロックしたくない。
+#   - Windows ランナーは Linux ランナーより実行コストが高い。
+#
+# ⚠️ **最大のリスク: windows-latest ランナー上で VeloX (WebView2 の
+# ウィンドウ) が起動できるかどうかは、この workflow を実際に走らせるまで
+# 分からない。** Linux は Xvfb で仮想ディスプレイを用意しているが、
+# Windows ランナーには同種の仕組みが無い。ci.yml の Windows ジョブが
+# D61 の判断で統合テスト (実ウィンドウを開くテスト) を意図的に除外して
+# いるのも同じ未検証点による — この workflow の「VeloX を起動する」
+# ステップが、そのものずばりの実地検証になる。起動できなかった場合は
+# 無理に通そうとせず、Job Summary / 診断ステップのログに何が起きたかを
+# 残し、セルフホストランナー等の方式再検討を次の課題とする
+# (docs/decisions.md D88、Issue #59 が起動時間の調査で採った進め方と同じ)。
+#
+# `on:` は workflow_dispatch のみが基本だが、release-windows.yml と同じ
+# パターンで、この workflow 自身を変更する PR に限り pull_request でも
+# 走らせる — workflow_dispatch は main にマージされるまで Actions タブに
+# 現れないため、workflow 自身の変更を検証する唯一の手段になる。
+on:
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "velox-bench list-scenarios の一覧から選ぶシナリオ ID"
+        type: choice
+        default: cold_startup
+        options:
+          - cold_startup
+          - warm_startup
+          - first_page_load
+          - navigation
+          - tab_create
+          - tab_switch
+          - tab_resume
+          - background_cpu
+          - tab_create_1
+          - tab_create_5
+          - tab_create_10
+          - tab_create_20
+          - tab_create_50
+          - tab_switch_1
+          - tab_switch_5
+          - tab_switch_10
+          - tab_switch_20
+          - tab_switch_50
+          - tabs_1
+          - tabs_5
+          - tabs_10
+          - tabs_20
+          - tabs_50
+      trials:
+        description: "試行回数 (velox-bench run --trials)"
+        type: string
+        default: "10"
+      url:
+        description: "計測対象ページの URL。空欄なら scripts/bench/pages/minimal.html を loopback 配信して使う"
+        type: string
+        default: ""
+  # この workflow 自身を変更する PR でのみ実行して検証する (docs/
+  # decisions.md D88、release-windows.yml と同じパターン)。それ以外の PR
+  # では走らない。workflow_dispatch の入力は使えないため、既定値
+  # (cold_startup / 10 回 / 固定ページ) で実行する。
+  pull_request:
+    paths:
+      - ".github/workflows/perf-windows.yml"
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 手動実行はいつでも重ねて起動できてよい (前回の結果を待たずに再実行したい
+# 場面がある) ので、Linux の perf-gate.yml のような直列化は行わない。
+# ブランチ + workflow_dispatch の入力が同じ場合のみ、素朴に前の実行を
+# 置き換える (cancel-in-progress = true) — Windows ランナーは高コストな
+# ため、同一条件の実行を並べて無駄に消費しないようにする。
+concurrency:
+  group: perf-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  perf-windows:
+    name: velox-bench run (windows-latest)
+    runs-on: windows-latest
+    # workflow_dispatch では常に走る。pull_request では上の paths フィルタ
+    # により、この workflow 自身を変更する PR だけがここに来る。
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # docs/performance-targets.md §1 は「測定環境を固定して記録する」
+      # ことを求めている。GitHub-hosted ランナーは実行のたびにイメージが
+      # 変わりうるため、毎回このステップで実際の値をログと Job Summary に
+      # 残す (数値を決め打ちで文書に書かず、都度記録する)。
+      - name: Record environment info (OS build / CPU / memory / WebView2 Runtime)
+        id: env_info
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $mem = [math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+
+          # WebView2 Runtime のバージョンはレジストリの pv 値から読む
+          # (Evergreen ランタイムの標準的な確認方法)。見つからない場合は
+          # 「不明」として記録する — このステップ自体は失敗させない
+          # (実測の主目的である velox-bench run を先に進めるため)。
+          $webview2Version = "(不明)"
+          $regPaths = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          )
+          foreach ($p in $regPaths) {
+            if (Test-Path $p) {
+              $pv = (Get-ItemProperty -Path $p -Name "pv" -ErrorAction SilentlyContinue).pv
+              if ($pv) { $webview2Version = $pv; break }
+            }
+          }
+
+          # PowerShell の here-string (@"..."@) は閉じ側を行頭に置く必要が
+          # あり、YAML のブロックスカラーが持ち込むインデントと相性が悪い
+          # ため、行の配列 + join で組み立てる。
+          $lines = @(
+            "| 項目 | 値 |",
+            "| --- | --- |",
+            "| OS | $($os.Caption) |",
+            "| OS ビルド番号 | $($os.BuildNumber) |",
+            "| CPU | $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) 論理コア) |",
+            "| メモリ (物理, GiB) | $mem |",
+            "| WebView2 Runtime | $webview2Version |",
+            "| rustc | $(rustc --version) |"
+          )
+          $summary = $lines -join "`n"
+          Write-Host $summary
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+          New-Item -ItemType Directory -Force -Path results | Out-Null
+          $summary | Out-File -FilePath "results\environment-info.md" -Encoding utf8
+
+      - name: Build (release)
+        run: cargo build --release
+
+      # 入力 (または pull_request 実行時の既定値) から --url を決める。
+      # 未指定/空なら scripts/bench/pages/ の固定ページを loopback 配信し、
+      # ネットワーク非依存の再現可能な数値にする (perf-gate.yml / D46 と
+      # 同じ方針)。
+      - name: Determine benchmark URL
+        id: bench_url
+        shell: pwsh
+        run: |
+          $url = "${{ inputs.url }}"
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            "url=http://127.0.0.1:8731/minimal.html" >> $env:GITHUB_OUTPUT
+            "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
+          } else {
+            "url=$url" >> $env:GITHUB_OUTPUT
+            "serve_fixed_pages=false" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Serve fixed benchmark pages (default URL only)
+        if: steps.bench_url.outputs.serve_fixed_pages == 'true'
+        shell: pwsh
+        run: |
+          Start-Process -FilePath python -ArgumentList "-m", "http.server", "8731" `
+            -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden
+          Start-Sleep -Seconds 2
+          Invoke-WebRequest -Uri "http://127.0.0.1:8731/minimal.html" -UseBasicParsing | Out-Null
+
+      # 最大のリスク (GUI/WebView2 ウィンドウが起動できるか) の実地検証。
+      # velox.exe を直接起動し、プロセス一覧と perf ログの有無を確認する —
+      # Linux 側 perf-gate.yml の「Diagnose VeloX under Xvfb」ステップと
+      # 同じ役割。**このステップ自体は失敗させない** (continue-on-error):
+      # 起動できなくても、その事実と観測結果をログに残すことが目的であり、
+      # 次の本実行ステップがどのみち同じ理由で失敗するため、ここで二重に
+      # ジョブを失敗させる必要はない。
+      - name: Diagnose VeloX launch on windows-latest (never fails the job)
+        id: diag
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          New-Item -ItemType Directory -Force -Path diag | Out-Null
+          $out = "diag\perf.jsonl"
+
+          $env:VELOX_PERF_METRICS = "1"
+          $env:VELOX_PERF_FORMAT = "json"
+          $env:VELOX_PERF_OUTPUT = $out
+          $env:VELOX_DATA_DIR = "diag\data"
+
+          $proc = Start-Process -FilePath "target\release\velox.exe" `
+            -ArgumentList "--homepage", "${{ steps.bench_url.outputs.url }}" `
+            -PassThru
+          Start-Sleep -Seconds 8
+
+          Write-Host "--- process snapshot ---"
+          Get-Process | Where-Object {
+            $_.ProcessName -match "velox|msedgewebview2"
+          } | Format-Table Id, ProcessName, MainWindowTitle | Out-String | Write-Host
+
+          if (-not $proc.HasExited) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host "velox.exe が診断中に自発的に終了していた (ExitCode=$($proc.ExitCode))"
+          }
+
+          Write-Host "--- perf log ---"
+          if (Test-Path $out) {
+            $lines = Get-Content $out
+            Write-Host "records: $($lines.Count)"
+            $lines | Select-Object -First 5 | Write-Host
+          } else {
+            Write-Host "NO perf records (perf ログファイルが作られていない = ウィンドウ作成の途中でブロックされている可能性)"
+          }
+
+      - name: Run velox-bench (windows-latest)
+        id: bench_run
+        shell: pwsh
+        run: |
+          $scenario = "${{ inputs.scenario }}"
+          if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = "cold_startup" }
+          $trials = "${{ inputs.trials }}"
+          if ([string]::IsNullOrWhiteSpace($trials)) { $trials = "10" }
+
+          & target\release\velox-bench.exe run `
+            --scenario $scenario `
+            --trials $trials `
+            --url "${{ steps.bench_url.outputs.url }}" `
+            --output "results\$scenario-windows.json"
+          if ($LASTEXITCODE -ne 0) {
+            throw "velox-bench run が失敗しました (exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
+          }
+
+      - name: Show result summary
+        if: always()
+        shell: pwsh
+        run: |
+          $path = Get-ChildItem -Path results -Filter "*-windows.json" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if ($path) {
+            Write-Host "--- $($path.Name) ---"
+            Get-Content $path.FullName | Write-Host
+          } else {
+            Write-Host "結果ファイルが生成されていません (velox-bench run が失敗した可能性)"
+          }
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: velox-perf-windows-${{ inputs.scenario || 'cold_startup' }}
+          path: |
+            results/
+            diag/
+          retention-days: 30
+          if-no-files-found: warn

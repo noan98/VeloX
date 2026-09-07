@@ -1269,10 +1269,15 @@ fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Insta
 /// once per process and would put a multi-process browser "over budget"
 /// on shared library pages alone). Where PSS is unavailable the RSS total
 /// is used instead — an over-estimate, so a budget tuned for PSS will
-/// suspend slightly earlier there; documented in D56. On a platform where
-/// neither can be read (Windows today, `RssError::Unsupported`), the
-/// failure is logged once and the thread exits: the memory signal is
-/// simply inert, and the idle/tab-count signals keep working.
+/// suspend slightly earlier there; documented in D56. This is the normal
+/// case on Windows (Issue #136, D88: RSS is read via
+/// `GetProcessMemoryInfo`, but PSS has no Windows equivalent and is not
+/// attempted, so `total_pss_bytes` is always `None` there — same as the
+/// non-Linux Unix `ps` fallback). On a platform where RSS itself cannot be
+/// read either (`RssError::Unsupported` — today, any OS other than Linux,
+/// other Unix, or Windows), the failure is logged once and the thread
+/// exits: the memory signal is simply inert, and the idle/tab-count
+/// signals keep working.
 ///
 /// Exits when the event loop is gone (`send_event` fails), like
 /// `spawn_automation`.
