@@ -699,6 +699,78 @@ $XV target/release/velox-bench run --scenario background_cpu --trials 3 \
   --velox-bin target/release/velox --url http://127.0.0.1:8731/busy.html
 ```
 
+## 15. バックグラウンドタブのネットワーク活動 (Issue #65, 2026-09-07)
+
+**設計判断と考察は `docs/decisions.md` D80 を参照。** 測定環境は §1 のとおり
+(このリポジトリの Linux/WebKitGTK 環境。Windows/macOS の実力値ではない)。
+
+負荷源は `scripts/bench/pages/network_activity.html` (新規、Issue #65)。
+サーバ側のアクセスログで数える `scripts/profile/network_activity.py` を
+使う — VeloX 自身にはリクエスト単位のイベントが存在しない理由は
+スクリプト冒頭のコメントと D80 を参照。
+
+### 15.1 典型的なポーリング間隔 (2 秒) — 各 3 試行、16 秒窓
+
+| 状態 | polling (件/16s) | background resource (件/16s) | websocket (件/16s) | 合計 |
+| --- | ---: | ---: | ---: | ---: |
+| アクティブタブ | 5, 5, 5 | 4, 4, 4 | 6, 6, 6 | 15, 15, 15 |
+| バックグラウンドタブ | 5, 6, 5 | 4, 4, 4 | 6, 7, 6 | 15, 17, 15 |
+
+有意差なし。
+
+### 15.2 高頻度ポーリング (`?poll_ms=200`) — 各 3 試行、8 秒窓
+
+| 状態 | polling (件/8s) | background resource (件/8s) | websocket (件/8s) |
+| --- | ---: | ---: | ---: |
+| アクティブタブ | 31, 31, 31 | 2, 2, 2 | 4, 4, 4 |
+| バックグラウンドタブ | 8, 8, 8 | 2, 2, 2 | 5, 5, 5 |
+
+polling のみ 74% 減 (3.9→1.0 件/秒)。1 秒以上の間隔を持つ他 2 系統は
+このケースでも間引かれていない。
+
+### 15.3 prefetch — 全試行で 0 件
+
+`GET /prefetch-target` は §15.1/§15.2 のどの試行 (アクティブ・
+バックグラウンドとも計 12 試行) でも 1 件も記録されなかった。一方
+「`<link rel=prefetch>` を挿入した直後」に無条件で送る `GET
+/prefetch-armed` は毎回 1 件記録されている — スクリプト自体は実行された
+が、WebKitGTK 2.52.6 がこの prefetch ヒントを実行しない。
+
+### 15.4 Adaptive Tab Suspension (#63) との連携 — 各 3 試行、16 秒窓 (`--suspend-after-ms 3000`, `--settle-secs 8`)
+
+| 状態 | 合計イベント数 (16s窓) |
+| --- | ---: |
+| バックグラウンド、suspension 無効 (§15.1 と同条件) | 15, 17, 15 |
+| バックグラウンド、suspension 有効・休止後 | **0, 0, 0** |
+
+### 15.5 再現手順
+
+```sh
+XV='xvfb-run -a --server-args=-screen 0 1280x900x24 dbus-run-session --'
+
+# 15.1: 通常のポーリング間隔、アクティブ vs バックグラウンド
+printf 'wait 16000\nquit\n' > /tmp/na_active.txt
+printf 'wait 1500\nopen about:blank\nwait 16000\nquit\n' > /tmp/na_bg.txt
+$XV python3 scripts/profile/network_activity.py --velox target/release/velox \
+  --script /tmp/na_active.txt --label active --settle-secs 6 --window-secs 16
+$XV python3 scripts/profile/network_activity.py --velox target/release/velox \
+  --script /tmp/na_bg.txt --label background --settle-secs 6 --window-secs 16
+
+# 15.2: 高頻度ポーリング (?poll_ms=200)
+printf 'wait 10000\nquit\n' > /tmp/na_fast_active.txt
+printf 'wait 1500\nopen about:blank\nwait 10000\nquit\n' > /tmp/na_fast_bg.txt
+$XV python3 scripts/profile/network_activity.py --velox target/release/velox \
+  --script /tmp/na_fast_active.txt --label fast_active --fixture-query "poll_ms=200" \
+  --settle-secs 4 --window-secs 8
+$XV python3 scripts/profile/network_activity.py --velox target/release/velox \
+  --script /tmp/na_fast_bg.txt --label fast_background --fixture-query "poll_ms=200" \
+  --settle-secs 4 --window-secs 8
+
+# 15.4: suspension との連携 (idle_after を意図的に短くする)
+printf 'wait 1500\nopen about:blank\nwait 26000\nquit\n' > /tmp/na_suspend.txt
+$XV python3 scripts/profile/network_activity.py --velox target/release/velox \
+  --script /tmp/na_suspend.txt --label suspended --settle-secs 8 --window-secs 16 \
+  --suspend-after-ms 3000
 ## 16. メモリ/リソースライフタイム監査 (Issue #62, 2026-09-07)
 
 **詳細な調査・実測データ・再現手順は [docs/memory-analysis.md](memory-analysis.md)

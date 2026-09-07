@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>VeloX network-activity fixture</title>
+<!--
+  バックグラウンドタブのネットワーク活動を測るための固定ページ (Issue #65)。
+  `scripts/bench/pages/busy.html` (Issue #64) が CPU 消費のパターンを模した
+  のと同じやり方で、今度は Issue #65 が挙げる 4 種類のネットワークパターンを
+  それぞれ判別できる別々のパスに向けて発生させる:
+
+    1. polling /           — setInterval で fetch と XMLHttpRequest を
+       periodic fetch・XHR    交互に同一パス (`GET /poll`) へ繰り返す。
+                               どちらも同じ通信パターンなので区別しない。
+    2. prefetch            — `<link rel="prefetch">` を一度だけ挿入する
+                             (`GET /prefetch-target`)
+    3. background resource — <img> の src を定期的に張り替える
+       loading                (`GET /pixel.gif`)
+
+  加えて、正当なバックグラウンド通信を壊していないことをテストするための
+  保護対象パターンとして WebSocket 心拍を送り続ける (`ws://.../ws`)。
+  WebSocket はサーバ側 (`scripts/profile/network_activity.py`) が
+  接続オープン・各メッセージ・クローズを個別にログへ記録する。
+
+  すべて `location.origin` からの相対パスを使うので、どのポート番号で
+  配信されているかをこのファイル自身は知らなくてよい (ページ自体もこの
+  fixture を配信するサーバから返される前提 — file:// では fetch/WebSocket
+  の相対パスが解決できない)。
+
+  `?idle=1` を付けると、フォアグラウンドに置く対照タブ用の完全に静的な版に
+  なる (`scripts/bench/pages/busy.html` と同じ約束)。
+-->
+<style>
+  body { font-family: system-ui, sans-serif; margin: 1rem; }
+  img { width: 8px; height: 8px; }
+</style>
+</head>
+<body>
+<p id="out">starting…</p>
+<img id="pixel" alt="">
+<script>
+  const PARAMS = new URLSearchParams(location.search);
+  const IDLE = PARAMS.get("idle") === "1";
+  // `?poll_ms=` で polling の間隔を上書きできる。既定の 2000ms は実際の
+  // SPA のポーリング間隔に近い値 (Issue #65)。WebKitGTK の隠しページ
+  // タイマー節流は 1000ms 未満のタイマーだけを底上げする、という仮説
+  // (`docs/decisions.md` D80 で検証) を確かめるため、`?poll_ms=200` の
+  // ような短い間隔でも呼び出せるようにしてある。
+  const POLL_INTERVAL_MS = Number(PARAMS.get("poll_ms")) || 2000;
+
+  // 発生源ごとに独立した間隔にしてあるのは、サーバ側のアクセスログを
+  // パス別に数えるだけで「何 Hz で発火したか」を発生源ごとに逆算できる
+  // ようにするため (Issue #64 の beacon と同じ考え方)。
+  const IMAGE_INTERVAL_MS = 3000;  // background resource loading
+  const WS_HEARTBEAT_MS = 2000;    // WebSocket 心拍 (保護対象)
+  const PREFETCH_AFTER_MS = 4000;  // prefetch は 1 回だけ
+
+  let polls = 0;       // fetch/XHR 到達回数 (交互に使う)
+  let images = 0;       // <img> 張り替え回数
+  let wsMessages = 0;   // WebSocket で送った心拍の数
+  let wsOpen = false;
+  let prefetched = false;
+
+  function poll() {
+    polls++;
+    // 偶数回は fetch、奇数回は XMLHttpRequest — どちらも同じ `/poll` に
+    // 当たるので、サーバ側のログでは区別できない (両方とも「periodic
+    // fetch/XHR」という同じ通信パターンなので、区別する必要が無い)。
+    if (polls % 2 === 0) {
+      fetch(`poll?n=${polls}`, { cache: "no-store" }).catch(() => {});
+    } else {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", `poll?n=${polls}`);
+      xhr.send();
+    }
+  }
+
+  function refreshImage() {
+    images++;
+    document.getElementById("pixel").src = `pixel.gif?n=${images}`;
+  }
+
+  function addPrefetchLink() {
+    if (prefetched) return;
+    prefetched = true;
+    // `armed` fires unconditionally so a measurement can tell "the script
+    // ran but WebKitGTK never actually requested the prefetch target" apart
+    // from "the script itself never ran" — see docs/performance-targets.md
+    // §15.3 (Issue #65): WebKitGTK 2.52.6 confirmed to do the former.
+    fetch("prefetch-armed", { cache: "no-store" }).catch(() => {});
+    const link = document.createElement("link");
+    link.rel = "prefetch";
+    link.href = "prefetch-target";
+    document.head.appendChild(link);
+  }
+
+  let ws = null;
+  function openWebSocket() {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+    ws.addEventListener("open", () => { wsOpen = true; });
+    ws.addEventListener("close", () => { wsOpen = false; });
+    ws.addEventListener("error", () => { wsOpen = false; });
+    setInterval(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        wsMessages++;
+        ws.send(`heartbeat ${wsMessages}`);
+      }
+    }, WS_HEARTBEAT_MS);
+  }
+
+  if (!IDLE) {
+    setInterval(poll, POLL_INTERVAL_MS);
+    setInterval(refreshImage, IMAGE_INTERVAL_MS);
+    setTimeout(addPrefetchLink, PREFETCH_AFTER_MS);
+    openWebSocket();
+  }
+
+  // 状態を <title> に出す。VeloX は document.title を読んで
+  // UserEvent::PageTitleResolved にするので、外から観測できる
+  // (busy.html と同じ約束)。
+  function report() {
+    const state = document.visibilityState;
+    document.title =
+      `${IDLE ? "idle" : "active"} ${state} poll=${polls} img=${images} ` +
+      `ws=${wsOpen ? "open" : "closed"}(${wsMessages}) pf=${prefetched ? 1 : 0}`;
+    document.getElementById("out").textContent = document.title;
+  }
+  setInterval(report, 500);
+  document.addEventListener("visibilitychange", report);
+  report();
+</script>
+</body>
+</html>
