@@ -515,9 +515,18 @@ pub fn command_name(body: &str) -> String {
 /// hardening to the query text it splices into the *content* webview's
 /// find-in-page scripts (Issue #43, docs/decisions.md D69) instead of
 /// duplicating this logic.
-pub(crate) fn escape_js_line_terminators(json: &str) -> String {
+///
+/// Takes `json` **by value** rather than `&str` (Issue #68): every call site
+/// already owns a freshly-`serde_json`-serialized `String` with nothing else
+/// left to do with it, and the fast path (no U+2028/U+2029 — the
+/// overwhelming majority of tab/history/bookmark payloads) returns it
+/// unchanged. Borrowing here used to force a full-length `.to_owned()` copy
+/// of that string on *every* toolbar push just to hand back something with
+/// the same lifetime as `&str` would have implied — see
+/// docs/decisions.md D89 for the measured cost of that copy.
+pub(crate) fn escape_js_line_terminators(json: String) -> String {
     if !json.contains('\u{2028}') && !json.contains('\u{2029}') {
-        return json.to_owned();
+        return json;
     }
     json.replace('\u{2028}', "\\u2028")
         .replace('\u{2029}', "\\u2029")
@@ -529,7 +538,7 @@ pub(crate) fn escape_js_line_terminators(json: &str) -> String {
 /// break out of the script.
 pub fn set_url_script(url: &str) -> String {
     let json = serde_json::Value::String(url.to_owned()).to_string();
-    format!("veloxSetUrl({});", escape_js_line_terminators(&json))
+    format!("veloxSetUrl({});", escape_js_line_terminators(json))
 }
 
 /// JS snippet that toggles the loading indicator.
@@ -550,7 +559,7 @@ pub fn set_block_count_script(count: u32) -> String {
 /// rather than panicking.
 pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
     let json = serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned());
-    format!("veloxSetTabs({});", escape_js_line_terminators(&json))
+    format!("veloxSetTabs({});", escape_js_line_terminators(json))
 }
 
 /// JS snippet that replaces the omnibox candidate dropdown's contents.
@@ -561,7 +570,7 @@ pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
 /// back to an empty list rather than panicking.
 pub fn set_candidates_script(candidates: &[Candidate]) -> String {
     let json = serde_json::to_string(candidates).unwrap_or_else(|_| "[]".to_owned());
-    format!("veloxSetCandidates({});", escape_js_line_terminators(&json))
+    format!("veloxSetCandidates({});", escape_js_line_terminators(json))
 }
 
 /// JS snippet that forces the address bar's text to `url`, focuses it, and
@@ -575,7 +584,7 @@ pub fn set_focus_address_bar_script(url: &str) -> String {
     let json = serde_json::Value::String(url.to_owned()).to_string();
     format!(
         "veloxFocusAddressBar({});",
-        escape_js_line_terminators(&json)
+        escape_js_line_terminators(json)
     )
 }
 
@@ -674,10 +683,7 @@ pub fn set_print_status_script(message: Option<&str>) -> String {
     match message {
         Some(text) => {
             let json = serde_json::Value::String(text.to_owned()).to_string();
-            format!(
-                "veloxSetPrintStatus({});",
-                escape_js_line_terminators(&json)
-            )
+            format!("veloxSetPrintStatus({});", escape_js_line_terminators(json))
         }
         None => "veloxSetPrintStatus(null);".to_owned(),
     }
@@ -719,14 +725,14 @@ pub fn set_theme_script(theme: Theme) -> String {
 
 fn entries_to_json<T: Serialize>(entries: &[T]) -> String {
     let json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_owned());
-    escape_js_line_terminators(&json)
+    escape_js_line_terminators(json)
 }
 
 /// Same shape and reasoning as [`entries_to_json`], for a single (non-slice)
 /// value such as [`BookmarksView`].
 fn value_to_json<T: Serialize>(value: &T) -> String {
     let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
-    escape_js_line_terminators(&json)
+    escape_js_line_terminators(json)
 }
 
 #[cfg(test)]
