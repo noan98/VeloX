@@ -150,6 +150,36 @@ jobs:
             if gh pr merge "$number" "--${MERGE_METHOD}" \
                  --match-head-commit "$sha" --delete-branch; then
               echo "merged: PR #${number}"
+
+              # --- Issue #168 -------------------------------------------
+              # GITHUB_TOKEN でのマージは GitHub 側のそれ以上の自動処理
+              # (Closes キーワードによる Issue 自動クローズ) を誘発しない
+              # ため、ここで明示的に閉じる。AUTO_MERGE_TOKEN (PAT) が
+              # 登録されて本物の自動クローズが効くようになった場合でも、
+              # 対象 Issue は既に closed のはずなので下の冪等チェックで
+              # 何もせず skip になる (二重クローズしない)。
+              # 抽出ロジック本体は .github/scripts/extract_closing_issues.py
+              # に切り出してあり、単体テストがある
+              # (.github/scripts/test_extract_closing_issues.py)。
+              body=$(gh pr view "$number" --json body --jq '.body // ""')
+              issues=$(printf '%s' "$body" | \
+                python3 .github/scripts/extract_closing_issues.py || true)
+              if [ -n "$issues" ]; then
+                echo "$issues" | while read -r issue; do
+                  [ -z "$issue" ] && continue
+                  state=$(gh issue view "$issue" --json state --jq '.state' 2>/dev/null) \
+                    || { echo "::warning::Issue #${issue} が見つかりません (PR #${number} 本文の Closes 参照)"; continue; }
+                  if [ "$state" = "CLOSED" ]; then
+                    echo "skip: Issue #${issue} は既に closed (PR #${number})"
+                    continue
+                  fi
+                  if gh issue close "$issue" --reason completed; then
+                    echo "closed: Issue #${issue} (PR #${number} の Closes キーワードにより)"
+                  else
+                    echo "::warning::Issue #${issue} のクローズに失敗しました (PR #${number})"
+                  fi
+                done
+              fi
             else
               # ブランチ保護 (レビュー必須など) や競合でマージできない場合。
               # 他の PR の処理は続ける。
