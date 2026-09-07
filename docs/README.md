@@ -7,7 +7,7 @@
 
 | 文書 | 内容 |
 | --- | --- |
-| [architecture.md](architecture.md) | 4 層 (`ui` / `app` / `browser` / `config`) の責務分担と、全状態変更をメインスレッドの `UserEvent` ディスパッチに集約する設計 |
+| [architecture.md](architecture.md) | UI (`src/ui/`) / Application (`src/app.rs`) / Browser logic (`src/browser/`) / Web engine (wry) という 4 層の責務分担と依存方向。UI 側は状態を直接触らず `UserEvent` を投げる、という設計もここ (`src/config/` は `src/browser/` と同じく純粋 Rust の補助モジュールで、層には数えない) |
 | [decisions.md](decisions.md) | 設計判断の記録。「なぜそうしたか」「なぜそうしなかったか」を D 番号ごとに残す。実装方針を変えたときはここに追記する |
 
 ## 性能
