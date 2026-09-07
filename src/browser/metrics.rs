@@ -420,7 +420,7 @@ impl std::error::Error for RssError {
 ///   compared against a Linux PSS number even if one existed, since the two
 ///   would be computed by entirely different methods.
 pub fn sample_process_tree_rss(root_pid: u32) -> Result<RssSample, RssError> {
-    let processes = imp::process_map()?;
+    let processes = imp::process_map(root_pid)?;
     build_sample(root_pid, &processes)
 }
 
@@ -1044,11 +1044,35 @@ mod imp {
     use std::fs;
     use std::path::Path;
 
-    /// Build a `pid -> ProcInfo` map for every process currently visible
-    /// under `/proc`. Processes that exit mid-scan are silently skipped
-    /// rather than treated as an error — RSS/PSS sampling is inherently a
-    /// snapshot of a moving target.
-    pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
+    /// Build a `pid -> ProcInfo` map covering `root_pid` and every
+    /// transitive child of it (Issue #189 follow-up to #187: two passes,
+    /// not one).
+    ///
+    /// **Pass 1** lists every process visible under `/proc` and reads only
+    /// `status` (`PPid:`/`VmRSS:`) for each — cheap, a few fields per file
+    /// (measured ~1.2ms for ~90 processes in #187's reference container).
+    /// This is enough to compute the tree shape
+    /// (`super::collect_descendants`), so `root_pid`'s descendant set is
+    /// now known.
+    ///
+    /// **Pass 2** reads `smaps_rollup` (PSS) and `stat` (CPU time) — the
+    /// two per-process reads that actually cost anything (a PSS read alone
+    /// measured ~85% of the whole scan's time in #187, because the kernel
+    /// has to walk that process's page table to answer it) — **only for
+    /// processes in that descendant set**, not for every process on the
+    /// machine. `build_sample` only ever looks at tree members anyway, so
+    /// every non-descendant process's `smaps_rollup`/`stat` read was pure
+    /// waste before this change — in this project's own reference
+    /// container, 21 processes were readable but only ~9 of them were ever
+    /// VeloX's own tree.
+    ///
+    /// Processes that exit mid-scan are silently skipped rather than
+    /// treated as an error — RSS/PSS sampling is inherently a snapshot of
+    /// a moving target. Every entry not in the descendant set keeps
+    /// `pss_bytes: None`/`cpu_seconds: None` (never even attempted) —
+    /// indistinguishable from D42/#63's existing "could not be read"
+    /// case, which `build_sample` already treats as "excluded", not "0".
+    pub(super) fn process_map(root_pid: u32) -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         let mut map = HashMap::new();
         for entry in fs::read_dir("/proc").map_err(super::RssError::Io)? {
             let entry = match entry {
@@ -1065,17 +1089,24 @@ mod imp {
             let Ok(contents) = fs::read_to_string(entry.path().join("status")) else {
                 continue; // process exited between listing and reading
             };
-            let Some(mut info) = parse_status(&contents) else {
+            let Some(info) = parse_status(&contents) else {
                 continue;
             };
-            // Best-effort: a process whose `smaps_rollup` cannot be read
-            // (old kernel, permissions, or it exited in the gap since
-            // `status` was read) simply keeps `pss_bytes: None` — it stays
-            // in the map (RSS is still valid) and is excluded from the PSS
-            // total by `build_sample` rather than treated as 0 bytes.
-            info.pss_bytes = read_pss_bytes(&entry.path());
-            info.cpu_seconds = read_cpu_seconds(&entry.path());
             map.insert(pid, info);
+        }
+        // Pass 2: only the tree `sample_process_tree_rss` will actually sum
+        // pays for `smaps_rollup`/`stat`. `collect_descendants` tolerates
+        // `root_pid` being absent (e.g. it exited between listing `/proc`
+        // and getting here) by simply returning `[root_pid]` with nothing
+        // to look up — `build_sample`'s own `ProcessNotFound` check (using
+        // this same map) is what actually reports that case.
+        for pid in super::collect_descendants(root_pid, &map) {
+            let Some(info) = map.get_mut(&pid) else {
+                continue;
+            };
+            let pid_path = Path::new("/proc").join(pid.to_string());
+            info.pss_bytes = read_pss_bytes(&pid_path);
+            info.cpu_seconds = read_cpu_seconds(&pid_path);
         }
         Ok(map)
     }
@@ -1230,8 +1261,12 @@ mod imp {
 
     /// Best-effort fallback for non-Linux Unix (macOS, *BSD): parse `ps`
     /// output instead of `/proc`. Untested by this project's CI, which
-    /// runs on Linux only; kept intentionally simple.
-    pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
+    /// runs on Linux only; kept intentionally simple. `root_pid` is unused
+    /// here (kept only so every platform's `process_map` shares one
+    /// signature, Issue #189) — this already does one cheap, whole-machine
+    /// `ps` call with no per-process PSS/CPU reads to narrow down, unlike
+    /// the Linux and Windows two-pass implementations.
+    pub(super) fn process_map(_root_pid: u32) -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         let output = Command::new("ps")
             .args(["-axo", "pid=,ppid=,rss="])
             .output()
@@ -1315,20 +1350,36 @@ mod imp {
         }
     }
 
-    /// Windows process-tree walk (Issue #136). `CreateToolhelp32Snapshot` +
-    /// `Process32First/NextW` is the Windows equivalent of iterating
-    /// `/proc` on Linux (see that `imp::process_map` above): the snapshot's
-    /// `PROCESSENTRY32W` entries already carry each process's PID and
-    /// parent PID (`th32ProcessID`/`th32ParentProcessID`), so no extra call
-    /// is needed for the tree shape itself. RSS and CPU time each need one
-    /// more per-process API (`GetProcessMemoryInfo`, `GetProcessTimes`),
-    /// both of which need an open handle — see [`query_process`].
+    /// Windows process-tree walk (Issue #136, two-pass since #189's follow-
+    /// up to #187). `CreateToolhelp32Snapshot` + `Process32First/NextW` is
+    /// the Windows equivalent of iterating `/proc` on Linux (see that
+    /// `imp::process_map` above): the snapshot's `PROCESSENTRY32W` entries
+    /// already carry each process's PID and parent PID
+    /// (`th32ProcessID`/`th32ParentProcessID`) for free, with no extra API
+    /// call — so **pass 1** below only builds the pid->ppid tree shape from
+    /// the snapshot, exactly like Linux's pass 1 reads only `status`.
+    ///
+    /// RSS and CPU time each need one further per-process API
+    /// (`GetProcessMemoryInfo`, `GetProcessTimes`, both behind an
+    /// `OpenProcess` handle — see [`query_process`]) — on Windows these are
+    /// full kernel round-trips, at least as expensive as Linux's
+    /// `smaps_rollup` read per #187's measurements, and Windows has no
+    /// snapshot-wide equivalent that gives them for free the way `status`
+    /// gives Linux's RSS. **Pass 2** below therefore calls `query_process`
+    /// only for `root_pid` and its descendants (`super::
+    /// collect_descendants`, computed from pass 1's tree), exactly
+    /// mirroring the Linux fix — this halves the surface `build_sample`
+    /// never even looks at. Unverified on real Windows hardware/CI (this
+    /// project's sandboxed session cannot run Windows); only `cargo check
+    /// --target x86_64-pc-windows-msvc` confirms it type-checks. See
+    /// docs/decisions.md D90 for the Linux-side measurement this mirrors
+    /// and the explicit "not measured on Windows" caveat.
     ///
     /// PSS has no Windows equivalent and is not attempted here; every
     /// [`ProcInfo::pss_bytes`] this returns is `None` — see the module docs
     /// on [`super::sample_process_tree_rss`] and D88 in `docs/decisions.md`
     /// for the investigation and why.
-    pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
+    pub(super) fn process_map(root_pid: u32) -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         // SAFETY: a plain FFI call into kernel32 with no caller-provided
         // buffers — it takes a system-wide snapshot and returns a handle to
         // it (or an error, via `windows_core::Result`, mapped below). The
@@ -1338,6 +1389,12 @@ mod imp {
             unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(to_io_error)?,
         );
 
+        // Pass 1: pid -> ppid only, no `OpenProcess`/`GetProcessMemoryInfo`/
+        // `GetProcessTimes` yet. `rss_bytes` starts at 0 and `cpu_seconds`
+        // at `None`; pass 2 below fills both in for tree members only —
+        // every other entry keeps these placeholder values, which is fine
+        // since `build_sample` (via `super::collect_descendants`) never
+        // looks at a non-tree entry's `rss_bytes`/`cpu_seconds` at all.
         let mut map = HashMap::new();
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -1353,14 +1410,13 @@ mod imp {
 
         while has_entry {
             let pid = entry.th32ProcessID;
-            let (rss_bytes, cpu_seconds) = query_process(pid);
             map.insert(
                 pid,
                 ProcInfo {
                     ppid: entry.th32ParentProcessID,
-                    rss_bytes: rss_bytes.unwrap_or(0),
+                    rss_bytes: 0,
                     pss_bytes: None,
-                    cpu_seconds,
+                    cpu_seconds: None,
                 },
             );
 
@@ -1368,6 +1424,19 @@ mod imp {
             // buffer as above, reused across iterations per the
             // Toolhelp32 API's contract.
             has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
+        }
+        // The snapshot itself is done with — pass 2 below queries live
+        // processes directly via `OpenProcess`, not the snapshot.
+        drop(snapshot);
+
+        // Pass 2: RSS + CPU time, only for root_pid and its descendants.
+        for pid in super::collect_descendants(root_pid, &map) {
+            let Some(info) = map.get_mut(&pid) else {
+                continue;
+            };
+            let (rss_bytes, cpu_seconds) = query_process(pid);
+            info.rss_bytes = rss_bytes.unwrap_or(0);
+            info.cpu_seconds = cpu_seconds;
         }
 
         Ok(map)
@@ -1453,8 +1522,9 @@ mod imp {
 
     /// No sampling strategy implemented yet (an OS other than Linux, other
     /// Unix, or Windows). Callers get a clean [`super::RssError::Unsupported`]
-    /// instead of a panic.
-    pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
+    /// instead of a panic. `root_pid` is unused (kept only for signature
+    /// parity with every other platform's `process_map`, Issue #189).
+    pub(super) fn process_map(_root_pid: u32) -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         Err(super::RssError::Unsupported)
     }
 }
