@@ -465,24 +465,44 @@ fn repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load() {
     // back to exactly 1 tab (the homepage) after every round, mirroring
     // `scripts/bench/tab_churn.py`'s round shape at a scale a unit-test
     // timeout can afford.
+    //
+    // The per-round waits started at 300ms/150ms and went red on a CI
+    // runner (only 4 of the expected 7 `page_load` records arrived) while
+    // passing locally. Opening a tab has to spawn a fresh
+    // `WebKitWebProcess`, and #60/D57 measured that spawn as the dominant
+    // cost of tab work (docs/performance-targets.md §13), so 300ms was far
+    // too little for the load to finish and be recorded before `close 1`
+    // ran. `AutomationCommand` has no "wait until the load completes"
+    // primitive, only a wall-clock `wait <ms>`, so the margin is the only
+    // lever — the same lever, for the same reason, as
+    // `visiting_pages_persists_history_json` (b303a78) and
+    // `restoring_the_previous_session_...` (PR #164). Raised to that
+    // test's 1500ms rather than lowered to a value that merely happens to
+    // pass: this test asserts *that every round's load is recorded*, and a
+    // timing constant must never decide whether the assertion is reached.
     const ROUNDS: usize = 6;
     let mut script = String::new();
     for _ in 0..ROUNDS {
-        script.push_str(&format!("open {page}\nwait 300\nclose 1\nwait 150\n"));
+        script.push_str(&format!("open {page}\nwait 1500\nclose 1\nwait 300\n"));
     }
     script.push_str("quit\n");
     let script_path = write_script(&dir, &script);
 
+    // The script itself now sleeps ~10.8s (6 rounds x 1800ms), so the old
+    // 30s budget left little room on top of it for a loaded runner's
+    // startup and teardown. 60s keeps the same intent — "velox exits on
+    // its own, it did not hang" — without the budget itself becoming the
+    // thing that fails.
     let launch = launch_and_wait(
         &perf_output,
         &data_dir,
         &homepage,
         &script_path,
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     );
     let Some(status) = launch.exit_status else {
         panic!(
-            "velox did not exit on its own within 30s while running {ROUNDS} tab open/close \
+            "velox did not exit on its own within 60s while running {ROUNDS} tab open/close \
              cycles. Perf records observed before the forced kill: {:?}",
             launch.perf_records
         );
