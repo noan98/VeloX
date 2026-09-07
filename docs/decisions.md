@@ -9621,3 +9621,176 @@ primitive を用意する) を検討すること。(2)
 待ちしか無い」という前提 (`AutomationWaitState::pending` が `Option` 1 枠)
 に依存している — 将来 `velox-bench`/統合テストが複数ウィンドウを並行して
 待つような使い方を必要とした場合は、この前提から見直すこと。
+
+## D85: 統合テストに残った固定 wait を無くす (#173) — `wait_startup` を追加して D84 の Revisit condition (1) を解消し、(2) は実測の上で「wait_load に置き換えない」結論を確定させた
+
+**対象**: Issue #173。D84 が残した 3 箇所の固定 `wait <ms>` のうち、
+`startup_completes_and_records_a_startup_event` の 1 箇所 (主目的) と
+`downloads_with_several_tabs_open_are_handled_exactly_once` の 2 箇所
+(副次) を扱った。
+
+**主目的 — `wait_startup [timeout_ms]` を追加 (案 A を選択)**: Issue 本文が
+示した 2 案 (A: `wait_startup` 専用コマンド / B: `wait_perf <event>` 汎用形)
+のうち **A を選んだ**。理由:
+
+- この Issue が実際に必要としている待ち条件は「`startup` perf レコードが
+  書かれること」ただ 1 つで、他の perf イベント (`page_load`/`tab_create`/
+  `tab_switch`/`rss`/...) を自動操作スクリプトから待つ具体的な需要は
+  Issue 本文にも既存のテスト群にも無い。
+- B はイベント名の妥当性検証 (存在しないイベント名を指定された場合の扱い、
+  `measure_start`/`ipc` のような「1 スクリプトにつき 1 回では終わらない」
+  イベントをどう扱うかなど) を余分に設計する必要があり、Issue が明記した
+  見積り (cost: low、`automation.rs`/`app.rs`/`tests/integration.rs` の
+  3 ファイルで完結) と釣り合わない。
+- A はコマンド名自体が「何を待つか」を表しており (`wait_perf startup` より
+  自己文書的)、`wait_load` と対になる語彙として自然。
+
+**設計**: D84 の `AutomationWaitState`/`AutomationWait`/
+`poll_automation_wait_timeout`/`resolve_automation_wait_if_matching`/
+`spawn_automation`/`handle_automation_command` という「main スレッドの
+状態機械 + 通知チャネル」をそのまま再利用し、待つ条件を 1 つ増やしただけ
+— D44 の枠内 (`VELOX_AUTOMATION_SCRIPT` 以外の制御チャネルを増やさない)
+を維持している。具体的な変更:
+
+1. `AutomationWait` に `window_id`/`tab_id` を直接持たせる代わりに、
+   `AutomationWaitKind { Load { window_id, tab_id }, Startup }` を導入し、
+   `AutomationWait { kind, deadline }` に一般化した。`wait_load` 側の
+   呼び出し・照合ロジック (`resolve_automation_wait_if_matching`) は
+   `Load` にだけマッチするよう変えただけで、意味は変えていない。
+2. `AutomationWaitState` に `startup_reported: bool` を追加した。
+   `wait_startup` が「`startup` レコードが書かれた**後**に発行された」
+   場合 (`wait_load` の「既に読み込み完了していれば即座に次へ」に相当する
+   ケース) に、`handle_automation_command` がこのフラグを見て即座に
+   `notify.send(())` するために要る — フラグが無いと、レコードが既に
+   書かれた後の `wait_startup` は「待つ相手がもういない `pending`」を
+   登録してしまい、次の解消経路が来るまで (実質タイムアウトするまで)
+   進めなくなる。
+3. `startup_reported` を立てる場所は `mark_startup` (`record_perf_event`
+   内) ではなく **`run()` のイベントループ側**にした。`run()` の
+   `Event::UserEvent` 節で `record_perf_event` を呼ぶ前後の
+   `startup: Option<StartupTimestamps>` を比較し (`Some -> None` の遷移
+   = ちょうど今 `mark_startup` がレコードを書いた瞬間、`mark_startup`
+   自身が「書いたら `None` にする」ことで保証している一意性と同じ signal
+   を再利用)、遷移を検知したら `resolve_automation_wait_for_startup` を
+   呼ぶ。`record_perf_event`/`mark_startup` の側には一切手を入れていない
+   — この 2 つは他の perf イベント (`page_load`/`tab_create`/...) と
+   同じく「自動操作の都合を知らない」ままにしておきたかった
+   (`AutomationWaitState` を引数に増やすと、perf 記録ロジックが
+   自動操作の待ち機構に依存するという逆向きの結合が生まれる)。
+   `record_perf_event` の単体テスト (3 箇所、`app.rs` の `mod tests`) も
+   シグネチャ変更なしで無傷のまま通る。
+4. `handle_automation_command` の `WaitStartup` 節は `WaitLoad` と対称:
+   `automation_wait.startup_reported` が `true` なら即座に解消、`false`
+   なら `pending` に `Startup` を登録して `deadline` を設定するだけで
+   ここではブロックしない (`WaitLoad` が `Tab::is_loading()` を見るのと
+   同じ形)。
+5. `UserEvent::Automation(command)` 節の「ウィンドウが既に無くなっている
+   場合は即座に通知して打ち切る」ガード (D84 の設計 5.) は `WaitLoad` と
+   `WaitStartup` の両方を対象にした — `wait_startup` は実際にはどの
+   ウィンドウにも依存しないが、他の自動操作コマンドと同じ
+   `ui_windows.get_mut(automation_window)` ゲートを経由して配送される
+   ため、同じガードが要る。
+6. `parse_wait_load` は `parse_optional_wait(line, keyword, rest)` に
+   一般化し、`wait_load`/`wait_startup` の両方から呼ぶ (エラーメッセージの
+   コマンド名だけ引数で差し替える)。デフォルトタイムアウト定数
+   `automation::DEFAULT_WAIT_LOAD_TIMEOUT_MS` (10000ms) はそのまま
+   両コマンドで共有した — 別名の定数を増やすと D84 の本文
+   (`docs/decisions.md` の既存エントリ、書き換え禁止) が参照している
+   名前と食い違うため、新しい定数は増やさずドキュメントコメントで
+   「`wait_startup` とも共有している」と明記するに留めた。
+
+**`tests/integration.rs` の置き換え**: `startup_completes_and_records_a_
+startup_event` の `wait 1500` を `wait_startup` (引数なし、デフォルト
+10000ms タイムアウト) に置き換えた。
+
+**副次 — ダウンロードへの `navigate` (実測結果)**: `VELOX_DEBUG=1` で
+`downloads_with_several_tabs_open_are_handled_exactly_once` と同じ形の
+スクリプトを実行し、`velox[debug]: <UserEvent>` のトレースを直接確認した。
+分かったこと:
+
+- `navigate <download_page>` そのもの (`download.html` を読み込む遷移) は
+  **`LoadFinished` を発火する** — `download.html` 自体は普通の HTML ページ
+  で、`with_download_started_handler` (D28) に横取りされるのは、その
+  ページの `load` イベント後に JS が `click()` する `download` 属性付き
+  リンクの**先** (`data:text/plain;...` への 2 段目のナビゲーション) だけ
+  だった。トレース上は `NavigationStarted(..., "file://.../download.html")`
+  → `LoadFinished(..., "file://.../download.html")` → (JS の `load`
+  ハンドラ発火) → `NavigationStarted(..., "data:text/plain;...")` →
+  (`LoadFinished` は無い、代わりに `DownloadStarted`/`DownloadCompleted`)
+  という順で観測された。D84 が「届くかどうか未検証」としていた懸念
+  (`wait_load` が来ない `LoadFinished` を待ち続けてタイムアウトするだけ、
+  実害は無い) はこの意味では外れていた — `wait_load` はハングしない
+  どころか、`download.html` 自身の読み込み完了で正常に、しかも今までの
+  固定 `wait 2500` よりずっと早く解消する。
+- **しかしこれは「置き換えても安全」を意味しなかった**。`wait_load` が
+  解消するのは「ページの読み込みが終わった」時点であり、それは
+  `DownloadStarted`/`DownloadCompleted` (非同期に、`LoadFinished` より
+  後で発火する — 上記トレースでも `DownloadCompleted` は次の
+  `navigate`/`LoadStarted` が始まった後に届いていた) より確実に前に来る。
+  2 回ダウンロードして 2 回目の直後が `quit` という実際のテストの形を
+  そのまま再現し (両方の `navigate <download_page>` の直後を `wait_load`
+  に置き換え、末尾の settle 用 `wait` は入れない)、同一スクリプトを
+  **10 回連続実行**したところ、**2/10 回で 2 個目のダウンロードファイルが
+  存在しなかった** (`velox-test (1).txt` が生成される前にプロセスが
+  `quit` してしまうケース)。1 個目のダウンロードは後続の `navigate
+  {homepage}`/`wait_load` がその間の実時間を稼ぐため毎回間に合っていたが、
+  2 個目には後続コマンドが無く `quit` までの猶予が本質的に無かった。
+- 結論: `wait_load`/`wait_startup` はいずれも「ページの読み込み完了」
+  「`startup` レコードの記録完了」という条件しか約束しておらず、
+  「ダウンロードの完了」は両者と独立した 3 つ目の条件になる。この Issue
+  は `wait_perf`/`wait_download` のような追加の待ちプリミティブを要求
+  しておらず (受け入れ条件は `wait_startup`/実測記録のみ)、スコープを
+  無断で広げてまで作るべきものでもないと判断し、この 2 箇所は**元の
+  `wait <ms>` のまま変更していない**。`tests/integration.rs` の当該テスト
+  のコメントと module doc comment に、上記の実測結果 (具体的な観測イベント
+  列と 10 回中 2 回という数値) を残した — 推測ではなく実測の記録として
+  今後の判断材料にできるようにするため。
+
+**動作確認**: `cargo fmt --check` / `cargo clippy --all-targets -- -D
+warnings` / `cargo test --lib` (969 件、D84 時点の 963 件 + `wait_startup`
+のパーサ単体テスト 6 件) / `cargo check --target x86_64-pc-windows-msvc
+--all-targets` (D61。`cfg` 分岐は今回も増やしていないが、D84 に倣い念のため
+実行) はすべて green。統合テスト (`VELOX_INTEGRATION_REQUIRE_GUI=1
+xvfb-run ... dbus-run-session -- cargo test`) は 11 件全 green を複数回
+(3 回) 確認した。
+
+`startup_completes_and_records_a_startup_event` (`wait_startup` への置き換え
+本体) は **単体で 25 回連続実行して全て pass** を確認した — 内訳は無負荷
+15 回 (各 0.40〜0.46s、旧 `wait 1500` より大幅に短い) と、4 コア全部を
+ビジーループで専有した状態での 15 回中10回 (各 0.62〜0.86s、負荷がかかって
+実際に遅くなっていることを実行時間で確認した上での 10 回) — 合計 25/25
+pass。D84 の記述にあった「このコンテナ上で 5 回に 2 回 red になる」という
+条件下 (`wait_load` へ単純置換した場合) との対比としては、`wait_load` への
+単純置換を試した時点の再現は本セッションでは行っていない (D84 の記述と
+今回の負荷再現実験の両方から、`wait_startup` が実イベントを直接待つ以上
+理論的にも同種の flake が起きないことは設計上保証されている、という位置
+付け)。
+
+タイムアウト経路は `wait_load`/`wait_startup` の両方を個別に確認した:
+`wait_startup` は `VELOX_PERF_METRICS` を設定せず (`startup` レコードが
+一生書かれない状況を人工的に作り) `wait_startup 500` を実行し、
+500ms 後に stderr に
+`wait_startup はタイムアウトしました (startup perf レコードがまだ書き込まれていません — VELOX_PERF_METRICS が有効か確認してください)`
+が出た上でプロセスが `quit` まで到達し自力終了する (ハングしない) ことを
+確認した。`wait_load` の既存タイムアウト経路も、応答を返さないローカル
+TCP リスナー (127.0.0.1:8899、`accept` はするが何も送らない) へ
+`navigate` させて回帰していないことを確認した (D84 と同じ手法)。
+
+`velox-bench run --scenario tab_create --trials 1` を実際に 1 試行走らせ、
+`tab_create_ms` 中央値 3.30ms・`page_load_ms` 中央値 10.60ms など
+D84 で確認した際と同オーダーの数値が出ることを確認した (`generate_bench_
+script` は本 Issue で一切変更していないので、この確認も「配線が壊れて
+いないか」の smoke test)。
+
+### Revisit condition
+
+D84 の Revisit condition (1) (`startup_completes_and_records_a_startup_
+event` の競合状態) は本 Issue で解消済み。(2) (ダウンロード遷移の
+`LoadFinished`) も実測により「届くが `wait_load` へは置き換えない」で
+確定した — 再訪の必要があるとすれば、ダウンロード完了という 3 つ目の
+条件を待つ専用プリミティブ (`wait_download` 相当) を作る価値が生じたとき
+のみ。(3) (`AutomationWaitState::pending` が `Option` 1 枠という前提) は
+本 Issue でも変えていない — `wait_load`/`wait_startup` を同時に 2 つ
+発行するスクリプトは今のところ存在せず、`spawn_automation` が 1 コマンド
+ずつ順に処理して次のコマンドへ進む前に必ず解消を待つ設計なので、依然
+1 枠で足りている。

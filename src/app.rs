@@ -161,10 +161,11 @@ pub enum UserEvent {
     /// use (`open_new_tab`, `close_tab`, `apply_activation`, ...), not a
     /// new state-mutation path. `AutomationCommand::Quit` is special-cased
     /// in `run`'s event loop, before dispatch, to set `ControlFlow::Exit`.
-    /// `AutomationCommand::WaitLoad` (Issue #169) *does* become an event
-    /// like any other non-`Wait` command, but the sending thread then also
-    /// blocks on a separate channel (`AutomationWaitState`) until the main
-    /// thread resolves it — see `spawn_automation`'s doc comment.
+    /// `AutomationCommand::WaitLoad`/`WaitStartup` (Issue #169/#173) *do*
+    /// become an event like any other non-`Wait` command, but the sending
+    /// thread then also blocks on a separate channel (`AutomationWaitState`)
+    /// until the main thread resolves it — see `spawn_automation`'s doc
+    /// comment.
     Automation(AutomationCommand),
     /// A fresh process-tree memory sample from `spawn_memory_pressure_sampler`
     /// (Issue #63): the total in bytes (PSS where the platform can read it,
@@ -447,23 +448,28 @@ impl PerfContext {
 /// entry either. See docs/decisions.md D79 for the audit that found this.
 type PageLoadTimers = HashMap<(WindowId, TabId), metrics::PageLoadTimer>;
 
-/// State for `AutomationCommand::WaitLoad` (Issue #169, docs/decisions.md
-/// D84): at most one `wait_load` is ever in flight at a time — the
-/// automation thread blocks on each `wait_load` (see [`spawn_automation`])
-/// before sending the next command — so a single `Option` slot is enough.
-/// Threaded through the event loop the same way [`PageLoadTimers`] is.
+/// State for `AutomationCommand::WaitLoad`/`WaitStartup` (Issue #169/#173,
+/// docs/decisions.md D84/D85): at most one wait is ever in flight at a time
+/// — the automation thread blocks on each `wait_load`/`wait_startup` (see
+/// [`spawn_automation`]) before sending the next command — so a single
+/// `Option` slot is enough for either kind. Threaded through the event loop
+/// the same way [`PageLoadTimers`] is.
 ///
-/// Resolved from exactly two places: `LoadFinished` for the tab being
-/// waited on ([`resolve_automation_wait_if_matching`], called from
-/// [`handle_user_event`]), or the deadline passing with no such event
+/// `pending`, when `Some`, is resolved from exactly two places (per
+/// [`AutomationWaitKind`]): `LoadFinished` for the tab a `wait_load` is
+/// waiting on ([`resolve_automation_wait_if_matching`], called from
+/// [`handle_user_event`]) or `mark_startup` writing the `startup` perf
+/// record for a `wait_startup` ([`resolve_automation_wait_for_startup`],
+/// called from `run`'s event loop right after `record_perf_event`) — or,
+/// regardless of kind, the deadline passing with no such event
 /// ([`poll_automation_wait_timeout`], called once per pass through `run`'s
-/// event loop, right alongside the existing tab-suspension sweep). Both
-/// paths clear `pending` before notifying, so the automation thread's
+/// event loop, right alongside the existing tab-suspension sweep). Every
+/// path clears `pending` before notifying, so the automation thread's
 /// blocked `recv()` (in [`spawn_automation`]) always receives exactly one
-/// notification per `wait_load` — never zero (which would hang it forever)
-/// and never more than one for the same command (which would let a later,
-/// unrelated `wait_load` resolve prematurely on a stale message still
-/// sitting in the channel).
+/// notification per wait — never zero (which would hang it forever) and
+/// never more than one for the same command (which would let a later,
+/// unrelated wait resolve prematurely on a stale message still sitting in
+/// the channel).
 struct AutomationWaitState {
     pending: Option<AutomationWait>,
     /// Wakes the automation thread's blocked `recv()`. The payload carries
@@ -471,16 +477,40 @@ struct AutomationWaitState {
     /// it may proceed; whichever resolution path fired already logged the
     /// reason to stderr on a timeout (see [`poll_automation_wait_timeout`]).
     notify: mpsc::Sender<()>,
+    /// Set once `mark_startup` has written the `startup` perf record (Issue
+    /// #173) — read by `handle_automation_command`'s `WaitStartup` arm so a
+    /// `wait_startup` issued *after* that point resolves immediately
+    /// instead of registering a pending wait nothing will ever notify again
+    /// (mirroring `WaitLoad`'s "already not loading" case). Set from
+    /// `run`'s event loop (see [`resolve_automation_wait_for_startup`]),
+    /// not from `mark_startup` itself — `mark_startup` lives in
+    /// `record_perf_event`, which stays free of any dependency on the
+    /// automation machinery, matching how `Wait`/`Mark` are handled
+    /// elsewhere in this file. Never reset back to `false`: `mark_startup`
+    /// only ever writes the report once per process (it clears `startup`
+    /// right after), so once true it stays true for the rest of the run.
+    startup_reported: bool,
 }
 
-/// One `wait_load` currently blocking the automation thread, waiting for
-/// `tab_id` (in `window_id`) to finish loading.
+/// What a pending [`AutomationWait`] is waiting for.
+enum AutomationWaitKind {
+    /// `wait_load` (Issue #169): `tab_id` (in `window_id`) to finish its
+    /// current page load.
+    Load { window_id: WindowId, tab_id: TabId },
+    /// `wait_startup` (Issue #173): the `startup` perf record to be
+    /// written — a broader condition than one tab's `LoadFinished`, since
+    /// `mark_startup` requires every `metrics::StartupTimestamps`
+    /// checkpoint (including the toolbar webview's independent `ready`
+    /// handshake) to have landed first.
+    Startup,
+}
+
+/// One `wait_load`/`wait_startup` currently blocking the automation thread.
 struct AutomationWait {
-    window_id: WindowId,
-    tab_id: TabId,
+    kind: AutomationWaitKind,
     /// When to give up and unblock the automation thread anyway (Issue
-    /// #169's "must never hang" requirement) if `LoadFinished` never
-    /// arrives — the tab or window closed, the load genuinely never
+    /// #169's "must never hang" requirement) if the awaited event never
+    /// arrives — the tab or window closed, the load/startup genuinely never
     /// completes, or any other case a script did not anticipate.
     deadline: Instant,
 }
@@ -718,6 +748,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     let mut automation_wait = AutomationWaitState {
         pending: None,
         notify: automation_wait_tx,
+        startup_reported: false,
     };
 
     let history = data_dir
@@ -815,6 +846,18 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                     eprintln!("velox[debug]: {user_event:?}");
                 }
                 if let Some(log) = perf_log.as_deref() {
+                    // Issue #173: detect the exact moment `record_perf_event`
+                    // (via `mark_startup`) writes the `startup` perf record —
+                    // a `startup: Some -> None` transition, the same signal
+                    // `mark_startup` itself uses to write the record exactly
+                    // once (see its own doc comment) — so a pending
+                    // `wait_startup` can be resolved right here without
+                    // threading `automation_wait` through
+                    // `record_perf_event`/`mark_startup` themselves (which
+                    // would otherwise need to know about the automation
+                    // machinery at all, unlike every other perf event they
+                    // handle).
+                    let startup_was_pending = startup.is_some();
                     record_perf_event(
                         &mut startup,
                         &mut page_load_timers,
@@ -822,6 +865,9 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                         process_start,
                         &user_event,
                     );
+                    if startup_was_pending && startup.is_none() {
+                        resolve_automation_wait_for_startup(&mut automation_wait);
+                    }
                 }
                 // `quit` (Issue #112) is handled here, before dispatch,
                 // exactly like `WindowEvent::CloseRequested` above — it
@@ -1275,18 +1321,26 @@ fn poll_automation_wait_timeout(
     if now < pending.deadline {
         return Some(pending.deadline);
     }
-    let AutomationWait {
-        window_id, tab_id, ..
-    } = *pending;
-    let url = state
-        .windows
-        .tabs(window_id)
-        .and_then(|tabs| tabs.get(tab_id))
-        .map(|tab| tab.current_url().to_owned());
-    eprintln!(
-        "velox: automation: wait_load はタイムアウトしました \
-         (window={window_id:?}, tab={tab_id:?}, url={url:?})"
-    );
+    match pending.kind {
+        AutomationWaitKind::Load { window_id, tab_id } => {
+            let url = state
+                .windows
+                .tabs(window_id)
+                .and_then(|tabs| tabs.get(tab_id))
+                .map(|tab| tab.current_url().to_owned());
+            eprintln!(
+                "velox: automation: wait_load はタイムアウトしました \
+                 (window={window_id:?}, tab={tab_id:?}, url={url:?})"
+            );
+        }
+        AutomationWaitKind::Startup => {
+            eprintln!(
+                "velox: automation: wait_startup はタイムアウトしました \
+                 (startup perf レコードがまだ書き込まれていません — \
+                 VELOX_PERF_METRICS が有効か確認してください)"
+            );
+        }
+    }
     automation_wait.pending = None;
     let _ = automation_wait.notify.send(());
     None
@@ -1294,19 +1348,47 @@ fn poll_automation_wait_timeout(
 
 /// If `wait_load` (Issue #169) is currently blocked waiting on tab `tab_id`
 /// in window `window_id`, unblock it: clear the pending wait and notify the
-/// automation thread. A no-op when nothing is pending, or when this
-/// `LoadFinished` belongs to some other tab — matching the "exactly one
-/// notification per `wait_load`" invariant [`AutomationWaitState`]'s doc
-/// comment describes.
+/// automation thread. A no-op when nothing is pending, when a `wait_startup`
+/// is pending instead, or when this `LoadFinished` belongs to some other tab
+/// — matching the "exactly one notification per wait" invariant
+/// [`AutomationWaitState`]'s doc comment describes.
 fn resolve_automation_wait_if_matching(
     automation_wait: &mut AutomationWaitState,
     window_id: WindowId,
     tab_id: TabId,
 ) {
-    let matches = automation_wait
-        .pending
-        .as_ref()
-        .is_some_and(|pending| pending.window_id == window_id && pending.tab_id == tab_id);
+    let matches = automation_wait.pending.as_ref().is_some_and(|pending| {
+        matches!(
+            pending.kind,
+            AutomationWaitKind::Load { window_id: w, tab_id: t } if w == window_id && t == tab_id
+        )
+    });
+    if matches {
+        automation_wait.pending = None;
+        let _ = automation_wait.notify.send(());
+    }
+}
+
+/// Mark the `startup` perf record as written (Issue #173) and, if a
+/// `wait_startup` is currently blocked waiting for exactly that, unblock it:
+/// clear the pending wait and notify the automation thread. Called from
+/// `run`'s event loop the moment it observes `startup` transition from
+/// `Some` to `None` (i.e. `mark_startup` just wrote the record) — see that
+/// call site's comment for why the transition is detected there rather than
+/// threading `automation_wait` into `record_perf_event`/`mark_startup`.
+/// `startup_reported` is set unconditionally (even when nothing is
+/// currently pending) so a `wait_startup` issued later in the script still
+/// resolves immediately in `handle_automation_command` instead of
+/// registering a wait nothing will ever notify again.
+fn resolve_automation_wait_for_startup(automation_wait: &mut AutomationWaitState) {
+    automation_wait.startup_reported = true;
+    let matches = matches!(
+        automation_wait
+            .pending
+            .as_ref()
+            .map(|pending| &pending.kind),
+        Some(AutomationWaitKind::Startup)
+    );
     if matches {
         automation_wait.pending = None;
         let _ = automation_wait.notify.send(());
@@ -1894,11 +1976,19 @@ fn handle_user_event(
                     automation_wait,
                     command,
                 );
-            } else if matches!(command, AutomationCommand::WaitLoad { .. }) {
+            } else if matches!(
+                command,
+                AutomationCommand::WaitLoad { .. } | AutomationCommand::WaitStartup { .. }
+            ) {
                 // The targeted window is already gone (should not happen in
                 // practice — see the doc comment on `tabs_of`'s `.expect`)
-                // but a `wait_load` must still never hang the automation
-                // thread waiting for a notification nothing will ever send.
+                // but a `wait_load`/`wait_startup` must still never hang the
+                // automation thread waiting for a notification nothing will
+                // ever send. (`wait_startup` does not actually need a window
+                // at all, unlike `wait_load` — but it is dispatched through
+                // this same `ui_windows.get_mut(automation_window)` gate as
+                // every other automation command, so it needs the same
+                // guard here.)
                 let _ = automation_wait.notify.send(());
             }
         }
@@ -3193,7 +3283,10 @@ fn handle_context_menu_action(
 /// this cannot become a synchronous, blocking wait *inside* this function:
 /// this function runs on the main thread, the same one that would have to
 /// deliver the `LoadFinished` this wait is waiting on, so blocking it here
-/// would deadlock.
+/// would deadlock. `AutomationCommand::WaitStartup` (Issue #173) is the same
+/// shape, checking `automation_wait.startup_reported` (set elsewhere, from
+/// `run`'s event loop — see `resolve_automation_wait_for_startup`) instead
+/// of `Tab::is_loading`.
 fn handle_automation_command(
     window: &mut BrowserWindow,
     window_id: WindowId,
@@ -3238,8 +3331,7 @@ fn handle_automation_command(
             let tab_id = tabs_of(state, window_id).active_id();
             if tabs_of(state, window_id).active().is_loading() {
                 automation_wait.pending = Some(AutomationWait {
-                    window_id,
-                    tab_id,
+                    kind: AutomationWaitKind::Load { window_id, tab_id },
                     deadline: Instant::now() + Duration::from_millis(timeout_ms),
                 });
             } else {
@@ -3247,6 +3339,22 @@ fn handle_automation_command(
                 // immediately, matching the issue's "already loaded ->
                 // proceed at once" requirement.
                 let _ = automation_wait.notify.send(());
+            }
+        }
+        // Issue #173: same shape as `WaitLoad` above, but the condition it
+        // polls is `automation_wait.startup_reported` (set from `run`'s
+        // event loop the moment `mark_startup` writes the `startup` record
+        // — see `resolve_automation_wait_for_startup`) rather than
+        // `Tab::is_loading` — there is no single tab/window this wait is
+        // scoped to, unlike `WaitLoad`.
+        AutomationCommand::WaitStartup { timeout_ms } => {
+            if automation_wait.startup_reported {
+                let _ = automation_wait.notify.send(());
+            } else {
+                automation_wait.pending = Some(AutomationWait {
+                    kind: AutomationWaitKind::Startup,
+                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
+                });
             }
         }
         // The marker is a perf-log record only (`record_perf_event` has
@@ -3279,12 +3387,12 @@ fn tab_id_at(state: &mut AppState, window_id: WindowId, index: usize) -> Option<
 /// `VELOX_AUTOMATION_SCRIPT` (Issue #112). Walks `commands` in order:
 /// `AutomationCommand::Wait` sleeps this thread (never blocking the main
 /// thread, which keeps servicing the webview/UI the whole time);
-/// `AutomationCommand::WaitLoad` (Issue #169) sends its event exactly like
-/// every other command below, then additionally blocks this thread on
-/// `automation_wait_rx` until the main thread resolves it (see
-/// `AutomationWaitState`'s doc comment) — still never the main thread, so
-/// the webview/UI keeps being serviced while a script waits on a load;
-/// every other command is proxied into the event loop as
+/// `AutomationCommand::WaitLoad`/`WaitStartup` (Issue #169/#173) send their
+/// event exactly like every other command below, then additionally block
+/// this thread on `automation_wait_rx` until the main thread resolves them
+/// (see `AutomationWaitState`'s doc comment) — still never the main thread,
+/// so the webview/UI keeps being serviced while a script waits on a load or
+/// on startup; every other command is proxied into the event loop as
 /// `UserEvent::Automation`, processed on the main thread exactly like any
 /// other `UserEvent` (see docs/decisions.md D44). `EventLoopProxy::send_event`
 /// is the same fire-and-forget channel every webview callback already uses
@@ -3311,6 +3419,19 @@ fn spawn_automation(
                 AutomationCommand::WaitLoad { timeout_ms } => {
                     if proxy
                         .send_event(UserEvent::Automation(AutomationCommand::WaitLoad {
+                            timeout_ms,
+                        }))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    if automation_wait_rx.recv().is_err() {
+                        return;
+                    }
+                }
+                AutomationCommand::WaitStartup { timeout_ms } => {
+                    if proxy
+                        .send_event(UserEvent::Automation(AutomationCommand::WaitStartup {
                             timeout_ms,
                         }))
                         .is_err()
