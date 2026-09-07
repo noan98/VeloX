@@ -36,6 +36,7 @@ use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use serde::Deserialize;
 use tao::event_loop::{EventLoopProxy, EventLoopWindowTarget};
@@ -49,6 +50,8 @@ use wry::{
 use crate::app::UserEvent;
 use crate::browser::context_menu;
 use crate::browser::downloads;
+use crate::browser::metrics::IpcDirection;
+use crate::browser::perf_log::IpcLog;
 use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
 use crate::browser::{
@@ -996,6 +999,12 @@ pub struct BrowserWindow {
     /// `blocklist`/`site_permissions` for the same reason: every tab opened
     /// later must build its download handlers with the same override.
     download_dir_override: Option<String>,
+    /// Where to log Rust → JS toolbar IPC traffic (Issue #66) — `None` when
+    /// `config.perf_metrics` is off, in which case [`Self::eval_toolbar`]
+    /// is a single `Option::is_none` check with no clock read, matching
+    /// this project's other metrics-off-path guarantees (see
+    /// `metrics::PerfRecord`'s module doc comment).
+    ipc_log: Option<IpcLog>,
 }
 
 /// Result of [`BrowserWindow::clear_all_site_data`]: how many webviews were
@@ -1049,6 +1058,11 @@ impl BrowserWindow {
         initial_url: &str,
         policies: SitePolicies,
         private: bool,
+        // Issue #66: `None` when `config.perf_metrics` is off (both
+        // `app::run`'s primary-window construction and
+        // `app::open_new_window` pass `None` in that case) — see
+        // `Self::eval_toolbar`.
+        ipc_log: Option<IpcLog>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let SitePolicies {
             blocklist,
@@ -1254,6 +1268,7 @@ impl BrowserWindow {
             site_exceptions,
             site_permissions,
             download_dir_override,
+            ipc_log,
         })
     }
 
@@ -1655,15 +1670,36 @@ impl BrowserWindow {
         }
     }
 
+    /// Push one Rust → JS update into the toolbar webview, instrumenting it
+    /// as an [`IpcDirection::Out`] event when `self.ipc_log` is set (Issue
+    /// #66, `config.perf_metrics`). Every `set_*`/`focus_address_bar`
+    /// method below routes its `evaluate_script` call through here instead
+    /// of calling `self.toolbar.evaluate_script` directly, so
+    /// counting/sizing/timing Rust → JS toolbar traffic needed no change at
+    /// any of those call sites beyond this one. `name` is a short, stable
+    /// label (e.g. `"set_tabs"`) rather than something derived from
+    /// `script` itself — parsing the generated JS back out to recover a
+    /// name would cost more than the call this is measuring. Metrics-off
+    /// path: a single `Option::is_none` check, no clock read, matching
+    /// this project's other `PerfContext`-gated call sites.
+    fn eval_toolbar(&self, name: &'static str, script: &str) -> wry::Result<()> {
+        let Some(ipc_log) = &self.ipc_log else {
+            return self.toolbar.evaluate_script(script);
+        };
+        let started = Instant::now();
+        let result = self.toolbar.evaluate_script(script);
+        ipc_log.record(IpcDirection::Out, name, script.len(), started);
+        result
+    }
+
     /// Show `url` in the toolbar's address bar.
     pub fn set_url_display(&self, url: &str) -> wry::Result<()> {
-        self.toolbar.evaluate_script(&toolbar::set_url_script(url))
+        self.eval_toolbar("set_url", &toolbar::set_url_script(url))
     }
 
     /// Toggle the toolbar's loading indicator.
     pub fn set_loading(&self, loading: bool) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_loading_script(loading))
+        self.eval_toolbar("set_loading", &toolbar::set_loading_script(loading))
     }
 
     /// Update the toolbar's blocked-request counter badge. The caller
@@ -1672,8 +1708,7 @@ impl BrowserWindow {
     /// they become active (see `Tab::on_navigation_blocked` and
     /// `UserEvent::NavigationBlocked`'s `TabId`).
     pub fn set_block_count(&self, count: u32) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_block_count_script(count))
+        self.eval_toolbar("set_block_count", &toolbar::set_block_count_script(count))
     }
 
     /// Open DevTools (Web Inspector) for the active tab's content webview.
@@ -1707,14 +1742,15 @@ impl BrowserWindow {
 
     /// Re-render the tab strip from `tabs`.
     pub fn set_tabs(&self, tabs: &[toolbar::TabSummary]) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_tabs_script(tabs))
+        self.eval_toolbar("set_tabs", &toolbar::set_tabs_script(tabs))
     }
 
     /// Toggle the bookmark ("star") button's active state.
     pub fn set_bookmark_active(&self, active: bool) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_bookmark_active_script(active))
+        self.eval_toolbar(
+            "set_bookmark_active",
+            &toolbar::set_bookmark_active_script(active),
+        )
     }
 
     /// Focus the toolbar webview and force the address bar to show `url`,
@@ -1726,22 +1762,25 @@ impl BrowserWindow {
     /// no-op re-focus.
     pub fn focus_address_bar(&self, url: &str) -> wry::Result<()> {
         self.toolbar.focus()?;
-        self.toolbar
-            .evaluate_script(&toolbar::set_focus_address_bar_script(url))
+        self.eval_toolbar(
+            "focus_address_bar",
+            &toolbar::set_focus_address_bar_script(url),
+        )
     }
 
     /// Replace the omnibox candidate dropdown's contents (Issue #15). Does
     /// not itself open/close `Panel::Omnibox` — the caller (`app.rs`)
     /// decides that from whether `candidates` is empty, via `set_panel`.
     pub fn set_candidates(&self, candidates: &[Candidate]) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_candidates_script(candidates))
+        self.eval_toolbar(
+            "set_candidates",
+            &toolbar::set_candidates_script(candidates),
+        )
     }
 
     /// Show or hide the toolbar's always-visible private-browsing indicator.
     pub fn set_private(&self, private: bool) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_private_script(private))
+        self.eval_toolbar("set_private", &toolbar::set_private_script(private))
     }
 
     /// This window's own private-browsing flag, fixed at construction (see
@@ -1767,8 +1806,7 @@ impl BrowserWindow {
     pub fn set_panel(&self, panel: Option<Panel>) -> wry::Result<()> {
         self.open_panel.set(panel);
         self.sync_layout()?;
-        self.toolbar
-            .evaluate_script(&toolbar::set_panel_script(panel))
+        self.eval_toolbar("set_panel", &toolbar::set_panel_script(panel))
     }
 
     /// Replace the history panel's contents, grouped into date sections
@@ -1777,14 +1815,12 @@ impl BrowserWindow {
     /// `HistoryStore::entries_newest_first` or `HistoryStore::search`.
     pub fn set_history(&self, entries: &[&HistoryEntry], now: u64) -> wry::Result<()> {
         let groups = group_by_date(entries.iter().copied(), now);
-        self.toolbar
-            .evaluate_script(&toolbar::set_history_script(&groups))
+        self.eval_toolbar("set_history", &toolbar::set_history_script(&groups))
     }
 
     /// Replace the bookmarks panel's contents (folders and their entries).
     pub fn set_bookmarks(&self, view: &toolbar::BookmarksView<'_>) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_bookmarks_script(view))
+        self.eval_toolbar("set_bookmarks", &toolbar::set_bookmarks_script(view))
     }
 
     /// Replace the always-visible bookmark bar's contents (Issue #19, see
@@ -1792,8 +1828,7 @@ impl BrowserWindow {
     /// — `app.rs` builds one [`toolbar::BookmarksView`] per refresh and
     /// pushes it to both.
     pub fn set_bookmark_bar(&self, view: &toolbar::BookmarksView<'_>) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_bookmark_bar_script(view))
+        self.eval_toolbar("set_bookmark_bar", &toolbar::set_bookmark_bar_script(view))
     }
 
     /// Whether the bookmark bar is currently showing.
@@ -1809,8 +1844,10 @@ impl BrowserWindow {
     pub fn set_bookmark_bar_visible(&self, visible: bool) -> wry::Result<()> {
         self.bookmark_bar_visible.set(visible);
         self.sync_layout()?;
-        self.toolbar
-            .evaluate_script(&toolbar::set_bookmark_bar_visible_script(visible))
+        self.eval_toolbar(
+            "set_bookmark_bar_visible",
+            &toolbar::set_bookmark_bar_visible_script(visible),
+        )
     }
 
     /// Whether the in-page find bar (Issue #43) is currently showing.
@@ -1828,16 +1865,20 @@ impl BrowserWindow {
     pub fn set_find_bar_visible(&self, visible: bool) -> wry::Result<()> {
         self.find_bar_visible.set(visible);
         self.sync_layout()?;
-        self.toolbar
-            .evaluate_script(&toolbar::set_find_bar_visible_script(visible))
+        self.eval_toolbar(
+            "set_find_bar_visible",
+            &toolbar::set_find_bar_visible_script(visible),
+        )
     }
 
     /// Push the find bar's "N/M" match counter. `active` is the 0-based
     /// index `browser::find::FindState::active` reports (`None`/`total: 0`
     /// both render as "0/0" — see `ui/toolbar.html`'s `veloxSetFindStatus`).
     pub fn set_find_status(&self, total: usize, active: Option<usize>) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_find_status_script(total, active))
+        self.eval_toolbar(
+            "set_find_status",
+            &toolbar::set_find_status_script(total, active),
+        )
     }
 
     /// Search tab `tab_id`'s content webview's DOM for `query` (already
@@ -1967,8 +2008,10 @@ impl BrowserWindow {
     /// shared by [`Self::print_tab`]'s failure path and the async
     /// [`crate::app::UserEvent::PdfExportFinished`] result.
     pub fn set_print_status(&self, message: Option<&str>) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_print_status_script(message))
+        self.eval_toolbar(
+            "set_print_status",
+            &toolbar::set_print_status_script(message),
+        )
     }
 
     /// Windows-only headless PDF export (see `ui::webview2_print` and
@@ -2037,15 +2080,13 @@ impl BrowserWindow {
     /// Replace the downloads panel's contents (Issue #16, see
     /// docs/decisions.md D28).
     pub fn set_downloads(&self, entries: &[&DownloadEntry]) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_downloads_script(entries))
+        self.eval_toolbar("set_downloads", &toolbar::set_downloads_script(entries))
     }
 
     /// Replace the settings screen's contents (Issue #30, see
     /// [`toolbar::SettingsView`] and docs/decisions.md D67).
     pub fn set_settings(&self, view: &toolbar::SettingsView<'_>) -> wry::Result<()> {
-        self.toolbar
-            .evaluate_script(&toolbar::set_settings_script(view))
+        self.eval_toolbar("set_settings", &toolbar::set_settings_script(view))
     }
 
     /// Apply the chrome theme override (Issue #30's Appearance tab; the
@@ -2070,8 +2111,7 @@ impl BrowserWindow {
     pub fn set_theme(&self, theme: crate::browser::Theme) -> wry::Result<()> {
         self.window
             .set_theme(crate::browser::native_window_theme(theme).map(tao_theme_of));
-        self.toolbar
-            .evaluate_script(&toolbar::set_theme_script(theme))
+        self.eval_toolbar("set_theme", &toolbar::set_theme_script(theme))
     }
 
     /// Asynchronously read `document.title` from tab `tab_id`'s content

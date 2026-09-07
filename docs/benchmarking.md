@@ -388,6 +388,68 @@ cargo run --release --bin velox-bench -- gate \
 PR の merge-base コミットをその場でビルド・計測して作る。コミット済みの
 `results/baseline/*.json` は経時トレンドを人が目視するための参考情報。
 
+### 6. IPC トラフィックを集計する (`ipc-summary`, Issue #66)
+
+**「WebView ↔ Rust の IPC は何回・何バイト・何ミリ秒か」を継続的に見える
+化するサブコマンド。** `run`/`aggregate` のようにシナリオに紐付いた
+`BenchmarkResult` は作らない — `ipc` イベント (`metrics::PerfRecord::Ipc`、
+Issue #66) だけを `(direction, name)` ごとに集計した表を出す、独立した
+診断コマンド。ロジックは `benchmark::summarize_ipc` (純粋 Rust、`cargo
+test` で検証済み)。
+
+```sh
+# VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json で採取したログなら何でもよい
+# — `run`/`aggregate` の --output ではなく VELOX_PERF_OUTPUT の生ログ (jsonl)
+# を渡す点に注意 (BenchmarkResult 化された JSON ではなく生イベント列が要る)。
+VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/session.jsonl \
+  VELOX_AUTOMATION_SCRIPT=/tmp/script.txt \
+  ./target/release/velox
+
+cargo run --release --bin velox-bench -- ipc-summary \
+  --input /tmp/session.jsonl \
+  --output results/ipc-summary.json
+```
+
+出力 (表は `total_bytes` 降順、`--output` を付けると同じ内容を JSON
+(`Vec<benchmark::IpcSummary>`) でも保存する):
+
+```text
+dir  name                        count  total_bytes  median_ms     p95_ms
+out  set_tabs                      120       257023      0.000      0.100
+out  set_url                        89         4436      0.000      0.100
+...
+in   ready                           1           15      0.000      0.000
+
+合計: 430 件 / 269277 bytes
+```
+
+- `--input <path>`: 集計対象の `VELOX_PERF_OUTPUT` ログ (jsonl)。**繰り返し
+  指定できる** — 複数セッション/複数トライアルのログをまとめて 1 つの表に
+  したいときに使う (per-trial の統計を出す `aggregate` とは異なり、ここでは
+  トライアル間の warm-up カットは行わない — 実セッションの IPC トラフィック
+  に「warm-up」という概念はない)。
+- `--output <path>`: 表と同じ内容を `IpcSummary` の JSON 配列として保存。
+- 終了コード: `0` = 集計できた、`1` = `ipc` イベントが 1 件も無かった
+  (`VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json` を付け忘れていないか確認)、
+  `2` = 引数エラー等。
+- **`direction=in`** (`window.ipc.postMessage` → `UserEvent::ToolbarMessage`)
+  は `ToolbarCommand` の `cmd` タグ、**`direction=out`**
+  (`ui::window::BrowserWindow::eval_toolbar`) は呼び出し元の `set_*` メソッド
+  名がそのまま `name` になる。`duration_ms` は Rust 側のコスト
+  (`parse_command`/`evaluate_script` の FFI 呼び出し) のみで、JS 実行や
+  DOM 更新の時間は含まない — WebView をブラックボックスとして扱う Epic #57
+  ルール 3 のとおり、VeloX 側から計測できるのはここまで。
+- 自動操作スクリプト (`VELOX_AUTOMATION_SCRIPT`) が送るタブ操作
+  (`open`/`switch`/`close`/`suspend`/`navigate`) は `AutomationCommand` 経由
+  で `app.rs` のハンドラを直接呼ぶため、`direction=in` としては現れない
+  (`docs/decisions.md` D81) — `in` 側の実測は「トースバーの `ready`/
+  `script_started` ハンドシェイク」に限られる。実際のユーザ操作
+  (クリック・キー入力) が送る `navigate`/`activate_tab` 等の `in` トラフィック
+  はメッセージ本体が数十バイトの固定形状の JSON であることがコード上明らか
+  (`ui::toolbar::ToolbarCommand`) なので、自動化スクリプトでは測れないと
+  いう限界を D81 に明記した。実測データと結論は
+  `docs/performance-targets.md` §18 を参照。
+
 ## 結果ファイルのフォーマット
 
 `velox-bench run` / `aggregate` が書き出す JSON (`BenchmarkResult`) の例:

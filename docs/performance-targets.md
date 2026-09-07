@@ -849,3 +849,170 @@ JSON をそのまま包んだものにしてあり (§7 の保存形式と地続
 ため、CI と同じ閾値 (`GateThresholds` 既定値 warn=20%/fail=60% + メトリクス
 ごとの最小絶対差) が二重管理にならない。詳細は
 `docs/performance-dashboard.md` §2/§5 を参照。
+## 18. IPC (WebView ↔ Rust) の計測結果 (Issue #66, 2026-09-07)
+
+**設計判断は `docs/decisions.md` D81 を参照。** ここでは実測データと
+結論だけを記録する。この節の数値はすべて §1 の環境 (Ubuntu 24.04.4 /
+WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、**Windows
+(WebView2) の実力値ではない** — IPC の実装 (wry の `evaluate_script`/
+`with_ipc_handler`) は OS 間でほぼ同じコードパスだが、未計測の OS へ
+そのまま外挿しないこと。
+
+### 18.1 何を計測できるようにしたか
+
+`metrics::PerfRecord::Ipc` (Issue #66) が JS → Rust (`direction=in`、
+`ToolbarCommand`) と Rust → JS (`direction=out`、
+`ui::window::BrowserWindow::eval_toolbar` の呼び出し元名) の両方向を
+1 メッセージ単位で記録する。`velox-bench ipc-summary` がそれを
+`(direction, name)` ごとに件数・合計バイト数・`duration_ms` 分布へ集計する
+(`docs/benchmarking.md` §6)。**`duration_ms` は Rust 側のコスト
+(`parse_command`/`evaluate_script` の呼び出し) のみで、JS 実行や DOM
+更新は含まない** — Epic #57 ルール 3 (WebView をブラックボックスとして
+扱う) のとおり、VeloX 側から測れるのはここまで。
+
+### 18.2 セッション実測 (`velox-bench ipc-summary`)
+
+自動操作スクリプトでタブ 20 個 (`minimal.html`) を開き、10 回切替 + 2 回
+ナビゲーション + 2 回クローズを行う「20 タブセッション」と、タブ 3 個で
+同種の操作を行う「3 タブセッション」を 1 回ずつ実行 (各 1 試行、
+`VELOX_MAX_TABS_PER_PROCESS=4`、既定)。再現手順は §18.5。
+
+**20 タブセッション、修正前 (this issue 着手前のコード) の内訳
+(上位 5、`total_bytes` 降順)**:
+
+| dir | name | count | total_bytes | median_ms | p95_ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| out | `set_tabs` | 120 | 256,648 | 0.000 | 0.105 |
+| out | `set_history` | 67 | 15,723 | 0.000 | 0.100 |
+| out | `set_url` | 91 | 4,536 | 0.000 | 0.200 |
+| out | `set_bookmark_active` | 91 | 2,730 | 0.000 | 0.100 |
+| out | `set_loading` | 91 | 2,033 | 0.000 | 0.100 |
+| — | 合計 | 502 | 284,268 | — | — |
+
+`in` 側は `script_started`(24 bytes)/`ready`(15 bytes) の 2 件のみ —
+16.4 で理由を説明する。
+
+### 18.3 高頻度イベントの特定と結論
+
+- **`set_tabs` (タブストリップの全件再送信) が量・回数とも最大**
+  (20 タブセッションで合計バイト数の 90%)。1 タブ操作 (open/navigate/
+  close/switch) につき最大 3 回 (`NavigationStarted`/`LoadFinished`/
+  `FaviconResolved` それぞれが `sync_tab_strip` を呼ぶ) 送られており、
+  120 件 / 約 34 回のタブ影響操作という比率もこれと整合する。**しかし
+  実測コストは無視できる規模だった**: 20 タブという本プロジェクトで
+  最も重いケースでも `duration_ms` の中央値は 0.000ms、p95 でも
+  0.105ms、120 件中の最悪値でも 3.5ms (1 件のみ、他はすべて 2ms 未満)。
+  1 メッセージの最大ペイロードも 3,585 bytes (20 タブ分の
+  `TabSummary` 配列) で、JSON 化・`evaluate_script` 呼び出しという
+  Rust 側の処理は sub-millisecond。タブストリップは**常時表示**の UI
+  であり、3 回の送信はそれぞれ「読込中インジケータ」「URL/タイトル」
+  「favicon」という実際に変化した状態を反映しているため、**意図的な
+  設計であり、バッチ化・削減の実測上の必要性は見つからなかった。**
+  T4 (タブ切替 100ms 以下、#60 で 0.40ms 達成済み) を脅かす要素はない。
+- **`set_history` (履歴パネルの全件再送信) は不要イベントだった。**
+  `refresh_history_panel` は履歴パネルが**閉じていても**
+  `LoadFinished`/`PageTitleResolved`/`FaviconResolved` の 3 箇所から
+  無条件に呼ばれており、閲覧のたびに `config.history_panel_limit`
+  (既定 200 件) 分の履歴を JSON 化して送っていた。履歴パネルは
+  ほとんどの時間閉じているため、この送信の大部分は**誰にも見られない
+  DOM 更新**だった。§18.4 で before/after を示す。
+- それ以外の `out` イベント (`set_url`/`set_bookmark_active`/
+  `set_loading`/`set_block_count` など) は 1 件あたり数十バイト、
+  `duration_ms` はほぼ 0 — 削減の対象にならない規模。
+
+### 18.4 実施した削減と before/after (同一自動操作スクリプトでの比較)
+
+`app::refresh_history_panel_if_open` を追加し、`LoadFinished`/
+`PageTitleResolved`/`FaviconResolved` の 3 箇所を
+`refresh_history_panel`(無条件) から `refresh_history_panel_if_open`
+(`window.open_panel() == Some(Panel::History)` のときだけ実際に送信)
+に変更した。パネルを開く操作 (`ToolbarCommand::TogglePanel`) は
+既存のまま無条件に `refresh_history_panel` を呼ぶので、**パネルを
+開いた瞬間に最新データが表示される挙動は変わらない** — 変わるのは
+「閉じている間、誰も見ない更新を送り続けない」点のみ。
+
+| セッション | 指標 | before | after | 変化 |
+| --- | --- | ---: | ---: | ---: |
+| 20 タブ | `set_history` 件数 | 67 | 1 | **-98.5%** |
+| 20 タブ | `set_history` bytes | 15,723 | 555 | **-96.5%** |
+| 20 タブ | ipc イベント総数 | 502 | 430 | -14.3% |
+| 20 タブ | ipc 総バイト数 | 284,268 | 269,277 | -5.3% |
+| 3 タブ | `set_history` 件数 | 13 | 1 | **-92.3%** |
+| 3 タブ | `set_history` bytes | 7,614 | 887 | **-88.4%** |
+| 3 タブ | ipc イベント総数 | 96 | 84 | -12.5% |
+| 3 タブ | ipc 総バイト数 | 20,262 | 13,917 | -31.3% |
+
+(`set_tabs` は before/after で変化なし — 120 件 → 120 件、256,648 →
+257,023 bytes。誤差は自動操作スクリプトの実行ごとの URL/タイトル文字数の
+揺れによるもので、意図的な変更はしていない。各 1 試行の実測であり、
+セッション間ノイズ〔§10〕を統計的に切り分けられるほどの試行数ではない
+ことに注意。)
+
+`cargo test` は本変更後も全件成功 (946 ユニットテスト + 10 統合テスト、
+xvfb-run + dbus-run-session)。履歴パネル自体の動作 (開いたときに最新の
+履歴が表示される、検索、削除、クリア) は `ToolbarCommand::TogglePanel`
+/`DeleteHistoryEntry`/`ClearHistory`/`SearchHistory` の呼び出し経路を
+変更していないため影響を受けない。
+
+### 18.5 結論
+
+- **IPC の回数・サイズ・時間を継続的に計測できる仕組み**: `metrics::
+  PerfRecord::Ipc` + `browser::benchmark::summarize_ipc` +
+  `velox-bench ipc-summary` (`docs/benchmarking.md` §6)。#67/#68/#69 は
+  このまま (追加の型を作らず) 使える。
+- **高頻度イベントの特定**: `set_tabs`(常時表示、意図的、コスト無視できる)、
+  `set_history`(閉じたパネルへの無駄な送信、削減済み)。
+- **不要イベントの削減**: `set_history` の無条件送信を撤廃 (§18.4)。
+- **batching の要否**: **導入しなかった。** `set_tabs` を含むすべての
+  `out` イベントの `duration_ms` が sub-millisecond (worst case でも
+  3.5ms) であり、複数イベントをまとめて 1 回の `evaluate_script`
+  呼び出しに合成する batching は、計測上のボトルネックが無い状態で
+  タイマー・デバウンスロジックという複雑さとステイル状態のリスクだけを
+  持ち込む — Epic #57 ルール 1 (ベンチマークなしの最適化をしない) に
+  照らして見送った。
+- **`direction=in` (JS → Rust) の限界**: 自動操作スクリプト
+  (`open`/`switch`/`navigate`/`close`) は `AutomationCommand` として
+  `app.rs` のハンドラを直接呼ぶため、実際の `window.ipc.postMessage`
+  を経由しない (`docs/decisions.md` D81 に理由を記録)。したがって
+  `in` 側の実測は起動時ハンドシェイク (`ready`/`script_started`、
+  15〜24 bytes、`duration_ms` は測定分解能以下) に限られる。**実際の
+  ユーザ操作 (クリック・キー入力) が送る `navigate`/`activate_tab`
+  等の `in` メッセージは `ui::toolbar::ToolbarCommand` の定義上、数十
+  バイトの固定形状 JSON であることがソースコードから明らかであり**
+  (例: `{"cmd":"activate_tab","id":42}` は 27 bytes)、`out` 側で
+  実測した「同程度サイズのメッセージは sub-millisecond」という結果と
+  合わせて、`in` 側もボトルネックである根拠は無いと判断した。ただし
+  これは実測ではなく推論であることを明記する — オムニボックスの
+  1 キー入力ごとの `omnibox_input`/`omnibox_close` 往復のような、
+  自動操作スクリプトの文法 (`browser::automation`) では今のところ
+  再現できない高頻度パスは**未計測**として残す (`docs/decisions.md`
+  D81)。
+
+### 18.6 再現手順
+
+```sh
+S=/path/to/scratch
+cargo build --release
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+XV='xvfb-run -a --server-args=-screen 0 1280x900x24 dbus-run-session --'
+
+cat > $S/session.txt << 'SCRIPT'
+open http://127.0.0.1:8731/minimal.html
+wait 300
+(... 18 回繰り返して合計 20 タブ ...)
+mark
+switch 0
+wait 200
+(... switch/navigate/close を繰り返す ...)
+quit
+SCRIPT
+
+$XV env VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json \
+  VELOX_PERF_OUTPUT=$S/session.jsonl \
+  VELOX_HOMEPAGE=http://127.0.0.1:8731/minimal.html \
+  VELOX_AUTOMATION_SCRIPT=$S/session.txt \
+  target/release/velox
+
+target/release/velox-bench ipc-summary --input $S/session.jsonl \
+  --output $S/ipc-summary.json
+```

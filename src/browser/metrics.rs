@@ -458,6 +458,38 @@ impl TabLatencyKind {
 }
 
 // ---------------------------------------------------------------------
+// IPC traffic events (Issue #66)
+// ---------------------------------------------------------------------
+
+/// Which side of the WebView boundary sent an IPC message: the toolbar's
+/// `window.ipc.postMessage` (JS → Rust, a [`ToolbarCommand`]) or one of
+/// `ui::window::BrowserWindow`'s `evaluate_script` calls that push updated
+/// state into the toolbar webview (Rust → JS). See
+/// `docs/architecture.md`, "IPC traffic metrics" for how these two
+/// directions are measured and what a caller can and cannot conclude from
+/// them (in particular: `Out`'s `duration` covers only the Rust-side
+/// `evaluate_script` call, never the JS execution or DOM work it triggers —
+/// the WebView stays a black box per Epic #57's rule 3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcDirection {
+    /// `window.ipc.postMessage` → `ui::window`'s `with_ipc_handler` →
+    /// `UserEvent::ToolbarMessage`.
+    In,
+    /// `ui::window::BrowserWindow`'s `evaluate_script` calls that push
+    /// updated toolbar state (tab strip, address bar, panels, ...).
+    Out,
+}
+
+impl IpcDirection {
+    fn as_str(self) -> &'static str {
+        match self {
+            IpcDirection::In => "in",
+            IpcDirection::Out => "out",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Unified event record + output format (Issue #13)
 // ---------------------------------------------------------------------
 
@@ -534,6 +566,21 @@ pub enum PerfRecord {
     Cpu {
         percent: f64,
     },
+    /// One WebView ↔ Rust IPC message (Issue #66): `direction` says which
+    /// side sent it, `name` is the command/update name (a `ToolbarCommand`
+    /// variant's `cmd` tag for [`IpcDirection::In`], or the `evaluate_script`
+    /// call site's name — e.g. `"set_tabs"` — for [`IpcDirection::Out`]),
+    /// `bytes` is the raw JSON payload size, and `duration` is how long the
+    /// Rust-side call took (`parse_command` for `In`, the `evaluate_script`
+    /// FFI call for `Out` — never JS execution time; see [`IpcDirection`]'s
+    /// doc comment). `name` is an owned `String` rather than `&'static str`
+    /// because `In` names come from parsing untrusted, dynamic JSON.
+    Ipc {
+        direction: IpcDirection,
+        name: String,
+        bytes: u64,
+        duration: Duration,
+    },
 }
 
 impl PerfRecord {
@@ -597,9 +644,28 @@ impl PerfRecord {
         PerfRecord::MeasureStart
     }
 
+    /// Build an [`PerfRecord::Ipc`] event. `started` is when the caller
+    /// began the Rust-side work being measured (`Instant::now()` right
+    /// before `parse_command`/`evaluate_script`); this computes the
+    /// duration itself, matching [`Self::tab_latency`]'s "caller only
+    /// brackets a clock read" contract.
+    pub fn ipc(
+        direction: IpcDirection,
+        name: impl Into<String>,
+        bytes: usize,
+        started: Instant,
+    ) -> Self {
+        PerfRecord::Ipc {
+            direction,
+            name: name.into(),
+            bytes: bytes as u64,
+            duration: started.elapsed(),
+        }
+    }
+
     /// The event name used by both output formats (`"startup"`,
     /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"tab_resume"`,
-    /// `"tab_suspend"`, `"measure_start"`, `"cpu"`, `"rss"`).
+    /// `"tab_suspend"`, `"measure_start"`, `"cpu"`, `"rss"`, `"ipc"`).
     pub fn event_name(&self) -> &'static str {
         match self {
             PerfRecord::Startup(_) => "startup",
@@ -609,6 +675,7 @@ impl PerfRecord {
             PerfRecord::MeasureStart => "measure_start",
             PerfRecord::Cpu { .. } => "cpu",
             PerfRecord::Rss(_) => "rss",
+            PerfRecord::Ipc { .. } => "ipc",
         }
     }
 
@@ -636,6 +703,16 @@ impl PerfRecord {
             PerfRecord::MeasureStart => "measure_start".to_owned(),
             PerfRecord::Cpu { percent } => format!("cpu percent={percent:.1}"),
             PerfRecord::Rss(sample) => sample.to_string(),
+            PerfRecord::Ipc {
+                direction,
+                name,
+                bytes,
+                duration,
+            } => format!(
+                "ipc dir={} name={name} bytes={bytes} duration={}",
+                direction.as_str(),
+                format_duration(*duration)
+            ),
         }
     }
 
@@ -711,6 +788,17 @@ impl PerfRecord {
                     "total_cpu_seconds".to_owned(),
                     json!(sample.total_cpu_seconds),
                 );
+            }
+            PerfRecord::Ipc {
+                direction,
+                name,
+                bytes,
+                duration,
+            } => {
+                fields.insert("direction".to_owned(), json!(direction.as_str()));
+                fields.insert("name".to_owned(), json!(name));
+                fields.insert("bytes".to_owned(), json!(bytes));
+                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
             }
         }
         serde_json::Value::Object(fields)
@@ -1609,6 +1697,31 @@ mod tests {
         // value, per the JSON schema in docs/architecture.md.
         assert!(value["total_pss_bytes"].is_null());
         assert_eq!(value["pss_process_count"], 0);
+    }
+
+    #[test]
+    fn perf_record_ipc_renders_in_both_formats() {
+        let started = Instant::now();
+        let record = PerfRecord::ipc(IpcDirection::In, "navigate", 42, started);
+        assert_eq!(record.event_name(), "ipc");
+        let text = record.to_text();
+        assert!(text.starts_with("ipc dir=in name=navigate bytes=42 duration="));
+        let value = record.to_json(Duration::from_millis(7));
+        assert_eq!(value["event"], "ipc");
+        assert_eq!(value["ts_ms"], 7.0);
+        assert_eq!(value["direction"], "in");
+        assert_eq!(value["name"], "navigate");
+        assert_eq!(value["bytes"], 42);
+        assert!(value["duration_ms"].as_f64().unwrap() >= 0.0);
+    }
+
+    #[test]
+    fn perf_record_ipc_out_direction_renders_as_out() {
+        let record = PerfRecord::ipc(IpcDirection::Out, "set_tabs", 128, Instant::now());
+        assert_eq!(record.to_json(Duration::ZERO)["direction"], "out");
+        assert!(record.to_text().contains("dir=out"));
+        assert!(record.to_text().contains("name=set_tabs"));
+        assert!(record.to_text().contains("bytes=128"));
     }
 
     #[test]

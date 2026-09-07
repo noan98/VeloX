@@ -1025,6 +1025,36 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
   zero). Other Unix falls back to parsing `ps` output for RSS only (no PSS
   equivalent there); Windows is not implemented yet (`RssError::Unsupported`,
   neither RSS nor PSS).
+- **IPC traffic** (Issue #66): every toolbar IPC message in both directions
+  is counted, sized, and timed — `metrics::IpcDirection::In` (JS → Rust, a
+  `ToolbarCommand`) and `::Out` (Rust → JS, one
+  `ui::window::BrowserWindow::eval_toolbar` call site, e.g. `"set_tabs"`).
+  `In` is measured at the one choke point every `window.ipc.postMessage`
+  call already funnels through, `app::record_perf_event`'s
+  `UserEvent::ToolbarMessage` branch: `toolbar::command_name` reads the raw
+  body's `"cmd"` tag (a shallow, non-validating parse — it still labels a
+  message that fails the real `parse_command`, which a metrics consumer
+  wants to see rather than silently lose) and `duration` covers both that
+  and the real parse. `Out` is measured by `eval_toolbar`, the single
+  private method every `set_*`/`focus_address_bar`/`set_panel` method on
+  `BrowserWindow` routes its `evaluate_script` call through — `duration`
+  covers only the Rust-side FFI call (building the JSON string,
+  `WebView::evaluate_script`), **never** the JS execution or DOM work it
+  triggers inside the (black-box, per Epic #57 rule 3) toolbar webview.
+  `BrowserWindow` holds an `Option<perf_log::IpcLog>` (`None` when metrics
+  are off — a single check, no clock read, same guarantee as everywhere
+  else in this list) built from the same `Arc<PerfLog>`/`process_start`
+  pair `AppState::perf` already carries (`app::PerfContext::to_ipc_log`);
+  every open window shares the one underlying log. The content webview's
+  separate, untrusted IPC channel (devtools/keyboard-shortcut sentinels —
+  see D18) is **not** instrumented here: it carries only a handful of fixed,
+  short strings, nowhere near the toolbar channel's volume — see
+  `docs/performance-targets.md` §18 for the measured numbers this scope
+  decision is based on. `browser::benchmark::summarize_ipc` (pure,
+  unit-tested) aggregates `ipc` events from one or more perf logs into a
+  per-`(direction, name)` table — count, total bytes, `duration_ms`
+  distribution — and `velox-bench ipc-summary` is the IO layer around it
+  (see docs/benchmarking.md).
 - The `Config` struct is the home for all of these toggles;
   `Config::from_env_and_args` layers the environment-variable overrides onto
   `Config::default`.
@@ -1035,7 +1065,8 @@ Every event kind above goes through one type, `metrics::PerfRecord`,
 written by a shared `perf_log::PerfLog` (stderr by default, or a file — see
 below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
 `tab_create`, `tab_switch`, `tab_resume` (Issue #63), `tab_suspend`
-(Issue #63), `measure_start` (Issue #60), `cpu` (Issue #64), `rss`.
+(Issue #63), `measure_start` (Issue #60), `cpu` (Issue #64), `rss`, `ipc`
+(Issue #66).
 
 - **`VELOX_PERF_FORMAT=text|json`** (default `text`; unset/unrecognized also
   falls back to `text`): selects `Config::perf_format`.
@@ -1053,6 +1084,8 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     velox[perf] measure_start
     velox[perf] cpu percent=0.6
     velox[perf] rss pid=4821 processes=5 total_mib=312.4 pss_processes=5/5 pss_mib=180.2 cpu_s=12.34
+    velox[perf] ipc dir=in name=navigate bytes=41 duration=0.0ms
+    velox[perf] ipc dir=out name=set_tabs bytes=2139 duration=0.1ms
     ```
     (Issue #108 / D42: `pss_processes=<readable>/<processes>` and `pss_mib`
     were appended to the `rss` line, not inserted — an existing scraper
@@ -1080,6 +1113,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     | `measure_start` | *(none)* — the `mark` automation command (Issue #60). Everything logged before the last one is warm-up: `benchmark::aggregate_trials` pools only what follows it, which is what lets a scenario open N tabs before measuring an operation *at* N tabs |
     | `cpu`        | `percent` (float) — CPU used by the whole process tree between the two most recent `rss` samples, as a percentage of one core (Issue #64). A rate, so the first sample of a run emits none |
     | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint), `total_cpu_seconds` (float or `null`) |
+    | `ipc`        | `direction` (string: `in` / `out`), `name` (string — a `ToolbarCommand`'s `cmd` tag for `in`, an `eval_toolbar` call-site label like `set_tabs` for `out`), `bytes` (uint — raw JSON payload size), `duration_ms` (float ms — Rust-side `parse_command`/`evaluate_script` cost only, never JS execution; Issue #66) |
 
     `total_pss_bytes`/`pss_process_count` were added by Issue #108 (D42).
     `total_pss_bytes` is the PSS counterpart to `total_rss_bytes` — see
@@ -1101,6 +1135,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     {"event":"tab_create","duration_ms":15.2,"tab_id":3,"ts_ms":8420.9}
     {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"total_pss_bytes":188978790,"pss_process_count":5,"ts_ms":10000.0}
     {"event":"rss","pid":4821,"process_count":5,"total_rss_bytes":327513600,"total_pss_bytes":null,"pss_process_count":0,"ts_ms":12000.0}
+    {"event":"ipc","direction":"out","name":"set_tabs","bytes":2139,"duration_ms":0.1,"ts_ms":8421.0}
     ```
     (Field order is whatever `serde_json` produces — alphabetical, since
     this project does not enable the `preserve_order` feature — a
@@ -1117,9 +1152,9 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
   behavior the moment metrics are turned on elsewhere.
 
 When metrics are off, `app::run` never spawns the RSS thread, never builds a
-`PerfLog`, and every checkpoint (startup, page load, tab create/switch) is a
-single `Option`-is-`None` check with no extra `Instant::now()` call — the
-disabled path stays effectively free.
+`PerfLog`, and every checkpoint (startup, page load, tab create/switch, IPC
+traffic) is a single `Option`-is-`None` check with no extra `Instant::now()`
+call — the disabled path stays effectively free.
 
 The layering matters more than any single hook: measurements attach to the
 application layer, so swapping or tuning the engine below does not invalidate
