@@ -411,6 +411,24 @@ struct PerfContext {
     log: Arc<PerfLog>,
 }
 
+/// In-flight page-load timers, one per open tab across every window
+/// (`NavigationStarted` inserts/restarts an entry, `LoadFinished` consumes
+/// and removes it) — keyed by `(WindowId, TabId)`, not `TabId` alone, since a
+/// `TabId` is only unique within its own window (Issue #29/D68).
+///
+/// **Lifetime (Issue #62).** Every entry must be removed once it stops being
+/// useful, or this map grows without bound for the life of the process: both
+/// `WindowId` and `TabId` are monotonically increasing counters that are
+/// never reused (`browser::tabs::Tabs::take_id`,
+/// `browser::windows::Windows::push_window`), so a stale entry left behind
+/// by a closed tab is never overwritten by a later one — it just sits there
+/// forever. `record_perf_event` removes the entry as soon as its load
+/// finishes (the common case); `close_tab`/`close_window_by_tao_id` also
+/// remove it on tab/window close so a load abandoned mid-flight (the tab is
+/// closed before `LoadFinished` ever arrives) does not leave an orphaned
+/// entry either. See docs/decisions.md D79 for the audit that found this.
+type PageLoadTimers = HashMap<(WindowId, TabId), metrics::PageLoadTimer>;
+
 /// Build the window and run the event loop. Only returns on setup failure;
 /// once running, the process exits with the event loop.
 ///
@@ -627,7 +645,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // (Issue #29/D68): a `TabId` is only unique within its own window, so
     // two windows loading a page at the same moment could otherwise share
     // one timer entry and corrupt each other's duration.
-    let mut page_load_timers: HashMap<(WindowId, TabId), metrics::PageLoadTimer> = HashMap::new();
+    let mut page_load_timers: PageLoadTimers = HashMap::new();
 
     let history = data_dir
         .as_deref()
@@ -703,7 +721,13 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 window_id: tao_id,
                 event: WindowEvent::CloseRequested,
                 ..
-            } => close_window_by_tao_id(&mut ui_windows, &mut state, tao_id, control_flow),
+            } => close_window_by_tao_id(
+                &mut ui_windows,
+                &mut state,
+                &mut page_load_timers,
+                tao_id,
+                control_flow,
+            ),
             Event::WindowEvent {
                 window_id: tao_id,
                 event: WindowEvent::Resized(_),
@@ -741,6 +765,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                         &config,
                         &homepage,
                         &mut automation_window,
+                        &mut page_load_timers,
                         user_event,
                     );
                 }
@@ -806,9 +831,16 @@ fn window_by_tao_id_mut(
 /// windows" convention, given CLAUDE.md's Windows-first priority). An
 /// unknown `tao_id` (should not happen — every native window this process
 /// creates is tracked here) is a silent no-op rather than a panic.
+///
+/// Also drops every `page_load_timers` entry that belonged to this window
+/// (Issue #62/D79): a tab whose page never finished loading before the
+/// window closed would otherwise leave its timer entry behind forever —
+/// `WindowId`s are never reused, so nothing would ever overwrite it. See
+/// [`PageLoadTimers`]'s doc comment.
 fn close_window_by_tao_id(
     ui_windows: &mut HashMap<WindowId, BrowserWindow>,
     state: &mut AppState,
+    page_load_timers: &mut PageLoadTimers,
     tao_id: tao::window::WindowId,
     control_flow: &mut ControlFlow,
 ) {
@@ -821,6 +853,7 @@ fn close_window_by_tao_id(
     };
     ui_windows.remove(&id);
     state.windows.close_window(id);
+    page_load_timers.retain(|(window_id, _), _| *window_id != id);
     if state.windows.is_empty() {
         *control_flow = ControlFlow::Exit;
     }
@@ -873,7 +906,7 @@ fn build_perf_log(config: &Config) -> Arc<PerfLog> {
 /// never reaches this function at all.
 fn record_perf_event(
     startup: &mut Option<metrics::StartupTimestamps>,
-    page_load_timers: &mut HashMap<(WindowId, TabId), metrics::PageLoadTimer>,
+    page_load_timers: &mut PageLoadTimers,
     perf_log: &PerfLog,
     process_start: Instant,
     event: &UserEvent,
@@ -906,9 +939,16 @@ fn record_perf_event(
         }
         UserEvent::LoadFinished(window_id, id, url) => {
             let now = Instant::now();
+            // Removed, not just looked up (Issue #62/D79): once this load
+            // has finished there is nothing left in the entry worth keeping
+            // — a later navigation of the same tab recreates it fresh via
+            // `NavigationStarted`'s `.entry().or_default()`. Leaving a
+            // "finished" entry behind here was the dominant leak this map
+            // had: `WindowId`/`TabId` never repeat, so every tab that ever
+            // finished loading a page left one entry behind forever.
             if let Some(duration) = page_load_timers
-                .get_mut(&(*window_id, *id))
-                .and_then(|timer| timer.finish(now))
+                .remove(&(*window_id, *id))
+                .and_then(|mut timer| timer.finish(now))
             {
                 let elapsed = now.saturating_duration_since(process_start);
                 perf_log.write(
@@ -1214,6 +1254,7 @@ fn handle_user_event(
     config: &Config,
     homepage: &str,
     automation_window: &mut WindowId,
+    page_load_timers: &mut PageLoadTimers,
     event: UserEvent,
 ) {
     match event {
@@ -1258,7 +1299,15 @@ fn handle_user_event(
             }
             Ok(command) => {
                 if let Some(window) = ui_windows.get_mut(&window_id) {
-                    handle_toolbar_command(window, window_id, state, config, homepage, command);
+                    handle_toolbar_command(
+                        window,
+                        window_id,
+                        state,
+                        config,
+                        homepage,
+                        page_load_timers,
+                        command,
+                    );
                 }
             }
             Err(err) => eprintln!(
@@ -1525,7 +1574,15 @@ fn handle_user_event(
         }
         UserEvent::ContentShortcut(window_id, shortcut) => {
             if let Some(window) = ui_windows.get_mut(&window_id) {
-                handle_content_shortcut(window, window_id, state, config, homepage, shortcut);
+                handle_content_shortcut(
+                    window,
+                    window_id,
+                    state,
+                    config,
+                    homepage,
+                    page_load_timers,
+                    shortcut,
+                );
             }
         }
         UserEvent::NewTabRequested(window_id, url) => {
@@ -1646,7 +1703,13 @@ fn handle_user_event(
         }
         UserEvent::Automation(command) => {
             if let Some(window) = ui_windows.get_mut(automation_window) {
-                handle_automation_command(window, *automation_window, state, command);
+                handle_automation_command(
+                    window,
+                    *automation_window,
+                    state,
+                    page_load_timers,
+                    command,
+                );
             }
         }
         UserEvent::MemorySampled(sample) => {
@@ -1900,12 +1963,14 @@ fn open_new_window(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_toolbar_command(
     window: &mut BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
     config: &Config,
     homepage: &str,
+    page_load_timers: &mut PageLoadTimers,
     command: ToolbarCommand,
 ) {
     match command {
@@ -1959,7 +2024,9 @@ fn handle_toolbar_command(
         ToolbarCommand::Reload => log_failure("reload", window.reload()),
         ToolbarCommand::OpenDevtools => window.open_devtools(),
         ToolbarCommand::NewTab => open_new_tab(window, window_id, state, homepage),
-        ToolbarCommand::CloseTab { id } => close_tab(window, window_id, state, TabId::from(id)),
+        ToolbarCommand::CloseTab { id } => {
+            close_tab(window, window_id, state, page_load_timers, TabId::from(id))
+        }
         ToolbarCommand::ActivateTab { id } => {
             let id = TabId::from(id);
             let started = Instant::now();
@@ -1970,7 +2037,7 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::CloseActiveTab => {
             let id = tabs_of(state, window_id).active_id();
-            close_tab(window, window_id, state, id);
+            close_tab(window, window_id, state, page_load_timers, id);
         }
         ToolbarCommand::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ToolbarCommand::NextTab => {
@@ -2708,9 +2775,21 @@ fn open_new_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut App
 /// `ContentShortcut::CloseTab`, both of which resolve `id` to the active
 /// tab before calling this). A no-op — matching `Tabs::close` — for an
 /// unknown id or the last remaining tab.
-fn close_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState, id: TabId) {
+///
+/// Also drops `id`'s `page_load_timers` entry, if any (Issue #62/D79): a
+/// page that never finished loading before its tab was closed would
+/// otherwise leave that entry behind forever — see [`PageLoadTimers`]'s doc
+/// comment.
+fn close_tab(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    page_load_timers: &mut PageLoadTimers,
+    id: TabId,
+) {
     if let Some((new_active, effect)) = tabs_of(state, window_id).close(id) {
         window.close_tab(id);
+        page_load_timers.remove(&(window_id, id));
         // The tab that replaces the one just closed may itself have been
         // suspended (a background tab can be suspended while the tab in
         // front of it is closed); `effect` already reflects that
@@ -2778,19 +2857,21 @@ fn switch_latency_kind(effect: ActivationEffect) -> metrics::TabLatencyKind {
 /// `ui::window::ContentShortcut` and docs/decisions.md D18/D23) to the same
 /// tab operations the toolbar's own equivalent commands use — every branch
 /// here mirrors one `ToolbarCommand` arm in `handle_toolbar_command`.
+#[allow(clippy::too_many_arguments)]
 fn handle_content_shortcut(
     window: &mut BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
     config: &Config,
     homepage: &str,
+    page_load_timers: &mut PageLoadTimers,
     shortcut: ContentShortcut,
 ) {
     match shortcut {
         ContentShortcut::NewTab => open_new_tab(window, window_id, state, homepage),
         ContentShortcut::CloseTab => {
             let id = tabs_of(state, window_id).active_id();
-            close_tab(window, window_id, state, id);
+            close_tab(window, window_id, state, page_load_timers, id);
         }
         ContentShortcut::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ContentShortcut::NextTab => {
@@ -2914,6 +2995,7 @@ fn handle_automation_command(
     window: &mut BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
+    page_load_timers: &mut PageLoadTimers,
     command: AutomationCommand,
 ) {
     match command {
@@ -2930,7 +3012,7 @@ fn handle_automation_command(
             None => eprintln!("velox: automation: switch {index} は範囲外です"),
         },
         AutomationCommand::Close { index } => match tab_id_at(state, window_id, index) {
-            Some(id) => close_tab(window, window_id, state, id),
+            Some(id) => close_tab(window, window_id, state, page_load_timers, id),
             None => eprintln!("velox: automation: close {index} は範囲外です"),
         },
         AutomationCommand::Suspend { index } => match tab_id_at(state, window_id, index) {
@@ -3809,6 +3891,66 @@ mod tests {
         // Exercises the write path end-to-end (stderr sink); nothing to
         // assert on the output itself here, but this must not panic.
         record_tab_latency(&state, metrics::TabLatencyKind::Switch, id, started);
+    }
+
+    // --- page_load_timers lifetime (Issue #62/D79): a `NavigationStarted`/
+    // `LoadFinished` pair must not leave a permanent entry behind — see
+    // `PageLoadTimers`'s doc comment for why an unbounded map here is a real
+    // leak (`WindowId`/`TabId` are never reused). ---
+
+    #[test]
+    fn load_finished_removes_the_page_load_timer_entry() {
+        let mut page_load_timers: PageLoadTimers = HashMap::new();
+        let mut startup = None;
+        let log = PerfLog::stderr(metrics::PerfFormat::Text);
+        let process_start = Instant::now();
+        let window_id = test_window_id();
+        let id = TabId::from(0);
+
+        record_perf_event(
+            &mut startup,
+            &mut page_load_timers,
+            &log,
+            process_start,
+            &UserEvent::NavigationStarted(window_id, id, "https://example.com/".to_owned()),
+        );
+        assert_eq!(page_load_timers.len(), 1, "start must record an entry");
+
+        record_perf_event(
+            &mut startup,
+            &mut page_load_timers,
+            &log,
+            process_start,
+            &UserEvent::LoadFinished(window_id, id, "https://example.com/".to_owned()),
+        );
+        assert!(
+            page_load_timers.is_empty(),
+            "finish must remove the entry, not just consume its start mark, or every tab a \
+             session ever navigates leaks one entry for the life of the process (TabId/WindowId \
+             are never reused)"
+        );
+    }
+
+    #[test]
+    fn load_finished_without_a_matching_start_leaves_no_entry() {
+        // A stray `LoadFinished` (e.g. this event arrived for a tab whose
+        // `NavigationStarted` was never recorded) must not create or leave
+        // an entry either.
+        let mut page_load_timers: PageLoadTimers = HashMap::new();
+        let mut startup = None;
+        let log = PerfLog::stderr(metrics::PerfFormat::Text);
+        record_perf_event(
+            &mut startup,
+            &mut page_load_timers,
+            &log,
+            Instant::now(),
+            &UserEvent::LoadFinished(
+                test_window_id(),
+                TabId::from(0),
+                "https://example.com/".to_owned(),
+            ),
+        );
+        assert!(page_load_timers.is_empty());
     }
 
     #[test]
