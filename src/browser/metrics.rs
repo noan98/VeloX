@@ -490,6 +490,49 @@ impl IpcDirection {
 }
 
 // ---------------------------------------------------------------------
+// State-file write events (Issue #67)
+// ---------------------------------------------------------------------
+
+/// Which persisted-state file a [`PerfRecord::StateWrite`] measures —
+/// matches `persistence.rs`'s file name without its `.json` extension.
+/// A fixed set (not a free `&str`) because every call site is one of
+/// `app::persist_session`/`persist_history`/`persist_bookmarks`/
+/// `persist_input_history`, known at compile time; keeping this an enum
+/// (like [`TabLatencyKind`]) rather than a `String` avoids allocating on
+/// every persisted write, which is the exact kind of per-event cost this
+/// Issue is checking for in the first place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateWriteKind {
+    /// `app::persist_session` → `persistence::save_session`. Called from
+    /// `app::sync_tab_strip` after nearly every tab-affecting event (Issue
+    /// #67's starting hypothesis: this is the one `persist_*` call that
+    /// runs *unconditionally* on a hot path, not just when its own state
+    /// actually changed — see docs/decisions.md D86).
+    Session,
+    /// `app::persist_history` → `persistence::save_history`. Only called
+    /// from actual history mutations (a visit, title/favicon resolution,
+    /// delete, clear) — once per real change, not per UI-sync event.
+    History,
+    /// `app::persist_bookmarks` → `persistence::save_bookmarks`. Only
+    /// called from actual bookmark mutations.
+    Bookmarks,
+    /// `app::persist_input_history` → `persistence::save_input_history`.
+    /// Only called when a search/navigation query is actually recorded.
+    InputHistory,
+}
+
+impl StateWriteKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            StateWriteKind::Session => "session",
+            StateWriteKind::History => "history",
+            StateWriteKind::Bookmarks => "bookmarks",
+            StateWriteKind::InputHistory => "input_history",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Unified event record + output format (Issue #13)
 // ---------------------------------------------------------------------
 
@@ -581,6 +624,16 @@ pub enum PerfRecord {
         bytes: u64,
         duration: Duration,
     },
+    /// One `persistence::save_*` disk write of a persisted-state file
+    /// (Issue #67). `duration` covers `write_json`'s full cost —
+    /// `fs::create_dir_all` + `serde_json::to_string_pretty` + `fs::write`
+    /// — real synchronous I/O, unlike [`Self::Ipc`]'s in-process
+    /// `evaluate_script` call. See [`StateWriteKind`]'s doc comment for
+    /// what each call site is and how often it should fire.
+    StateWrite {
+        kind: StateWriteKind,
+        duration: Duration,
+    },
 }
 
 impl PerfRecord {
@@ -663,9 +716,19 @@ impl PerfRecord {
         }
     }
 
+    /// Build a [`PerfRecord::StateWrite`] event. `duration` is the caller's
+    /// own `Instant::now().saturating_duration_since(started)` around the
+    /// `persistence::save_*` call — the same "caller measures, this just
+    /// wraps the value" shape [`Self::tab_latency`] uses, matching
+    /// `app::record_tab_latency`/`app::record_state_write`'s pairing.
+    pub fn state_write(kind: StateWriteKind, duration: Duration) -> Self {
+        PerfRecord::StateWrite { kind, duration }
+    }
+
     /// The event name used by both output formats (`"startup"`,
     /// `"page_load"`, `"tab_create"`, `"tab_switch"`, `"tab_resume"`,
-    /// `"tab_suspend"`, `"measure_start"`, `"cpu"`, `"rss"`, `"ipc"`).
+    /// `"tab_suspend"`, `"measure_start"`, `"cpu"`, `"rss"`, `"ipc"`,
+    /// `"state_write"`).
     pub fn event_name(&self) -> &'static str {
         match self {
             PerfRecord::Startup(_) => "startup",
@@ -676,6 +739,7 @@ impl PerfRecord {
             PerfRecord::Cpu { .. } => "cpu",
             PerfRecord::Rss(_) => "rss",
             PerfRecord::Ipc { .. } => "ipc",
+            PerfRecord::StateWrite { .. } => "state_write",
         }
     }
 
@@ -711,6 +775,11 @@ impl PerfRecord {
             } => format!(
                 "ipc dir={} name={name} bytes={bytes} duration={}",
                 direction.as_str(),
+                format_duration(*duration)
+            ),
+            PerfRecord::StateWrite { kind, duration } => format!(
+                "state_write name={} duration={}",
+                kind.as_str(),
                 format_duration(*duration)
             ),
         }
@@ -798,6 +867,10 @@ impl PerfRecord {
                 fields.insert("direction".to_owned(), json!(direction.as_str()));
                 fields.insert("name".to_owned(), json!(name));
                 fields.insert("bytes".to_owned(), json!(bytes));
+                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+            }
+            PerfRecord::StateWrite { kind, duration } => {
+                fields.insert("name".to_owned(), json!(kind.as_str()));
                 fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
             }
         }
@@ -1722,6 +1795,27 @@ mod tests {
         assert!(record.to_text().contains("dir=out"));
         assert!(record.to_text().contains("name=set_tabs"));
         assert!(record.to_text().contains("bytes=128"));
+    }
+
+    #[test]
+    fn perf_record_state_write_renders_in_both_formats() {
+        let record = PerfRecord::state_write(StateWriteKind::Session, Duration::from_millis(3));
+        assert_eq!(record.event_name(), "state_write");
+        let text = record.to_text();
+        assert_eq!(text, "state_write name=session duration=3.0ms");
+        let value = record.to_json(Duration::from_millis(7));
+        assert_eq!(value["event"], "state_write");
+        assert_eq!(value["ts_ms"], 7.0);
+        assert_eq!(value["name"], "session");
+        assert_eq!(value["duration_ms"], 3.0);
+    }
+
+    #[test]
+    fn state_write_kind_as_str_matches_persistence_file_stems() {
+        assert_eq!(StateWriteKind::Session.as_str(), "session");
+        assert_eq!(StateWriteKind::History.as_str(), "history");
+        assert_eq!(StateWriteKind::Bookmarks.as_str(), "bookmarks");
+        assert_eq!(StateWriteKind::InputHistory.as_str(), "input_history");
     }
 
     #[test]

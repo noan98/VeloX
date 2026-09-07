@@ -1055,6 +1055,20 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
   per-`(direction, name)` table — count, total bytes, `duration_ms`
   distribution — and `velox-bench ipc-summary` is the IO layer around it
   (see docs/benchmarking.md).
+- **Persisted-state disk writes** (Issue #67): every `persistence::save_*`
+  call (`session`/`history`/`bookmarks`/`input_history`) is timed and
+  written as one `state_write` record — `app::record_state_write`, the same
+  "`state.perf` is `None` ⇒ a single check, no clock read" shape as
+  `record_tab_latency` above, called from `app::persist_session`/
+  `persist_history`/`persist_bookmarks`/`persist_input_history`.
+  `duration` covers `persistence::write_json`'s full cost
+  (`fs::create_dir_all` + `serde_json::to_string_pretty` + `fs::write`) —
+  real synchronous disk I/O, unlike the in-process `evaluate_script` call
+  `PerfRecord::Ipc` measures above. See `docs/performance-targets.md` §19
+  for the measured numbers and docs/decisions.md D86 for why
+  `app::persist_session` also caches the last snapshot it wrote
+  (`AppState::last_persisted_session`) and skips the write when nothing
+  actually changed.
 - The `Config` struct is the home for all of these toggles;
   `Config::from_env_and_args` layers the environment-variable overrides onto
   `Config::default`.

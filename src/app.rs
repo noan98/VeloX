@@ -341,6 +341,18 @@ struct AppState {
     /// `persistence::default_data_dir`), in which case all three stores
     /// stay in-memory only for this run.
     data_dir: Option<PathBuf>,
+    /// The [`SessionSnapshot`] most recently written to `session.json` by
+    /// [`persist_session`] (Issue #67) — `None` until the first successful
+    /// write. `sync_tab_strip` calls `persist_session` after nearly every
+    /// tab-affecting event, but most of those events do not change what a
+    /// restore needs (`SessionSnapshot` only carries url/title/favicon per
+    /// tab, not the loading flag `NavigationStarted`/`LoadFinished` flip);
+    /// caching the last-written value lets `persist_session` skip the
+    /// `fs::create_dir_all`/`serde_json::to_string_pretty`/`fs::write`
+    /// sequence entirely when the freshly-built snapshot is unchanged,
+    /// instead of re-writing byte-identical content to disk. See
+    /// docs/decisions.md D86 for the measurement that motivated this.
+    last_persisted_session: Option<SessionSnapshot>,
     /// Tab-create/switch latency logging (Issue #13). `None` when
     /// `config.perf_metrics` is off, in which case `record_tab_latency`
     /// below is a single `Option::is_none` check — no extra `Instant::now()`
@@ -772,6 +784,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         bookmarks,
         input_history,
         data_dir,
+        last_persisted_session: None,
         perf: perf_log
             .clone()
             .map(|log| PerfContext { process_start, log }),
@@ -1216,6 +1229,23 @@ fn record_tab_latency(
         &metrics::PerfRecord::tab_latency(kind, id.get(), duration),
         elapsed,
     );
+}
+
+/// Log a `persistence::save_*` disk-write record if performance metrics
+/// are on — Issue #67's counterpart to [`record_tab_latency`], same
+/// "single `Option::is_none` check when metrics are off" shape. `started`
+/// is the timestamp the caller captured right before the `save_*` call
+/// (never around the dedup check that may skip it — a skipped write has no
+/// disk-I/O cost worth recording).
+fn record_state_write(state: &AppState, kind: metrics::StateWriteKind, started: Instant) {
+    let Some(perf) = &state.perf else {
+        return;
+    };
+    let now = Instant::now();
+    let duration = now.saturating_duration_since(started);
+    let elapsed = now.saturating_duration_since(perf.process_start);
+    perf.log
+        .write(&metrics::PerfRecord::state_write(kind, duration), elapsed);
 }
 
 /// Spawn a background thread that periodically samples this process's
@@ -3844,28 +3874,28 @@ fn cancel_download(state: &mut AppState, id: DownloadId) {
 
 fn persist_history(state: &AppState) {
     if let Some(dir) = &state.data_dir {
-        log_io_failure(
-            "save history",
-            persistence::save_history(dir, &state.history),
-        );
+        let started = Instant::now();
+        let result = persistence::save_history(dir, &state.history);
+        record_state_write(state, metrics::StateWriteKind::History, started);
+        log_io_failure("save history", result);
     }
 }
 
 fn persist_bookmarks(state: &AppState) {
     if let Some(dir) = &state.data_dir {
-        log_io_failure(
-            "save bookmarks",
-            persistence::save_bookmarks(dir, &state.bookmarks),
-        );
+        let started = Instant::now();
+        let result = persistence::save_bookmarks(dir, &state.bookmarks);
+        record_state_write(state, metrics::StateWriteKind::Bookmarks, started);
+        log_io_failure("save bookmarks", result);
     }
 }
 
 fn persist_input_history(state: &AppState) {
     if let Some(dir) = &state.data_dir {
-        log_io_failure(
-            "save input history",
-            persistence::save_input_history(dir, &state.input_history),
-        );
+        let started = Instant::now();
+        let result = persistence::save_input_history(dir, &state.input_history);
+        record_state_write(state, metrics::StateWriteKind::InputHistory, started);
+        log_io_failure("save input history", result);
     }
 }
 
@@ -3928,16 +3958,39 @@ fn clear_all_site_data(window: &BrowserWindow) {
 /// window itself is private (`--private`/`VELOX_PRIVATE` at launch, D74) —
 /// a private window opened later already never reaches here at all, since
 /// it is never `state.primary_window`.
-fn persist_session(state: &AppState, window_id: WindowId) {
+///
+/// **Redundant-write skip (Issue #67, D86)**: `sync_tab_strip` — the only
+/// caller — runs this after nearly every tab-affecting event, but
+/// `SessionSnapshot` only carries url/title/favicon, so a burst of events
+/// from a single navigation (`NavigationStarted`/`LoadFinished`/
+/// `PageTitleResolved`/`FaviconResolved`) mostly produces the *same*
+/// snapshot content more than once (the loading flag they actually
+/// differ on isn't part of it). This compares the freshly-built snapshot
+/// against `state.last_persisted_session` and skips the disk write
+/// entirely when nothing changed, exactly like `app::
+/// refresh_history_panel_if_open` (Issue #66) skipped a redundant
+/// `set_history` push — same shape, different layer (disk I/O, not IPC).
+fn persist_session(state: &mut AppState, window_id: WindowId) {
     if window_id != state.primary_window || window_is_private(state, window_id) {
         return;
     }
-    if let Some(dir) = &state.data_dir {
-        let Some(tabs) = state.windows.tabs(window_id) else {
-            return;
-        };
-        let snapshot = SessionSnapshot::from_tabs(tabs);
-        log_io_failure("save session", persistence::save_session(dir, &snapshot));
+    let Some(dir) = state.data_dir.clone() else {
+        return;
+    };
+    let Some(tabs) = state.windows.tabs(window_id) else {
+        return;
+    };
+    let snapshot = SessionSnapshot::from_tabs(tabs);
+    if state.last_persisted_session.as_ref() == Some(&snapshot) {
+        return;
+    }
+    let started = Instant::now();
+    let result = persistence::save_session(&dir, &snapshot);
+    record_state_write(state, metrics::StateWriteKind::Session, started);
+    let succeeded = result.is_ok();
+    log_io_failure("save session", result);
+    if succeeded {
+        state.last_persisted_session = Some(snapshot);
     }
 }
 
@@ -4070,6 +4123,7 @@ mod tests {
             bookmarks: BookmarkStore::new(),
             input_history: InputHistoryStore::new(),
             data_dir: None,
+            last_persisted_session: None,
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
@@ -4144,6 +4198,7 @@ mod tests {
             bookmarks: BookmarkStore::new(),
             input_history: InputHistoryStore::new(),
             data_dir: None,
+            last_persisted_session: None,
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
@@ -4242,7 +4297,7 @@ mod tests {
         let window_id = state.windows.ids().next().unwrap();
         assert_eq!(window_id, state.primary_window);
 
-        persist_session(&state, window_id);
+        persist_session(&mut state, window_id);
         assert!(
             !dir.join("session.json").exists(),
             "a private primary window must never write session.json"
@@ -4253,10 +4308,54 @@ mod tests {
         let mut normal_state = state_with_history_enabled(true);
         normal_state.data_dir = Some(dir.clone());
         let normal_window_id = normal_state.windows.ids().next().unwrap();
-        persist_session(&normal_state, normal_window_id);
+        persist_session(&mut normal_state, normal_window_id);
         assert!(
             dir.join("session.json").exists(),
             "a normal primary window must still write session.json"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_session_skips_a_redundant_write_when_the_snapshot_is_unchanged() {
+        // Issue #67/D86: `sync_tab_strip` calls `persist_session`
+        // unconditionally after nearly every tab-affecting event, but most
+        // of those do not change what `SessionSnapshot` actually captures
+        // (url/title/favicon) — this must not re-write identical content.
+        let dir = unique_temp_dir("redundant-session");
+        let mut state = state_with_history_enabled(true);
+        state.data_dir = Some(dir.clone());
+        let window_id = state.windows.ids().next().unwrap();
+
+        persist_session(&mut state, window_id);
+        let path = dir.join("session.json");
+        assert!(path.exists(), "the first call must write session.json");
+        assert!(state.last_persisted_session.is_some());
+
+        // Overwrite the file on disk out from under `persist_session` with
+        // a sentinel — if a second call with an unchanged in-memory
+        // snapshot actually re-serializes and re-writes (rather than being
+        // skipped), this sentinel is what gets clobbered.
+        std::fs::write(&path, "sentinel").expect("overwrite with sentinel");
+        persist_session(&mut state, window_id);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "sentinel",
+            "a snapshot identical to the last write must not touch the file"
+        );
+
+        // A real change (a new tab) must still be written.
+        state
+            .windows
+            .tabs_mut(window_id)
+            .unwrap()
+            .open("https://second.example/");
+        persist_session(&mut state, window_id);
+        assert_ne!(
+            std::fs::read_to_string(&path).unwrap(),
+            "sentinel",
+            "an actual snapshot change must still be written"
         );
 
         std::fs::remove_dir_all(&dir).ok();
