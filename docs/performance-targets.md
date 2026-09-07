@@ -699,7 +699,7 @@ $XV target/release/velox-bench run --scenario background_cpu --trials 3 \
   --velox-bin target/release/velox --url http://127.0.0.1:8731/busy.html
 ```
 
-## 15. メモリ/リソースライフタイム監査 (Issue #62, 2026-09-07)
+## 16. メモリ/リソースライフタイム監査 (Issue #62, 2026-09-07)
 
 **詳細な調査・実測データ・再現手順は [docs/memory-analysis.md](memory-analysis.md)
 §12 を、判断の根拠は `docs/decisions.md` D79 を参照。要点のみここに残す。**

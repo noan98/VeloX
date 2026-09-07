@@ -1083,7 +1083,7 @@ $XV target/release/velox-bench run --scenario tab_resume --trials 8 \
 まま開閉「だけ」を大量に繰り返す (churn) と PSS がじわじわ増えないか** —
 であり、Issue 本文の「タブ開閉を大量に繰り返して memory growth を測定」
 「resource lifetime をコード上で追跡」にそのまま対応する。判断の要約は
-`docs/decisions.md` D79 に、`docs/performance-targets.md` §15 にも短い
+`docs/decisions.md` D79 に、`docs/performance-targets.md` §16 にも短い
 サマリを置いた。測定環境は §1 と同一 (このコンテナ、WebKitGTK 2.52.6、
 GPU なし)。before は `af09682` (このブランチの分岐元) のバイナリ、after は
 本 Issue の変更 (§12.2) を適用したバイナリで、どちらも同じセッションで
