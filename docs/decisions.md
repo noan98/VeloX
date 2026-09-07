@@ -10342,3 +10342,177 @@ workflow には `velox.exe` を直接起動してプロセス一覧・perf ロ�
   `velox-bench run` の完走、結果 JSON の実際の中身。`docs/performance-targets.md`
   §21 には Windows の数値をまだ書けないため、CI 実行後に埋めるプレースホルダの
   みを記載した。
+## D89: Serialization / Allocation 最適化 (#68) — `escape_js_line_terminators` の常時フルコピーを削除。`write_json` の内訳は実測の結果 `fs::write` が支配的でシリアライズは対象外と判明
+
+Issue #68 (Epic #57 Phase 3、依存元 #66/#67 の後続)。「IPC やブラウザ状態処理の
+serialization / allocation / clone を分析し、不要なコストを削減する」という
+課題に対して、#66 (D81) / #67 (D86) と同じ手順 (Profile → Baseline →
+Optimize → Benchmark → Regression Check) を踏んだ。数値・再現手順は
+`docs/performance-targets.md` §22 を参照。**この節の数値はすべて Linux
+(WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、Windows (WebView2) の
+実力値ではない** (Epic #57 ルール 5)。
+
+### 最初に検討した事項 — D86 の Revisit condition (2): `write_json` の内訳
+
+D86 は「`state_write` の `duration` は `write_json` 全体 (`create_dir_all` +
+シリアライズ + 書き込み) の合算で内訳が分離されていない」ことを本 Issue が
+最初に検討すべき事項として残していた。まずここから着手した。
+
+`persistence::write_json` が呼ぶ 3 ステップそれぞれを、20 タブ相当の
+`SessionSnapshot` (JSON 4,169 bytes) を対象に、既に存在するディレクトリへの
+書き込み (`persist_session`が実運用で辿る定常状態) という条件でマイクロ
+ベンチマークした (1 プロセス内で 20,000 回ずつ、`std::hint::black_box`で
+最適化による消失を防止、3 回実行して再現性を確認 — 具体的な計測コードと
+手順は §22.1):
+
+| ステップ | 1 回あたり (3 回の実行、中央値) |
+| --- | ---: |
+| `fs::create_dir_all`(既存ディレクトリ、stat 相当) | 約 1.2〜1.4µs |
+| `serde_json::to_string_pretty` | 約 3.3〜3.5µs |
+| `fs::write`(実ディスク書き込み syscall) | 約 90〜97µs |
+
+**`fs::write`の実ディスク書き込みが全体の 90%以上を占め、シリアライズの
+25〜30 倍のコストがある。** 3 つの合計 (約 95〜102µs ≈ 0.1ms) は
+`docs/performance-targets.md` §19 が報告した `state_write` の実測中央値
+(0.1ms) とほぼ一致しており、このマイクロベンチマークが実際の呼び出しコストを
+正しく再現できていることの裏付けにもなっている。
+
+**結論: `write_json`のシリアライズ部分を最適化しても、`state_write`全体の
+コストにはほとんど効かない。** `serde_json::to_writer`でバッファ経由の
+`String`確保を避ける案も検討したが、節約できるのはこの 3.3〜3.5µs の一部
+(実際には`to_writer`は複数回の小さい`write()`呼び出しに分割されうるため、
+`BufWriter`でラップしない限り`fs::write`1 回より遅くなるリスクすらある)
+であり、全体の 90µs 超を占める syscall 本体には触れない。Epic #57 ルール 1
+に照らし、**`persistence.rs`側のシリアライズ経路には手を入れなかった** —
+D86 が残した「内訳を分離する必要があるか」という問いへの答えは「分離しても
+シリアライズは支配的要因ではないので、専用の計測を追加する価値も薄い」
+だった。専用の`serialize_duration`フィールドを`PerfRecord::StateWrite`に
+追加する案も検討したが、上記の理由でシリアライズが最適化対象にならない
+以上、恒久的な計測用フィールドを増やすメリットは実測上ない — 本 Issue の
+その場限りのマイクロベンチマークで十分と判断した (§22.1 に再現手順を残す
+ことで、将来この判断を再検証したくなった場合の出発点にはなる)。
+
+### 実測して見つかった唯一の削減対象: `escape_js_line_terminators`の常時フルコピー
+
+`ui::toolbar::escape_js_line_terminators`(Issue #43/D62、U+2028/U+2029 を
+JS 文字列リテラル内で無害化する関数) は、`set_tabs_script`/`set_url_script`/
+`set_candidates_script`/`entries_to_json`(`set_history`/`set_downloads`の
+JSON 化)/`value_to_json`(`set_bookmarks`)/`find_query_literal`/
+`context_menu_script`など、**Rust → JS へ渡るほぼ全ての `eval_toolbar`呼び出し
+経路が最後に通る共通関数**だった。旧実装は `&str`を受け取り、対象文字が
+1 つも無い (実運用の大半を占める) ケースでも`json.to_owned()`で**呼び出し元
+が既に所有している`String`をまるごとコピーしていた** — `serde_json::
+to_string`が確保した`String`を、中身を一切変えないまま複製し直すだけの
+アロケーション + memcpy。呼び出し元 6 箇所 (`toolbar.rs`) + 2 箇所
+(`window.rs`の`find_query_literal`/context menu) はいずれも呼び出し直前に
+`String`を新規構築しており、以降その値を使っていない — つまり所有権を
+そのまま渡せば済む場所だった。
+
+**この関数の性質上、`PerfRecord::Ipc`では変化を測れない**: `ui::window::
+BrowserWindow::eval_toolbar`が`Instant::now()`を読むのは、呼び出し元が
+`toolbar::set_tabs_script(tabs)`(このコピーを含む)を**呼び終えたあと**の
+`&str`を受け取ってから — #66 (D81) の`Ipc`の`duration`が測るのは
+`evaluate_script`という FFI 呼び出し 1 本だけで、スクリプト文字列の組み立て
+コストはそこに一切含まれない。したがって本 Issue で見つけたこのコストは
+既存の IPC 計測の外側にあり、確認するには別のマイクロベンチマークが要る
+(この事実自体、既存計測の限界として記録しておく価値がある — 将来
+`eval_toolbar`呼び出し元でのシリアライズコストを見たくなったら、
+`Instant::now()`をスクリプト組み立ての前に移す必要がある)。
+
+**修正**: `escape_js_line_terminators(json: &str) -> String`を
+`escape_js_line_terminators(json: String) -> String`に変更し、対象文字が
+無い高速経路では所有権をそのまま返すだけ (コピー無し) にした。全呼び出し元
+は変更前から既にコピーを作る直前で`String`を所有していたため、`&json`を
+渡していた箇所を`json`に変えるだけで済み、シグネチャ以外の呼び出し側の
+ロジックは変わっていない。
+
+**before/after (マイクロベンチマーク、`set_tabs_script`、20,000 回のうち
+先頭 1,000 回をウォームアップとして除外、`black_box`で最適化消失を防止、
+それぞれ 3 回実行、詳細な手順は §22.2)**:
+
+| tabs | before (1 回あたり、3 回の範囲) | after (1 回あたり、3 回の範囲) |
+| --- | --- | --- |
+| 3   | 943〜1,012ns | 856〜913ns |
+| 20  | 4.721〜4.791µs | 4.286〜4.599µs |
+| 50  | 10.806〜11.747µs | 10.344〜10.416µs |
+
+3 サイズすべてで **after の 3 回の実行値は before の 3 回の実行値をすべて
+下回った** (範囲が重ならない) — 単発のノイズではなく再現する差であること
+の確認。20 タブでの改善幅はおおむね 5〜10%。絶対値としては 1 回あたり
+数百 ns 相当と小さいが、これは実際に`serde_json::to_string`が確保した
+バッファをまるごと複製していたコストがそのまま消えた分であり、`Vec`/
+`String`の不要な clone を削るという Issue #68 の対象そのものである。
+
+### 検討した他の対象 — 実測の結果、対象外と判断したもの
+
+- **`ui::toolbar::TabSummary`の所有フィールド (`url`/`title`/`favicon`)
+  を`&'a str`の借用に変える案**: `sync_tab_strip`(`app.rs`) は
+  `Tab::current_url()`/`title()`/`favicon()`(いずれも借用を返す) から
+  `TabSummary`を組み立てる際に`.to_owned()`/`.clone()`しており、タブ数分の
+  `String`確保が発生する。`BookmarkFolderView<'a>`(`ui::toolbar.rs`) が
+  既に同種の借用パターンを採用しており、技術的には可能。しかし
+  `set_tabs_script`全体 (JSON 化含む) が 20 タブで 1 回あたり 4.3〜4.8µs
+  (本 Issue の計測) であり、`TabSummary`の構築自体はこのうちさらに小さい
+  部分でしかない。#66 (D81) が実測した`set_tabs`の`evaluate_script`呼び出し
+  コスト (中央値 0.000ms、最悪 3.5ms) と比べても 3 桁小さい。`TabSummary`
+  にライフタイムパラメータを持ち込むと`set_tabs_script`のシグネチャ・
+  呼び出し側の型注釈が連鎖的に変わり可読性が下がる一方、削減できる時間は
+  20 タブのセッション全体 (120 回呼び出し) を通算しても 1ms に満たないと
+  見積もられる — Epic #57 ルール 1 (実測に基づく判断) とルール
+  「可読性を大きく損なわない」の両方に照らし、見送った。
+- **`toolbar::command_name`(Issue #66) による IPC メッセージの二重パース**:
+  JS → Rust の`UserEvent::ToolbarMessage`は`command_name`(タグだけを見る
+  簡易パース) と`parse_command`(完全な型付きパース) を両方呼んでおり、一見
+  同じ JSON を 2 回パースしているように見える。しかし呼び出し箇所
+  (`app::record_perf_event`) は`config.perf_metrics`が有効なとき
+  (`VELOX_PERF_METRICS=1`) にしか実行されない診断専用コードパスであり、
+  かつ`command_name`は`parse_command`が失敗するメッセージにもラベルを
+  残すための意図的な設計 (コード自身のドキュメントコメントに明記済み) —
+  実運用のブラウジングでは一切実行されない。本 Issue の対象 (通常運用の
+  hot path) には当たらないため変更しなかった。
+- **`app::persist_session`の`state.data_dir.clone()`のタイミング**:
+  現在の実装はプライバシー判定の直後、スナップショット比較 (直前と同じ
+  内容ならディスク書き込み自体をスキップする #67/D86 の分岐) より前に
+  `PathBuf`をクローンしている。スキップされる呼び出しでもこのクローンは
+  必ず発生する。並べ替えれば無駄なクローンを避けられるが、`PathBuf`1 個
+  の clone は数十バイトのヒープ確保 1 回 (見積もりで概ね数十〜100ns 未満)
+  であり、本 Issue で計測した他のどの数値 (µs〜ms オーダー) と比べても
+  2〜3 桁小さい。並べ替えは`let Some(dir) = ... else { return }`という
+  早期リターンの並びを崩し、なぜこの順序なのかを追加のコメントで説明する
+  必要が生じる分だけ可読性コストが生じる一方、得られる時間は測定誤差にすら
+  埋もれる規模と判断し、変更しなかった。
+- **lock scope**: D86 が既に「本アーキテクチャ (シングルスレッド state
+  machine) にはロック競合が構造的に発生しない」と結論しており (§19.3)、
+  本 Issue で新たに見つかった対象は無い。
+
+### Regression check
+
+`velox-bench gate --scenario tab_create_20`(baseline=本 Issue 着手前の
+コミット `e3d1986`、candidate=本 Issue の変更後、各 8 試行 × 2 回、
+`--warn-pct 20 --fail-pct 60`) は総合判定 **OK**
+(`page_load_ms`/`page_load_engine_ms`/`page_load_dispatch_ms`/
+`tab_create_ms`のいずれも baseline 比 -6.2%〜+2.3%、warn 閾値 20%を大きく
+下回る)。`cargo test`は変更後も全件成功 (982 ユニットテスト + 11 統合
+テスト、`xvfb-run` + `dbus-run-session`)。`cargo fmt --check`/`cargo clippy
+--all-targets -- -D warnings`もクリーン。
+
+### 後続 Issue が使えるもの
+
+- `escape_js_line_terminators(json: String) -> String`という「所有権を
+  そのまま返せる高速経路ではコピーしない」パターン — 将来 Rust → JS の
+  新しいペイロードを追加する際、同じ関数を再利用するだけで恩恵を受けられる
+  (コピーを避けるために呼び出し元を書き換える必要はない)。
+- `persistence::write_json`の内訳 (mkdir/serialize/write) のマイクロ
+  ベンチマーク手順 (§22.1) — 将来ディスク書き込み方式そのもの (非同期化・
+  バッチ化など) を検討する際の基礎データとして再利用できる。
+
+### Revisit condition
+
+(1) `TabSummary`を借用ベースに変える判断は、1 ウィンドウのタブ数が
+現在の上限 (20〜50) から大きく増える設計変更が検討され始めたら再検証する
+こと (D86 の tab/window lookup の Revisit condition (1) と同じ条件)。
+(2) `persistence::write_json`が非同期化・バッチ化された場合、本 Issue が
+測った「`fs::write`が支配的」という前提ごと崩れるため、内訳の再計測が
+必要になる。(3) 本節の数値はすべて Linux/WebKitGTK — Windows (WebView2) の
+NTFS 上でのディスク書き込みコスト・アロケータの挙動は異なりうるため未計測
+(Epic #57 ルール 5)。

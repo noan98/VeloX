@@ -1357,3 +1357,214 @@ perf ログの有無を確認する) の結果を貼ること。
   ランナー等の方式再検討が必要という結論をここに残す。**無理に通そうとした
   形跡 (数値の捏造・失敗の隠蔽) を残さないこと** — D88 および #59 が同じ
   方針を採っている。
+
+## 22. Serialization / Allocation 最適化の計測結果 (Issue #68, 2026-09-07)
+
+**設計判断は `docs/decisions.md` D89 を参照。** ここでは実測データと
+再現手順だけを記録する。**この節の数値はすべて §1 の環境 (Ubuntu 24.04.4 /
+WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、Windows (WebView2) /
+macOS (WKWebView) の実力値ではない** — ディスク書き込み (`fs::write`) の
+コストは NTFS/APFS のメタデータ操作コストが Linux の ext4/tmpfs と異なる
+ため、22.1 の内訳比率がそのまま外挿できる保証はない。
+
+### 22.1 `persistence::write_json` の内訳 (D86 の Revisit condition (2))
+
+`write_json`(`fs::create_dir_all` → `serde_json::to_string_pretty` →
+`fs::write`) の 3 ステップを、20 タブ相当の `SessionSnapshot`(シリアライズ後
+4,169 bytes) に対して個別に計測した。**`create_dir_all`は毎回すでに存在する
+ディレクトリを対象にしている** — `persist_session`が実運用で辿る定常状態
+(初回起動直後を除けば常にディレクトリは存在済み) を再現するため。各ステップ
+20,000 回、`std::hint::black_box`で結果を消費させて最適化による消失を防止。
+3 回実行した結果 (1 回あたり):
+
+| ステップ | 実行1 | 実行2 | 実行3 |
+| --- | ---: | ---: | ---: |
+| `fs::create_dir_all`(既存ディレクトリ) | 1.337µs | 1.423µs | 1.158µs |
+| `serde_json::to_string_pretty` | 3.385µs | 3.331µs | 3.450µs |
+| `fs::write`(実ディスク書き込み) | 96.876µs | 91.471µs | 90.298µs |
+
+3 ステップの合計 (約 95.6〜102.7µs ≈ 0.1ms) は §19 が報告した
+`state_write name=session` の実測中央値 (0.1ms) とほぼ一致しており、この
+マイクロベンチマークが実際の呼び出しコストを正しく再現できていることの
+裏付けになっている。**`fs::write`が全体の約 90〜95%を占め、シリアライズの
+25〜30 倍のコスト** — D89 が結論づけたとおり、シリアライズ経路の最適化は
+`state_write`全体のコストにはほとんど効かない。
+
+再現手順 (このベンチマーク自体は使い捨てのローカルテストとして書き、
+リポジトリには残していない — 再現する場合は以下を `tests/` 配下に一時的に
+作成して `cargo test --release` で実行する):
+
+```rust
+use std::fs;
+use std::time::Instant;
+use velox::browser::session::{SavedTab, SessionSnapshot};
+
+fn make_snapshot(n: usize) -> SessionSnapshot {
+    let tabs = (0..n)
+        .map(|i| SavedTab {
+            url: format!("https://example.com/page/{i}/some/longer/path/segment"),
+            title: Some(format!("Example Page Title Number {i} - Some Longer Title Text")),
+            favicon: Some(format!("https://example.com/favicon-{i}.ico")),
+        })
+        .collect();
+    SessionSnapshot { tabs, active_index: 0 }
+}
+
+#[test]
+fn scratch_write_json_breakdown() {
+    let dir = std::env::temp_dir().join(format!("velox-wjb-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("session.json");
+    let snapshot = make_snapshot(20);
+    let iters = 20_000u32;
+
+    let started = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(fs::create_dir_all(std::hint::black_box(&dir))).unwrap();
+    }
+    let mkdir_elapsed = started.elapsed();
+
+    let started = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(serde_json::to_string_pretty(std::hint::black_box(&snapshot)).unwrap());
+    }
+    let serialize_elapsed = started.elapsed();
+
+    let data = serde_json::to_string_pretty(&snapshot).unwrap();
+    let started = Instant::now();
+    for _ in 0..iters {
+        fs::write(std::hint::black_box(&path), std::hint::black_box(&data)).unwrap();
+    }
+    let write_elapsed = started.elapsed();
+
+    println!(
+        "mkdir_per_call={:?} serialize_per_call={:?} write_per_call={:?}",
+        mkdir_elapsed / iters, serialize_elapsed / iters, write_elapsed / iters
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+```
+
+### 22.2 `escape_js_line_terminators` の before/after (D89)
+
+`toolbar::set_tabs_script`(タブ数 3/20/50 の `TabSummary` 配列) を対象に、
+`escape_js_line_terminators`の常時フルコピーを除去する前後でマイクロ
+ベンチマークした。各条件 1,000 回のウォームアップの後、本計測を実施
+(`black_box`で最適化消失を防止)。それぞれ 3 回実行:
+
+**before (修正前、`e3d1986`)**:
+
+| tabs | iters | 実行1 (1回あたり) | 実行2 | 実行3 |
+| --- | ---: | ---: | ---: | ---: |
+| 3 | 200,000 | 943ns | 956ns | 1.012µs |
+| 20 | 200,000 | 4.721µs | 4.735µs | 4.791µs |
+| 50 | 100,000 | 11.747µs | 10.806µs | 11.188µs |
+
+**after (修正後)**:
+
+| tabs | iters | 実行1 (1回あたり) | 実行2 | 実行3 |
+| --- | ---: | ---: | ---: | ---: |
+| 3 | 200,000 | 856ns | 859ns | 913ns |
+| 20 | 200,000 | 4.286µs | 4.432µs | 4.599µs |
+| 50 | 100,000 | 10.344µs | 10.390µs | 10.416µs |
+
+3 サイズすべてで after の 3 回の実行値が before の 3 回の実行値をすべて
+下回っている (範囲が重ならない) — 単発のノイズではなく再現する差である
+ことを示す。20 タブでの改善幅はおおむね 5〜10%。
+
+再現手順 (同じく使い捨てのローカルテストとして `tests/` 配下に一時的に
+作成し、修正前後のコミットそれぞれで `cargo test --release --test
+<name> -- --nocapture` を実行して比較した):
+
+```rust
+use std::time::Instant;
+use velox::ui::toolbar::{set_tabs_script, TabSummary};
+
+fn make_tabs(n: usize) -> Vec<TabSummary> {
+    (0..n)
+        .map(|i| TabSummary {
+            id: i as u64,
+            url: format!("https://example.com/page/{i}/some/longer/path/segment"),
+            title: Some(format!("Example Page Title Number {i} - Some Longer Title Text")),
+            favicon: Some(format!("https://example.com/favicon-{i}.ico")),
+            loading: i % 3 == 0,
+            active: i == 0,
+            suspended: false,
+        })
+        .collect()
+}
+
+fn bench(label: &str, n_tabs: usize, iters: u32) {
+    let tabs = make_tabs(n_tabs);
+    for _ in 0..1000 {
+        std::hint::black_box(set_tabs_script(std::hint::black_box(&tabs)));
+    }
+    let started = Instant::now();
+    for _ in 0..iters {
+        std::hint::black_box(set_tabs_script(std::hint::black_box(&tabs)));
+    }
+    let elapsed = started.elapsed();
+    println!("{label} tabs={n_tabs} iters={iters} per_call={:?}", elapsed / iters);
+}
+
+#[test]
+fn scratch_bench_set_tabs_script() {
+    bench("set_tabs_script", 3, 200_000);
+    bench("set_tabs_script", 20, 200_000);
+    bench("set_tabs_script", 50, 100_000);
+}
+```
+
+### 22.3 `velox-bench gate` — 回帰の有無
+
+`tab_create_20` シナリオ (`sync_tab_strip`/`set_tabs`/`persist_session`を
+繰り返し経由する、この Issue の変更が最も効きうるシナリオ) で
+baseline=修正前コミット `e3d1986`、candidate=修正後を各 8 試行 × 2 回
+計測:
+
+```
+regression gate: scenario=tab_create_20 candidates=2 (warn>20.0% fail>60.0%)
+metric                             baseline       candidates (中央値/変化率)       判定       備考
+page_load_dispatch_ms                  8.65     8.4(-2.9%), 8.9(+2.3%)       OK
+page_load_engine_ms                    7.45     7.2(-2.7%), 7.4(-0.7%)       OK
+page_load_ms                          16.15   15.2(-6.2%), 15.9(-1.5%)       OK
+tab_create_ms                          3.10     3.1(+0.0%), 3.2(+1.6%)       OK
+
+総合判定: OK
+```
+
+`tab_create_ms`/`page_load_ms`とも baseline 比で有意な劣化は無い (変化率は
+すべて warn 閾値 20%を大きく下回る) — 22.2 のマイクロベンチマークが捉えた
+数百 ns〜µs オーダーの差は、この規模のシナリオ計測 (ms オーダー、共有 VM
+上のスケジューリングノイズを含む) では検出限界以下であることの確認でもある
+(#66/#67 の`set_tabs`/`persist_session`の結論と同じ形: 「呼ばれる回数」や
+「アロケーション」を削っても、既にサブミリ秒の処理の`duration_ms`表示上は
+変化として見えない)。
+
+### 22.4 再現手順 (`velox-bench gate` 部分)
+
+§20.6 と同じ環境構築 (HTTP サーバ) の後:
+
+```sh
+cargo build --release
+S=/path/to/scratch
+XV_RUN() { xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- "$@"; }
+
+# baseline/candidate バイナリをそれぞれ用意 (git stash 等で切り替えてビルド)
+XV_RUN target/release/velox-bench run --scenario tab_create_20 --trials 8 \
+  --velox-bin "$S/velox-baseline" --url http://127.0.0.1:8731/minimal.html \
+  --output "$S/tab_create_20-baseline.json"
+
+for i in 1 2; do
+  XV_RUN target/release/velox-bench run --scenario tab_create_20 --trials 8 \
+    --velox-bin "$S/velox-candidate" --url http://127.0.0.1:8731/minimal.html \
+    --output "$S/tab_create_20-candidate-$i.json"
+done
+
+target/release/velox-bench gate \
+  --baseline "$S/tab_create_20-baseline.json" \
+  --candidate "$S/tab_create_20-candidate-1.json" \
+  --candidate "$S/tab_create_20-candidate-2.json" \
+  --warn-pct 20 --fail-pct 60 \
+  --output "$S/gate-report.json" --markdown-output "$S/gate-summary.md"
+```

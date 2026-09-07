@@ -2625,7 +2625,7 @@ fn context_menu_render_script(entries: &[context_menu::MenuEntry], x: f64, y: f6
         .map(|(index, entry)| context_menu_item_json(index, entry))
         .collect();
     let items_json =
-        toolbar::escape_js_line_terminators(&serde_json::Value::Array(items).to_string());
+        toolbar::escape_js_line_terminators(serde_json::Value::Array(items).to_string());
     format!(
         r#"(() => {{
   "use strict";
@@ -2720,7 +2720,7 @@ struct FindSearchResult {
 /// webview instead of the toolbar's).
 fn find_query_literal(query: &str) -> String {
     let json = serde_json::Value::String(query.to_owned()).to_string();
-    toolbar::escape_js_line_terminators(&json)
+    toolbar::escape_js_line_terminators(json)
 }
 
 /// Builds the script [`BrowserWindow::search_in_page`] evaluates in a
