@@ -8922,3 +8922,108 @@ Windows で `webview2_blocking.rs` の動作を確認できるようになった
 要る。(4) `?poll_ms=` のクランプ境界 (1 秒付近) を二分探索的に測れば、
 WebKitGTK の実際の閾値を特定できる。今回は 200ms/2000ms の 2 点比較に
 留めた。
+## D82: Performance Dashboard (#71) — `velox-bench`/perf-gate の出力形式をそのまま保存し、比較は「明示的に同一とマークしたセッション」の中でしか許可しない
+
+**対象**: Issue #71 の受け入れ条件 4 点 (過去結果と比較できる / OS ごとに
+分離できる / commit・PR 単位で性能差を確認できる / 測定条件を結果と一緒に
+保存する)。設計・実装の詳細は
+[docs/performance-dashboard.md](performance-dashboard.md) を、回帰ゲート
+(#72) との役割分担は `docs/performance-targets.md` §17 を参照。ここでは
+決定そのものと、他の選択肢を採らなかった理由を記録する。
+
+### 決定
+
+1. **新しい計測手段は作らない。** `velox-bench run`/`aggregate`/`gate` が
+   生成する `BenchmarkResult`/`GateReport` JSON (#14/#72 で確定済み) を
+   そのまま消費する。ダッシュボード側の独自フォーマットは、それを 1 エン
+   トリの `"result"` フィールドに包んだ薄いラッパー
+   (`schema_version`/`session_id`/`source`/`branch`/`pr_number`/`note`)
+   だけで、`BenchmarkResult` 自体は無変換。**理由**: perf-gate.yml の出力
+   形式とダッシュボードの保存形式を分岐させると「別々の形式を2つ持つと
+   必ず腐る」(Issue #71 本文) — 変換ステップそのものを無くすのが最も確実
+   な予防策。
+2. **保存はリポジトリ内への追記 (JSON Lines)、レポートは静的
+   HTML/Markdown 生成。** `results/history/<os>/<scenario>.jsonl` に 1 行
+   1 エントリで追記し、`scripts/dashboard/report.py` がそれを読んで
+   レポートを生成する。GitHub Pages やサーバは使わない (プライベートリポ
+   ジトリであり、それらを前提にできるとは限らない — Issue #71 本文の
+   スコープ指針どおり)。
+3. **グラフは matplotlib 等を使わず、素の SVG を文字列で組み立てる。**
+   `scripts/dashboard/report.py` の `render_svg_chart`。新規依存クレート/
+   パッケージはゼロ (Rust・Python とも標準ライブラリ + 既存の `serde`/
+   `serde_json` のみ)。
+4. **比較の単位を「セッション」に限定し、それ以外は自動比較しない。**
+   `session_id` は記録のたびに既定で一意に自動生成される
+   (`common.generate_session_id`) — つまり**何もしなければ 2 回の記録は
+   別セッション扱い**になる。複数の記録を比較可能な系列として扱いたい
+   場合、呼び出し側が同じ `session_id` を明示的に指定しなければならない。
+   `report.py` は同一 `session_id` の隣接エントリ同士だけを折れ線でつなぎ、
+   `velox-bench gate` (CI と同一ロジック) で差分の重大度 (OK/WARN/FAIL)
+   を計算する。セッションが変わる境界では、点は表示するが線ではつながず、
+   差分バッジも出さない。
+5. **閾値判定は独自実装せず `velox-bench gate` を呼び出す。** `report.py`
+   は一時ディレクトリに `BenchmarkResult` を書き出し、`velox-bench gate
+   --baseline <前のエントリ> --candidate <このエントリ>` をサブプロセスで
+   呼んで `GateReport` を得る。`velox-bench` バイナリが手元に無い場合のみ、
+   絶対差フロアを持たない簡易フォールバック (既定 warn=20%/fail=60%) に
+   切り替わり、その旨をレポートに明記する。
+6. **`results/history/**/*.jsonl` はコミットする。レンダリング結果
+   (`report.html`/`report.md`) はコミットしない** (`.gitignore` に追加)。
+   前者は `results/baseline/` と同じ「再生成できない生データ」、後者は
+   `target/` と同じ「いつでも再生成できるビルド出力」という整理。
+
+### 検討したが採らなかった選択肢
+
+- **固定 baseline ファイルとの単純な時系列比較** (「最新の結果を、履歴上の
+  1 つ前の結果と常に比較する」): §10/D46 が実測した「同一バイナリでも
+  セッションを跨ぐと最大 +78.9% 動く」というノイズの大きさの前では、
+  session の概念なしにこれをやると、ノイズを回帰の証拠であるかのように
+  表示してしまう。**この「セッションを跨いだ比較を許さない」制約こそが
+  本 Issue で最も設計判断を要した部分** (Issue #71 本文の指摘どおり) であり、
+  4 の決定はそれへの直接の回答である。
+- **CI (`perf-gate.yml`) からの自動記録**: `record.py` はそのまま呼べる
+  形にしてあるが、実際にワークフローへ組み込むと「誰が
+  `results/history/` への commit を作るか」(fork からの PR は push 権限が
+  無い等) という運用設計が追加で必要になり、本 Issue のスコープ (保存
+  形式を固める) を超える。**Revisit condition (1)** として送る。
+- **matplotlib 等のグラフ描画ライブラリ**: Issue #71 本文が明示的に
+  「重い依存を安易に足さないこと。素の SVG 生成で足りるならそちらを選ぶ」
+  と指示しており、実際に足りた (折れ線 + 点 + ツールチップ程度で十分)
+  ため導入しなかった。
+- **`RunEnvironment`/`BenchmarkResult` (`src/browser/benchmark.rs`) への
+  フィールド追加 (`session_id` 等を Rust 側に持たせる)**: 検討したが、
+  (a) `benchmark.rs`/`velox-bench` は #72 の回帰ゲートが CI で直接依存する
+  コードであり、Issue #71 のためにここへ手を入れると変更範囲が
+  perf-gate.yml の挙動にまで及ぶリスクがある、(b) ダッシュボードが必要と
+  するメタデータ (session/source/branch/PR) は「計測」ではなく「記録」の
+  文脈でのみ意味を持つため、Rust 側の `BenchmarkResult` (計測結果そのもの)
+  に持たせるより、Python 側の保存レイヤーに持たせる方が責務が素直に
+  分かれる。そのため本 Issue では **Rust コードは一切変更していない**
+  (新規依存クレートもゼロ)。
+
+### 動作確認
+
+`results/baseline/cold_startup-linux-xvfb.json` (#58 で実際に計測された
+real data) を履歴に記録し、レポートを生成できることを確認した。加えて、
+この dev/agent コンテナ上で `cargo build` した debug ビルドの
+`velox`/`velox-bench` を使い、Xvfb + `dbus-run-session` 上で実際に
+`cold_startup` を同一セッション内で 2 回、`tab_switch` を別セッションで
+1 回計測し、記録・レポート生成の一連の流れが動くこと、同一セッション内の
+差分が `velox-bench gate` 経由で正しく重大度付きで計算されること、
+セッション境界で線が途切れ差分が計算されないこと、`--os`/`--scenario`
+フィルタや履歴が空の場合・`velox-bench` バイナリが無い場合のフォールバック
+が例外を出さずに動作することを確認した (詳細は
+`docs/performance-dashboard.md` §8)。この確認用の計測データ自体は debug
+ビルドの数値であり正式な baseline ではないため、`results/history/` には
+コミットしていない — コミットしたのは `results/baseline/` 由来の 1 エント
+リのみ。
+
+### Revisit condition
+
+(1) `.github/workflows/perf-gate.yml` から `record.py` を自動で呼び、
+`results/history/` への commit 運用を設計する。(2) Issue #136 (Windows
+実機での性能計測) が着地したら、その結果を `record.py` に渡すだけで
+`results/history/windows/` に自然に載ることを実データで確認する。(3) 実機
+(ノイズの小さい環境) が使えるようになった段階で、「セッションを跨いでも
+許容誤差内なら緩やかにつなぐ」といった、比較の単位を広げる拡張を再検討
+する — 現時点ではこの環境のノイズの大きさ (D46) がそれを許さない。
