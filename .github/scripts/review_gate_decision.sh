@@ -12,33 +12,44 @@
 #      したら、このスクリプトが `@codex review` を自動投稿する (下記
 #      allow_codex_request_post 引数を参照)。
 #   2. Codex には利用上限があり、上限に達すると "You have reached your
-#      Codex usage limits" 系のメッセージを返す。これを検知した場合に限り
-#      要件を緩和する (check_review_gate.py 側のロジック)。
+#      Codex usage limits" 系のメッセージを返す。これを検知した場合、この
+#      PR の過去のレビューで代替できなければ、`@claude` へレビューを依頼
+#      する (下記 CLAUDE_REVIEWER_LOGINS 参照。check_review_gate.py 側の
+#      ロジック)。
 #
 # 使い方: review_gate_decision.sh <PR番号> <head_sha> [codex_bypass] [allow_codex_request_post]
 #   codex_bypass              - "true" なら Codex レビュー必須判定だけを
 #                                免除する (`automerge-without-codex` ラベル
 #                                用)。省略時は "false"。未解決スレッド判定・
 #                                CHANGES_REQUESTED 判定は免除しない。
-#   allow_codex_request_post  - "true" のときのみ、Codex 未レビューを検知
-#                                したら実際に `@codex review` コメントを
-#                                投稿する (pull-requests: write が必要)。
-#                                省略時は "false" (dry-run 用 — 投稿はせず
-#                                「投稿する判定になった」ことをログに出す
-#                                だけ)。本番の auto-merge job のみ "true"
-#                                を渡すこと。
+#   allow_codex_request_post  - "true" のときのみ、Codex/Claude への
+#                                レビュー依頼コメントを実際に投稿する
+#                                (pull-requests: write が必要)。省略時は
+#                                "false" (dry-run 用 — 投稿はせず「投稿
+#                                する判定になった」ことをログに出すだけ)。
+#                                本番の auto-merge job のみ "true" を渡す
+#                                こと。
 #
 # 前提の環境変数:
-#   GH_REPO               - "owner/repo" (gh CLI が要求)
-#   GH_TOKEN               - gh CLI の認証トークン (check-suites 取得に
-#                             `checks: read`、コメント投稿に
-#                             `pull-requests: write` 権限が要る)
-#   GRACE_PERIOD_MINUTES   - 猶予期間 (分)。未設定なら 15。
+#   GH_REPO                 - "owner/repo" (gh CLI が要求)
+#   GH_TOKEN                 - gh CLI の認証トークン (check-suites 取得に
+#                               `checks: read`、コメント投稿に
+#                               `pull-requests: write` 権限が要る)
+#   GRACE_PERIOD_MINUTES     - 猶予期間 (分)。未設定なら 15。
+#   CLAUDE_REVIEWER_LOGINS   - Codex の利用上限到達時に「Claude のレビュー/
+#                               コメントで条件3を満たす」とみなすログイン名
+#                               のカンマ区切りリスト。**未設定/空なら
+#                               Claude フォールバックは常に不成立**
+#                               (Codex の利用上限緩和のみで判断する安全側)。
+#                               このリポジトリには `@claude` に応答する
+#                               仕組みが導入されているか未確認のため、
+#                               ログイン名をハードコードしていない
+#                               (docs/decisions.md D91 参照)。
 #
 # 標準出力: 判定理由を1行ずつ (問題が無ければ何も出さない)。「今このPRは
 #   何を待っているのか」が一目で分かる文言にしてある (Issue #168 の教訓)。
-#   Codex の利用上限緩和が発動した場合は ::warning:: も出す (黙って緩め
-#   ない)。
+#   Codex/Claude の利用上限緩和が発動した場合は ::warning:: も出す (黙って
+#   緩めない)。
 # 標準エラー出力: API 呼び出し自体が失敗した場合の生エラー (握りつぶさない)。
 # 終了コード:
 #   0 - ブロックする理由なし (マージしてよい)
@@ -61,6 +72,9 @@ scripts_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 owner="${GH_REPO%%/*}"
 repo="${GH_REPO##*/}"
 grace="${GRACE_PERIOD_MINUTES:-15}"
+# カンマ区切り -> JSON 配列。空文字列なら空配列 (Claude フォールバック無効)。
+claude_logins_json=$(printf '%s' "${CLAUDE_REVIEWER_LOGINS:-}" \
+  | jq -R 'split(",") | map(select(length > 0))')
 
 # reviewThreads: 未解決かどうかと、代表コメント (先頭1件) のファイル/投稿者。
 # latestReviews: レビュアーごとの最新 (submitted) レビュー状態。PENDING の
@@ -77,6 +91,7 @@ read -r -d '' query <<'GRAPHQL' || true
 query($owner: String!, $repo: String!, $number: Int!) {
   repository(owner: $owner, name: $repo) {
     pullRequest(number: $number) {
+      title
       reviewThreads(first: 100) {
         pageInfo { hasNextPage }
         nodes {
@@ -170,30 +185,41 @@ payload=$(jq -n \
   --argjson grace "$grace" \
   --arg sha "$sha" \
   --arg codexBypass "$codex_bypass" \
+  --argjson claudeLogins "$claude_logins_json" \
   '{
     reviewThreads: $pr.reviewThreads,
     latestReviews: $pr.latestReviews,
     reactions: $pr.reactions,
     prComments: $pr.comments,
+    prTitle: $pr.title,
     headSha: $sha,
     headPushObservedAt: (if ($pushObservedAt | length) > 0 then $pushObservedAt else null end),
     now: $now,
     gracePeriodMinutes: $grace,
-    codexBypass: ($codexBypass == "true")
+    codexBypass: ($codexBypass == "true"),
+    claudeLogins: $claudeLogins
   }')
 
 result=$(echo "$payload" | python3 "${scripts_dir}/check_review_gate.py")
 blocked=$(echo "$result" | jq -r '.blocked')
-request_needed=$(echo "$result" | jq -r '.codex_review_request_needed')
-relaxed=$(echo "$result" | jq -r '.codex_relaxed')
+codex_request_needed=$(echo "$result" | jq -r '.codex_review_request_needed')
+codex_relaxed=$(echo "$result" | jq -r '.codex_relaxed')
+claude_request_needed=$(echo "$result" | jq -r '.claude_review_request_needed')
+claude_relaxed=$(echo "$result" | jq -r '.claude_relaxed')
 
 echo "$result" | jq -r '.reasons[]'
 
 # 利用上限緩和が発動した場合は、黙って緩めず ::warning:: で目立たせる
 # (ユーザの明示的な指示: 「緩和したことを ::warning:: でログに大きく残す
-# こと」)。
-if [ "$relaxed" = "true" ]; then
+# こと」)。Codex 側の緩和 (この PR の過去のレビューで代替) と Claude
+# フォールバック (Claude のレビュー/コメントで代替) は排他 (どちらか
+# 一方だけが発動する)。
+if [ "$codex_relaxed" = "true" ]; then
   relaxed_detail=$(echo "$result" | jq -r '.codex_relaxed_detail')
+  echo "::warning::PR #${number}: ${relaxed_detail}"
+fi
+if [ "$claude_relaxed" = "true" ]; then
+  relaxed_detail=$(echo "$result" | jq -r '.claude_relaxed_detail')
   echo "::warning::PR #${number}: ${relaxed_detail}"
 fi
 
@@ -201,7 +227,7 @@ fi
 # 自動投稿する (同じ head SHA には1回だけ — 重複防止は check_review_gate.py
 # 側のマーカー検出で担保されている)。dry-run (allow_codex_request_post=
 # false) では実際には投稿せず、判定になったことだけをログに出す。
-if [ "$request_needed" = "true" ]; then
+if [ "$codex_request_needed" = "true" ]; then
   if [ "$allow_codex_request_post" = "true" ]; then
     comment_body=$(echo "$result" | jq -r '.codex_review_request_comment_body')
     if printf '%s' "$comment_body" | gh pr comment "$number" --body-file - >/dev/null 2>&1; then
@@ -211,6 +237,22 @@ if [ "$request_needed" = "true" ]; then
     fi
   else
     echo "info: (dry-run) @codex review を投稿する判定になりました。実際には投稿しません (head SHA ${sha:0:7})"
+  fi
+fi
+
+# Codex の利用上限到達 + この PR が一度も Codex にレビューされておらず、
+# Claude 許可リストが設定されている場合、`@claude` へのレビュー依頼を
+# 自動投稿する (同じ head SHA には1回だけ)。dry-run では投稿しない。
+if [ "$claude_request_needed" = "true" ]; then
+  if [ "$allow_codex_request_post" = "true" ]; then
+    comment_body=$(echo "$result" | jq -r '.claude_review_request_comment_body')
+    if printf '%s' "$comment_body" | gh pr comment "$number" --body-file - >/dev/null 2>&1; then
+      echo "info: PR #${number} に @claude へのレビュー依頼を自動投稿しました (head SHA ${sha:0:7})"
+    else
+      echo "::warning::PR #${number} への @claude レビュー依頼の自動投稿に失敗しました (head SHA ${sha:0:7})" >&2
+    fi
+  else
+    echo "info: (dry-run) @claude へのレビュー依頼を投稿する判定になりました。実際には投稿しません (head SHA ${sha:0:7})"
   fi
 fi
 

@@ -55,11 +55,13 @@ def _evaluate(
     head_sha=_HEAD_SHA,
     codex_bypass=True,
     pr_comments=_EMPTY_PR_COMMENTS,
+    claude_logins=frozenset(),
 ):
     """条件1/2/4 (Codex 非依存の条件) を検証するための既定ヘルパー。
 
     `codex_bypass=True` を既定にしているため、Codex レビューの有無に
-    関わらず条件3ではブロックされない。
+    関わらず条件3ではブロックされない。`claude_logins` は既定で空集合
+    (Claude フォールバック無効)。
     """
     return evaluate_review_gate(
         threads,
@@ -71,6 +73,7 @@ def _evaluate(
         head_sha=head_sha,
         codex_bypass=codex_bypass,
         pr_comments=pr_comments,
+        claude_logins=claude_logins,
     )
 
 
@@ -495,11 +498,13 @@ class CodexUsageLimitAndAutoRequestTest(unittest.TestCase):
        `@codex review` を自動リクエストする (`codex_review_request_needed`)。
        同じ head SHA には1回だけリクエストする (マーカーコメントで重複
        防止)。
-    2. Codex には利用上限がある — 上限到達メッセージを検知した場合に限り、
-       「この PR のいずれかの commit を Codex がレビュー済み」に条件3を
-       緩和する (`codex_relaxed`)。ただし一度もレビューされていない PR は
-       緩和しない。未解決スレッド判定・CHANGES_REQUESTED 判定は独立した
-       条件のため、緩和の影響を受けない。
+    2. Codex には利用上限がある — 上限到達メッセージを検知した場合、
+       「この PR のいずれかの commit を Codex がレビュー済み」であれば
+       条件3を緩和する (`codex_relaxed`。このクラスで検証)。それも無理な
+       場合は Claude フォールバック (`ClaudeFallbackTest` で検証、
+       2026-09-07 ユーザ決定) を試す。いずれも満たさず一度もレビューされて
+       いない PR は緩和しない。未解決スレッド判定・CHANGES_REQUESTED 判定
+       は独立した条件のため、緩和の影響を受けない。
     """
 
     def _request_marker_comment(self, head_sha: str, created_at: str) -> dict:
@@ -738,6 +743,261 @@ class CodexUsageLimitAndAutoRequestTest(unittest.TestCase):
         self.assertIn(
             f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->", body
         )
+
+
+class ClaudeFallbackTest(unittest.TestCase):
+    """Codex の利用上限到達時、この PR が一度も Codex にレビューされて
+    いない場合の Claude フォールバック (2026-09-07 ユーザ決定、
+    docs/decisions.md D91)。
+
+    Claude のレビュアーを何と識別するかが最大の設計課題だったため、
+    `_CLAUDE_LOGINS` のようなハードコードは行わず、呼び出し側
+    (`claude_logins` 引数、workflow の `env.CLAUDE_REVIEWER_LOGINS`) で
+    明示的に設定されたログインだけを許可する。**未設定 (既定の空集合) の
+    場合は Claude 経路が常に不成立になる**ことをこのクラスの複数のテストで
+    確認する — 「未設定なのに何となく通る」実装になっていないことの
+    直接的な検証。
+    """
+
+    _CLAUDE_LOGIN = "claude[bot]"
+
+    def _codex_request_marker_comment(self, head_sha: str, created_at: str) -> dict:
+        return {
+            "author": {"login": "github-actions[bot]", "__typename": "Bot"},
+            "body": (
+                "@codex review\n\n"
+                f"<!-- auto-merge:codex-review-request:{head_sha} -->\n"
+            ),
+            "createdAt": created_at,
+        }
+
+    def _codex_usage_limit_comment(self, created_at: str) -> dict:
+        return {
+            "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+            "body": "You have reached your Codex usage limits for code reviews.",
+            "createdAt": created_at,
+        }
+
+    def _claude_request_marker_comment(self, head_sha: str, created_at: str) -> dict:
+        return {
+            "author": {"login": "github-actions[bot]", "__typename": "Bot"},
+            "body": (
+                "@claude この PR のレビューをお願いします。\n\n"
+                f"<!-- auto-merge:claude-review-request:{head_sha} -->\n"
+            ),
+            "createdAt": created_at,
+        }
+
+    def _usage_limit_state_comments(self) -> list[dict]:
+        """「上限検知済み・この PR は一度も Codex にレビューされていない」
+        状態を再現する共通のコメント列 (Codex 依頼 + 上限メッセージのみ)。
+        """
+        return [
+            self._codex_request_marker_comment(
+                _HEAD_SHA, "2026-09-07T16:00:00Z"
+            ),
+            self._codex_usage_limit_comment("2026-09-07T16:01:00Z"),
+        ]
+
+    def test_claude_configured_and_reviewed_head_sha_merges(self) -> None:
+        # 上限検知 + Claude 許可リスト設定済み + head SHA への Claude
+        # レビューあり -> マージ可。
+        pr_comments = {"nodes": self._usage_limit_state_comments()}
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertFalse(result["blocked"])
+        self.assertTrue(result["claude_relaxed"])
+        self.assertIsNotNone(result["claude_relaxed_detail"])
+        self.assertFalse(result["claude_review_request_needed"])
+
+    def test_claude_configured_but_not_reviewed_yet_blocks_and_requests(
+        self,
+    ) -> None:
+        # 上限検知 + Claude 許可リスト設定済み + Claude レビュー無し
+        # -> ブロック (依頼コメントを投稿する判定になる)。
+        pr_comments = {"nodes": self._usage_limit_state_comments()}
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertTrue(result["claude_review_request_needed"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_claude_allowlist_unset_does_not_satisfy_even_with_matching_comment(
+        self,
+    ) -> None:
+        # 上限検知 + Claude 許可リスト未設定 -> Claude 経路では充足しない。
+        # たとえ「Claude らしき」ログインのレビューが実際に head SHA に
+        # 付いていても、claude_logins が空なら一切考慮しない。
+        pr_comments = {"nodes": self._usage_limit_state_comments()}
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset(),  # 未設定
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+        self.assertFalse(result["claude_review_request_needed"])
+        self.assertTrue(
+            any("Claude 許可リスト" in r for r in result["reasons"])
+        )
+
+    def test_claude_request_comment_not_reposted_for_same_head_sha(self) -> None:
+        # 同じ head SHA への依頼コメントを重複投稿しない
+        # (claude_review_request_needed=False、応答待ちのまま)。
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                )
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_review_request_needed"])
+        self.assertTrue(
+            any("依頼済み" in r for r in result["reasons"])
+        )
+
+    def test_usage_limit_with_unresolved_thread_still_blocks_even_with_claude_review(
+        self,
+    ) -> None:
+        # 上限検知 + 未解決スレッドあり -> ブロック
+        # (Claude レビューがあっても未解決スレッド判定は緩めない)。
+        pr_comments = {"nodes": self._usage_limit_state_comments()}
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        threads = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "nodes": [{"path": "a.rs", "author": {"login": "octocat"}}]
+                    },
+                }
+            ],
+        }
+        result = _evaluate(
+            threads=threads,
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        # 条件3自体は Claude レビューで緩和されているはずだが、条件1で
+        # 独立してブロックされる。
+        self.assertTrue(result["claude_relaxed"])
+        self.assertTrue(
+            any("未解決のレビュースレッド" in r for r in result["reasons"])
+        )
+
+    def test_reviewer_not_in_claude_allowlist_does_not_satisfy(self) -> None:
+        # Claude 許可リストに無い投稿者のレビュー -> 充足しない。
+        pr_comments = {"nodes": self._usage_limit_state_comments()}
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": "some-other-bot"},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+        self.assertTrue(result["claude_review_request_needed"])
+
+    def test_claude_comment_fallback_signal_after_request(self) -> None:
+        # レビュー形式ではなく、単なるコメント (依頼より後) でも充足する
+        # (Claude の応答形式が未確認であるためのフォールバックシグナル)。
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                {
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "body": "確認しました。特に問題は見当たりません。",
+                    "createdAt": "2026-09-07T16:05:00Z",
+                },
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertFalse(result["blocked"])
+        self.assertTrue(result["claude_relaxed"])
+
+    def test_request_comment_body_contains_title_and_marker(self) -> None:
+        from check_review_gate import claude_review_request_comment_body
+
+        body = claude_review_request_comment_body(_HEAD_SHA, "テストPR")
+        self.assertIn("@claude", body)
+        self.assertIn("テストPR", body)
+        self.assertIn(
+            f"<!-- auto-merge:claude-review-request:{_HEAD_SHA} -->", body
+        )
+
+    def test_request_comment_body_without_title(self) -> None:
+        from check_review_gate import claude_review_request_comment_body
+
+        body = claude_review_request_comment_body(_HEAD_SHA, None)
+        self.assertIn("@claude", body)
 
 
 class CodexLoginExactMatchTest(unittest.TestCase):

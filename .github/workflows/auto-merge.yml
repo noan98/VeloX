@@ -20,9 +20,14 @@ name: Auto Merge
 #        - CHANGES_REQUESTED が残っている
 #        - **Codex (`chatgpt-codex-connector[bot]`) が現在の head SHA を
 #          レビュー済みでない** (マージの必須要件。`CODEX_BYPASS_LABEL`
-#          で免除可能 — 下記参照)
-#        - head commit が猶予期間 (既定15分、下記 GRACE_PERIOD_MINUTES)
-#          を過ぎていない
+#          で免除可能 — 下記参照)。Codex は push では再レビューしない
+#          ため、未レビューを検知すると `@codex review` を自動リクエスト
+#          する。Codex が利用上限に達した場合は、この PR の過去のレビュー
+#          で代替できなければ `@claude` へレビューを依頼する
+#          (`CLAUDE_REVIEWER_LOGINS` が設定されている場合のみ有効。既定は
+#          無効)。いずれのレビューも一度も無い PR は緩和しない。
+#        - head SHA の push 観測時刻が猶予期間 (既定15分、下記
+#          GRACE_PERIOD_MINUTES) を過ぎていない
 #      CodeRabbit は判定に含めない (Free プランの制限で実質機能せず、
 #      リポジトリへのアクセスも除外済み)。詳細は docs/decisions.md D91。
 #   5. 上記すべてを満たせばマージする。
@@ -30,9 +35,9 @@ name: Auto Merge
 # 対象外にしたい PR には `no-automerge` ラベルを付ける。Draft PR も対象外。
 # `CODEX_BYPASS_LABEL` (既定 `automerge-without-codex`) は Codex レビュー
 # 要件だけを免除する — 未解決スレッド判定と CHANGES_REQUESTED 判定は
-# 免除されない (人間の明示的な差し戻しを尊重するため)。Codex が指摘ゼロの
-# ときに何を残すかがこのリポジトリでは未検証であり (D91)、Codex 側の障害・
-# クォータ切れでも全 PR が永久停止しないための保険。
+# 免除されない (人間の明示的な差し戻しを尊重するため)。Codex 側の障害・
+# クォータ切れ・応答の文言変更でも全 PR が永久停止しないための最終手段の
+# 保険 (D91)。
 #
 # 注意: GITHUB_TOKEN でマージすると、マージ後の `main` への push では他の
 # workflow (ci.yml の push トリガなど) が起動しない (GitHub の仕様)。
@@ -95,12 +100,23 @@ env:
   SKIP_LABEL: no-automerge
   # 自動マージ対象のベースブランチ
   BASE_BRANCH: main
-  # Issue #188: head commit の committer date からこの分数が経過するまで
-  # マージしない (レビューボットがまだ投稿していない場合の保険)。
+  # Issue #188: head SHA の push 観測時刻からこの分数が経過するまで
+  # マージしない (レビューボットがまだ投稿していない場合の保険。git
+  # commit の committer date ではない — docs/decisions.md D91 参照)。
   GRACE_PERIOD_MINUTES: 15
   # Issue #188: このラベルが付いた PR は Codex レビュー必須要件のみを免除
   # する (未解決スレッド判定・CHANGES_REQUESTED 判定は免除しない)。
   CODEX_BYPASS_LABEL: automerge-without-codex
+  # Issue #188 (2026-09-07 ユーザ決定): Codex の利用上限到達時、この PR が
+  # 一度も Codex にレビューされていない場合のフォールバックとして
+  # `@claude` へレビューを依頼する。ここに設定したログイン名 (カンマ区切り)
+  # からの反応だけを「Claude のレビュー」として認める。**既定は空文字列
+  # = Claude フォールバックは常に不成立** (Codex の利用上限緩和のみで判断
+  # する安全側)。このリポジトリに `@claude` へ応答する仕組み
+  # (claude-code-action 等) が導入されているかは未確認であり、ログイン名を
+  # ハードコードしていない (docs/decisions.md D91 参照)。実際に運用する
+  # 場合は、応答する GitHub App/Actions のログイン名をここに設定すること。
+  CLAUDE_REVIEWER_LOGINS: ""
 
 jobs:
   auto-merge:

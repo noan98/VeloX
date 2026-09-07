@@ -68,22 +68,50 @@ docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベ
    (マーカーに head SHA を埋め込んでいるので、既に投稿済みなら再投稿
    しない)。
 
-   **利用上限到達時の緩和**: 依頼コメントが既にあり、かつそのコメントより
-   **後**に Codex (完全一致で照合、なりすまし防止) が利用上限メッセージ
+   **利用上限到達時の対応 (2026-09-07、ユーザ決定で Claude フォールバック
+   へ変更)**: 依頼コメントが既にあり、かつそのコメントより **後**に
+   Codex (完全一致で照合、なりすまし防止) が利用上限メッセージ
    (`"reached your codex usage limits"` を含む、大小無視) を投稿している
-   場合に限り、条件3を「**この PR のいずれかの commit を Codex がレビュー
-   済み** (head SHA と一致しなくてよい)」に緩和する。ただし **この PR が
-   一度も Codex にレビューされていない場合は緩和しない** (未レビューの
-   まま通してしまうため)。**未解決スレッド判定 (条件1) と
-   `CHANGES_REQUESTED` 判定 (条件2) は緩和の対象外** — これらは互いに
-   独立した条件として評価されるため、緩和は条件3にしか影響しない。
-   緩和が発動した場合は `codex_relaxed`/`codex_relaxed_detail` を返す
-   (呼び出し側で `::warning::` として目立たせるため。黙って緩めない)。
+   場合、以下の**いずれか**で条件3を満たすとみなす:
+     A. **この PR のいずれかの commit を Codex がレビュー済み**
+        (head SHA と一致しなくてよい)。
+     B. **Claude が現在の head SHA をレビュー/コメント済み**
+        (`claude_logins` に設定されたログインからの反応に限る。下記
+        「Claude フォールバック」参照)。
+   A も B も満たさない場合、B のための `@claude` レビュー依頼コメントを
+   自動投稿する (`claude_review_request_needed`。Codex と同じマーカー
+   方式で head SHA ごとに1回だけ)。**この PR が Codex にも Claude にも
+   一度もレビューされていない場合は緩和しない** (未レビューのまま通して
+   しまうため — 実例: PR #193 は作成時に Codex が上限メッセージを返し、
+   一度もレビューされていない)。**未解決スレッド判定 (条件1) と
+   `CHANGES_REQUESTED` 判定 (条件2) は対象外** — これらは互いに独立した
+   条件として評価されるため、緩和は条件3にしか影響しない。緩和が発動した
+   場合は `codex_relaxed`/`codex_relaxed_detail` (A の場合) または
+   `claude_relaxed`/`claude_relaxed_detail` (B の場合) を返す (呼び出し側
+   で `::warning::` として目立たせるため。黙って緩めない)。
+
+   **Claude フォールバック (`claude_logins`)**: `chatgpt-codex-connector`
+   と違い、Claude のレビューに応答する仕組み (GitHub App / Actions) が
+   このリポジトリに導入されているかは **未確認**であり、応答時のログイン
+   名やレビュー形式 (review/comment/何も残さない) も分かっていない。
+   そのため **ログイン名をハードコードしない**: `claude_logins`
+   (workflow の `env.CLAUDE_REVIEWER_LOGINS`、カンマ区切り) で明示的に
+   設定された場合のみ有効になり、**既定は空集合 = 常に不成立** (Codex の
+   利用上限緩和 A のみで判断する、従来どおりの安全側)。判定シグナルは
+   OR: (i) `latestReviews[].commit.oid` が head SHA と完全一致する Claude
+   のレビュー、(ii) `@claude` 依頼コメントより後に Claude ログインが
+   投稿したコメント (レビューという形式を取らない可能性があるため)。
+   Codex と異なり `__typename == "Bot"` は要求しない (Claude 側の実装が
+   Bot か User か不明なため)。
 
    > ⚠️ 利用上限メッセージの検出は **Codex 側のメッセージ文言との文字列
    > マッチ**であり、Codex がこの文言を変更すると検出できなくなる。その
    > 場合は緩和が発動せず「厳格なまま待ち続ける」= 安全側に倒れる (誤って
    > マージされる方向には壊れない)。
+   > ⚠️ **`@claude` メンションが実際に応答を得られるかは未検証**
+   > (`claude-code-action` 等の workflow がこのリポジトリに存在しない
+   > ため)。応答が無い場合、PR は `automerge-without-codex` ラベルを
+   > 付けるまで止まる。docs/decisions.md D91 の Revisit condition 参照。
 
    Codex ログインの照合は **完全一致** (許可リスト `_CODEX_LOGINS`) で行う
    — `chatgpt-codex-connector-review` のような別名アカウントが前方一致で
@@ -148,8 +176,15 @@ _REVIEWED_COMMIT_RE = re.compile(
 # auto-merge が「この head SHA に対して @codex review をリクエスト済み」
 # を識別するためのマーカー。head SHA (40桁 hex) を埋め込む。同じ head SHA
 # に対して2回以上投稿しないための重複防止に使う。
-_REQUEST_MARKER_RE = re.compile(
+_CODEX_REQUEST_MARKER_RE = re.compile(
     r"<!--\s*auto-merge:codex-review-request:([0-9a-fA-F]{40})\s*-->"
+)
+
+# Codex の利用上限到達時に「この head SHA に対して @claude レビューを
+# リクエスト済み」を識別するためのマーカー。仕組みは Codex のマーカーと
+# 同じ (head SHA ごとに重複投稿しない)。
+_CLAUDE_REQUEST_MARKER_RE = re.compile(
+    r"<!--\s*auto-merge:claude-review-request:([0-9a-fA-F]{40})\s*-->"
 )
 
 
@@ -166,6 +201,30 @@ def codex_review_request_comment_body(head_sha: str) -> str:
         "<sub>auto-merge (Issue #188): Codex がこの head SHA をまだ"
         "レビューしていないため自動的にリクエストしました。"
         "docs/decisions.md D91 参照。</sub>"
+    )
+
+
+def claude_review_request_comment_body(head_sha: str, pr_title: str | None) -> str:
+    """Codex の利用上限到達時に `@claude` へレビューを依頼するコメント
+    本文を組み立てる (`review_gate_decision.sh` が `gh pr comment` で
+    投稿する)。
+
+    依頼理由 (Codex が利用上限に達しており、この head が未レビューである
+    こと) と、PR のタイトルが分かる最低限の情報を含める — レビュアーが
+    文脈を掴めない依頼にしないため (ユーザの明示的な指示)。
+    """
+    head_short = head_sha[:7]
+    title_line = f"対象 PR: {pr_title}\n\n" if pr_title else ""
+    return (
+        "@claude この PR のレビューをお願いします。\n\n"
+        f"{title_line}"
+        "**依頼理由**: Codex (`chatgpt-codex-connector[bot]`) が利用上限に"
+        f"達しており、現在の head SHA (`{head_short}`) がまだ Codex にも"
+        "Claude にもレビューされていません。\n\n"
+        f"<!-- auto-merge:claude-review-request:{head_sha} -->\n"
+        "<sub>auto-merge (Issue #188): Codex の利用上限到達時のフォール"
+        "バックとして自動的に依頼しました。docs/decisions.md D91 参照。"
+        "</sub>"
     )
 
 
@@ -268,23 +327,74 @@ def _codex_reacted_after(
 
 
 def _find_request_marker(
-    comment_nodes: list[dict[str, Any]], head_sha: str
+    comment_nodes: list[dict[str, Any]], head_sha: str, marker_re: re.Pattern[str]
 ) -> dict[str, Any] | None:
-    """`head_sha` に対する `@codex review` 自動リクエストコメントを探す。
+    """`head_sha` に対する自動リクエストコメント (Codex/Claude 共通) を探す。
 
     投稿者は問わない (`AUTO_MERGE_TOKEN`/`GITHUB_TOKEN` どちらでも投稿
     され得るため、マーカー文字列だけで判定する)。複数見つかった場合は
-    最新 (`createdAt` が最大) のものを返す。
+    最新 (`createdAt` が最大) のものを返す。`marker_re` には
+    `_CODEX_REQUEST_MARKER_RE`/`_CLAUDE_REQUEST_MARKER_RE` を渡す。
     """
     matches = []
     for c in comment_nodes:
         body = c.get("body") or ""
-        m = _REQUEST_MARKER_RE.search(body)
+        m = marker_re.search(body)
         if m and m.group(1).lower() == head_sha.lower():
             matches.append(c)
     if not matches:
         return None
     return max(matches, key=lambda c: c.get("createdAt") or "")
+
+
+def _is_login_in(author: dict[str, Any] | None, allowed_logins: frozenset[str]) -> bool:
+    """`author`/`user` のログイン名が許可リストに完全一致 (大小無視) するか。
+
+    Codex 用の `_is_codex_author` と異なり `__typename` を要求しない —
+    Claude 側の実際の投稿者の種別 (Bot/User) が未確認のため。
+    """
+    if not author or not allowed_logins:
+        return False
+    login = (author.get("login") or "").lower()
+    return login in {l.lower() for l in allowed_logins}
+
+
+def _claude_reviewed_or_commented(
+    latest_reviews_nodes: list[dict[str, Any]],
+    comment_nodes: list[dict[str, Any]],
+    head_sha: str,
+    claude_logins: frozenset[str],
+    request_created_at: str | None,
+) -> bool:
+    """Claude (許可リストに設定されたログイン) が現在の head SHA に反応
+    済みか判定する。
+
+    シグナルは2つの OR: (1) `latestReviews[].commit.oid` が head SHA と
+    完全一致するレビュー、(2) `@claude` 依頼コメント (`request_created_at`)
+    より後に Claude ログインが投稿したコメント (レビューという形式を
+    取らない可能性を考慮したフォールバック)。`claude_logins` が空 (未設定)
+    なら常に `False` (Claude 経路は無効)。
+    """
+    if not claude_logins:
+        return False
+
+    for r in latest_reviews_nodes:
+        if not _is_login_in(r.get("author"), claude_logins):
+            continue
+        commit_oid = (r.get("commit") or {}).get("oid")
+        if commit_oid and head_sha and commit_oid == head_sha:
+            return True
+
+    if request_created_at:
+        after_at = _parse_iso8601(request_created_at)
+        for c in comment_nodes:
+            if not _is_login_in(c.get("author"), claude_logins):
+                continue
+            created_at = c.get("createdAt")
+            if created_at and _parse_iso8601(created_at) > after_at:
+                return True
+
+    return False
 
 
 def _find_codex_usage_limit_after(
@@ -319,6 +429,7 @@ def evaluate_review_gate(
     codex_bypass: bool = False,
     codex_logins: frozenset[str] = _CODEX_LOGINS,
     pr_comments: dict[str, Any] | None = None,
+    claude_logins: frozenset[str] = frozenset(),
 ) -> dict[str, Any]:
     """マージしてよいかを判定する。
 
@@ -358,27 +469,41 @@ def evaluate_review_gate(
             に差し替え可能)。前方一致・部分一致は使わない。
         pr_comments: GraphQL `pullRequest.comments` connection
             (`{"nodes": [{"author": {"login": str, "__typename": str},
-            "body": str, "createdAt": str}, ...]}`)。`@codex review` の
-            自動リクエストの重複防止と、Codex の利用上限メッセージの検出に
-            使う。`None` は「取得できなかった」を表し、この機能に関しては
-            安全側 (リクエストもしない・緩和もしない) に倒す。
+            "body": str, "createdAt": str}, ...]}`)。`@codex review`/
+            `@claude` の自動リクエストの重複防止と、Codex の利用上限
+            メッセージ・Claude の応答コメントの検出に使う。`None` は
+            「取得できなかった」を表し、この機能に関しては安全側
+            (リクエストもしない・緩和もしない) に倒す。
+        claude_logins: Codex の利用上限到達時に「Claude のレビュー/コメント
+            で条件3を満たした」とみなすログイン名の完全一致許可リスト
+            (workflow の `env.CLAUDE_REVIEWER_LOGINS` で設定)。**既定は
+            空集合** — Claude 側の実際のログイン名やレビュー形式が未確認
+            のため、未設定時は Claude 経路を常に不成立とし、Codex の利用
+            上限緩和 (この PR の過去のレビューで代替) のみで判断する
+            (安全側)。「未設定なのに何となく通る」実装はしない。
 
     Returns:
         `{"blocked": bool, "reasons": [str, ...],
         "codex_review_request_needed": bool, "codex_relaxed": bool,
-        "codex_relaxed_detail": str | None}`。`reasons` はログ出力用の
-        日本語メッセージ (先頭が "wait: ")。`blocked` は
-        `len(reasons) > 0` と等価。`codex_review_request_needed` が
-        `True` の場合、呼び出し側は `codex_review_request_comment_body()`
+        "codex_relaxed_detail": str | None, "claude_review_request_needed":
+        bool, "claude_relaxed": bool, "claude_relaxed_detail": str | None}`。
+        `reasons` はログ出力用の日本語メッセージ (先頭が "wait: ")。
+        `blocked` は `len(reasons) > 0` と等価。`codex_review_request_needed`
+        が `True` の場合、呼び出し側は `codex_review_request_comment_body()`
         の内容で `@codex review` を投稿すべき (本関数自体は投稿しない)。
-        `codex_relaxed` が `True` の場合、呼び出し側は
-        `codex_relaxed_detail` を `::warning::` として目立たせて出力
-        すべき。
+        `claude_review_request_needed` が `True` の場合、呼び出し側は
+        `claude_review_request_comment_body()` の内容で `@claude` への
+        依頼コメントを投稿すべき。`codex_relaxed`/`claude_relaxed` が
+        `True` の場合、呼び出し側は対応する `*_relaxed_detail` を
+        `::warning::` として目立たせて出力すべき。
     """
     reasons: list[str] = []
     codex_review_request_needed = False
     codex_relaxed = False
     codex_relaxed_detail: str | None = None
+    claude_review_request_needed = False
+    claude_relaxed = False
+    claude_relaxed_detail: str | None = None
 
     # --- 1. 未解決のレビュースレッド -----------------------------------
     threads_page_info = (review_threads or {}).get("pageInfo") or {}
@@ -471,7 +596,9 @@ def evaluate_review_gate(
                     else ""
                 )
                 comment_nodes = pr_comments.get("nodes") or []
-                request_comment = _find_request_marker(comment_nodes, head_sha)
+                request_comment = _find_request_marker(
+                    comment_nodes, head_sha, _CODEX_REQUEST_MARKER_RE
+                )
                 if request_comment is None:
                     # まだこの head SHA への @codex review リクエストを
                     # 投稿していない。呼び出し側に投稿させる。
@@ -498,6 +625,10 @@ def evaluate_review_gate(
                             "応答を待っています"
                         )
                     else:
+                        # Codex が利用上限に達している。A. この PR の過去の
+                        # レビューで代替 (従来どおり) を試し、それが無理な
+                        # 場合のみ B. Claude フォールバックを試す
+                        # (2026-09-07 ユーザ決定)。
                         any_codex_review = any(
                             _is_codex_author(r.get("author"), codex_logins)
                             for r in latest_reviews_nodes
@@ -513,12 +644,55 @@ def evaluate_review_gate(
                                 "で代替。未解決スレッド/CHANGES_REQUESTED の"
                                 "判定は引き続き有効です)"
                             )
+                        elif claude_logins:
+                            claude_request_comment = _find_request_marker(
+                                comment_nodes, head_sha, _CLAUDE_REQUEST_MARKER_RE
+                            )
+                            claude_request_created_at = (
+                                claude_request_comment.get("createdAt")
+                                if claude_request_comment
+                                else None
+                            )
+                            claude_matched = _claude_reviewed_or_commented(
+                                latest_reviews_nodes,
+                                comment_nodes,
+                                head_sha,
+                                claude_logins,
+                                claude_request_created_at,
+                            )
+                            if claude_matched:
+                                matched = True
+                                claude_relaxed = True
+                                claude_relaxed_detail = (
+                                    "Codex の利用上限到達を検知し、この PR は"
+                                    "Codex に一度もレビューされていないため、"
+                                    f"head SHA `{head_short}` への再レビュー"
+                                    "要件を Claude のレビュー/コメントで代替"
+                                    "しました (未解決スレッド/"
+                                    "CHANGES_REQUESTED の判定は引き続き有効"
+                                    "です)"
+                                )
+                            elif claude_request_comment is None:
+                                claude_review_request_needed = True
+                                reasons.append(
+                                    "wait: Codex の利用上限到達を検知しました。"
+                                    "この PR は一度も Codex にレビューされて"
+                                    "いないため、Claude にレビューを依頼します"
+                                    f" (head SHA `{head_short}`)"
+                                )
+                            else:
+                                reasons.append(
+                                    "wait: Codex の利用上限到達により Claude に"
+                                    f"レビューを依頼済みです (head SHA "
+                                    f"`{head_short}`)。応答を待っています"
+                                )
                         else:
                             reasons.append(
                                 "wait: Codex の利用上限到達を検知しましたが、"
-                                "この PR は一度も Codex にレビューされて"
-                                f"いません (head SHA `{head_short}`)。安全側で"
-                                "マージを見送ります"
+                                "この PR は一度も Codex にレビューされておらず"
+                                "、Claude 許可リスト (CLAUDE_REVIEWER_LOGINS) "
+                                "も未設定のため安全側でマージを見送ります "
+                                f"(head SHA `{head_short}`)"
                             )
             elif not matched and pr_comments is None:
                 reasons.append(
@@ -553,6 +727,9 @@ def evaluate_review_gate(
         "codex_review_request_needed": codex_review_request_needed,
         "codex_relaxed": codex_relaxed,
         "codex_relaxed_detail": codex_relaxed_detail,
+        "claude_review_request_needed": claude_review_request_needed,
+        "claude_relaxed": claude_relaxed,
+        "claude_relaxed_detail": claude_relaxed_detail,
     }
 
 
@@ -563,10 +740,13 @@ def main(argv: list[str]) -> int:
     payload の形は `{"reviewThreads": ..., "latestReviews": ...,
     "reactions": ..., "prComments": ..., "headSha": ...,
     "headPushObservedAt": ..., "now": ..., "gracePeriodMinutes": ...,
-    "codexBypass": ...}`。`now`/`gracePeriodMinutes` を省略した場合は
-    それぞれ現在時刻/15分を使う。`headPushObservedAt` には GitHub が
-    サーバ側で観測した時刻を渡すこと (git committer date ではない —
-    モジュール docstring の警告を参照)。
+    "codexBypass": ..., "claudeLogins": [...], "prTitle": ...}`。
+    `now`/`gracePeriodMinutes` を省略した場合はそれぞれ現在時刻/15分を
+    使う。`headPushObservedAt` には GitHub がサーバ側で観測した時刻を
+    渡すこと (git committer date ではない — モジュール docstring の
+    警告を参照)。`claudeLogins` は文字列の配列 (省略/空なら Claude
+    フォールバックは常に不成立)。`prTitle` は `@claude` への依頼コメント
+    に含める PR タイトル (省略可)。
     """
     if len(argv) > 1:
         with open(argv[1], "r", encoding="utf-8") as f:
@@ -575,6 +755,8 @@ def main(argv: list[str]) -> int:
         payload = json.load(sys.stdin)
 
     head_sha = payload.get("headSha") or None
+    pr_title = payload.get("prTitle") or None
+    claude_logins = frozenset(payload.get("claudeLogins") or [])
     result = evaluate_review_gate(
         review_threads=payload.get("reviewThreads"),
         latest_reviews=payload.get("latestReviews"),
@@ -585,13 +767,18 @@ def main(argv: list[str]) -> int:
         head_sha=head_sha,
         codex_bypass=bool(payload.get("codexBypass", False)),
         pr_comments=payload.get("prComments"),
+        claude_logins=claude_logins,
     )
-    # 呼び出し側 (review_gate_decision.sh) が実際に `@codex review` を投稿
-    # する際に使うコメント本文。マーカー文字列の組み立て方をここに一元化
-    # しておき、bash 側で文字列を再構築しない (DRY)。
+    # 呼び出し側 (review_gate_decision.sh) が実際にコメントを投稿する際に
+    # 使う本文。マーカー文字列の組み立て方をここに一元化しておき、bash 側
+    # で文字列を再構築しない (DRY)。
     if result["codex_review_request_needed"] and head_sha:
         result["codex_review_request_comment_body"] = codex_review_request_comment_body(
             head_sha
+        )
+    if result["claude_review_request_needed"] and head_sha:
+        result["claude_review_request_comment_body"] = claude_review_request_comment_body(
+            head_sha, pr_title
         )
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
