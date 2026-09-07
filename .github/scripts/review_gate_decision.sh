@@ -45,6 +45,14 @@
 #                               仕組みが導入されているか未確認のため、
 #                               ログイン名をハードコードしていない
 #                               (docs/decisions.md D91 参照)。
+#   AUTO_MERGE_TOKEN         - `@claude` メンション投稿専用の PAT。
+#                               **未設定なら `@claude` を投稿しない**
+#                               (GH_TOKEN の AUTO_MERGE_TOKEN||GITHUB_TOKEN
+#                               フォールバックとは別に、投稿の瞬間だけこの
+#                               変数を明示的に使う)。GITHUB_TOKEN で投稿
+#                               したメンションに Claude App が反応しな
+#                               かったことを PR #193 で実測したため
+#                               (docs/decisions.md D91 参照)。
 #
 # 標準出力: 判定理由を1行ずつ (問題が無ければ何も出さない)。「今このPRは
 #   何を待っているのか」が一目で分かる文言にしてある (Issue #168 の教訓)。
@@ -73,8 +81,17 @@ owner="${GH_REPO%%/*}"
 repo="${GH_REPO##*/}"
 grace="${GRACE_PERIOD_MINUTES:-15}"
 # カンマ区切り -> JSON 配列。空文字列なら空配列 (Claude フォールバック無効)。
-claude_logins_json=$(printf '%s' "${CLAUDE_REVIEWER_LOGINS:-}" \
-  | jq -R 'split(",") | map(select(length > 0))')
+# ⚠️ `printf '%s' "" | jq -R ...` は使わないこと — `printf '%s' ""` は
+# 改行を含まない0バイト出力になり、`jq -R` は行単位で読むため入力に行が
+# 1つも無いと何も出力しない (空文字列のまま)。結果として後段の
+# `--argjson claudeLogins "$claude_logins_json"` が「invalid JSON」で
+# 落ちる — これは CLAUDE_REVIEWER_LOGINS の既定値そのもの (空文字列) で
+# 必ず再現する致命的なバグだった (PR #192 の dry-run 実測、2026-09-07)。
+# `jq -n` は標準入力を一切読まないため、空文字列でも確実に有効な JSON
+# (`[]`) を返す。前後の空白除去 (`gsub`) も入れ、`"a, b"` のような
+# カンマ区切りでも壊れないようにする。
+claude_logins_json=$(jq -n --arg s "${CLAUDE_REVIEWER_LOGINS:-}" \
+  '$s | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')
 
 # reviewThreads: 未解決かどうかと、代表コメント (先頭1件) のファイル/投稿者。
 # latestReviews: レビュアーごとの最新 (submitted) レビュー状態。PENDING の
@@ -243,16 +260,28 @@ fi
 # Codex の利用上限到達 + この PR が一度も Codex にレビューされておらず、
 # Claude 許可リストが設定されている場合、`@claude` へのレビュー依頼を
 # 自動投稿する (同じ head SHA には1回だけ)。dry-run では投稿しない。
+#
+# ⚠️ `@claude` の投稿だけは $GH_TOKEN (AUTO_MERGE_TOKEN||GITHUB_TOKEN の
+# フォールバック) を使わず、必ず AUTO_MERGE_TOKEN (PAT) を明示的に使う。
+# PR #193 で実測: GITHUB_TOKEN で投稿した `@claude` メンションには Claude
+# App が反応しなかった一方、Web UI から人間が投稿したメンションには
+# 反応した (docs/decisions.md D91 参照)。`@codex review` は GITHUB_TOKEN
+# 経由でも Codex が反応することを確認済みなのでそちらは変更しない —
+# アプリごとに挙動が異なるため、Claude 側だけ個別に対処する。
+# AUTO_MERGE_TOKEN が無いなら「反応されないまま空打ちする」より
+# 「投稿しない」方が安全側 (レビュー依頼が届いたと誤認させない)。
 if [ "$claude_request_needed" = "true" ]; then
-  if [ "$allow_codex_request_post" = "true" ]; then
+  if [ "$allow_codex_request_post" != "true" ]; then
+    echo "info: (dry-run) @claude へのレビュー依頼を投稿する判定になりました。実際には投稿しません (head SHA ${sha:0:7})"
+  elif [ -z "${AUTO_MERGE_TOKEN:-}" ]; then
+    echo "::warning::PR #${number}: AUTO_MERGE_TOKEN が未設定のため @claude へのレビュー依頼を投稿しません (GITHUB_TOKEN で投稿すると Claude App が反応しない可能性が高いことを PR #193 で実測済み。docs/decisions.md D91 参照。automerge-without-codex ラベルでの手動対応を検討してください、head SHA ${sha:0:7})"
+  else
     comment_body=$(echo "$result" | jq -r '.claude_review_request_comment_body')
-    if printf '%s' "$comment_body" | gh pr comment "$number" --body-file - >/dev/null 2>&1; then
-      echo "info: PR #${number} に @claude へのレビュー依頼を自動投稿しました (head SHA ${sha:0:7})"
+    if printf '%s' "$comment_body" | GH_TOKEN="$AUTO_MERGE_TOKEN" gh pr comment "$number" --body-file - >/dev/null 2>&1; then
+      echo "info: PR #${number} に @claude へのレビュー依頼を自動投稿しました (AUTO_MERGE_TOKEN 使用、head SHA ${sha:0:7})"
     else
       echo "::warning::PR #${number} への @claude レビュー依頼の自動投稿に失敗しました (head SHA ${sha:0:7})" >&2
     fi
-  else
-    echo "info: (dry-run) @claude へのレビュー依頼を投稿する判定になりました。実際には投稿しません (head SHA ${sha:0:7})"
   fi
 fi
 

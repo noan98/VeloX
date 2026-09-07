@@ -141,6 +141,15 @@ jobs:
           # この workflow 自身が check-run に現れた場合に除外するための名前
           SELF_WORKFLOW: ${{ github.workflow }}
           SELF_JOB: Auto merge PRs whose checks all passed
+          # Issue #188 / D91: `@claude` メンションの投稿専用。PR #193 で
+          # 実測したところ、GITHUB_TOKEN で投稿したメンションには Claude
+          # App が反応しなかった (Web UI から人間が投稿したメンションには
+          # 反応した)。そのため `@claude` の投稿だけは GH_TOKEN (上記の
+          # AUTO_MERGE_TOKEN||GITHUB_TOKEN フォールバック) を使わず、この
+          # 専用の PAT が設定されている場合のみ行う
+          # (review_gate_decision.sh 側で判定)。未設定なら secret 参照は
+          # 空文字列になる (GitHub Actions の仕様)。
+          AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
         run: |
           set -euo pipefail
 

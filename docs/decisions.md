@@ -11437,18 +11437,88 @@ check-run を登録しないため、auto-merge からは「レビューが存�
       流儀。`review_gate_decision.sh` で両方を個別にチェックする — 両者
       は互いに排他 [A が成立すれば B は試さない] だが、コードの単純さの
       ため個別の `if` にしてある)。
-    > ⚠️⚠️ **`@claude` メンションが実際に応答を得られるかは、この PR の
-    > 範囲では一切検証できていない。** このリポジトリに Claude 関連の
-    > workflow (`claude-code-action` 等) を導入する作業はこの PR の
-    > スコープ外であり、`CLAUDE_REVIEWER_LOGINS` は既定で空文字列のまま
-    > 出荷される。**現状では「Codex が利用上限に達し、かつこの PR が
-    > 一度もレビューされていない」状態は、`CLAUDE_REVIEWER_LOGINS` を
-    > 明示的に設定するか `automerge-without-codex` ラベルを付けるまで
-    > 止まる。** 実際に Claude フォールバックを機能させたい場合は、(1)
-    > `@claude` に応答する GitHub App/Actions workflow をこのリポジトリ
-    > に導入し、(2) その応答者の実際のログイン名を確認したうえで
-    > `CLAUDE_REVIEWER_LOGINS` に設定する、という2段階の作業が別途必要
-    > (Revisit condition (7) に記録)。
+    > ⚠️⚠️ **決定10 執筆時点では「`@claude` メンションが実際に応答を得ら
+    > れるかは一切検証できていない」としていたが、その後 PR #193 で
+    > 実地検証が行われ、状況が更新された。詳細は決定11を参照。** 要点だけ
+    > 先に書くと: **Claude App 自体は導入済みで動作している**が、
+    > **`GITHUB_TOKEN` で投稿したメンションには反応しなかった** (Web UI
+    > から人間が投稿したメンションには反応した)。そのため決定11で
+    > `@claude` の投稿を `AUTO_MERGE_TOKEN` (PAT) 専用にし、未設定なら
+    > 投稿しない構成にした。`AUTO_MERGE_TOKEN` が未設定のままなら、
+    > 「Codex が利用上限に達し、かつこの PR が一度もレビューされていない」
+    > 状態は `automerge-without-codex` ラベルを付けるまで止まる。
+
+11. **PR #192 の dry-run job が実際に failure になった (`jq: invalid JSON
+    text passed to --argjson`)。原因は決定10で追加した CSV→JSON 変換の
+    バグで、しかも既定設定 (`CLAUDE_REVIEWER_LOGINS: ""`) で必ず再現する
+    ものだった。あわせて、`@claude` メンションの投稿トークンについても
+    実測に基づき修正した。**
+
+    - **バグの内容**: `review_gate_decision.sh` が
+      `printf '%s' "${CLAUDE_REVIEWER_LOGINS:-}" | jq -R '...'` という形で
+      カンマ区切り文字列を JSON 配列に変換していた。`printf '%s' ""` は
+      **改行を含まない 0 バイト出力**になり、`jq -R` は入力を行単位で
+      読むため、**入力に完全な行が1つも無いと何も出力しない** (jq の
+      raw-input モードの仕様)。結果 `claude_logins_json` が空文字列に
+      なり、後段の `jq -n --argjson claudeLogins "$claude_logins_json"`
+      が「invalid JSON」で失敗していた。`CLAUDE_REVIEWER_LOGINS` の既定値
+      そのものが空文字列 (`auto-merge.yml` の `env`) なので、**設定を
+      一切いじらない既定状態で必ずクラッシュする**バグだった — 決定10の
+      「未設定なら Claude 経路は不成立 (安全にブロック)」という意図とは
+      まったく違う、動作不能という結果になっていた。
+    - **修正**: `jq -n --arg s "${CLAUDE_REVIEWER_LOGINS:-}" '$s |
+      split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length >
+      0))'` に変更した。`jq -n` は標準入力を一切読まないため、`$s` が
+      空文字列でも確実に有効な JSON (`[]`) を返す。前後の空白除去
+      (`gsub`) も追加し、`"a, b"` のような区切りでも壊れないようにした。
+    - **点検**: リポジトリ内の他のスクリプト・workflow に同種の
+      `printf | jq -R` パターンが無いかを確認し、無いことを確認した
+      (`.github/workflows/auto-merge.yml` の他の `--argjson` 呼び出しは
+      いずれも `jq -s` [slurp モード。空入力でも確実に `[]` を返す] か、
+      REST レスポンスから `--jq` で直接抽出した値であり、この脆弱性の
+      パターンには該当しない)。
+    - **テスト**: `.github/scripts/test_review_gate_decision.sh` を新規
+      追加した (`review_gate_decision.sh` 自体のシェルレベルの統合テスト
+      — 判定ロジック本体は `test_check_review_gate.py` で別途網羅済み
+      のため、ここでは shell ラッパー固有の挙動だけを見る)。`gh` を
+      スタブに差し替え、`CLAUDE_REVIEWER_LOGINS` が未設定/空文字列/
+      空白のみ/カンマのみ (`",,"`) のときにクラッシュせず空配列として
+      扱われることを確認する。**実際に旧実装 (`printf | jq -R`) に戻して
+      実行し、未設定/空文字列の2ケースで `invalid JSON` の再現と fail を
+      確認**したうえで、修正版に戻して全件 pass することを確認した
+      (修正前に失敗し修正後に通る回帰テスト)。
+
+    **発見: `GITHUB_TOKEN` で投稿した `@claude` メンションは Claude App
+    に無視される可能性が高い (PR #193 での実測)。**
+
+    | コメント | 投稿経路 | Claude App の反応 |
+    | --- | --- | --- |
+    | API トークンで投稿した `@claude` レビュー依頼 | API (`GITHUB_TOKEN`
+    相当) | 反応なし (リアクション0件) |
+    | Web UI から人間が投稿した `@claude` メンション | Web UI | 👀
+    リアクションが付いた |
+
+    > 📝 **これは「反応しなかった」という否定的観測でしかなく、Claude
+    > App 側の仕様を断定するものではない。** GITHUB_TOKEN 経由の投稿が
+    > 反応されない理由 (Actions からの投稿を意図的に無視している、
+    > たまたまこの1回だけ反応が遅れた、等) は特定できていない。ただし
+    > `auto-merge.yml` が既に警告している「`GITHUB_TOKEN` でのマージ・
+    > push は GitHub 側のそれ以上の自動処理を誘発しない」という既知の
+    > 制約 (D55) と構造が似ており、慎重を期して安全側の対応を取った。
+
+    - **対処**: `@claude` の投稿だけは `AUTO_MERGE_TOKEN` (PAT) を明示的
+      に使うようにした (`review_gate_decision.sh` 内で、その1回の
+      `gh pr comment` 呼び出しにだけ `GH_TOKEN="$AUTO_MERGE_TOKEN"` を
+      前置する)。**`AUTO_MERGE_TOKEN` が未設定なら投稿しない**
+      (「反応されないまま空打ちする」より「投稿しない」方が安全 — レビュー
+      依頼が実際に届いたと誤認させないため)。`@codex review` の投稿は
+      これまでどおり `GH_TOKEN` (`AUTO_MERGE_TOKEN||GITHUB_TOKEN` の
+      フォールバック) のままにした — こちらは GITHUB_TOKEN 経由でも
+      Codex が実際に反応することを確認済みであり (この PR 自身で複数回
+      観測)、アプリごとに挙動が異なるため Claude 側だけ個別に対処した。
+      `auto-merge.yml` の `Merge eligible pull requests` ステップに
+      `AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}` を追加した
+      (未設定なら空文字列になる — GitHub Actions の仕様)。
 
 ### 実装
 
@@ -11471,8 +11541,12 @@ check-run を登録しないため、auto-merge からは「レビューが存�
   (検証、同 `false`) の両方から同じスクリプトを呼ぶ (ロジックの二重管理
   を避ける)。終了コード 0=マージ可 / 1=ブロック理由あり / 2=API 呼び
   出し自体が失敗、を返す。
+- `.github/scripts/test_review_gate_decision.sh` — 決定11で新規追加。
+  `review_gate_decision.sh` 自体の shell レベル統合テスト
+  (`gh` スタブ使用)。
 - `.github/workflows/auto-merge.yml` — 上記を呼び出す形に変更。
-  `env.CLAUDE_REVIEWER_LOGINS` (既定は空文字列) を追加。
+  `env.CLAUDE_REVIEWER_LOGINS` (既定は空文字列) と、`Merge eligible pull
+  requests` ステップの `env.AUTO_MERGE_TOKEN` (決定11) を追加。
 
 ### 動作確認
 
@@ -11499,9 +11573,9 @@ check-run を登録しないため、auto-merge からは「レビューが存�
 
 **`dry-run-review-gate` job は、PR #192 (この Issue の実装 PR 自身、
 `.github/workflows/auto-merge.yml` を変更している) 上で GitHub Actions
-上で実際に起動し success で完走した (2026-09-07 実測)。** GraphQL 呼び出し
-は成功し、ブロック理由を最初の1件で打ち切らず該当する全件出力できている
-ことも確認できた (実際の出力例):
+上で実際に起動している。** commit `f34617bbdc` (P1/P2 修正前) の時点では
+success で完走し、GraphQL 呼び出しの成功・ブロック理由を最初の1件で
+打ち切らず該当する全件出力できることを確認した:
 
 ```
 wait: Codex のレビュー待ち (head SHA `f34617b` に対するレビュー/👍リアクションが見つかりません)
@@ -11510,8 +11584,14 @@ wait: head commit からまだ 0.9分 しか経過していません (猶予期�
 ```
 
 これにより「workflow 自身の変更を、マージ前に検証する」という決定6の
-目的 (D88 のパターン踏襲) は実際に機能することを確認できた。**一方、
-本番の `auto-merge` job (実際にマージを行う側) は、`main` にマージされ
+目的 (D88 のパターン踏襲) は実際に機能することを確認できた — そして
+**決定10 (Claude フォールバック) を追加した commit `05c7918` では、まさに
+この dry-run job が実際に failure になり、決定11のバグ (`jq: invalid
+JSON text passed to --argjson`) をマージ前に検出した。** 「workflow 自身
+の変更をマージ前に検証する」という決定6の狙いが、ここでも実地で機能した
+ことになる。決定11の修正後、再度 dry-run job が success で完走すること
+を commit ハッシュとともに確認する (下記 Revisit condition (5) 参照)。
+**本番の `auto-merge` job (実際にマージを行う側) は、`main` にマージされ
 `workflow_run`/`schedule` で起動するまで検証できていない** (D83 と
 同じ制約 — この job は `pull_request` イベントでは起動しない設計のため、
 PR の段階では検証できない)。
@@ -11525,8 +11605,13 @@ PR の段階では検証できない)。
 で本当に想定どおり判定できていたかを一度確認する。(2) この PR (workflow
 自身の変更) がマージされた時点で、`dry-run-review-gate` job が実際に
 GitHub Actions 上で正しく起動・完走したかを確認する — 最初の実地検証に
-なる (2026-09-07 時点で PR #192 上での dry-run job の success 完走は
-既に確認済み。詳細は下記「動作確認」)。(3) レビュー解消の反映が最大10分
+なる。**2026-09-07 時点の経緯**: commit `f34617bbdc` (P1/P2 修正前) では
+success 完走を確認したが、その後 commit `05c7918` (決定10、Claude
+フォールバック追加) で実際に failure になり、決定11のバグ (`jq:
+invalid JSON`) をマージ前に検出した。決定11の修正 push 後、再度
+success で完走することをこの PR のマージ前に確認すること (「workflow
+自身の変更をマージ前に検証する」という決定6の目的が実際に機能して
+いるかの最終確認)。(3) レビュー解消の反映が最大10分
 遅延する制約 (決定5) が実運用で問題になった場合は、
 `pull_request_review`/`pull_request_review_thread` トリガの追加を
 再検討する。(4) 将来コラボレータが増えてブランチ内 PR の信頼性前提が
@@ -11550,4 +11635,12 @@ GitHub Actions 上で正しく起動・完走したかを確認する — 最初
 しない場合、「Codex が利用上限に達し、かつ PR が一度もレビューされて
 いない」状態は `automerge-without-codex` ラベルを付けるまで止まり続ける
 仕様であることを、運用開始後に一度確認しておくとよい (PR #193 で実際に
-発生した状態)。
+発生した状態)。(8) **決定11の `AUTO_MERGE_TOKEN` 専用化が実際に Claude
+App の反応を引き出せるかは、この PR の範囲では検証できていない**
+(`AUTO_MERGE_TOKEN` シークレット自体がこのセッションから登録・確認
+できないため)。`AUTO_MERGE_TOKEN` が実際に登録されている環境で、
+Claude フォールバックが発動した最初のケースにおいて、投稿された
+`@claude` メンションに実際に反応があったかを確認すること。反応が無い
+場合、PAT を使っても反応しない別の要因 (トークンの権限スコープ、
+Claude App 側のインストール範囲など) がある可能性があり、追加調査が
+必要になる。
