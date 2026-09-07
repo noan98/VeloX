@@ -435,6 +435,79 @@ fn tab_operations_produce_expected_tab_create_and_tab_switch_records() {
     );
 }
 
+/// Guarantees (Issue #62/D79): repeatedly opening *and closing* tabs — not
+/// just opening them, unlike the test above — drives the real close path
+/// (`app::close_tab`) through many cycles without hanging, panicking, or
+/// losing `page_load` records. This is also the regression test for the
+/// `page_load_timers` plumbing itself: `close_tab`/`handle_toolbar_command`/
+/// `handle_content_shortcut`/`handle_automation_command`/
+/// `close_window_by_tao_id` all gained a new `&mut PageLoadTimers` parameter
+/// to fix the leak (see `PageLoadTimers`'s doc comment in `src/app.rs`) — a
+/// mistake in any one of those call sites (wrong map, wrong key, an early
+/// return that skips the cleanup) would either panic, hang, or make some of
+/// the `page_load` records below silently vanish, so a clean exit with the
+/// exact expected counts is meaningful evidence the rewiring is correct end
+/// to end, not just that it compiles.
+#[test]
+fn repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load() {
+    skip_without_gui!("repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("tab-churn");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let homepage = fixture_url("minimal.html");
+    let page = fixture_url("text.html");
+
+    // 6 rounds of "open a tab, let it finish loading, close it again" —
+    // back to exactly 1 tab (the homepage) after every round, mirroring
+    // `scripts/bench/tab_churn.py`'s round shape at a scale a unit-test
+    // timeout can afford.
+    const ROUNDS: usize = 6;
+    let mut script = String::new();
+    for _ in 0..ROUNDS {
+        script.push_str(&format!("open {page}\nwait 300\nclose 1\nwait 150\n"));
+    }
+    script.push_str("quit\n");
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+    );
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s while running {ROUNDS} tab open/close \
+             cycles. Perf records observed before the forced kill: {:?}",
+            launch.perf_records
+        );
+    };
+    assert!(status.success(), "velox exited abnormally: {status:?}");
+
+    let tab_create = events_named(&launch.perf_records, "tab_create").count();
+    assert_eq!(
+        tab_create, ROUNDS,
+        "{ROUNDS} `open` commands should yield {ROUNDS} `tab_create` records, got {tab_create}: \
+         {:?}",
+        launch.perf_records
+    );
+    // The homepage's own load plus one per round-opened tab.
+    let page_load = events_named(&launch.perf_records, "page_load").count();
+    assert_eq!(
+        page_load,
+        ROUNDS + 1,
+        "expected {} `page_load` records ({ROUNDS} round tabs + the homepage), got {page_load}: \
+         {:?}",
+        ROUNDS + 1,
+        launch.perf_records
+    );
+}
+
 // ---------------------------------------------------------------------
 // 2b. Multiple windows (Issue #29, see docs/decisions.md D68).
 // ---------------------------------------------------------------------

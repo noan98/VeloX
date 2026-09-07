@@ -698,3 +698,57 @@ VELOX_MAX_TABS_PER_PROCESS=1 $XV python3 scripts/profile/cpu_usage.py \
 $XV target/release/velox-bench run --scenario background_cpu --trials 3 \
   --velox-bin target/release/velox --url http://127.0.0.1:8731/busy.html
 ```
+
+## 15. メモリ/リソースライフタイム監査 (Issue #62, 2026-09-07)
+
+**詳細な調査・実測データ・再現手順は [docs/memory-analysis.md](memory-analysis.md)
+§12 を、判断の根拠は `docs/decisions.md` D79 を参照。要点のみここに残す。**
+
+Issue #62 は #61/#63/#64 のどの計測にも無かった軸 — **タブ数を一定に保った
+まま開閉「だけ」を繰り返す (churn) と PSS がじわじわ増えないか** — を新設の
+`scripts/bench/tab_churn.py` で測った (`browser::automation` スクリプトで
+「K 個開く→落ち着かせる→K 個とも閉じて 1 タブに戻す→落ち着かせる」を 1
+ラウンドとして繰り返し、ラウンド境界ごとに PSS を採る)。
+
+**コード上のリソースライフタイム監査で 1 件、本物のバグを見つけて修正した**:
+`app::run` の `page_load_timers` (タブ latency 計測用マップ、`perf_metrics`
+有効時のみ書き込まれる) が、タブを閉じてもエントリを一度も削除しておらず、
+`WindowId`/`TabId` は再利用されないため**開いたタブの延べ数に比例して
+無制限に増え続けていた**。`LoadFinished` でエントリを `remove` し、
+`close_tab`/`close_window_by_tao_id` でも明示的に破棄するよう修正
+(`src/app.rs`)。回帰ゲート (`cold_startup`/`tab_create`/`tab_switch`、
+baseline 8 試行 + candidate 2×8 試行) は 3 シナリオとも総合判定 OK。ただし
+このエントリ 1 件は高々 100 バイト程度で、本 Issue で実際に流せた churn の
+規模 (最大 72 回の open/close) では `/proc` 経由の PSS/RSS 計測でこの修正の
+効果を独立に検出できるだけの大きさにならなかった (このコンテナには
+`heaptrack` が無く、malloc 単位の独立検証もできなかった) — 正しさの根拠は
+単体/統合テストによる直接確認であり、PSS 計測で改善を実測したわけではない。
+
+**churn そのものによる PSS 増加は観測されたが、無制限ではなく有界だった**:
+`minimal.html`・6 タブ/ラウンド・12 ラウンド (のべ 72 回の open/close、42.1
+秒) では round 1 (558.3 MiB) → round 2 (638.7 MiB) で跳ねた後、round 3〜12
+は 581〜693 MiB の範囲で**増加が止まる** (round 3〜12 の最小二乗傾きは
+-0.756 MiB/round)。プロセス数は全ラウンドを通じて一定 (4)。#63 (D56) が
+「休止でも解放ヒープはプロセスに残り、プロセス終了だけが確実に OS へ返す」
+と結論した現象が、休止だけでなく本当の tab close (相乗りしているプロセス
+の一部だけ閉じる場合) にも及ぶことを示す一方、**アロケータのアリーナが
+一度ピーク相当まで育った後は使い回されるだけで、無制限には育たない**
+(いわゆる leak ではなく、有界な 1 回きりのウォームアップコスト) ことも
+同時に確認できた。よって本 Issue ではプロセスグループの寿命ベース recycle
+のような新規の設計変更には着手せず、D79 に Revisit condition として残した。
+
+**「1 時間以上の連続利用」の外挿について**: 実際に流せたのは最大 15
+ラウンド (60 回の open/close、約 39 秒) までで、1 時間相当 (1000+ ラウンド)
+は本 Issue でも実測していない。`tab_churn.py` は実測区間の平均ラウンド
+所要時間から単純な線形外挿も出力するが、実測データ自体が「数ラウンドで
+頭打ちになる非線形な形」を示しているため、この線形外挿の数値そのものは
+信頼できる予測として使わない — 出力にもその旨を明記している。
+
+再現コマンド:
+
+```sh
+xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+  python3 scripts/bench/tab_churn.py --velox target/release/velox \
+    --page minimal.html --rounds 12 --tabs-per-round 6 \
+    --output results/tab-churn.json
+```

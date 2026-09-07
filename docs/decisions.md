@@ -8751,3 +8751,232 @@ Windows の `ICoreWebView2_11::ContextMenuRequested` を将来
 だけで、経路自体は本項で調査・記録済み)。(6) `<input>`/`<textarea>`
 内部の選択テキストを拾えるようにする。(7) メニューセッションをタブごとに
 複数持てるようにする。
+
+## D79: メモリ/リソースライフタイム監査 (#62) — `page_load_timers` の無制限成長を修正、共有 WebProcess の retention は「有界」と確認して見送り
+
+**対象**: Issue #62 の受け入れ条件 (1 時間以上の連続利用シナリオ / タブ開閉の
+反復での memory growth 測定 / resource lifetime のコード上の追跡 / 検出した
+leak・retention の修正 / 修正後の再測定)。Epic #57 の性能最適化の絶対ルール
+(ベンチマーク駆動、WebView はブラックボックス、OS ごとに結果を分ける — この
+節の計測はすべて Linux/WebKitGTK 上) に従う。前提: #61 (D48/D49)・#63
+(D54/D56)・#64 (D58) がタブ数固定時の PSS 内訳・`WebContext`/`WebProcess`
+共有・バックグラウンド CPU をそれぞれ切り分け済み。**本 Issue が新しく測った
+のはそのどれとも違う軸 — 「タブ数を一定に保ったまま開閉だけを繰り返す」
+churn シナリオ**で、これは #61/#63/#64 のどの計測にも存在しなかった。
+
+### 監査の対象と方法
+
+Issue が挙げた 8 領域 (WebView ownership / tab close / event listener
+cleanup / IPC subscriptions / timers / async tasks / caches /
+handles・resources) をコードレビューで辿った。対象は主に `src/app.rs`
+(イベントディスパッチ・`AppState`)、`src/ui/window.rs`
+(`BrowserWindow`/webview 生成・破棄)、`src/browser/tabs.rs`
+(`Tabs`/`closed_tabs` スタック)、`src/ui/toolbar.html` (タブストリップの
+JS 再描画)、`src/ui/webview2_blocking.rs` (Windows の COM イベント
+ハンドラ)。async ランタイムは無く (`Cargo.toml` に tokio 等の依存なし)、
+`async tasks` の懸念は該当しない。`std::thread::spawn` の呼び出し箇所は
+3 箇所のみ (`spawn_rss_sampler`/`spawn_memory_pressure_sampler`/
+`spawn_automation`) — いずれもプロセス寿命 or 1 回のスクリプト実行の
+寿命で終了し、タブごとに増殖しないことをコードで確認した。`closed_tabs`
+スタックは既存のテスト (`closed_tabs_stack_drops_the_oldest_entry_once_
+over_capacity`) で上限があることを確認済み。`toolbar.html` のタブ
+ストリップ (`window.veloxSetTabs`) は毎回 `innerHTML = ""` で全消去して
+から再構築しており、イベントリスナーは DOM ノードごと GC される設計 —
+リスナーの累積は無い。
+
+### 見つけたもの (1): `page_load_timers` が閉じたタブのエントリを永久に
+### 保持していた (修正済み)
+
+`app::run` の `page_load_timers: HashMap<(WindowId, TabId),
+metrics::PageLoadTimer>` (Issue #13 のタブ latency 計測用、
+`config.perf_metrics` が有効なときだけ書き込まれる) は、
+`UserEvent::NavigationStarted` でエントリを作り、`UserEvent::
+LoadFinished` では `get_mut` で中身 (`started_at`) を読むだけで **エントリ
+自体を一度も `remove` していなかった**。`WindowId`/`TabId` はどちらも
+単調増加でタブが閉じても再利用されない
+(`browser::tabs::Tabs::take_id`/`browser::windows::Windows::push_window`)
+ため、**タブを閉じても既存のエントリは永久にマップに残り続け、開いた
+タブの延べ数に比例して無制限に増え続ける** — Issue が挙げた「caches」
+「handles/resources」に該当する、本物のリソースライフタイムのバグだった。
+タブを閉じる際もこのマップからは何も削除されていなかった (`close_tab`/
+`close_window_by_tao_id` はこのマップの存在を知らなかった) ため、
+読み込み途中でタブを閉じた場合 (`LoadFinished` が届かない) はさらに
+確実にエントリが残る。
+
+**影響範囲**: `config.perf_metrics` が無効な既定設定では、このマップは
+一度も書き込まれず空のままなので実害は無い。しかし `VELOX_PERF_METRICS=1`
+(または `--perf-metrics`) は `velox-bench`・本 Issue が追加した churn
+計測・実際のユーザが `docs/performance-targets.md`/`docs/profiling.md` の
+手順で長時間計測するときに使う、正規のサポート対象の実行モードであり
+— **まさに Issue #62 が要求する「1 時間以上の連続利用シナリオ」を計測
+しようとするときに限って確実に踏むバグ**だった。
+
+**修正 (`src/app.rs`)**:
+1. `record_perf_event`'s `LoadFinished` 節を `get_mut` → `remove` に変更。
+   ロード完了後のエントリには何も有用な情報が残らない (`PageLoadTimer::
+   finish` が `started_at` を `take()` で消費する) ので、丸ごと削除して
+   問題ない。次の `NavigationStarted` が `.entry().or_default()` で作り
+   直す。
+2. `close_tab`/`close_window_by_tao_id` に `page_load_timers: &mut
+   PageLoadTimers` を追加し、タブ/ウィンドウを閉じる際に該当エントリを
+   `remove`/`retain` で明示的に落とす — ロードが完了する前にタブが
+   閉じられたケース (1 だけでは救えない) をカバーする。この配線のため
+   `handle_toolbar_command`/`handle_content_shortcut`/
+   `handle_automation_command`/`handle_user_event` のシグネチャに同じ
+   引数を通した (呼び出し元は `run()` の event loop 1 箇所)。
+3. `type PageLoadTimers = HashMap<(WindowId, TabId), metrics::
+   PageLoadTimer>;` を新設し、この寿命規約をドキュメントコメント 1 箇所
+   にまとめた。
+
+**検証**: `src/app.rs` の単体テストに `load_finished_removes_the_page_
+load_timer_entry`/`load_finished_without_a_matching_start_leaves_no_
+entry` を追加し、`record_perf_event` を直接呼んでマップが空に戻ることを
+確認した (表示なしで実行できる — `record_perf_event` は `wry`/`tao` に
+依存しない純粋なロジック)。加えて `tests/integration.rs` に
+`repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load`
+を追加: 実バイナリを `VELOX_AUTOMATION_SCRIPT` で 6 ラウンドの
+open→close サイクルにかけ、プロセスがハングも panic もせずに終了し、
+`tab_create`/`page_load` の記録数が期待どおり (それぞれ 6 件・7 件) に
+一致することを確認する — このシグネチャ変更が dispatch チェーンの
+どこかで壊れていれば、記録が欠落するか、最悪ハング/panic として顕在化
+するはずのテスト。
+
+**PSS レベルでの計測について、正直に書く**: `PageLoadTimer` 1 エントリは
+`Option<Instant>` (数バイト) + タプルキー + `HashMap` のバケットオーバー
+ヘッドで、1 件あたりせいぜい 100 バイト程度と見積もられる。本 Issue の
+churn 計測 (下記) でも 1 セッションあたり数十〜100 件程度のタブ開閉しか
+流していないため、**この修正の効果を `/proc` 経由の PSS/RSS 計測で直接
+検出することはできなかった** — smaps のページ粒度 (4 KiB) およびこの
+コンテナで観測されているセット間ノイズ (`docs/memory-analysis.md` §7、
+0.1〜8.6%) の両方に対して、この修正が動かすバイト数は 3〜4 桁小さい。
+#61 (D45) は同じ性質の疑問に `heaptrack` (malloc 単位で追跡できる) で
+答えていたが、**このコンテナには `heaptrack` が導入されておらず**
+(`which heaptrack` はゼロ件、`docs/profiling.md`/`docs/memory-analysis.md`
+が前提にしている環境と本セッションの環境は異なる)、独立した byte 単位の
+再現はできなかった。したがってこの修正の正しさの根拠は「コードレビュー +
+上記の単体/統合テストによる直接的な動作確認」であり、「PSS 計測で改善を
+実測した」わけではない — 捏造を避けるため、できなかったことをそのまま
+書く。一方で、この種の per-tab エントリが無制限に残る設計上のバグである
+ことと、それを消す修正で消えることは、テストが直接に (マップの中身を
+覗いて) 証明している。
+
+**回帰確認 (`velox-bench gate`、修正前後、各シナリオ baseline 8 試行 +
+candidate 2×8 試行、同一セッション内、warn>20%/fail>60%)**:
+
+| シナリオ | 総合判定 |
+| --- | --- |
+| `cold_startup` | OK |
+| `tab_create` | OK |
+| `tab_switch` | OK |
+
+いずれも Fail/Warn なし。`pss_total_bytes`/`rss_total_bytes` を含む全指標が
+ゲート内— この修正が既存の起動・タブ操作性能に悪影響を与えていないことを
+確認した。
+
+### 見つけたもの (2): タブ開閉を繰り返すと共有 `WebKitWebProcess` の PSS が
+### 上がるが、有界で頭打ちになる (バグではないと判断・修正見送り)
+
+**新設のベンチマーク**: `scripts/bench/tab_churn.py` (`docs/benchmarking.md`
+にあるとおり `browser::automation` のスクリプト形式をそのまま使う)。
+「K 個のタブを開く → 落ち着かせる → K 個とも閉じて 1 タブに戻す → 落ち
+着かせる」を 1 ラウンドとして R 回繰り返し、**各ラウンドの「閉じ終わって
+タブ数が常に同じ 1 に戻った瞬間」** に `tab_scaling.py` と同じ `/proc` の
+読み方でプロセスツリー全体の PSS/RSS を採る。タブ数を毎回同じに揃えて
+いるので、点が右肩上がりなら「タブ数は変わっていないのに増えている」=
+retention の直接的な証拠になる。`--extrapolate-minutes` (既定 60、Issue
+本文の「1 時間以上」に対応) で、実測した区間の平均ラウンド所要時間から
+外挿した推定値も出す — **この外挿はあくまで実測ではない推定であること
+を出力・本節の両方で明記する** (Issue の指示どおり)。
+
+**実測 (この環境、`minimal.html`、`VELOX_PERF_METRICS` オフ = 純粋に
+WebKit/プロセス側の挙動だけを見る)**:
+
+1. 4 タブ/ラウンド、3 ラウンドの短い試し撃ち: 483.0 → 557.8 → 588.9 MiB
+   (単調増加に見える)。
+2. 4 タブ/ラウンド、15 ラウンドに伸ばすと: 447.6 → 560.7 → 578.0 →
+   687.5 MiB (round 4) の後は 581〜736 MiB の範囲で**増加が止まり横ばい
+   になる** (round 5〜15 の最小二乗傾き成分はほぼゼロ、全体の傾きは
+   +12.9 MiB/round だが round 1〜4 の立ち上がりに引っ張られているだけ)。
+3. 6 タブ/ラウンド、12 ラウンド (最終確認、のべ 72 回の open/close、
+   42.1 秒): round 1 が 558.3 MiB、round 2 で 638.7 MiB に跳ねた後は
+   581〜693 MiB の範囲で**増加も減少もしない** (round 3〜12 の最小二乗
+   傾きは **-0.756 MiB/round** — むしろ僅かに右肩下がり)。
+
+再現コマンド:
+
+```sh
+xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+  python3 scripts/bench/tab_churn.py --velox target/release/velox \
+    --page minimal.html --rounds 12 --tabs-per-round 6 \
+    --output results/tab-churn.json
+```
+
+**プロセス数は全ラウンドを通じて一定 (`velox`+`NetworkProcess`+toolbar
+`WebProcess`+content `WebProcess` = 4)** — #63 (D54) のプロセスグループ
+共有 (既定 `max_tabs_per_web_process=4`) により、ホームタブと同じ
+グループに入りきらない分だけ一時的な 2 個目の content プロセスが
+生まれるが、そのグループはラウンド終了時に空になり (ホームタブは
+含まれないため) プロセスごと終了する。**ホームタブを含む方のグループ
+だけが全ラウンドを通じて生き続け、そこに毎ラウンド新しいタブが相乗り
+しては閉じられる**、というのが観測された挙動の実体である。
+
+**解釈**: これは #63 (D56/`docs/memory-analysis.md` §11.1 の v2) が
+「休止 (suspend) でも解放されたヒープはプロセス内に残り、プロセスの
+終了だけが確実にメモリを OS に返す」と結論した現象と同根で、対象が
+「休止」ではなく「本当のタブ close (相乗りしているプロセスの一部だけ
+閉じる)」に広がっただけである。ただし本 Issue で新たに分かったのは
+**この retention は無制限には増えない — round 1〜2 で急に増えたあとは
+頭打ちになり、以降は開閉を繰り返してもほぼ横ばい (ノイズの範囲でむしろ
+減ることさえある)** という点。これは glibc malloc/`bmalloc`/JSC の GC
+ヒープのような世代・アリーナ型アロケータが典型的に見せる挙動 —
+「そのプロセスの過去のピーク相当まで一度大きくなったアリーナは、以後
+同程度の作業量のリクエストに対しては新たに OS へメモリを要求せず、
+アリーナ内で使い回す」— と整合する。**Issue #62 の懸念していた「無制限
+に増え続ける leak」ではなく、「共有プロセスの初回ウォームアップに相当
+する、有界な 1 回きりのコスト」であると判断する。**
+
+**修正を見送った理由**: (1) 上記のとおり無制限成長ではなく有界 — 「leak」
+の定義に当てはまらない。(2) 唯一考えられる対策 (ホームタブと同じグループ
+に一定回数以上乗せたら退役させ、以後の新規タブは別グループに送る、という
+「プロセスグループの寿命ベース recycle」) は、#63 が v1→v2→v3 の 3 回の
+実装・計測を経てようやく安全な設計 (グループ単位の丸ごと休止) に至った
+のと同種の、**新規の設計変更**であり、Epic #57 のルール 1
+(ベンチマーク駆動、Hypothesis→Profile→Baseline→Optimize→Benchmark→
+Regression Check) とルール 4 (メモリと速度のトレードオフを見る —
+グループを退役させれば新規プロセス起動が増え、#124 (D54) の§10.4 が
+示した「burst オープン時のページロード直列化」と同種の速度リスクを
+背負う) の両方を満たす検証には、この Issue の残り時間では届かない規模の
+作業になる。(3) 効果自体、頭打ちになる時点の絶対値 (この計測では
+~600〜690 MiB 程度) をどこまで削れるかは実装して計測するまで分からない
+— 憶測で着手すべきではない。
+
+### 「1 時間以上の連続利用」の外挿について、正直に書く
+
+CI・この検証環境で実際に 1 時間 (churn なら 1000 ラウンド超) を回すのは
+非現実的なため、**実際に流したのは最大 15 ラウンド (60 回の open/close、
+約 39 秒) までである。** `tab_churn.py` の `--extrapolate-minutes` は
+実測区間の平均ラウンド所要時間から単純な線形外挿を行うが、**上記のとおり
+実測データそのものが「round 1〜2 で頭打ちになる非線形な形」を示しており、
+線形外挿 (例: 60 分 ≈ 1000+ round として傾きを掛けるとGiB級の数字になる)
+は明らかに実態と乖離する。** スクリプトの出力・本節の両方に「これは外挿
+であり実測ではない」旨を明記し、**外挿された数値そのものは信頼できる
+予測として使わないこと** — 実際に確認できた事実は「短い区間 (最大 15
+ラウンド) では頭打ちになる」ということだけであり、それ以上長い時間で
+何が起きるかは本 Issue では実測していない。
+
+### Revisit condition
+
+(1) `page_load_timers` と同じ「`WindowId`/`TabId` は再利用されない
+キーで無制限に増え得るマップ」というパターンが将来別の場所に増えない
+よう、新しい per-tab キャッシュ/マップを足すときはタブ close の経路で
+明示的に破棄することをレビューの chuck リストに入れる。(2) 共有
+`WebProcess` のプロセスグループ寿命ベース recycle (本節「修正を見送った
+理由」) は、実際にその挙動が問題になる規模の長時間利用データが得られた
+場合に、#63 と同じ v1→v2→v3 型の反復検証で着手する — 新しい Issue を
+切ってから始めること。(3) `heaptrack` がこのコンテナに存在しないため、
+Rust 側の小さな malloc の増減を独立に検証する手段が今は無い — 導入する
+か、代替手段 (例: `mallinfo2`/`jemalloc` の統計を `velox` 自身が perf
+ログに出す) を検討する余地がある。(4) macOS (WKWebView)/Windows
+(WebView2) では churn 時の挙動が未検証 — 3 エンジンとも同じ「複数
+webview で 1 プロセスを共有する」設計を持つか自体が異なるため、この
+節の結論を他 OS にそのまま適用しないこと。
