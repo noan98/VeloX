@@ -364,11 +364,33 @@ struct AppState {
     /// docs/decisions.md D28.
     downloads: DownloadStore,
     /// The most recent `UserEvent::MemorySampled` not yet acted on by
-    /// `sweep_tabs` (Issue #63). `take()`n by the sweep, so each sample
+    /// `sweep_tabs` (Issue #63). Consumed exactly once per pass — by
+    /// whichever window `next_memory_sample_window` names — so each sample
     /// drives the memory signal exactly once — re-using a stale sample on
     /// every loop pass would keep suspending tabs before the previous
     /// sweep's effect is even visible in the numbers.
     pending_memory_sample: Option<MemorySample>,
+    /// Which window's `sweep_tabs` call should consume the next fresh
+    /// memory sample (Issue #186, docs/decisions.md D90). A sample is
+    /// consumed by exactly one window's sweep per event-loop pass — with
+    /// more than one window open, always handing it to whichever window
+    /// happens to be swept first (`state.windows.ids()`'s fixed,
+    /// window-creation order) meant a window with nothing eligible to
+    /// suspend (e.g. a single always-active tab) silently discarded every
+    /// sample forever, starving every *other* window's memory signal no
+    /// matter how far over budget the whole process tree was. Round-
+    /// robining which window gets first claim on each fresh sample fixes
+    /// this without suspending more than one window's worth of tabs per
+    /// sample (unlike handing the same sample to every window, which would
+    /// multiply a single over-budget reading into simultaneous over-
+    /// reclaim across every open window — see D90 for the measurements
+    /// behind this choice). `None` means "no preference yet" (defaults to
+    /// the first window in `ids()` order); `run`'s sweep loop advances it
+    /// after handing a sample out, to whichever window comes right after
+    /// the served one in the *current* window order — self-healing if that
+    /// window has since closed, since the lookup simply falls back to the
+    /// front of the list.
+    next_memory_sample_window: Option<WindowId>,
     /// Persisted, user-editable settings (Issue #30, see
     /// docs/decisions.md D67) — the settings screen's current, already-
     /// sanitized value. `Config` was already merged with this once at
@@ -791,6 +813,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
             .map(|log| PerfContext { process_start, log }),
         downloads: DownloadStore::new(),
         pending_memory_sample: None,
+        next_memory_sample_window: None,
         settings,
         site_permissions: site_permissions_for_state,
     };
@@ -918,16 +941,39 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         // unit-tested without a window. Issue #29/D68: run once per open
         // window rather than pooling every window's tabs into one policy
         // decision — each window's live-tab cap/idle timer is evaluated
-        // independently of every other window's. See the PR description for
-        // why a single cross-window budget was not attempted in this issue.
+        // independently of every other window's.
+        //
+        // Issue #186: exactly one window's sweep this pass gets the fresh
+        // memory sample (if any) — `pending_memory_sample` is taken once,
+        // up front, not per window — and it goes to whichever window
+        // `next_memory_sample_window` names (round-robin, advanced below),
+        // not always the first window `ids()` happens to list. See that
+        // field's doc comment and docs/decisions.md D90 for why round-robin
+        // was chosen over handing the same sample to every window.
         if *control_flow != ControlFlow::Exit {
             let mut next_wake: Option<Instant> = None;
-            for window_id in state.windows.ids().collect::<Vec<_>>() {
+            let window_ids: Vec<WindowId> = state.windows.ids().collect();
+            let memory_sample = state.pending_memory_sample.take();
+            let served_window = if memory_sample.is_some() {
+                let (served, next_cursor) =
+                    choose_memory_sample_window(&window_ids, state.next_memory_sample_window);
+                state.next_memory_sample_window = next_cursor;
+                served
+            } else {
+                None
+            };
+            for window_id in window_ids {
+                let memory = if Some(window_id) == served_window {
+                    memory_sample
+                } else {
+                    None
+                };
                 if let Some(wake) = sweep_tabs(
                     &mut ui_windows,
                     &mut state,
                     window_id,
                     &suspension_policy,
+                    memory,
                     Instant::now(),
                 ) {
                     next_wake = Some(match next_wake {
@@ -1440,6 +1486,53 @@ fn resolve_automation_wait_for_startup(automation_wait: &mut AutomationWaitState
     }
 }
 
+/// Decide which open window's `sweep_tabs` call should consume this pass's
+/// fresh memory sample, and what `AppState::next_memory_sample_window`
+/// should become for the *next* one (Issue #186, docs/decisions.md D90).
+/// Pure and window/webview-independent — `ids` is whatever `Windows::ids()`
+/// currently returns (creation order) and `next` is `AppState::
+/// next_memory_sample_window` going in — so the round-robin fairness
+/// itself is unit-tested without a real window, matching D20's rule for
+/// everything else `browser::`/`app.rs`'s policy logic can keep pure.
+///
+/// Round-robin, not "hand the same sample to every window" and not
+/// "always the first window in `ids`": the former would multiply a single
+/// over-budget reading into simultaneous suspensions across every open
+/// window (over-reclaim — D56's sawtooth behavior amplified by the window
+/// count); the latter is the bug this issue fixes — a window with nothing
+/// eligible to suspend (a single always-active tab, say) would silently
+/// discard every sample forever, starving every *other* window's memory
+/// signal no matter how far over budget the whole process tree was, since
+/// it is always first. Round-robin guarantees, by construction, both that
+/// **at most one window's tabs are suspended per sample** (the caller only
+/// ever passes the sample to the one window this returns) and that no
+/// window can be permanently skipped (the cursor always advances past
+/// whichever window was just served).
+///
+/// Returns `(served, next_cursor)`. `served` is `None` only when `ids` is
+/// empty (cannot happen while the event loop is running — the app exits
+/// once `Windows` is empty — handled defensively rather than assumed
+/// away); `next_cursor` is left as `next` unchanged in that case (nothing
+/// to advance from). Otherwise `served` is the window at `next`'s position
+/// in `ids` (or the first window if `next` is `None` or no longer present
+/// — self-healing when the previously-served window has since closed),
+/// and `next_cursor` is whichever window comes right after it, wrapping
+/// around to the front.
+fn choose_memory_sample_window(
+    ids: &[WindowId],
+    next: Option<WindowId>,
+) -> (Option<WindowId>, Option<WindowId>) {
+    if ids.is_empty() {
+        return (None, next);
+    }
+    let start = next
+        .and_then(|id| ids.iter().position(|&w| w == id))
+        .unwrap_or(0);
+    let served = ids[start];
+    let next_index = (start + 1) % ids.len();
+    (Some(served), Some(ids[next_index]))
+}
+
 /// Run the automatic suspension policy once (Issue #63): suspend every
 /// background tab [`suspension::plan`] picks as of `now`, then return when
 /// the loop should next check again (the soonest a still-awake background
@@ -1449,14 +1542,19 @@ fn resolve_automation_wait_for_startup(automation_wait: &mut AutomationWaitState
 /// re-evaluated on the next event anyway, and the memory signal wakes the
 /// loop itself via `UserEvent::MemorySampled`).
 ///
-/// The memory signal only sees a sample on the first sweep after it
-/// arrived (`AppState::pending_memory_sample` is `take()`n here), so a
-/// sample never suspends more than one sweep's worth of tabs.
+/// `memory` is the fresh sample for *this* window's sweep, or `None` when
+/// there is no new sample or (Issue #186) this pass's sample was handed to
+/// a different window's sweep instead — the caller (`run`'s event loop)
+/// decides that once per pass, round-robin, before calling this for every
+/// open window; see `AppState::next_memory_sample_window`'s doc comment. A
+/// sample never suspends more than one sweep's worth of tabs, in exactly
+/// one window.
 fn sweep_tabs(
     ui_windows: &mut HashMap<WindowId, BrowserWindow>,
     state: &mut AppState,
     window_id: WindowId,
     policy: &SuspensionPolicy,
+    memory: Option<MemorySample>,
     now: Instant,
 ) -> Option<Instant> {
     if !policy.is_enabled() {
@@ -1464,11 +1562,6 @@ fn sweep_tabs(
     }
     let window = ui_windows.get_mut(&window_id)?;
     let tabs = state.windows.tabs(window_id)?;
-    // Issue #29/D68: at most one window's sweep consumes a given memory
-    // sample (`take()` empties it for every other window this same event
-    // loop pass) — a budget shared across every open window is left to a
-    // follow-up; see the PR description.
-    let memory = state.pending_memory_sample.take();
     let candidates = tabs.suspension_candidates(
         now,
         |id| window.is_playing_audio(id),
@@ -4114,6 +4207,98 @@ mod tests {
         WindowId::from(0)
     }
 
+    // --- choose_memory_sample_window (Issue #186): round-robin fairness,
+    // and the "no window is ever skipped forever" / "at most one window
+    // per sample" guarantees it exists for. ---
+
+    #[test]
+    fn one_window_is_always_served_regardless_of_cursor() {
+        let ids = [WindowId::from(0)];
+        assert_eq!(
+            choose_memory_sample_window(&ids, None),
+            (Some(WindowId::from(0)), Some(WindowId::from(0)))
+        );
+        // Even a stale/unknown cursor (e.g. a since-closed window's id)
+        // still serves the only window that exists.
+        assert_eq!(
+            choose_memory_sample_window(&ids, Some(WindowId::from(99))),
+            (Some(WindowId::from(0)), Some(WindowId::from(0)))
+        );
+    }
+
+    #[test]
+    fn no_windows_serves_nothing_and_leaves_the_cursor_untouched() {
+        // Defensive only — the event loop never calls this with an empty
+        // `Windows` in practice (the app exits first), but must not panic
+        // or silently invent a window id if it ever did.
+        assert_eq!(choose_memory_sample_window(&[], None), (None, None));
+        let stale = Some(WindowId::from(7));
+        assert_eq!(choose_memory_sample_window(&[], stale), (None, stale));
+    }
+
+    #[test]
+    fn repeated_calls_round_robin_through_every_window_in_order() {
+        // Issue #186's core fairness property: starting from "no
+        // preference yet" (`None`, e.g. right after startup), successive
+        // samples visit every window in turn and cycle back to the start —
+        // no window is served twice before every other window has had its
+        // turn, and (equally important) every window under budget-pressure
+        // eventually gets a sample rather than being starved forever by
+        // whichever window happens to be first.
+        let ids = [WindowId::from(0), WindowId::from(1), WindowId::from(2)];
+        let mut cursor = None;
+        let mut served_order = Vec::new();
+        for _ in 0..7 {
+            let (served, next) = choose_memory_sample_window(&ids, cursor);
+            served_order.push(served.expect("non-empty ids always serves someone"));
+            cursor = next;
+        }
+        assert_eq!(
+            served_order,
+            vec![
+                WindowId::from(0),
+                WindowId::from(1),
+                WindowId::from(2),
+                WindowId::from(0),
+                WindowId::from(1),
+                WindowId::from(2),
+                WindowId::from(0),
+            ],
+            "7 calls over 3 windows must complete two full round-robin \
+             cycles plus one extra, in the same fixed order every time"
+        );
+    }
+
+    #[test]
+    fn a_single_call_never_serves_more_than_one_window() {
+        // The structural half of "no over-reclaim": whatever `ids` looks
+        // like, exactly one window (never zero-with-panic, never more than
+        // one) is named per call — the caller passes the sample to that
+        // window's `sweep_tabs` alone, so a single over-budget sample can
+        // never suspend more than one window's worth of tabs in one pass.
+        for window_count in 1..=5 {
+            let ids: Vec<WindowId> = (0..window_count).map(WindowId::from).collect();
+            let (served, _) = choose_memory_sample_window(&ids, None);
+            assert!(
+                served.is_some(),
+                "{window_count} window(s) must serve exactly one, got None"
+            );
+        }
+    }
+
+    #[test]
+    fn a_served_windows_cursor_survives_closing_a_different_window() {
+        // Self-healing when the *previously* served window has since
+        // closed: the stored cursor no longer appears in `ids`, so the
+        // lookup falls back to the front rather than serving no one or
+        // panicking.
+        let ids = [WindowId::from(0), WindowId::from(2)]; // window 1 closed
+        assert_eq!(
+            choose_memory_sample_window(&ids, Some(WindowId::from(1))),
+            (Some(WindowId::from(0)), Some(WindowId::from(2)))
+        );
+    }
+
     /// Build an `AppState` the way `run()` would for a fresh tab, with its
     /// one window's history recording set to `history_enabled` (i.e. its
     /// privacy is `!history_enabled` — what `Config::private` drove at
@@ -4142,6 +4327,7 @@ mod tests {
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
+            next_memory_sample_window: None,
             settings: Settings::default(),
             site_permissions: Arc::new(SitePermissionStore::new()),
         }
@@ -4217,6 +4403,7 @@ mod tests {
             perf: None,
             downloads: DownloadStore::new(),
             pending_memory_sample: None,
+            next_memory_sample_window: None,
             settings: Settings::default(),
             site_permissions: Arc::new(SitePermissionStore::new()),
         };

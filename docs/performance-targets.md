@@ -1771,3 +1771,47 @@ target/release/velox-bench gate \
   --candidate "$S/tab_switch_20-candidate-1.json" --candidate "$S/tab_switch_20-candidate-2.json" \
   --warn-pct 20 --fail-pct 60 --output "$S/gate-report.json" --markdown-output "$S/gate-summary.md"
 ```
+
+### 23.5 複数ウィンドウでのメモリ予算 (Issue #186)
+
+設計判断・不具合の詳細は `docs/decisions.md` D90 (「#186: 複数ウィンドウで
+メモリ予算が機能しない不具合の修正」) を参照。ここでは実測だけを記録する。
+
+**再現テスト**: `tests/integration.rs::memory_budget_signal_reaches_a_
+second_windows_background_tabs`。ウィンドウ 1 はホームタブのみ (休止候補
+なし)、`new_window` で開いたウィンドウ 2 に背景タブ 2 つ、
+`VELOX_MEMORY_BUDGET_MB=1`・`VELOX_MEMORY_CHECK_INTERVAL_MS=100`。修正前の
+コードでは `tab_suspend` イベントが 0 件 (100ms ごとにサンプルが取れて
+いるにもかかわらず、ウィンドウ 2 の背景タブは一度も休止されない) — 実際に
+失敗することを確認した上で、ラウンドロビン方式 (D90) で修正した。
+
+**過剰回収が起きていないことの確認**: `tests/integration.rs::memory_
+budget_signal_never_suspends_more_than_one_windows_tabs_per_sample`。両
+ウィンドウに背景タブ 2 つずつ (計 4 つ、すべて休止対象) を持たせ、
+`tab_suspend` (reason=memory) のタイムスタンプを 50ms 以内でクラスタ化し、
+どのクラスタも 2 件 (1 ウィンドウ分) を超えないことを確認 (green)。
+`choose_memory_sample_window` (純粋関数、`src/app.rs`) 自体のユニット
+テスト 5 本が、1 回の呼び出しで選ばれるウィンドウが常にちょうど 1 つで
+あることを構造的に保証している。
+
+**回帰ゲート** (`cold_startup`/`tab_create`/`tab_switch`、baseline=修正前
+バイナリ、candidate=修正後バイナリ ×2、各 8 試行): いずれも**総合判定
+OK**。
+
+**再現手順**:
+
+```sh
+cargo build --release
+S=/path/to/scratch
+cp target/release/velox "$S/velox-fixed"
+git stash && cargo build --release && cp target/release/velox "$S/velox-before" && git stash pop
+XV_RUN() { xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- "$@"; }
+
+# 再現テスト (修正前のバイナリでは失敗、修正後は成功)
+XV_RUN cargo test --test integration memory_budget_signal_reaches_a_second_windows
+XV_RUN cargo test --test integration memory_budget_signal_never_suspends_more
+
+# 過剰回収なしのユニットテスト
+cargo test --lib app::tests::a_single_call_never_serves_more_than_one_window
+cargo test --lib app::tests::repeated_calls_round_robin_through_every_window_in_order
+```

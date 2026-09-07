@@ -1313,6 +1313,223 @@ fn memory_budget_signal_suspends_a_background_tab_end_to_end() {
     );
 }
 
+/// Guarantees the memory-budget signal (Issue #184, D90) reaches a
+/// *second* window's background tabs, not just whichever window
+/// `app::run`'s event loop happens to sweep first each pass (Issue #186).
+///
+/// `sweep_tabs` (`src/app.rs`) `take()`s `AppState::pending_memory_sample`
+/// — at most one window's sweep per event-loop pass ever sees a given
+/// sample. Before this issue's fix, the loop sweeps windows in a fixed
+/// order (`state.windows.ids()`, window-creation order), so if the
+/// *first* window has no eligible candidate, the sample is silently
+/// discarded and every other window's background tabs never see it, no
+/// matter how far over budget the whole process tree is — a memory-budget-
+/// driven suspension in window 2 would simply never happen. This test
+/// constructs exactly that shape: window 1 has only its home tab, always
+/// active (never a suspension candidate, by design — `sweep_tabs` can
+/// never satisfy the memory demand from window 1 alone), while window 2
+/// (opened via `new_window`) has two background tabs that *are* eligible.
+/// An absurdly low budget (1 MiB) makes the process tree deterministically
+/// over budget regardless of the real PSS this machine happens to
+/// produce, the same way `memory_budget_signal_suspends_a_background_tab_
+/// end_to_end` above uses it for the single-window case.
+#[test]
+fn memory_budget_signal_reaches_a_second_windows_background_tabs() {
+    skip_without_gui!("memory_budget_signal_reaches_a_second_windows_background_tabs");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("memory-suspension-multiwindow");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let stderr_path = dir.join("stderr.log");
+    let homepage = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+    let page_b = fixture_url("dom_heavy.html");
+
+    // Window 1 (created first, so it is the one every sweep pass would
+    // visit first per `state.windows.ids()`'s creation order): only ever
+    // the home tab, left active throughout — never a suspension
+    // candidate. `new_window` retargets automation to window 2, which
+    // gets two background tabs after `switch 0` makes the home tab active
+    // there instead.
+    let script = format!(
+        "wait_load\n\
+         new_window\n\
+         wait_load\n\
+         open {page_a}\n\
+         wait_load\n\
+         open {page_b}\n\
+         wait_load\n\
+         switch 0\n\
+         wait_load\n\
+         wait 600\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+        &[
+            ("VELOX_MEMORY_BUDGET_MB", Path::new("1")),
+            ("VELOX_MEMORY_CHECK_INTERVAL_MS", Path::new("100")),
+        ],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the multi-window \
+             memory-suspension test. Perf records: {:?}\nstderr:\n{stderr}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let records = &launch.perf_records;
+    let suspends: Vec<_> = events_named(records, "tab_suspend").collect();
+    assert!(
+        !suspends.is_empty(),
+        "expected at least one automatic suspension of window 2's background tabs from \
+         the 1 MiB budget, even though window 1 (swept first every pass) never has an \
+         eligible candidate of its own — Issue #186: a memory sample must not be silently \
+         discarded just because the first window swept has nothing to suspend: \
+         {records:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        suspends
+            .iter()
+            .all(|r| r["reason"].as_str() == Some("memory")),
+        "every suspension here must be driven by the memory-budget signal: {suspends:?}"
+    );
+}
+
+/// Guarantees the round-robin fix for Issue #186 does not over-reclaim:
+/// with *two* windows each holding background tabs that are all eligible
+/// for the memory signal, a single event-loop pass must never suspend more
+/// than one window's worth of tabs at once, even under an absurdly low
+/// budget that would gladly claim every eligible tab in either window.
+/// (`app::choose_memory_sample_window`'s own unit tests already prove this
+/// structurally — exactly one window is ever named per call — this test
+/// is the end-to-end confirmation through the real event loop and a real
+/// memory sampler thread, per Epic #57 rule 1's "measure it for real, not
+/// just at the unit level".)
+///
+/// Detection: every `tab_suspend` this test can produce comes from the
+/// memory signal (no idle timer, no live-tab cap configured), and each
+/// sweep pass that suspends anything does so for the tabs of exactly one
+/// window in one tight burst — so grouping `tab_suspend` records by how
+/// close their timestamps are (within 50ms of each other) recovers "which
+/// pass suspended these" without needing a `window_id` field the perf
+/// event does not carry. If the round-robin fix instead (incorrectly)
+/// handed the sample to *every* window at once, a single pass would
+/// suspend both windows' tabs together — more than 2 in one cluster, since
+/// each window here has exactly 2 eligible tabs.
+#[test]
+fn memory_budget_signal_never_suspends_more_than_one_windows_tabs_per_sample() {
+    skip_without_gui!("memory_budget_signal_never_suspends_more_than_one_windows_tabs_per_sample");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("memory-suspension-no-over-reclaim");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let stderr_path = dir.join("stderr.log");
+    let homepage = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+    let page_b = fixture_url("dom_heavy.html");
+
+    // Window 1: two background tabs (both eligible once `switch 0` returns
+    // to the home tab). `new_window` retargets to window 2, which gets its
+    // own two background tabs the same way. Every one of the 4 background
+    // tabs across both windows is eligible for the memory signal.
+    let script = format!(
+        "wait_load\n\
+         open {page_a}\n\
+         wait_load\n\
+         open {page_b}\n\
+         wait_load\n\
+         switch 0\n\
+         wait_load\n\
+         new_window\n\
+         wait_load\n\
+         open {page_a}\n\
+         wait_load\n\
+         open {page_b}\n\
+         wait_load\n\
+         switch 0\n\
+         wait_load\n\
+         wait 900\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+        &[
+            ("VELOX_MEMORY_BUDGET_MB", Path::new("1")),
+            ("VELOX_MEMORY_CHECK_INTERVAL_MS", Path::new("150")),
+        ],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the no-over-reclaim test. \
+             Perf records: {:?}\nstderr:\n{stderr}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let records = &launch.perf_records;
+    let mut suspend_timestamps: Vec<f64> = events_named(records, "tab_suspend")
+        .filter(|r| r["reason"].as_str() == Some("memory"))
+        .filter_map(|r| r["ts_ms"].as_f64())
+        .collect();
+    assert!(
+        !suspend_timestamps.is_empty(),
+        "expected at least one memory-driven suspension across the two windows: \
+         {records:?}\nstderr:\n{stderr}"
+    );
+    suspend_timestamps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    // Cluster consecutive timestamps within 50ms of each other — each
+    // cluster is "what one sweep pass suspended".
+    const CLUSTER_GAP_MS: f64 = 50.0;
+    let mut clusters: Vec<usize> = vec![1];
+    for pair in suspend_timestamps.windows(2) {
+        if pair[1] - pair[0] <= CLUSTER_GAP_MS {
+            *clusters.last_mut().unwrap() += 1;
+        } else {
+            clusters.push(1);
+        }
+    }
+    assert!(
+        clusters.iter().all(|&size| size <= 2),
+        "no single sweep pass may suspend more than one window's worth of tabs (2 here) — \
+         a cluster of suspensions within {CLUSTER_GAP_MS}ms of each other exceeded that, \
+         which would mean the memory sample reached more than one window in the same pass: \
+         timestamps={suspend_timestamps:?} clusters={clusters:?}\n{records:?}"
+    );
+}
+
 // ---------------------------------------------------------------------
 // 7. Session restore (Issue #25): a saved session survives a real second
 //    launch of the binary, and a restored background tab is genuinely
