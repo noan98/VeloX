@@ -10841,9 +10841,9 @@ check-run を登録しないため、auto-merge からは「レビューが存�
       (GraphQL `latestReviews`) に残っている。レビュアー名をログに出す。
    3. **Codex が現在の head SHA をレビュー済みでない** (下記参照。
       `codex_bypass=True` で免除可能)。
-   4. **head commit の committer date から猶予期間 (既定15分、workflow の
-      `env.GRACE_PERIOD_MINUTES`) が経過していない。** レビューボットが
-      まだ投稿していない場合の保険。
+   4. **head SHA の push 観測時刻 (`head_push_observed_at`、下記の決定7
+      参照) から猶予期間 (既定15分、workflow の `env.GRACE_PERIOD_MINUTES`)
+      が経過していない。** レビューボットがまだ投稿していない場合の保険。
    いずれの GraphQL 呼び出し (`review_threads`/`latest_reviews` が `None`)
    もページング不足 (`pageInfo.hasNextPage == true` で全件を確認できない)
    も、**常に安全側 (blocked) に倒す**。「取得できなかったので指摘ゼロと
@@ -10854,7 +10854,7 @@ check-run を登録しないため、auto-merge からは「レビューが存�
    だけ**のケースを見逃す (push 後に再レビューされていない状態でマージ
    してしまう)。そこで以下のいずれか1つでも現在の head SHA を指せば
    「レビュー済み」とみなす (`check_review_gate.py` の
-   `_codex_reviewed_head_sha`/`_codex_reacted_after_commit`):
+   `_codex_reviewed_head_sha`/`_codex_reacted_after`):
    - **a. `latestReviews[].commit.oid` (GraphQL) が head SHA と完全一致。**
      最も確実なシグナル。GraphQL の `PullRequestReview.commit` は
      レビューが実際に付けられたコミットを指す (レビュー後に新しい commit
@@ -10869,14 +10869,14 @@ check-run を登録しないため、auto-merge からは「レビューが存�
      (`str.startswith`)。正規表現 `_REVIEWED_COMMIT_RE` は太字マーカー
      (`**`) とバッククォートの有無ゆらぎの両方を許容する。
    - **c. Codex による 👍 リアクション (PR 本体への `THUMBS_UP`、GraphQL
-     `pullRequest.reactions`) の `createdAt` が head commit の committer
-     date 以降。** Codex の説明文 (“If Codex has suggestions, it will
-     comment; otherwise it will react with 👍.”) に基づく代替シグナル。
-     **リアクションは commit に紐付かない (1 ユーザ 1 個)** ため、古い
-     push に対する 👍 が新しい push 後も残り続ける — そのため単独では
-     「どの push に対する反応か」を厳密に特定できず、`createdAt` が
-     head commit の日時以降であることを条件に加えて弱めのシグナルとして
-     扱う。
+     `pullRequest.reactions`) の `createdAt` が **head SHA の push 観測
+     時刻 (`head_push_observed_at`、決定7参照)** 以降。** Codex の説明文
+     (“If Codex has suggestions, it will comment; otherwise it will react
+     with 👍.”) に基づく代替シグナル。**リアクションは commit に紐付か
+     ない (1 ユーザ 1 個)** ため、古い push に対する 👍 が新しい push 後も
+     残り続ける — そのため単独では「どの push に対する反応か」を厳密に
+     特定できず、`createdAt` が push 観測時刻以降であることを条件に加えて
+     弱めのシグナルとして扱う。
    > ✅ **シグナル c (👍 リアクション) は PR #191 (0 バイトのファイル
    > 1 本だけを追加する、意図的に「批評対象が何もない」PR) で実測に
    > 成功し、Codex の公式説明どおりの挙動を確認した。** #190
@@ -10895,8 +10895,8 @@ check-run を登録しないため、auto-merge からは「レビューが存�
    > やレビューコメントに付くのではない — シグナル c が
    > `pullRequest.reactions` [issue 本体] を見る設計になっているのは
    > この観測と一致している)。参考値: PR #191 head SHA
-   > `e4c8811bcb7298a12247f5c0712bd510cab658b5`、head commit の committer
-   > date `2026-09-07T16:20:51Z`、PR 作成 `2026-09-07T16:21:12Z`。
+   > `e4c8811bcb7298a12247f5c0712bd510cab658b5`、PR 作成
+   > `2026-09-07T16:21:12Z`。
    >
    > **残る限界**: この観測に使ったツールはリアクションの**集計値**
    > (`+1: 1` 等) しか返さず、**投稿者が実際に `chatgpt-codex-connector
@@ -10905,11 +10905,10 @@ check-run を登録しないため、auto-merge からは「レビューが存�
    > であり、かつレビュー/コメントを一切出さなかった PR にだけ +1 が
    > 付いている状況証拠から Codex によるものとみて差し支えないと判断した
    > が、断定はできていない。**そのため `check_review_gate.py` の実装は
-   > 依然として集計値ではなく `user.login` で
-   > `chatgpt-codex-connector` に前方一致する投稿者だけを対象にする**
-   > (`_is_codex_login`)。万一 👍 の投稿者が別ユーザだった場合に
-   > 誤ってマージ可と判定しないための必須の防御であり、実装済みである
-   > ことを確認済み。この防御がないと第三者の 👍 でマージが通ってしまう。
+   > 集計値ではなく `user.login` の完全一致 (決定7の P2 参照) だけを
+   > 対象にする。** 万一 👍 の投稿者が別ユーザだった場合に誤ってマージ可と
+   > 判定しないための必須の防御であり、実装済みであることを確認済み。
+   > この防御がないと第三者の 👍 でマージが通ってしまう。
 
 3. **`automerge-without-codex` ラベルで Codex レビュー必須要件のみを免除
    する (workflow の `env.CODEX_BYPASS_LABEL`)。** 「指摘ゼロのとき Codex
@@ -10999,9 +10998,78 @@ check-run を登録しないため、auto-merge からは「レビューが存�
      では実害は小さいと判断したが、将来コラボレータが増える場合はこの
      残余リスクを再評価すること。
 
-7. **GraphQL に必要な権限は `pull-requests: read` で足り、既存の
+7. **PR #192 (この実装 PR 自身) に Codex が指摘した P1/P2 の2件を、実装に
+   反映した。** 皮肉にも、この Issue が「Codex の指摘を見落とさない
+   ようにする」ための実装自体に、Codex が実在の脆弱性を2件見つけた。
+   いずれも「Codex を必須要件にする」判定ロジックの正しさを直接損なう
+   欠陥だったため、両方とも修正した。
+
+   - **P1 (最重要): 猶予期間とシグナル c の基準時刻に committer date を
+     使ってはいけない。** 初版の実装は `head_committed_date` (git commit
+     の committer date) を、猶予期間の起点とシグナル c (👍 リアクション)
+     の基準時刻の**両方**に使っていた。しかし committer date は「commit
+     をローカルで作った時刻」であり「GitHub に push された時刻」ではない
+     — ローカルで数時間前に作った commit を今 push する、cherry-pick/
+     rebase で古い commit を持ち込む、といった特殊な操作ではない普通の
+     git 操作で committer date は容易に過去の日時になる。この状態では
+     (a) 以前の head に付いた Codex の 👍 の `createdAt` が新しい (実は
+     古い日時の) committer date より後になり、誤って「現在の SHA を
+     レビュー済み」と判定されてしまい、(b) 猶予期間も同時に即座に満たさ
+     れてしまう — **2つの防御が同一の操作可能なタイムスタンプに依存し、
+     同時に破られる**という、判定ロジックの中核に関わる欠陥だった。
+     **対処**: `head_committed_date` を `head_push_observed_at` にリネーム
+     し、値の取得元を **head SHA に対する check-suite の作成時刻の最小値**
+     (`repos/{owner}/{repo}/commits/{sha}/check-suites` の `created_at`)
+     に変更した。push を受けて GitHub 自身がサーバ側で作成するものなので
+     attacker が直接操作できない (本リポジトリは PR で必ず CI
+     [`ci.yml`] が走るため、check-suite は実用上必ず作成される)。取得
+     できなかった場合 (check-suite が1件も無い等) は **committer date へ
+     のフォールバックはせず**、安全側 (マージしない) に倒す — フォール
+     バック自体がこの脆弱性を再現するため。`dry-run-review-gate` job の
+     `permissions` に `checks: read` を追加した (`auto-merge` job は既に
+     決定1で `checks: read` を持っていたため変更不要)。
+     > ⚠️ **この方式は「head SHA に対して check-suite が作成されている」
+     > ことに依存する、という前提を明記しておく。** 本リポジトリは PR
+     > で必ず CI (`ci.yml`) が走るため実用上は問題にならないが、CI を
+     > 持たないリポジトリや、push 直後で GitHub 側の check-suite 作成が
+     > まだ反映されていない極めて早いタイミングでは取得できない場合が
+     > ある。**その場合は意図的に安全側 (マージしない) に倒す設計であり、
+     > 副作用として「(その PR に対する) CI が始まるまでマージされない」
+     > という挙動になる。** これは望ましい挙動と判断した (「push 観測を
+     > 確認できない = レビューボットがまだ push を認識していない可能性が
+     > 排除できない」ため) 上での意図した設計であり、取りこぼしではない。
+   - **P2: Codex ログインの判定は前方一致ではなく完全一致にする。**
+     初版の実装 (`_is_codex_login`) はログイン名が `chatgpt-codex-
+     connector` で**始まるか** (`str.startswith`) で判定していた。この
+     ため `chatgpt-codex-connector-review` のような別名アカウントが
+     レビューを出せば (本 PR のコメント権限を持つ第三者が実際に作成
+     できる)、Codex レビュー必須要件をすり抜けられてしまう。**対処**:
+     既知の Codex ログイン名の完全一致許可リスト
+     (`_CODEX_LOGINS = frozenset({"chatgpt-codex-connector[bot]"})`、
+     大小文字は無視) で判定する `_is_codex_author` に置き換えた。GraphQL
+     クエリで取得できる場合は追加で `__typename == "Bot"` であることも
+     要求する (`author { login __typename }` — 通常の `User` アカウントが
+     たまたま同名を名乗ることはできない [GitHub がログイン名の重複を
+     禁止する] が、多層防御として追加した)。
+   - **テスト**: `test_check_review_gate.py` に
+     `PushObservedAtSecurityRegressionTest` (P1: 呼び出し側が正しい
+     push 観測時刻を渡した場合に、古い head に付いた 👍 が正しく拒否され
+     ることを確認 — 関数自体は committer date と push 観測時刻を区別する
+     情報を持たないため、修正の本体である `review_gate_decision.sh` 側の
+     データソース変更と対で見る必要がある) と `CodexLoginExactMatchTest`
+     (P2: `chatgpt-codex-connector-review` 等の別名ログインが**前方一致の
+     ままだと PASS してしまい [脆弱性を再現]、完全一致に直したことで
+     BLOCKED [FAIL→修正後 PASS] になる**ことを確認する回帰テスト) を
+     追加した。
+   - PR #192 上の Codex のレビュースレッド2件 (P1: discussion_r3951397804
+     / P2: discussion_r3951397806) は、修正を返信・push した上で明示的に
+     resolve した (決定4の運用注意のとおり、push しただけでは
+     `isResolved` は自動で `true` にならない)。
+
+8. **GraphQL に必要な権限は `pull-requests: read` で足り、既存の
    `permissions.pull-requests: write` (D55/D83 で既に付与済み) に包含
-   される。** 追加の `permissions` 変更は不要だった。GraphQL 呼び出し
+   される。** 追加の `permissions` 変更は不要だった (ただし決定7の P1
+   対応で `checks: read` を dry-run job に追加している)。GraphQL 呼び出し
    自体が失敗した場合 (権限不足の 403 等) は `gh` の生のエラー出力を
    `::warning::` に含めて安全側ブロックする — #168 で `issues` 権限が
    抜けて 404 になった際にエラーメッセージだけでは原因が分からなかった

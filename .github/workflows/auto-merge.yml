@@ -309,6 +309,9 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # review_gate_decision.sh が head SHA の push 観測時刻を取得するため
+      # に check-suites API (commits/{sha}/check-suites) を呼ぶ (D91)。
+      checks: read
     steps:
       - uses: actions/checkout@v7
 

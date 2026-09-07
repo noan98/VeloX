@@ -6,13 +6,18 @@
 または (このディレクトリから):
     python3 -m unittest test_check_review_gate -v
 
-Issue #188 の完了条件・PR #185 / #189 の実例をそのまま網羅する。
+Issue #188 の完了条件・PR #185 / #189 / #191 の実例をそのまま網羅する。
 
 テスト方針: 「未解決スレッド」「CHANGES_REQUESTED」「猶予期間」の3条件を
 検証するテストクラスは `codex_bypass=True` を既定にして Codex 必須判定を
 分離する (この3条件は Codex 要件と無関係のため)。Codex 必須判定
 (条件3、`automerge-without-codex` ラベルでの免除を含む) は専用の
-`CodexReviewRequiredTest` で個別に検証する。
+`CodexReviewRequiredTest` で個別に検証する。`CodexLoginExactMatchTest` /
+`PushObservedAtSecurityRegressionTest` は 2026-09-07 の Codex レビュー
+指摘 (PR #192、docs/decisions.md D91) を受けて追加した回帰テスト:
+Codex ログイン判定の前方一致 (別名アカウントによるなりすまし) と、猶予期間
+/シグナルcの基準時刻に committer date を使う設計 (attacker が操作可能な
+タイムスタンプ) の2件の脆弱性を防ぐ。
 """
 
 from __future__ import annotations
@@ -21,11 +26,12 @@ import unittest
 
 from check_review_gate import evaluate_review_gate
 
-# 猶予期間を確実に満たす基準時刻 (head commit から1時間後)。
+# 猶予期間を確実に満たす基準時刻 (head SHA の push 観測時刻から1時間後)。
 _NOW = "2026-09-07T16:31:14Z"
-_HEAD_COMMITTED_1H_AGO = "2026-09-07T15:31:14Z"
+_HEAD_PUSH_OBSERVED_1H_AGO = "2026-09-07T15:31:14Z"
 _GRACE = 15
 _HEAD_SHA = "80246e861a57bb526dea041b86bd07d51b6d7957"
+_CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 
 _EMPTY_THREADS = {"pageInfo": {"hasNextPage": False}, "nodes": []}
 _EMPTY_REVIEWS = {"pageInfo": {"hasNextPage": False}, "nodes": []}
@@ -35,7 +41,7 @@ _EMPTY_REACTIONS = {"pageInfo": {"hasNextPage": False}, "nodes": []}
 def _evaluate(
     threads=_EMPTY_THREADS,
     reviews=_EMPTY_REVIEWS,
-    committed=_HEAD_COMMITTED_1H_AGO,
+    push_observed_at=_HEAD_PUSH_OBSERVED_1H_AGO,
     now=_NOW,
     grace=_GRACE,
     reactions=_EMPTY_REACTIONS,
@@ -50,7 +56,7 @@ def _evaluate(
     return evaluate_review_gate(
         threads,
         reviews,
-        committed,
+        push_observed_at,
         now,
         grace,
         reactions=reactions,
@@ -249,36 +255,44 @@ class ChangesRequestedBlocksTest(unittest.TestCase):
 
 
 class GracePeriodBlocksTest(unittest.TestCase):
-    """条件4: 猶予期間。"""
+    """条件4: 猶予期間 (head SHA の push 観測時刻からの経過)。"""
 
-    def test_fresh_commit_blocked(self) -> None:
-        result = _evaluate(committed="2026-09-07T16:20:00Z", now=_NOW)  # 11分
+    def test_fresh_push_blocked(self) -> None:
+        result = _evaluate(push_observed_at="2026-09-07T16:20:00Z", now=_NOW)  # 11分
         self.assertTrue(result["blocked"])
         self.assertIn("猶予期間", result["reasons"][0])
 
-    def test_commit_exactly_at_grace_period_not_blocked(self) -> None:
+    def test_push_exactly_at_grace_period_not_blocked(self) -> None:
         # 15分ちょうど経過 -> 猶予期間は満了 (blocked にならない)。
-        result = _evaluate(committed="2026-09-07T16:16:14Z", now=_NOW, grace=15)
+        result = _evaluate(
+            push_observed_at="2026-09-07T16:16:14Z", now=_NOW, grace=15
+        )
         self.assertFalse(result["blocked"])
 
-    def test_commit_one_second_before_grace_period_blocked(self) -> None:
-        result = _evaluate(committed="2026-09-07T16:16:15Z", now=_NOW, grace=15)
+    def test_push_one_second_before_grace_period_blocked(self) -> None:
+        result = _evaluate(
+            push_observed_at="2026-09-07T16:16:15Z", now=_NOW, grace=15
+        )
         self.assertTrue(result["blocked"])
 
-    def test_missing_committed_date_blocks_safely(self) -> None:
-        result = _evaluate(committed=None)
+    def test_missing_push_observed_at_blocks_safely(self) -> None:
+        result = _evaluate(push_observed_at=None)
         self.assertTrue(result["blocked"])
         self.assertIn("取得できなかった", result["reasons"][0])
 
-    def test_empty_committed_date_blocks_safely(self) -> None:
-        result = _evaluate(committed="")
+    def test_empty_push_observed_at_blocks_safely(self) -> None:
+        result = _evaluate(push_observed_at="")
         self.assertTrue(result["blocked"])
 
     def test_custom_grace_period_respected(self) -> None:
         # 猶予期間を60分に設定すると、1時間経過ちょうどでも境界を割る。
-        result = _evaluate(committed=_HEAD_COMMITTED_1H_AGO, now=_NOW, grace=60)
+        result = _evaluate(
+            push_observed_at=_HEAD_PUSH_OBSERVED_1H_AGO, now=_NOW, grace=60
+        )
         self.assertFalse(result["blocked"])
-        result = _evaluate(committed=_HEAD_COMMITTED_1H_AGO, now=_NOW, grace=61)
+        result = _evaluate(
+            push_observed_at=_HEAD_PUSH_OBSERVED_1H_AGO, now=_NOW, grace=61
+        )
         self.assertTrue(result["blocked"])
 
 
@@ -293,7 +307,7 @@ class CodexReviewRequiredTest(unittest.TestCase):
     def _reviews_with_codex(self, **codex_review_fields):
         node = {
             "state": "COMMENTED",
-            "author": {"login": "chatgpt-codex-connector[bot]"},
+            "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
         }
         node.update(codex_review_fields)
         return {"pageInfo": {"hasNextPage": False}, "nodes": [node]}
@@ -336,14 +350,14 @@ class CodexReviewRequiredTest(unittest.TestCase):
         self.assertIn("deadbeef00", result["reasons"][0])
 
     def test_codex_thumbs_up_reaction_after_push_not_blocked(self) -> None:
-        # PR #185/#189 の実データには無い (未検証の) 「指摘ゼロ」ケースの
-        # 代替シグナル: Codex 公式説明文どおり 👍 リアクションを想定する。
+        # PR #191 (0バイトのファイルのみ追加) で実測済み: 指摘ゼロのとき
+        # Codex はレビュー・コメントを一切残さず、PR本体への👍のみを付ける。
         reactions = {
             "pageInfo": {"hasNextPage": False},
             "nodes": [
                 {
                     "createdAt": "2026-09-07T15:32:00Z",  # push (15:31:14) の後
-                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "user": {"login": _CODEX_LOGIN, "__typename": "Bot"},
                 }
             ],
         }
@@ -354,13 +368,13 @@ class CodexReviewRequiredTest(unittest.TestCase):
 
     def test_codex_thumbs_up_reaction_before_push_blocked(self) -> None:
         # 古い push に対する 👍 が残っているだけ (リアクションは SHA に
-        # 紐付かないため created_at で判定する)。
+        # 紐付かないため createdAt で判定する)。
         reactions = {
             "pageInfo": {"hasNextPage": False},
             "nodes": [
                 {
                     "createdAt": "2026-09-07T15:30:00Z",  # push (15:31:14) より前
-                    "user": {"login": "chatgpt-codex-connector[bot]"},
+                    "user": {"login": _CODEX_LOGIN, "__typename": "Bot"},
                 }
             ],
         }
@@ -446,7 +460,7 @@ class CodexReviewRequiredTest(unittest.TestCase):
             "nodes": [
                 {
                     "state": "COMMENTED",
-                    "author": {"login": "chatgpt-codex-connector[bot]"},
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
                     "commit": {"oid": "1" * 40},
                 },
                 {
@@ -457,6 +471,211 @@ class CodexReviewRequiredTest(unittest.TestCase):
         }
         result = _evaluate(
             reviews=reviews, head_sha="1" * 40, codex_bypass=False
+        )
+        self.assertFalse(result["blocked"])
+
+
+class CodexLoginExactMatchTest(unittest.TestCase):
+    """P2 (2026-09-07 の Codex レビュー指摘、PR #192): ログイン判定は完全
+    一致でなければならない。前方一致だと `chatgpt-codex-connector-review`
+    のような別名アカウントの 👍/レビューで必須要件がすり抜けてしまう。
+    このクラスの各テストは、判定が前方一致 (`str.startswith`) のままだと
+    FAIL し、完全一致に直したことで PASS する。
+    """
+
+    def test_lookalike_login_prefix_review_not_accepted(self) -> None:
+        # "chatgpt-codex-connector-review" は
+        # "chatgpt-codex-connector" で始まるが別のアカウント。
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {
+                        "login": "chatgpt-codex-connector-review",
+                        "__typename": "User",
+                    },
+                    "commit": {"oid": _HEAD_SHA},
+                    "body": "**Reviewed commit:** `80246e861a`",
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertTrue(result["blocked"])
+        self.assertIn("Codex のレビュー待ち", result["reasons"][0])
+
+    def test_lookalike_login_thumbs_up_not_accepted(self) -> None:
+        reactions = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "createdAt": "2026-09-07T15:32:00Z",
+                    "user": {
+                        "login": "chatgpt-codex-connector-imposter",
+                        "__typename": "User",
+                    },
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS, reactions=reactions, codex_bypass=False
+        )
+        self.assertTrue(result["blocked"])
+
+    def test_exact_login_match_still_accepted(self) -> None:
+        # 完全一致に厳格化しても、正規の Codex ログインは引き続き通る
+        # (回帰していないことの確認)。
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertFalse(result["blocked"])
+
+    def test_login_match_case_insensitive(self) -> None:
+        # ログイン名の大小文字ゆらぎは許容する (完全一致だが大小無視)。
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {
+                        "login": _CODEX_LOGIN.upper(),
+                        "__typename": "Bot",
+                    },
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertFalse(result["blocked"])
+
+    def test_correct_login_but_wrong_typename_rejected(self) -> None:
+        # __typename が取得できていて "Bot" 以外なら、ログイン名が一致
+        # していても拒否する (なりすましアカウントへの追加防御)。
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "User"},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertTrue(result["blocked"])
+
+    def test_missing_typename_field_does_not_block(self) -> None:
+        # __typename を取得していない (テストデータや将来の互換性) 場合は
+        # ログイン名の完全一致だけで判定する。
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertFalse(result["blocked"])
+
+
+class PushObservedAtSecurityRegressionTest(unittest.TestCase):
+    """P1 (2026-09-07 の Codex レビュー指摘、PR #192): 猶予期間とシグナルc
+    の基準時刻に git commit の committer date を使ってはいけない。
+    committer date は「commit をローカルで作った時刻」であり「GitHub に
+    push された時刻」ではないため、ローカルで古い日時のコミットを作って
+    今 push する (cherry-pick/rebase でも起こる) 操作で、(a) 猶予期間が
+    即座に満たされる、(b) 以前の head に付いていた古い 👍 のリアクションが
+    「現在の head をレビュー済み」と誤認される、という2つの防御が同時に
+    破られる。
+
+    この単体テストは committer date と push 観測時刻の違いそのものは検証
+    できない (どちらも `evaluate_review_gate` にとってはただの ISO8601
+    文字列であり、区別する情報を持たない — 修正の本体は呼び出し側
+    `review_gate_decision.sh` が渡す値を committer date から check-suites
+    の作成時刻に変更したことにある。docs/decisions.md D91 参照)。
+    ここでは代わりに、呼び出し側が正しく「直近の push 観測時刻」を渡した
+    場合に、シナリオどおり安全側の判定になることを確認する。
+    """
+
+    def test_reaction_from_before_a_recent_push_is_rejected(self) -> None:
+        # シナリオ: 攻撃者 (あるいは単なる rebase) が過去の日時のコミットを
+        # 用意し、それを今 push した。もし誤って committer date
+        # (= 過去の日時) を基準にしていれば、その過去の日時の直後に付いた
+        # 古い 👍 のリアクションが「現在の head をレビュー済み」と誤認され、
+        # 猶予期間も同時に即座に満たされてしまう。
+        #
+        # ここでは呼び出し側が正しい値 (直近の push 観測時刻、6分前) を
+        # 渡した場合を検証する: 古い 👍 (push 観測時刻より前) はシグナルc
+        # を満たさず、かつ push 観測から6分しか経っていないため猶予期間も
+        # 満たさない — 結果として正しくブロックされる。
+        recent_push_observed_at = "2026-09-07T16:25:00Z"  # 実際の push 観測 (6分前)
+        now = "2026-09-07T16:31:00Z"
+        stale_reaction = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    # 古い head (attacker が用意した過去の committer date
+                    # 相当) の直後に付いていた 👍。
+                    "createdAt": "2026-09-07T15:05:00Z",
+                    "user": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                }
+            ],
+        }
+
+        result = evaluate_review_gate(
+            review_threads=_EMPTY_THREADS,
+            latest_reviews=_EMPTY_REVIEWS,
+            head_push_observed_at=recent_push_observed_at,
+            now=now,
+            grace_period_minutes=15,
+            reactions=stale_reaction,
+            head_sha=_HEAD_SHA,
+            codex_bypass=False,
+        )
+        self.assertTrue(result["blocked"])
+        # Codex 待ち (古い👍は不成立) + 猶予期間 (6分しか経っていない) の
+        # 2件がともに正しくブロック理由になっていること。
+        self.assertEqual(len(result["reasons"]), 2)
+        self.assertTrue(
+            any("Codex のレビュー待ち" in r for r in result["reasons"])
+        )
+        self.assertTrue(any("猶予期間" in r for r in result["reasons"]))
+
+    def test_reaction_after_recent_push_is_accepted(self) -> None:
+        # 対照: push 観測時刻より後に付いた 👍 は正しく受理される
+        # (誤検出だけでなく、正当なケースを壊していないことも確認する)。
+        recent_push_observed_at = "2026-09-07T16:25:00Z"
+        now = "2026-09-07T16:41:00Z"  # push から16分後 (猶予期間も満了)
+        fresh_reaction = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "createdAt": "2026-09-07T16:26:00Z",  # push の1分後
+                    "user": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                }
+            ],
+        }
+
+        result = evaluate_review_gate(
+            review_threads=_EMPTY_THREADS,
+            latest_reviews=_EMPTY_REVIEWS,
+            head_push_observed_at=recent_push_observed_at,
+            now=now,
+            grace_period_minutes=15,
+            reactions=fresh_reaction,
+            head_sha=_HEAD_SHA,
+            codex_bypass=False,
         )
         self.assertFalse(result["blocked"])
 
@@ -481,7 +700,7 @@ class MultipleReasonsTest(unittest.TestCase):
         result = _evaluate(
             threads=threads,
             reviews=reviews,
-            committed="2026-09-07T16:30:00Z",
+            push_observed_at="2026-09-07T16:30:00Z",
         )
         self.assertTrue(result["blocked"])
         self.assertEqual(len(result["reasons"]), 3)  # 未解決 + CHANGES_REQUESTED + 猶予期間
@@ -548,7 +767,7 @@ class PR185RegressionTest(unittest.TestCase):
             "nodes": [
                 {
                     "state": "COMMENTED",
-                    "author": {"login": "chatgpt-codex-connector[bot]"},
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
                     "commit": {"oid": _HEAD_SHA},
                     "body": "**Reviewed commit:** `80246e861a`",
                 }
@@ -557,7 +776,7 @@ class PR185RegressionTest(unittest.TestCase):
         result = evaluate_review_gate(
             review_threads=threads,
             latest_reviews=reviews,
-            head_committed_date="2026-09-07T15:31:14Z",
+            head_push_observed_at="2026-09-07T15:31:14Z",
             now="2026-09-07T15:37:55Z",
             grace_period_minutes=15,
             reactions=_EMPTY_REACTIONS,
