@@ -48,8 +48,11 @@ speed can be built on top of it rather than bolted on.
 
 ### Performance
 
-- [x] Tab suspension driven by idle time, tab count and a memory budget
-      (off by default)
+- [x] Tab suspension driven by idle time, tab count and a memory budget —
+      the memory-budget signal (700 MiB) is **on by default** as of Issue
+      #184 (docs/decisions.md D90); idle time and tab count stay opt-in.
+      Set `VELOX_MEMORY_BUDGET_MB=0` (or the settings screen's Performance
+      tab) to turn even that off
 - [x] Performance instrumentation and a benchmark suite (`velox-bench`),
       including IPC volume/latency accounting
 - [x] Performance regression gate in CI, and a dashboard that tracks results
@@ -253,18 +256,17 @@ Measured and settled:
   re-sent on every page event even while closed (-98.5%). The tab strip's
   full re-send was left alone at a measured worst case of 3.5ms (D81)
 - **Memory** — the leak audit found and fixed an unbounded map, and long-run
-  growth under repeated tab churn is bounded (D79). Footprint at 20 tabs is
-  **+245% versus Chromium with the default settings**, dropping to **+20%
-  once tab suspension is enabled** — still short of the +10% target either
-  way. Suspension being off by default is exactly why that gap is still open
-  (D48 / D56)
+  growth under repeated tab churn is bounded (D79). Footprint at 20 tabs used
+  to be **+245% versus Chromium with the default settings**; as of Issue
+  #184 (D90) the memory-budget signal is on by default (700 MiB), bringing
+  the default-settings figure down to **+32%**, and it drops further to
+  **+20% with an explicit `VELOX_MAX_LIVE_TABS=4`** — still short of the
+  +10% target either way (D48 / D56 / D90)
 
 Still open:
 
 - Browser state / event dispatch, serialization / allocation, and page load
   optimization
-- Whether tab suspension should be **on** by default (it cuts 20-tab memory
-  by 65%, but is off today)
 - Windows performance measurement — no runner is set up for it yet
 
 ### Remaining browser features (Phase 2)

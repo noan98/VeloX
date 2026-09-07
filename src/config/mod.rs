@@ -174,13 +174,17 @@ pub struct Config {
     pub max_tabs_per_web_process: usize,
     /// Automatic tab suspension policy (Issue #63, see
     /// `browser::suspension`): idle time, live-tab cap and memory budget,
-    /// each individually optional. Defaults to every signal off
-    /// ([`SuspensionPolicy::default`]) so a fresh checkout never suspends a
-    /// tab the user did not ask to suspend — see docs/decisions.md D9 for
-    /// why automatic suspension is opt-in, and D56 for the policy. Manual
-    /// suspension (the tab strip's suspend button,
-    /// `ui::toolbar::ToolbarCommand::SuspendTab`) is always available
-    /// regardless. Configured via `VELOX_AUTO_SUSPEND_AFTER_MS`,
+    /// each individually optional. **Defaults to the memory-budget signal on
+    /// (700 MiB), idle time and tab-count off**
+    /// ([`SuspensionPolicy::default`]) — Issue #184 / docs/decisions.md D90
+    /// decided D56's Revisit condition (3), superseding D9's original
+    /// "every signal off" default (D9/D56 are left as written; D90 records
+    /// why and what changed). With few tabs open the process tree stays
+    /// under budget and nothing is suspended, so this is unobservable for
+    /// most sessions; set `VELOX_MEMORY_BUDGET_MB=0` (or the settings
+    /// screen) to turn even that off. Manual suspension (the tab strip's
+    /// suspend button, `ui::toolbar::ToolbarCommand::SuspendTab`) is always
+    /// available regardless. Configured via `VELOX_AUTO_SUSPEND_AFTER_MS`,
     /// `VELOX_MAX_LIVE_TABS`, `VELOX_MEMORY_BUDGET_MB` and
     /// `VELOX_MEMORY_CHECK_INTERVAL_MS` — see [`Config::from_env_and_args`].
     pub suspension: SuspensionPolicy,
@@ -288,19 +292,29 @@ impl Config {
     ///   default (4).
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
-    ///   `browser::suspension`). Unset, `0` or not a number leaves the
-    ///   idle signal off.
+    ///   `browser::suspension`). Off by default; unset or not a number
+    ///   keeps that default (off). `0` explicitly turns it off (a no-op
+    ///   today, since off is already the default — kept for symmetry with
+    ///   the other two knobs and in case a future default changes this).
     /// - `VELOX_MAX_LIVE_TABS` — keep at most this many tabs alive at once
     ///   (the active tab included); the least recently used background
-    ///   tabs beyond it are suspended. Unset, `0` or not a number leaves
-    ///   the tab-count signal off.
+    ///   tabs beyond it are suspended. Off by default (see
+    ///   docs/decisions.md D90 for why this one specifically is not
+    ///   defaulted on); unset or not a number keeps that default (off), `0`
+    ///   explicitly turns it off.
     /// - `VELOX_MEMORY_BUDGET_MB` — suspend least recently used background
-    ///   tabs whenever the whole process tree's memory (PSS on Linux)
-    ///   exceeds this many MiB. Unset, `0` or not a number leaves the
-    ///   memory signal off (and no memory sampling runs).
-    /// - `VELOX_MEMORY_CHECK_INTERVAL_MS` — only consulted when
-    ///   `VELOX_MEMORY_BUDGET_MB` is set; how often memory is sampled.
-    ///   Unset, `0` or not a number keeps
+    ///   tabs whenever the whole process tree's memory (PSS on Linux, RSS
+    ///   on Windows/other Unix — docs/decisions.md D88/D90) exceeds this
+    ///   many MiB. **On by default as of Issue #184 (700 MiB,
+    ///   docs/decisions.md D90).** Unset or not a number keeps that
+    ///   default; **`0` is the escape hatch that turns the memory signal
+    ///   off** even though the default has it on (the settings screen's
+    ///   Performance tab offers the same toggle — leave the field blank).
+    ///   Any other positive value overrides the default outright.
+    /// - `VELOX_MEMORY_CHECK_INTERVAL_MS` — only consulted when the memory
+    ///   signal ends up on (by the `VELOX_MEMORY_BUDGET_MB` default or an
+    ///   explicit override); how often memory is sampled. Unset, `0` or not
+    ///   a number keeps
     ///   [`SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`].
     /// - `VELOX_SEARCH_ENGINE` — select a built-in preset by name
     ///   (`duckduckgo`/`ddg`, `google`, `bing`, `startpage`, `ecosia`;
@@ -686,18 +700,46 @@ fn resolve_max_tabs_per_web_process(raw: Option<&str>) -> usize {
 }
 
 /// Pure decision logic behind [`Config::from_env_and_args`]'s
-/// `suspension` (Issue #63), factored out like [`resolve_perf_env`] so the
-/// parsing rules are unit-tested without touching the process environment.
-/// Every knob follows the same rule: unset, empty, `0`, or not a number
-/// means "off" (or "default", for the interval) — a typo in a shell
-/// profile must never produce a surprising policy, only the conservative
-/// one.
+/// `suspension` (Issue #63, defaults revised by #184/D90), factored out
+/// like [`resolve_perf_env`] so the parsing rules are unit-tested without
+/// touching the process environment.
+///
+/// Every knob is resolved against [`SuspensionPolicy::default`], not a
+/// hardcoded "off": unset, empty, or not a number keeps whatever the
+/// compiled-in default already is for that field (`None` for idle time and
+/// tab-count, `Some(700 MiB)` for the memory budget as of D90) — a typo in
+/// a shell profile must never produce a surprising policy, only the
+/// conservative one, which since D90 means "the compiled default", not
+/// unconditionally "off". An explicit `0` is the one value that always
+/// means "off", *even when the default for that field is on* — this is the
+/// escape hatch `VELOX_MEMORY_BUDGET_MB=0` needs to exist for D90's default
+/// to be turnable off at all. Any other positive number overrides the
+/// default outright. `check_interval_ms_raw` is the one exception: a
+/// `Duration` has no "off" state, so unset/`0`/garbage there all keep
+/// [`SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`], unchanged from
+/// before D90.
 fn resolve_suspension(
     idle_after_ms_raw: Option<&str>,
     max_live_tabs_raw: Option<&str>,
     memory_budget_mb_raw: Option<&str>,
     check_interval_ms_raw: Option<&str>,
 ) -> SuspensionPolicy {
+    /// A knob whose *default* may itself be `Some` (D90's memory budget):
+    /// unset/blank/not-a-number keeps `default`, an explicit `0` disables
+    /// the signal regardless of what `default` says, and any other
+    /// positive number overrides it. Generalizes the pre-D90 rule ("unset
+    /// or 0 means off") to a world where "unset" and "explicitly off" are
+    /// no longer always the same outcome.
+    fn overridable(raw: Option<&str>, default: Option<u64>) -> Option<u64> {
+        match raw
+            .map(str::trim)
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            None => default,
+            Some(0) => None,
+            Some(value) => Some(value),
+        }
+    }
     fn positive(raw: Option<&str>) -> Option<u64> {
         raw.map(str::trim)
             .and_then(|value| value.parse::<u64>().ok())
@@ -705,11 +747,23 @@ fn resolve_suspension(
     }
     let defaults = SuspensionPolicy::default();
     SuspensionPolicy {
-        idle_after: positive(idle_after_ms_raw).map(Duration::from_millis),
-        max_live_tabs: positive(max_live_tabs_raw)
-            .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
-        memory_budget_bytes: positive(memory_budget_mb_raw)
-            .map(|mib| mib.saturating_mul(1024 * 1024)),
+        idle_after: overridable(
+            idle_after_ms_raw,
+            defaults.idle_after.map(|d| d.as_millis() as u64),
+        )
+        .map(Duration::from_millis),
+        max_live_tabs: overridable(
+            max_live_tabs_raw,
+            defaults.max_live_tabs.map(|value| value as u64),
+        )
+        .map(|value| usize::try_from(value).unwrap_or(usize::MAX)),
+        memory_budget_bytes: overridable(
+            memory_budget_mb_raw,
+            defaults
+                .memory_budget_bytes
+                .map(|bytes| bytes / (1024 * 1024)),
+        )
+        .map(|mib| mib.saturating_mul(1024 * 1024)),
         memory_check_interval: positive(check_interval_ms_raw)
             .map(Duration::from_millis)
             .unwrap_or(defaults.memory_check_interval),
@@ -745,14 +799,21 @@ mod tests {
         assert!(config.panel_height > 0);
         assert!(config.bookmark_bar_height > 0);
         assert!(config.history_panel_limit > 0);
-        // Automatic suspension must be opt-in: a fresh checkout should never
-        // surprise a user by suspending a tab on its own.
+        // Issue #184 / docs/decisions.md D90: a fresh checkout has the
+        // memory-budget signal on (700 MiB) and nothing else — see
+        // `browser::suspension`'s own `default_policy_enables_only_the_
+        // memory_budget_signal` for the exact values. With few tabs open
+        // this never actually suspends anything (D90), but `is_enabled()`
+        // is true, unlike before D90.
         assert_eq!(
             config.max_tabs_per_web_process,
             DEFAULT_MAX_TABS_PER_WEB_PROCESS
         );
         assert_eq!(config.suspension, SuspensionPolicy::default());
-        assert!(!config.suspension.is_enabled());
+        assert!(config.suspension.is_enabled());
+        assert_eq!(config.suspension.idle_after, None);
+        assert_eq!(config.suspension.max_live_tabs, None);
+        assert!(config.suspension.memory_budget_bytes.is_some());
         assert!(!config.private);
         assert!(!config.perf_metrics);
         assert_eq!(config.perf_rss_interval, None);
@@ -1115,13 +1176,22 @@ mod tests {
         }
     }
 
-    // -- resolve_suspension (Issue #63) -----------------------------------
+    // -- resolve_suspension (Issue #63, defaults revised by #184/D90) -----
 
     #[test]
-    fn resolve_suspension_defaults_to_everything_off() {
+    fn resolve_suspension_with_no_env_vars_matches_the_compiled_default() {
+        // Since D90, "nothing set" no longer means "everything off" — it
+        // means "whatever `SuspensionPolicy::default` already is", which as
+        // of D90 has the memory-budget signal on.
         let policy = resolve_suspension(None, None, None, None);
         assert_eq!(policy, SuspensionPolicy::default());
-        assert!(!policy.is_enabled());
+        assert!(policy.is_enabled());
+        assert_eq!(policy.idle_after, None);
+        assert_eq!(policy.max_live_tabs, None);
+        assert_eq!(
+            policy.memory_budget_bytes,
+            Some(crate::browser::suspension::DEFAULT_MEMORY_BUDGET_BYTES)
+        );
     }
 
     #[test]
@@ -1133,8 +1203,10 @@ mod tests {
         assert_eq!(policy.memory_check_interval, Duration::from_millis(500));
         assert!(policy.is_enabled());
 
-        // One knob alone is enough to enable the policy.
-        let only_count = resolve_suspension(None, Some(" 3 "), None, None);
+        // One knob alone is enough to enable the policy — isolated here by
+        // explicitly turning the now-default-on memory signal off (`"0"`),
+        // so this only demonstrates the tab-count knob.
+        let only_count = resolve_suspension(None, Some(" 3 "), Some("0"), None);
         assert_eq!(only_count.max_live_tabs, Some(3));
         assert_eq!(only_count.idle_after, None);
         assert_eq!(only_count.memory_budget_bytes, None);
@@ -1142,19 +1214,66 @@ mod tests {
     }
 
     #[test]
-    fn resolve_suspension_treats_zero_empty_and_garbage_as_off() {
-        for raw in ["0", "", "  ", "-1", "abc", "1.5"] {
+    fn resolve_suspension_empty_and_garbage_are_treated_as_unset_so_the_default_applies() {
+        // Blank/unparseable input is indistinguishable from "not set" —
+        // every knob falls back to `SuspensionPolicy::default()`, exactly
+        // as an entirely absent env var would (this is what changed with
+        // D90: falling back to "the default" is no longer always the same
+        // as falling back to "off").
+        for raw in ["", "  ", "-1", "abc", "1.5"] {
             let policy = resolve_suspension(Some(raw), Some(raw), Some(raw), Some(raw));
             assert_eq!(policy, SuspensionPolicy::default(), "raw was {raw:?}");
         }
     }
 
     #[test]
-    fn resolve_suspension_interval_falls_back_to_default_without_a_budget() {
-        // The interval alone never enables anything.
-        let policy = resolve_suspension(None, None, None, Some("100"));
+    fn resolve_suspension_explicit_zero_disables_every_signal_even_ones_defaulted_on() {
+        // The escape hatch D90 requires: `0` always means "off", even for
+        // the memory-budget signal whose *default* is on. Without this,
+        // there would be no way to turn D90's default off via env var.
+        let policy = resolve_suspension(Some("0"), Some("0"), Some("0"), Some("0"));
         assert!(!policy.is_enabled());
-        assert_eq!(policy.memory_check_interval, Duration::from_millis(100));
+        assert_eq!(policy.idle_after, None);
+        assert_eq!(policy.max_live_tabs, None);
+        assert_eq!(policy.memory_budget_bytes, None);
+        // The interval has no "off" state — explicit `0` there keeps the
+        // compiled default, same as before D90.
+        assert_eq!(
+            policy.memory_check_interval,
+            SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn resolve_suspension_memory_budget_zero_alone_is_the_real_world_off_switch() {
+        // The exact env var a user (or docs/README) would actually set:
+        // `VELOX_MEMORY_BUDGET_MB=0`, nothing else. This must fully turn
+        // automatic suspension off again, matching pre-D90 behavior.
+        let policy = resolve_suspension(None, None, Some("0"), None);
+        assert!(!policy.is_enabled());
+        assert_eq!(policy.memory_budget_bytes, None);
+        assert_eq!(policy.idle_after, None);
+        assert_eq!(policy.max_live_tabs, None);
+    }
+
+    #[test]
+    fn resolve_suspension_interval_override_applies_independently_of_the_memory_signal() {
+        // With the memory signal left at its default (on), an interval
+        // override still applies on top of it.
+        let with_default_memory = resolve_suspension(None, None, None, Some("100"));
+        assert!(with_default_memory.is_enabled());
+        assert_eq!(
+            with_default_memory.memory_check_interval,
+            Duration::from_millis(100)
+        );
+        // And with the memory signal explicitly off, the interval override
+        // still applies (it is simply irrelevant — no sampler runs).
+        let with_memory_off = resolve_suspension(None, None, Some("0"), Some("100"));
+        assert!(!with_memory_off.is_enabled());
+        assert_eq!(
+            with_memory_off.memory_check_interval,
+            Duration::from_millis(100)
+        );
     }
 
     // --- Robustness against hostile/malformed env values (Issue #35): a
@@ -1336,11 +1455,13 @@ mod tests {
     }
 
     #[test]
-    fn apply_settings_none_performance_signals_disable_the_suspension_policy() {
-        // Start from a config where every signal was already on (e.g. from
-        // an earlier env-var-driven run), to prove `apply_settings`
-        // overwrites rather than merges — turning a signal off in the
-        // settings screen must actually turn it off.
+    fn apply_settings_with_default_settings_leaves_the_default_on_memory_signal_enabled() {
+        // Since D90, `Settings::default()` (a settings screen never opened,
+        // or opened and saved without changing Performance) carries the
+        // same memory-budget-on default `SuspensionPolicy::default` does
+        // (`PerformanceSettings::default`'s `memory_budget_mb` mirrors it —
+        // see that constant's doc comment) — applying it must not silently
+        // disable what a fresh checkout already has on.
         let mut config = Config {
             suspension: SuspensionPolicy {
                 idle_after: Some(Duration::from_secs(10)),
@@ -1352,7 +1473,37 @@ mod tests {
         };
         config.apply_settings(&Settings::default());
         assert_eq!(config.suspension, SuspensionPolicy::default());
+        assert!(config.suspension.is_enabled());
+    }
+
+    #[test]
+    fn apply_settings_explicit_none_signals_disable_the_suspension_policy() {
+        // The actual "turn it off in the settings screen" path: every
+        // Performance-tab field explicitly `None` (what saving the
+        // Performance tab with every suspension field left blank produces,
+        // `PerformanceSettings::sanitize`'s `Some(0)` -> `None` collapse
+        // included) must overwrite an already-on policy with a fully
+        // disabled one — proving `apply_settings` overwrites rather than
+        // merges, and that D90's default-on memory signal really can be
+        // turned off from the UI, not just via `VELOX_MEMORY_BUDGET_MB=0`.
+        let mut config = Config {
+            suspension: SuspensionPolicy {
+                idle_after: Some(Duration::from_secs(10)),
+                max_live_tabs: Some(3),
+                memory_budget_bytes: Some(100),
+                memory_check_interval: Duration::from_secs(1),
+            },
+            ..Config::default()
+        };
+        let mut settings = Settings::default();
+        settings.performance.auto_suspend_after_ms = None;
+        settings.performance.max_live_tabs = None;
+        settings.performance.memory_budget_mb = None;
+        config.apply_settings(&settings);
         assert!(!config.suspension.is_enabled());
+        assert_eq!(config.suspension.idle_after, None);
+        assert_eq!(config.suspension.max_live_tabs, None);
+        assert_eq!(config.suspension.memory_budget_bytes, None);
     }
 
     #[test]

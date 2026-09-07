@@ -233,7 +233,7 @@ Phase 3 のメモリ最適化 (#61 / #62 / #63) は「Chromium より軽い」�
 | # | 目標 | 現在値 | 目標値 | 根拠 |
 | --- | --- | ---: | ---: | --- |
 | T1 | 起動〜load の優位を**維持**する | Chromium 比 -22〜-32% | **Chromium より速い状態を維持** (目安 -20%) | 既に勝っている領域を最適化で失わないことが最優先。回帰ゲート (#72) の対象 — **判定方式は §10 で確定**。単発の測定値で -20% を割ったことを回帰と判定してはならない (§10 参照) |
-| T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +45% (1 タブ)。**自動休止を有効にすると** 10/20 タブで +14% / +20% (`VELOX_MAX_LIVE_TABS=4`)、既定 (無効) では +171% / +245% (§12・`docs/memory-analysis.md` §11) | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。**#61 で主因を特定 → #118 で `WebContext` 共有 (-2.5〜-11%) → #124 で `WebKitWebProcess` 共有 (5/10/20 タブで -17/-23/-26%、D54) → #63 で Adaptive Tab Suspension (D56): 空にできるプロセスグループを丸ごと休止する適応ポリシーで、有効時は 20 タブ -65% (1612 → 560 MiB、Chromium 比 +245% → +20%)。既定は無効 (D9) のため、T2 の「現在値」は設定次第。残りは 1 タブ時の toolbar 用 `WebProcess` (+45%) と生存タブ分 — §12 参照**
+| T2 | メモリ (PSS) で Chromium と**同等**まで詰める | Chromium 比 +45% (1 タブ)。**既定 (Issue #184/D90、メモリ予算 700 MiB) で** 10/20 タブ +26% / +32%、上限を明示 (`VELOX_MAX_LIVE_TABS=4`) すると 10/20 タブで +14% / +20% (§12・§23・`docs/memory-analysis.md` §11) | **Chromium 比 +10% 以内** | 「低メモリ」を名乗る最低条件。**#61 で主因を特定 → #118 で `WebContext` 共有 (-2.5〜-11%) → #124 で `WebKitWebProcess` 共有 (5/10/20 タブで -17/-23/-26%、D54) → #63 で Adaptive Tab Suspension (D56): 空にできるプロセスグループを丸ごと休止する適応ポリシーで、有効時は 20 タブ -65% (1612 → 560 MiB、Chromium 比 +245% → +20%) → #184 でこれを既定 ON に (D90): メモリ予算 700 MiB のみを既定で有効化し、20 タブ +245% → +32% を設定なしで誰でも得られるようにした。**T2 (+10% 以内) は未達のまま**。残りは 1 タブ時の toolbar 用 `WebProcess` (+45%) と生存タブ分 — §12・§23 参照**
 | T3 | `startup_toolbar_ready_ms` を短縮する | 528.4ms | **300ms 以下** | ⚠️ **保留**。当初「この区間は VeloX 自身のコードでエンジン差ではないから確実に手が出せる」と設定したが、**#59 の実測でこの前提は誤りと判明した** (支配的なのは tao/GTK の初期化と WebKitGTK の webview 生成)。目標値は据え置くが、達成手段は現時点で不明。§9 参照 |
 | T4 | 20 タブ時に操作不能な遅延を出さない | **20 タブでタブ切替 0.40ms** (`tab_switch_20`、48 サンプル)、休止タブへの切替 `tab_resume` 2.7ms + 再読み込み 10ms | タブ切替 median **100ms 以下** | ✅ **達成** (#60、§13)。目標を 2 桁下回る。ただしこの指標はメインスレッドのハンドラが返るまでで、描画完了までではない (D57 の「残る限界」) |
 
@@ -1638,4 +1638,136 @@ target/release/velox-bench gate \
   --candidate "$S/tab_create_20-candidate-2.json" \
   --warn-pct 20 --fail-pct 60 \
   --output "$S/gate-report.json" --markdown-output "$S/gate-summary.md"
+```
+
+## 23. 自動タブ休止のデフォルト ON (Issue #184, 2026-09-07)
+
+**設計判断は `docs/decisions.md` D90 を参照。** ここでは既定 ON にした状態
+での実測結果だけを記録する。測定環境は §1 と同一 (このコンテナ、
+WebKitGTK、Xvfb、GPU なし)。before は本 Issue 着手前 (`beba7b7`、D9/D56 の
+「全シグナル無効」既定) のバイナリ、after は本 Issue の変更 (D90、メモリ
+予算 700 MiB を既定で有効化) を適用したバイナリで、どちらも同じセッション
+で `cargo build --release` した。
+
+### 23.1 1/5/10/20 タブの PSS (`tab_scaling.py`、3 試行の中央値、`minimal.html`)
+
+| タブ数 | Chromium (MiB) | before (旧既定=無効, MiB) | after (新既定=700 MiB, env 上書き無し, MiB) | before→after |
+| ---: | ---: | ---: | ---: | ---: |
+| 1  |  281.7 |  400.2 |  399.8 | ±0.0% |
+| 5  |  321.9 |  646.6 |  646.5 | ±0.0%（予算内のため休止なし） |
+| 10 |  369.5 |  979.7 |  464.4 | **-52.6%** |
+| 20 |  468.2 | 1655.7 |  617.7 | **-62.7%** |
+
+Chromium 比 (after): 1 タブ +41.9%、5 タブ +100.8%（予算内でまだ休止して
+いない分、旧既定と同じ）、10 タブ **+25.7%**、20 タブ **+31.9%**。絶対値は
+D56 の元セッション (§12: 409.0/653.6/990.6/1612.1 MiB) と数十 MiB のずれが
+あるが (実行時刻・コンテナ負荷によるドリフト。§10/D46 が言う「異なる
+セッションを比較してはならない」の対象で、本節の結論はすべて同一セッション
+内の before/after 比較のみに基づく)、**相対的な形は D56 と一致**する: 5
+タブでは予算 (700 MiB) 内に収まるため休止が起きず before と同一、10/20
+タブでは大きく下がる。T2 (Chromium 比 +10% 以内) は引き続き未達 (§12/D56
+と同じ結論) — 本 Issue は T2 の目標値に新たに近づけることを目的にしておらず、
+既定 ON でも D56 が実測した削減効果 (-65%程度) がそのまま出ることを確認する
+のが狙いだった。
+
+### 23.2 軽量ケース (1〜3 タブ) のポーリングコスト
+
+Issue #184 の acceptance criterion: 「休止が発生しない軽量ケースで、メモリ
+予算のポーリング自体のコストが無視できること」の確認。`scripts/profile/
+cpu_usage.py` (`/proc/<pid>/stat` の utime+stime を起動直後と 30 秒後の 2
+点だけ外部から読み、差分を取る — 測定自体のコストが被測定側に乗らない) で、
+アイドル 30 秒窓の CPU% を「既定 (メモリ監視 ON)」と「`VELOX_MEMORY_BUDGET_
+MB=0` (OFF)」で比較した。既定の `memory_check_interval` は 2 秒。
+
+| ケース | 既定 ON (CPU%) | `VELOX_MEMORY_BUDGET_MB=0` (CPU%) | 差分 |
+| --- | ---: | ---: | ---: |
+| 1 タブ | 1.2%（0.35〜0.36 秒/30 秒、3 試行） | 0.1%（0.04 秒/30 秒） | 約 +1.1pt |
+| 3 タブ | 1.5%（0.44 秒/30 秒） | 0.2%（0.05 秒/30 秒） | 約 +1.3pt |
+
+`/proc` 全体を 2 秒ごとに 1 回歩くサンプラ自体のコストは 1 コア換算で約
+1〜1.3 ポイント。**厳密にはゼロではない**が、アイドル中のデスクトップ
+アプリとしては実用上無視できる水準と判断した。この数値からは `memory_
+check_interval` の既定 (2 秒) を変える理由は出てこない。
+
+### 23.3 `velox-bench gate`
+
+`--warn-pct 20 --fail-pct 60`、baseline=旧既定バイナリ、candidate=新既定
+バイナリ ×2、各 8 試行:
+
+| シナリオ | 総合判定 | 備考 |
+| --- | --- | --- |
+| `cold_startup` | OK | `startup_toolbar_ready_ms` など全項目 -3.6%〜+2.6% |
+| `tab_create` | OK | `tab_create_ms` -4.9%〜+9.8% |
+| `tab_switch` | OK | `tab_switch_ms` ±0.0% |
+| `tab_create_20` | OK | `tab_create_ms` -1.3%〜±0.0%、`page_load_*` 数%以内 |
+| `tab_switch_20` | **OK — ただし比較不能** | 下記参照 |
+
+上位 4 シナリオはいずれも少タブ (数タブ) しか開かないため 700 MiB を超えず、
+既定を変える前と実質的に同じものを測っている。
+
+**`tab_switch_20` は「回帰なし」の確認になっていない、という発見**: 20
+タブまで開くこの手動シナリオでは、新既定のメモリ予算がベンチマーク実行中
+に実際にバックグラウンドタブを休止させてしまうため、`switch` コマンドの
+大半が `tab_switch` ではなく `tab_resume`(+`page_load`) として記録される。
+baseline の出力は `tab_switch_ms` のみ、candidate の出力は
+`tab_resume_ms`/`page_load_*` のみとなり、`velox-bench gate` は「比較可能な
+メトリクスがありません」として機械的に**総合判定 OK** を返す — これは
+性能に問題が無いことの確認では**ない**。`VELOX_MEMORY_BUDGET_MB=0` を明示
+すると `tab_switch_ms` は再び記録され、baseline とほぼ同じ値 (0.80ms 中央値、
+両者一致) になることを確認した — 休止の無効化は完全に機能している。
+
+**影響範囲は限定的**: 自動化されている唯一の回帰ゲート
+(`.github/workflows/perf-gate.yml`) は `cold_startup` のみを対象にしており、
+20 タブ級のシナリオは走らせていないため、CI の自動回帰検知がサイレントに
+機能を失っているわけではない。ただし今後 `tab_switch_20`/`tab_create_20`
+のような多タブシナリオを手動で再計測する際は、`VELOX_MEMORY_BUDGET_MB=0`
+を明示しない限り「switch のレイテンシ」のつもりが実際には「resume の
+レイテンシ」を測ってしまう点に注意が必要 (`docs/decisions.md` D90 の
+Revisit condition (4))。
+
+### 23.4 再現手順
+
+```sh
+cargo build --release
+S=/path/to/scratch
+cp target/release/velox "$S/velox-after"
+git stash && cargo build --release && cp target/release/velox "$S/velox-before" && git stash pop
+CHROME=/opt/pw-browsers/chromium-1194/chrome-linux/chrome
+XV_RUN() { xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- "$@"; }
+
+# 23.1: タブ数スケーリング (旧既定 = before は Chromium も同時計測)
+XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-before" --chromium "$CHROME" \
+  --page minimal.html --tab-counts 1,5,10,20 --trials 3 --output "$S/before.json"
+XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-after" \
+  --page minimal.html --tab-counts 1,5,10,20 --trials 3 --output "$S/after-default.json"
+
+# 23.2: 軽量ケースのポーリングコスト
+P=$PWD/scripts/bench/pages
+printf 'wait 40000\nquit\n' > "$S/light1.txt"
+printf 'open file://%s/text.html\nwait_load\nopen file://%s/dom_heavy.html\nwait_load\nwait 40000\nquit\n' \
+  "$P" "$P" > "$S/light3.txt"
+XV_RUN python3 scripts/profile/cpu_usage.py --velox "$S/velox-after" \
+  --script "$S/light1.txt" --homepage "file://$P/minimal.html" \
+  --settle-secs 6 --window-secs 30 --label 1tab_on
+VELOX_MEMORY_BUDGET_MB=0 XV_RUN python3 scripts/profile/cpu_usage.py --velox "$S/velox-after" \
+  --script "$S/light1.txt" --homepage "file://$P/minimal.html" \
+  --settle-secs 6 --window-secs 30 --label 1tab_off
+# 3 タブも同様に light3.txt で
+
+# 23.3: gate (§22.4 と同じ形。cold_startup/tab_create/tab_switch/tab_create_20/tab_switch_20 を
+# baseline=velox-before, candidate=velox-after ×2 で。tab_switch_20 のみ VELOX_MEMORY_BUDGET_MB=0
+# を付けた追加実行で無効化の効果も確認した)
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+XV_RUN target/release/velox-bench run --scenario tab_switch_20 --trials 8 \
+  --velox-bin "$S/velox-before" --url http://127.0.0.1:8731/minimal.html \
+  --output "$S/tab_switch_20-baseline.json"
+for i in 1 2; do
+  XV_RUN target/release/velox-bench run --scenario tab_switch_20 --trials 8 \
+    --velox-bin "$S/velox-after" --url http://127.0.0.1:8731/minimal.html \
+    --output "$S/tab_switch_20-candidate-$i.json"
+done
+target/release/velox-bench gate \
+  --baseline "$S/tab_switch_20-baseline.json" \
+  --candidate "$S/tab_switch_20-candidate-1.json" --candidate "$S/tab_switch_20-candidate-2.json" \
+  --warn-pct 20 --fail-pct 60 --output "$S/gate-report.json" --markdown-output "$S/gate-summary.md"
 ```

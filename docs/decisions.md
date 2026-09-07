@@ -10541,3 +10541,260 @@ BrowserWindow::eval_toolbar`が`Instant::now()`を読むのは、呼び出し元
 必要になる。(3) 本節の数値はすべて Linux/WebKitGTK — Windows (WebView2) の
 NTFS 上でのディスク書き込みコスト・アロケータの挙動は異なりうるため未計測
 (Epic #57 ルール 5)。
+
+## D90: 自動タブ休止をデフォルト ON にする (Issue #184) — メモリ予算シグナルのみ、700 MiB。D9 の opt-in 方針と D56 Revisit condition (3) の決着
+
+**対象**: Issue #184。D56 (Adaptive Tab Suspension のポリシー本体) の Revisit
+condition (3) 「既定を有効にするかどうか」への決着で、D9 が定めた「ユーザが
+頼んでいない休止で状態を失わせない」という opt-in デフォルト方針を覆す。**D9
+/ D56 はどちらも書き換えず、本節から参照する。**
+
+### 決定
+
+`browser::suspension::SuspensionPolicy::default()` を次のとおり変更した:
+
+| シグナル | 旧既定 (D9/D56) | 新既定 (D90) |
+| --- | --- | ---: |
+| `memory_budget_bytes` | 無効 (`None`) | **有効 — 700 MiB** (`DEFAULT_MEMORY_BUDGET_BYTES`) |
+| `max_live_tabs` | 無効 (`None`) | 無効 (`None`) のまま |
+| `idle_after` | 無効 (`None`) | 無効 (`None`) のまま |
+
+700 MiB は D56 が同一セッションで実測済みの `VELOX_MEMORY_BUDGET_MB=700` の
+値そのもの (`docs/performance-targets.md` §12: 1/5/10/20 タブで 407.3 /
+659.6 / 476.2 / 615.1 MiB、いずれも予算内に収まる挙動を確認済み)。新しい値を
+測り直したわけではなく、既に実測済みの値を「既定」に昇格させただけ — Epic
+#57 ルール 1 (ベンチマーク無しに最適化しない) に沿っている。
+
+`max_live_tabs` を既定にしない理由は D56 の「なぜ `max_live_tabs=4` を既定に
+しないか」の議論そのもの (Issue #184 本文にも転記) — 休止の単位がプロセス
+グループであるため上限を 1 超えただけで最大 4 タブ分の状態を失う一方、推奨値
+は D56 Revisit condition (2) が「実サイトで決めるべき」としており、
+`minimal.html` の計測値をそのまま既定に昇格させるのは Epic #57 ルール 4
+(トレードオフの評価) に反する。`idle_after` は D9 の元々の理由 (メモリ圧の
+悪い代理指標) が一度も再検証されておらず、本 Issue のスコープでもないため
+据え置いた。
+
+### なぜこれは D9 の懸念 (「頼んでいない休止で状態を失う」) と両立するか
+
+D9 の懸念は「メモリに関係なく一律に休止が発生する」ことへの懸念だった
+(旧: `idle_after` のみが既定候補で、3 タブを 1 日開いているだけの利用者も
+巻き込みうる)。メモリ予算シグナルは性質が異なる: **タブが少ないうちは
+プロセスツリーが 700 MiB を超えないため、`suspension::plan` は何も返さない**
+(`browser::suspension::tests::default_policy_stays_inert_with_few_tabs_and_
+no_over_budget_sample`)。本 Issue の実測 (下記) でも 1/5 タブでは休止が発生
+していない。つまり新しい既定は「タブを多く開いてメモリを圧迫している利用者
+だけ」に効き、通常利用の体験は旧既定と区別がつかない。
+
+### 実装
+
+1. **`SuspensionPolicy::default()`** (`src/browser/suspension.rs`) —
+   `memory_budget_bytes: Some(DEFAULT_MEMORY_BUDGET_BYTES)` (700 MiB の新規
+   定数)。既存の保護 (アクティブタブ・読み込み中・音声再生中) はこの変更で
+   一切触っていない — `plan`/`Candidate::eligible` は無変更。
+2. **より重要な副作用に先に気づく必要があった: 旧 `resolve_suspension` は
+   `SuspensionPolicy::default()` を一切参照していなかった。** 実際に起動する
+   バイナリが呼ぶのは常に `Config::from_env_and_args` であり、そこで
+   `suspension` フィールドは `resolve_suspension(...)` の戻り値でこれまでも
+   無条件に上書きされていた (`..defaults` の対象外)。旧 `resolve_suspension`
+   は 4 つの env 値だけから毎回ポリシーを**ゼロから組み立てて**おり
+   (`positive(raw).map(...)`)、`SuspensionPolicy::default()` の値は使って
+   いなかった — 旧既定が「全シグナル無効」だったから、未設定時にたまたま
+   無効相当の結果と一致していただけである。**つまり `SuspensionPolicy::
+   default()` だけを 700 MiB に変えて `resolve_suspension` に手を入れなければ、
+   実際に起動する `velox` バイナリはこの新既定を一切拾わず、旧来どおり
+   全シグナル無効のまま動き続けていた** (`Config::default()` を直接呼ぶ
+   一部のテストだけが新既定を見る、という食い違った状態になる)。これは
+   単なる「無効化する手段が無い」以上の問題 — 新既定そのものが実際には
+   効かないバグだった。
+   `resolve_suspension` を「env 未設定なら `SuspensionPolicy::default()` に
+   フォールバック、明示的な `0` は既定が有効でも常に無効化する」
+   `overridable()` ヘルパー経由に書き換え、この両方を解決した:
+   - `VELOX_MEMORY_BUDGET_MB` 未設定 / 空 / 数値でない → **既定
+     (`SuspensionPolicy::default()`、700 MiB・有効) を継承する** (旧実装は
+     ここで無条件に無効へフォールバックしていた)
+   - `VELOX_MEMORY_BUDGET_MB=0` → **明示的に無効化** (既定が有効でも) —
+     これが既定 ON に対する無効化の手段
+   - それ以外の正の値 → その値で上書き
+   - `VELOX_AUTO_SUSPEND_AFTER_MS` / `VELOX_MAX_LIVE_TABS` も同じ
+     `overridable()` を通すが、既定が `None` のままなので挙動は変わらない
+     (対称性のために揃えた)
+3. **設定画面 (#30)** (`src/browser/settings.rs`) — `PerformanceSettings::
+   default().memory_budget_mb` を `Some(700)` に変更し、
+   `#[serde(default = "default_memory_budget_mb")]` を追加した。これにより:
+   - 初回起動 (settings.json 無し) の設定画面は「メモリ予算: 700」を表示
+     した状態で開く (`Config::to_settings()` が `Config::default()` から
+     導出するため)。ユーザは既存の UI (`src/ui/toolbar.html` の「メモリ予算
+     (MiB、空欄で無効)」欄) で数値を変更するか、空欄にして保存すれば無効化
+     できる — **この経路は Issue #30 で既に実装済みで、今回 UI の変更は
+     不要だった** (`optionalNumber()` が空欄を `null` として送る)。
+   - `performance` オブジェクトごと欠けた古い settings.json (Issue #30 より
+     前の形式) を読み込んだ場合も 700 MiB の新既定を継承する
+     (`#[serde(default)]` が `PerformanceSettings::default()` 全体を使う)。
+     一方、**`performance` オブジェクト自体は存在するが `memory_budget_mb`
+     キーだけが欠けている場合**は `#[serde(default = "default_memory_budget_mb")]`
+     によりやはり 700 MiB を補う。**`保存` を一度でも押したことがある
+     settings.json は `memory_budget_mb` キーが常に明示的に書き出されて
+     いる**ため (serde の `Serialize` は既定で全フィールドを書く)、その
+     場合は保存時点の値 (旧バージョンなら `null` = 無効) がそのまま維持
+     される — 既存ユーザの明示的な設定を新既定で上書きすることはない。
+   - `Config::apply_settings`/`to_settings` の往復契約
+     (`apply_settings_with_default_settings_leaves_the_default_on_memory_
+     signal_enabled`) は「`Settings::default()` を適用しても既定を変えない」
+     という不変条件を保つよう `PerformanceSettings::default()` を
+     `SuspensionPolicy::default()` と揃えた。
+4. **テスト**: `browser::suspension::tests::default_policy_is_fully_
+   disabled` は前提が崩れるため**削除して緑にするのではなく**、
+   `default_policy_enables_only_the_memory_budget_signal` (新しい既定の値
+   そのものを検証)・`default_policy_stays_inert_with_few_tabs_and_no_over_
+   budget_sample` (少タブでは無害)・`default_policy_actually_suspends_
+   once_over_budget` (予算超過では実際に休止する) の 3 本に置き換えた。
+   既存の per-signal テスト (`..policy()`) は `SuspensionPolicy::default()`
+   に依存すると新既定 (メモリ有効) を意図せず引き込むため、明示的に
+   全無効な `disabled_policy()` ヘルパーへ切り替えた
+   (`..disabled_policy()`)。`config::resolve_suspension` 側のテストも
+   同様に「未設定 = 既定」「明示的な 0 = 常に無効」の 2 系統に整理し直した。
+   `browser::settings`/`config` 双方の `Settings::default()`/
+   `Config::default()` 関連テストのアサーションも新しい既定値に合わせて
+   更新した。加えて `tests/integration.rs` の `launch_and_wait_with` に
+   `VELOX_MEMORY_BUDGET_MB=0` を既定の起動環境として追加した — 既定 ON に
+   なったことで、これを入れないとこのファイルの**全ての**既存統合テスト
+   (元々どれもメモリ休止を想定していない) が非決定的になる。この環境
+   (Xvfb 上の WebKitGTK) では 1 タブだけでも PSS が約 400 MiB あり
+   (`docs/memory-analysis.md` §11)、複数タブを開くテストは 700 MiB を
+   実際に超えうるため、これは仮説ではなく実際に確認した (下記実測)。
+   その上で、既定のメモリ予算が実際にプロセスツリー越しに動くことを
+   確認する新規統合テスト
+   (`memory_budget_signal_suspends_a_background_tab_end_to_end`、
+   `VELOX_MEMORY_BUDGET_MB=1` で決定的に発火させる) を追加した — #63 の
+   時点でもメモリシグナルを実バイナリ経由で検証する統合テストは無かった
+   ギャップの解消でもある。
+
+### 実測結果 (このセッション内、Linux / WebKitGTK / Xvfb コンテナ)
+
+`docs/performance-targets.md` §23 に詳細を記録した。要点:
+
+- **1/5/10/20 タブの PSS** (`tab_scaling.py`、3 試行の中央値、`minimal.html`、
+  同一セッション内 before/after):
+
+  | タブ数 | Chromium | before (旧既定=無効) | after (新既定=700 MiB、env 上書き無し) |
+  | ---: | ---: | ---: | ---: |
+  | 1  |  281.7 MiB |  400.2 MiB |  399.8 MiB (±0.0%) |
+  | 5  |  321.9 MiB |  646.6 MiB |  646.5 MiB (±0.0%、予算内のため休止なし) |
+  | 10 |  369.5 MiB |  979.7 MiB |  464.4 MiB (**-52.6%**) |
+  | 20 |  468.2 MiB | 1655.7 MiB |  617.7 MiB (**-62.7%**) |
+
+  絶対値は D56 の元セッション (409/653/990/1612 MiB) と数十 MiB 程度ずれて
+  いるが (コンテナの実行時刻・負荷によるドリフト、D46 が言う「異なる
+  セッションを比較してはならない」の対象)、**相対的な形は一致**しており
+  D56 の知見を新しい既定でも再現した: 5 タブでは予算内のため休止が起きず
+  before と同一、10/20 タブでは大きく下がる。Chromium 比は 10 タブ
+  **+25.7%**、20 タブ **+31.9%** (T2 目標 +10% 以内には未達、D56 と同じ
+  結論のまま — 本 Issue はこの目標に新たに近づけることを目的にしていない)。
+- **軽量ケース (1〜3 タブ) のポーリングコスト** (`scripts/profile/
+  cpu_usage.py`、idle 30 秒窓、`/proc/<pid>/stat` の utime+stime 差分を
+  外部から計測。既定の `memory_check_interval` は 2 秒):
+
+  | ケース | メモリ監視 既定 ON | `VELOX_MEMORY_BUDGET_MB=0` (OFF) |
+  | --- | ---: | ---: |
+  | 1 タブ | CPU 1.2% (0.35〜0.36 秒/30 秒、3 試行) | CPU 0.1% (0.04 秒/30 秒) |
+  | 3 タブ | CPU 1.5% (0.44 秒/30 秒) | CPU 0.2% (0.05 秒/30 秒) |
+
+  サンプラ自体 (`/proc` 全体を 2 秒ごとに 1 回歩く) に起因する差分はおよそ
+  **1〜1.3 ポイント (1 コア換算)**で、厳密にはゼロではないが、アイドル中の
+  デスクトップアプリとしては実用上無視できる水準と判断した。`memory_
+  check_interval` の既定 (2 秒) を変える理由はこの数値からは出てこない。
+- **`velox-bench gate`** (`--warn-pct 20 --fail-pct 60`、baseline=旧既定
+  バイナリ、candidate=新既定バイナリ ×2、各 8 試行): `cold_startup` /
+  `tab_create` / `tab_switch` / `tab_create_20` はいずれも**総合判定 OK**
+  (`tab_create_ms`/`tab_switch_ms`/`page_load_*` の変化率はいずれも数%〜
+  ±10%程度で warn 閾値 20%を大きく下回る) — 少タブのシナリオは 700 MiB を
+  超えないため、既定を変える前と実質的に同じものを測っている。
+- **`tab_switch_20` は比較不能になった (重要な発見)**: 20 タブまで開く
+  この手動シナリオでは、新既定のメモリ予算がベンチマーク実行中にバック
+  グラウンドタブを実際に休止させてしまうため、`switch` コマンドの大半が
+  `tab_switch` ではなく `tab_resume`(+`page_load`) として記録される。
+  baseline の出力は `tab_switch_ms` のみ、candidate の出力は
+  `tab_resume_ms`/`page_load_*` のみとなり、`velox-bench gate` は
+  「比較可能なメトリクスがありません」として機械的に**総合判定 OK**を返す
+  — これは「回帰が無い」ことの確認では **ない**。`VELOX_MEMORY_BUDGET_MB=0`
+  を明示すれば `tab_switch_ms` は再び記録され、baseline とほぼ同じ値
+  (0.80ms 中央値、両者一致) になることを確認した — 休止の無効化は完全に
+  機能している。**影響範囲は限定的**: 自動化されている唯一の回帰ゲート
+  (`.github/workflows/perf-gate.yml`) は `cold_startup` のみを対象にして
+  おり、20 タブ級のシナリオは走らせていないため、CI の自動回帰検知が
+  サイレントに機能を失っているわけではない。ただし今後 `tab_switch_20`/
+  `tab_create_20` のような多タブシナリオを手動で再計測する際は、
+  `VELOX_MEMORY_BUDGET_MB=0` を明示しない限り「switch のレイテンシ」を
+  測っているつもりが実際には「resume のレイテンシ」を測っていることに
+  なる点を、以後の Issue のために書き残す。
+
+### Windows での意味の違い (最重要の検討事項)
+
+D88 が確定させたとおり、`sample_process_tree_rss` は **Linux では PSS**
+(`smaps_rollup` の `Pss:`)、**Windows では RSS のみ** (`GetProcessMemoryInfo`
+の `WorkingSetSize`、PSS 相当は「実装しない」と結論済み)。
+`app::spawn_memory_pressure_sampler` は `total_pss_bytes.unwrap_or(total_
+rss_bytes)` で両者を同じ「700 MiB」という数値と比較する。
+
+- **RSS は共有ページを保有プロセスの数だけ二重・多重に計上する** —
+  D56 のメモリ信号のドキュメント自身が既に明記しているとおり (「PSS が
+  使えない環境では RSS を代わりに使う。これは過大評価であり、PSS 用に
+  調整した予算はそちらでは少し早く発動する」)。VeloX は toolbar 用と
+  content 用に別々の `WebProcess` を持つ設計 (D3) であり、共有ライブラリ
+  ページ (WebKit2/JavaScriptCore 相当の DLL 等) の重複計上は Linux での
+  RSS 実測 (本 Issue の tab_scaling 結果: 同一構成で RSS は PSS の
+  1.6〜1.8 倍、例えば 20 タブで RSS 940 MiB 対 PSS 618 MiB) からも推測
+  できる規模感である。**同じ「700 MiB」という設定値でも、Windows では
+  実際に解放されるべき固有メモリのより早い段階で休止が発動する可能性が
+  高い。**
+- **これは新しい問題ではなく、既存のドキュメント済みの制約が「既定 ON」
+  になったことで初めて全 Windows ユーザに影響する、という話である。**
+  #63 の時点でも `VELOX_MEMORY_BUDGET_MB` を明示的に設定した Windows
+  ユーザは同じ影響を受けていたはずだが、既定が無効だったため実際に
+  この経路を踏む Windows ユーザはほぼいなかった。本 Issue はこれを
+  「全 Windows ユーザに既定で影響する」設定へ格上げする。
+- **結論: 本 Issue では OS 別の既定値を導入しない。** 理由:
+  1. **この環境には Windows 実機が無く**、「Windows で 700 MiB がどれだけ
+     早く発動するか」を実測する手段が無い (D88 と同じ制約)。実測せずに
+     Windows 用の数値をでっち上げることは Epic #57 ルール 1 (ベンチマーク
+     無しに最適化しない) に反する。
+  2. RSS がメモリ予算を超えやすい方向の誤差は、**過小評価 (休止しすぎない)
+     より安全側の誤差**である — 早めに休止してメモリを守る方向のズレで
+     あり、OOM やスワップより実害が小さい。D56 も同じ理由でこの誤差を
+     「許容範囲」として受け入れている。
+  3. 逆方向 (Windows の 700 MiB を Linux より緩めるべきか) を判断する
+     材料も無い。
+- **未検証であることを明記する**: 本 Issue のセッションでは Windows 上での
+  実際の RSS 値・休止の発動タイミング・体感頻度は一切測定していない
+  (`cargo check --target x86_64-pc-windows-msvc --all-targets` による
+  型チェックのみ)。`docs/performance-targets.md` §21 の Windows 実測環境
+  (`perf-windows.yml`、`workflow_dispatch`) はメモリ予算シグナルを対象に
+  していないため、このまま Windows 実機/CI で `tab_scaling.py` 相当の
+  計測を行い、700 MiB が Windows で「早すぎる」と分かった場合は Windows
+  専用の既定値 (例: RSS ベースで同等の実効休止タイミングになるよう
+  850〜900 MiB 程度に引き上げる) を再検討することを Revisit condition
+  に残す。
+
+### 700 MiB という絶対値がすべてのマシンで妥当か (限界)
+
+700 MiB は D56 の計測環境 (このコンテナ、詳細は §1) 1 台で測った値であり、
+**搭載 RAM に対する相対値ではない**。RAM 4GB のマシンにとっての 700 MiB
+と RAM 32GB のマシンにとっての 700 MiB は体感インパクトが大きく異なる —
+前者では早期の積極的な休止が望ましく、後者ではそもそも休止しなくても
+困らない可能性が高い。搭載 RAM 相対の予算は Issue #176 (Memory Budget
+Manager) のスコープと明記されており、本 Issue はそれを前提に固定値のまま
+出荷する。**この判断の限界は次の Revisit condition に残す。**
+
+### Revisit condition
+
+(1) **Windows 実機/CI での 700 MiB の実効性を計測すること** — 上記の
+「未検証」を解消し、必要なら Windows 専用の既定値を導入する。(2) **搭載
+RAM に対する相対化** — Issue #176 が実装されたら、700 MiB という絶対値は
+その基盤の上の「フォールバック値」に格下げされるべきかを再検討する。
+(3) `max_live_tabs`/`idle_after` を既定にするかどうかは、D56 Revisit
+condition (2) 「実サイトでの推奨値」が解消されるまで見送ったままにする —
+本 Issue はこれを一切変更していない。(4) 多タブ規模 (20 タブ級) の
+`velox-bench` シナリオを再計測する際は `VELOX_MEMORY_BUDGET_MB=0` を明示し
+ない限り `tab_switch_ms`/`tab_create_ms` が `tab_resume_ms`/`page_load_*`
+に置き換わりうる点を、次にこれらのシナリオを触る Issue のために記録して
+おく (上記実測の「`tab_switch_20` は比較不能になった」参照)。

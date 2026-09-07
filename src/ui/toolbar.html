@@ -1000,6 +1000,12 @@
           <label for="set-max-live-tabs">同時に保持する最大タブ数 (空欄で無効)</label>
           <input id="set-max-live-tabs" type="number" min="0" />
         </div>
+        <div class="settings-hint" style="margin-bottom: 8px;">
+          メモリ予算は既定で 700 MiB が有効です。プロセスツリー全体のメモリが
+          この値を超えると、使っていないバックグラウンドタブが自動的に休止
+          されます（切り替え時に再読み込みされ、スクロール位置や入力中の
+          内容は失われます）。無効にするには空欄にして保存してください。
+        </div>
         <div class="settings-field">
           <label for="set-memory-budget-mb">メモリ予算 (MiB、空欄で無効)</label>
           <input id="set-memory-budget-mb" type="number" min="0" />
