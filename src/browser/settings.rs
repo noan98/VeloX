@@ -40,6 +40,7 @@
 //! not needed yet, since every change so far has been additive.
 
 use crate::browser::navigation;
+use crate::browser::suspension::DEFAULT_MEMORY_BUDGET_BYTES;
 
 /// Bumped only for a structural (not just additive) change to this shape —
 /// see the module doc comment. Every field added so far has been additive
@@ -384,11 +385,17 @@ impl PrivacySettings {
 /// plain optional numbers rather than the `Duration`/`usize` types those use
 /// internally (again: this module cannot depend on `config`, and keeping
 /// wire types boring simplifies both the JSON shape and the settings UI's
-/// own number inputs). `None`/`0` uniformly means "this signal is off",
-/// matching every `VELOX_*` env var's existing "unset or 0 means off" rule.
-/// Applies after the next restart only (docs/decisions.md D67): the
-/// suspension policy and the tab/process-sharing cap are both read once at
-/// startup.
+/// own number inputs). `auto_suspend_after_ms`/`max_live_tabs` follow the
+/// original "`None`/`0` means off" rule unchanged. `memory_budget_mb` does
+/// not: since Issue #184 (docs/decisions.md D90) its *default* is
+/// `Some(DEFAULT_MEMORY_BUDGET_MB)`, so for that one field `None` means "the
+/// user (or an explicit `VELOX_MEMORY_BUDGET_MB=0`) turned it off", not "not
+/// configured yet" — see [`PerformanceSettings::default`] and
+/// `default_memory_budget_mb`. `Some(0)` is still sanitized to `None`
+/// ([`PerformanceSettings::sanitize`]) rather than stored, so "off" only
+/// ever has the one representation. Applies after the next restart only
+/// (docs/decisions.md D67): the suspension policy and the tab/process-
+/// sharing cap are both read once at startup.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PerformanceSettings {
     #[serde(default = "default_max_tabs_per_web_process")]
@@ -397,7 +404,7 @@ pub struct PerformanceSettings {
     pub auto_suspend_after_ms: Option<u64>,
     #[serde(default)]
     pub max_live_tabs: Option<usize>,
-    #[serde(default)]
+    #[serde(default = "default_memory_budget_mb")]
     pub memory_budget_mb: Option<u64>,
     #[serde(default = "default_memory_check_interval_ms")]
     pub memory_check_interval_ms: u64,
@@ -406,6 +413,25 @@ pub struct PerformanceSettings {
 fn default_max_tabs_per_web_process() -> usize {
     DEFAULT_MAX_TABS_PER_WEB_PROCESS
 }
+
+/// Issue #184 / docs/decisions.md D90: derived from
+/// `browser::suspension::DEFAULT_MEMORY_BUDGET_BYTES` (a real intra-`browser`
+/// dependency, not the cross-layer `config::` case [`DEFAULT_HOMEPAGE`]/
+/// [`DEFAULT_MAX_TABS_PER_WEB_PROCESS`] have to duplicate) so this and
+/// `SuspensionPolicy::default` can never drift apart. Used both as
+/// [`PerformanceSettings::default`]'s value and, via `#[serde(default =
+/// ...)]`, as what a `settings.json` whose `performance` object predates
+/// this field (missing the key entirely, not present-and-`null`) fills in —
+/// this module's documented "missing fields fill in today's defaults"
+/// migration story (see the module doc comment) applied to this one field's
+/// changed default. A key present as `null`, or `Some(0)` before
+/// `sanitize()` collapses it, still means "off" — this function only ever
+/// runs when the JSON key itself is absent.
+fn default_memory_budget_mb() -> Option<u64> {
+    Some(DEFAULT_MEMORY_BUDGET_MB)
+}
+
+const DEFAULT_MEMORY_BUDGET_MB: u64 = DEFAULT_MEMORY_BUDGET_BYTES / (1024 * 1024);
 
 fn default_memory_check_interval_ms() -> u64 {
     DEFAULT_MEMORY_CHECK_INTERVAL_MS
@@ -417,7 +443,7 @@ impl Default for PerformanceSettings {
             max_tabs_per_web_process: default_max_tabs_per_web_process(),
             auto_suspend_after_ms: None,
             max_live_tabs: None,
-            memory_budget_mb: None,
+            memory_budget_mb: default_memory_budget_mb(),
             memory_check_interval_ms: default_memory_check_interval_ms(),
         }
     }
@@ -669,7 +695,13 @@ mod tests {
         );
         assert_eq!(settings.performance.auto_suspend_after_ms, None);
         assert_eq!(settings.performance.max_live_tabs, None);
-        assert_eq!(settings.performance.memory_budget_mb, None);
+        // The one exception to this test's name (Issue #184 / D90): the
+        // memory budget's default changed from off to 700 MiB, mirroring
+        // `SuspensionPolicy::default`.
+        assert_eq!(
+            settings.performance.memory_budget_mb,
+            Some(DEFAULT_MEMORY_BUDGET_MB)
+        );
         assert_eq!(
             settings.performance.memory_check_interval_ms,
             DEFAULT_MEMORY_CHECK_INTERVAL_MS

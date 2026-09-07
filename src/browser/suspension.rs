@@ -15,10 +15,16 @@
 //! | tab count | [`SuspensionPolicy::max_live_tabs`] | when more than this many tabs have a live webview, the least recently used background tabs are suspended until the count fits |
 //! | memory | [`SuspensionPolicy::memory_budget_bytes`] | when the process tree's memory (PSS, `metrics::sample_process_tree_rss`) exceeds the budget, enough least recently used background tabs are suspended to be expected to bring it back under (see [`ESTIMATED_BYTES_PER_TAB`]) — the further over budget, the more tabs go in one sweep, which is the "adaptive" part |
 //!
-//! Every signal is optional (`None` = off) and the default policy has all
-//! three off, so a fresh checkout still never suspends a tab the user did
-//! not ask to suspend (D9's rule stands). Turning any of them on is a
-//! configuration choice (`VELOX_AUTO_SUSPEND_AFTER_MS`,
+//! Every signal is optional (`None` = off). **As of Issue #184
+//! (docs/decisions.md D90), the default policy has the memory-budget signal
+//! on** ([`DEFAULT_MEMORY_BUDGET_BYTES`], 700 MiB) while idle time and
+//! tab-count stay off — D9's "never suspend a tab the user did not ask for"
+//! rule still holds for those two, but D90 concluded a memory-budget-only
+//! default does not actually violate it in practice: with few tabs open the
+//! process tree never crosses the budget, so nothing is ever suspended,
+//! exactly like the old fully-off default. Set `VELOX_MEMORY_BUDGET_MB=0`
+//! (or the settings screen's Performance tab) to turn even that off. Every
+//! knob is a configuration choice (`VELOX_AUTO_SUSPEND_AFTER_MS`,
 //! `VELOX_MAX_LIVE_TABS`, `VELOX_MEMORY_BUDGET_MB` — see `config`).
 //!
 //! **Protections** — a tab is never suspended automatically when it is:
@@ -77,6 +83,20 @@ use super::tab::TabId;
 /// `/proc` walks on the hot path for a second-order improvement.
 pub const ESTIMATED_BYTES_PER_TAB: u64 = 64 * 1024 * 1024;
 
+/// The default policy's memory budget (Issue #184, docs/decisions.md D90):
+/// 700 MiB, the same figure D56 measured (`VELOX_MEMORY_BUDGET_MB=700`) to
+/// land within budget at 1/5/10/20 tabs on `minimal.html` in this project's
+/// reference Linux/WebKitGTK environment (407 / 660 / 476 / 615 MiB —
+/// `docs/performance-targets.md` §12). A single, absolute, compiled-in
+/// number, not scaled to the machine's installed RAM — D90's Revisit
+/// condition records that limitation (Issue #176 is where a RAM-relative
+/// budget belongs).
+///
+/// `browser::settings::PerformanceSettings::default`'s `memory_budget_mb`
+/// mirrors this value in MiB so `Config::default().to_settings()` and
+/// `Settings::default()` agree (see that constant's doc comment).
+pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 700 * 1024 * 1024;
+
 /// The automatic suspension policy — three independent, individually
 /// optional signals plus how often memory is checked. See the module doc
 /// comment for what each does and [`plan`] for how they combine.
@@ -121,12 +141,23 @@ impl SuspensionPolicy {
 }
 
 impl Default for SuspensionPolicy {
-    /// Every signal off — automatic suspension stays opt-in (D9).
+    /// Memory budget on ([`DEFAULT_MEMORY_BUDGET_BYTES`], 700 MiB), idle
+    /// time and tab-count off (Issue #184, docs/decisions.md D90 — this
+    /// decided D56's Revisit condition (3), superseding D9's original
+    /// "every signal off" default without rewriting D9/D56 themselves).
+    /// `max_live_tabs` is not defaulted on: D90 records why (a process-
+    /// group-unit cap loses up to `max_tabs_per_web_process` tabs' worth of
+    /// scroll/form state the moment it is exceeded, and D56's own Revisit
+    /// condition (2) says its recommended value should come from real-site
+    /// measurement, not `minimal.html`). `idle_after` is not defaulted on
+    /// either — it is a poor proxy for memory pressure by itself (see the
+    /// module doc comment) and D9's original reasoning for leaving it off
+    /// was never revisited.
     fn default() -> Self {
         Self {
             idle_after: None,
             max_live_tabs: None,
-            memory_budget_bytes: None,
+            memory_budget_bytes: Some(DEFAULT_MEMORY_BUDGET_BYTES),
             memory_check_interval: Self::DEFAULT_MEMORY_CHECK_INTERVAL,
         }
     }
@@ -405,21 +436,85 @@ mod tests {
         planned.iter().map(|(id, _)| id.get()).collect()
     }
 
-    fn policy() -> SuspensionPolicy {
-        SuspensionPolicy::default()
+    /// Baseline for testing one signal in isolation: every signal off. This
+    /// is deliberately *not* [`SuspensionPolicy::default`] — since D90 (Issue
+    /// #184) the compiled-in default has the memory signal on, and the
+    /// per-signal tests below (`..disabled_policy()`) need a genuinely inert
+    /// starting point so they exercise exactly the one signal each is named
+    /// after, not "that signal plus whatever the compiled default happens to
+    /// enable".
+    fn disabled_policy() -> SuspensionPolicy {
+        SuspensionPolicy {
+            idle_after: None,
+            max_live_tabs: None,
+            memory_budget_bytes: None,
+            memory_check_interval: SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL,
+        }
     }
 
     #[test]
-    fn default_policy_is_fully_disabled() {
+    fn default_policy_enables_only_the_memory_budget_signal() {
+        // Issue #184 / docs/decisions.md D90: automatic suspension is on by
+        // default, but only the memory-budget signal — idle time and
+        // tab-count stay opt-in. See D90 for why tab-count specifically is
+        // not defaulted on.
         let policy = SuspensionPolicy::default();
-        assert!(!policy.is_enabled());
+        assert!(policy.is_enabled());
         assert_eq!(policy.idle_after, None);
         assert_eq!(policy.max_live_tabs, None);
-        assert_eq!(policy.memory_budget_bytes, None);
+        assert_eq!(
+            policy.memory_budget_bytes,
+            Some(DEFAULT_MEMORY_BUDGET_BYTES)
+        );
+        assert_eq!(policy.memory_budget_bytes, Some(700 * MIB));
         assert_eq!(
             policy.memory_check_interval,
             SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL
         );
+    }
+
+    #[test]
+    fn default_policy_stays_inert_with_few_tabs_and_no_over_budget_sample() {
+        // The property that keeps D90's default from being a surprise: with
+        // few tabs open (the common case) there is either no fresh memory
+        // sample yet, or the sample is comfortably under budget, so `plan`
+        // returns nothing — bit-for-bit the same as the old fully-off
+        // default for everyone who never approaches 700 MiB.
+        let candidates = [tab(1, 3600), tab(2, 3600)];
+        assert!(plan(
+            &SuspensionPolicy::default(),
+            &with_active(&candidates),
+            None
+        )
+        .is_empty());
+        let under_budget = Some(MemorySample {
+            total_bytes: 400 * MIB,
+        });
+        assert!(plan(
+            &SuspensionPolicy::default(),
+            &with_active(&candidates),
+            under_budget
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn default_policy_actually_suspends_once_over_budget() {
+        // The other half: D90's default is not just "enabled" in name —
+        // fed a real over-budget sample, it plans suspensions, tagged with
+        // the memory reason, exactly like an explicit
+        // `VELOX_MEMORY_BUDGET_MB` would.
+        let candidates = [tab(1, 5), tab(2, 10)];
+        let over_budget = Some(MemorySample {
+            total_bytes: 900 * MIB,
+        });
+        let planned = plan(
+            &SuspensionPolicy::default(),
+            &with_active(&candidates),
+            over_budget,
+        );
+        assert!(!planned.is_empty());
+        assert!(planned.iter().all(|(_, r)| *r == SuspendReason::Memory));
     }
 
     #[test]
@@ -428,7 +523,7 @@ mod tests {
         let memory = Some(MemorySample {
             total_bytes: 10_000 * MIB,
         });
-        assert!(plan(&policy(), &with_active(&candidates), memory).is_empty());
+        assert!(plan(&disabled_policy(), &with_active(&candidates), memory).is_empty());
     }
 
     // -- idle signal (pre-#63 behavior) ------------------------------------
@@ -437,7 +532,7 @@ mod tests {
     fn idle_signal_suspends_every_tab_past_the_threshold() {
         let policy = SuspensionPolicy {
             idle_after: Some(Duration::from_secs(60)),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [tab(1, 10), tab(2, 60), tab(3, 600)];
         let planned = plan(&policy, &with_active(&candidates), None);
@@ -452,7 +547,7 @@ mod tests {
     fn tab_count_signal_suspends_lru_tabs_until_the_count_fits() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(3),
-            ..policy()
+            ..disabled_policy()
         };
         // 5 live tabs (active + 4 background): two must go.
         let candidates = [tab(1, 5), tab(2, 50), tab(3, 1), tab(4, 20)];
@@ -465,7 +560,7 @@ mod tests {
     fn tab_count_signal_is_satisfied_when_within_the_limit() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(3),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [tab(1, 5), tab(2, 50)];
         assert!(plan(&policy, &with_active(&candidates), None).is_empty());
@@ -475,7 +570,7 @@ mod tests {
     fn max_live_tabs_of_zero_behaves_as_one() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(0),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [tab(1, 5), tab(2, 50)];
         // live = active + 2 background = 3; with a floor of 1 live tab,
@@ -492,7 +587,7 @@ mod tests {
     fn memory_signal_scales_with_how_far_over_budget() {
         let policy = SuspensionPolicy {
             memory_budget_bytes: Some(500 * MIB),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [tab(1, 1), tab(2, 2), tab(3, 3), tab(4, 4), tab(5, 5)];
         let over_by = |mib: u64| {
@@ -530,7 +625,7 @@ mod tests {
     fn memory_signal_does_nothing_at_or_under_budget() {
         let policy = SuspensionPolicy {
             memory_budget_bytes: Some(500 * MIB),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [tab(1, 1), tab(2, 2)];
         for total in [0, 100 * MIB, 500 * MIB] {
@@ -543,7 +638,7 @@ mod tests {
     fn memory_signal_needs_a_fresh_sample() {
         let policy = SuspensionPolicy {
             memory_budget_bytes: Some(1),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [tab(1, 1), tab(2, 2)];
         // Budget is effectively zero, but with no sample this sweep the
@@ -573,7 +668,7 @@ mod tests {
             idle_after: Some(Duration::from_secs(1)),
             max_live_tabs: Some(1),
             memory_budget_bytes: Some(1),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [
             Candidate {
@@ -603,7 +698,7 @@ mod tests {
         let policy = SuspensionPolicy {
             idle_after: Some(Duration::from_secs(100)),
             max_live_tabs: Some(3),
-            ..policy()
+            ..disabled_policy()
         };
         // Live = 5, limit 3 -> two must go. Tab 4 is idle anyway, so the
         // tab-count signal only needs one more (the next LRU: tab 2).
@@ -623,7 +718,7 @@ mod tests {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(4),
             memory_budget_bytes: Some(500 * MIB),
-            ..policy()
+            ..disabled_policy()
         };
         // Live = 6, limit 4 -> count wants 2. 150 MiB over -> memory wants 3.
         let candidates = [tab(1, 1), tab(2, 2), tab(3, 3), tab(4, 4), tab(5, 5)];
@@ -645,7 +740,7 @@ mod tests {
     fn stable_order_for_equal_idle_times() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(2),
-            ..policy()
+            ..disabled_policy()
         };
         // All opened in one burst (equal idle): the caller's order wins,
         // deterministically.
@@ -662,7 +757,7 @@ mod tests {
     fn an_emptyable_group_is_taken_whole_even_when_it_overshoots_the_demand() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(5),
-            ..policy()
+            ..disabled_policy()
         };
         // Group 0: four background tabs. Group 1: the active tab plus one
         // background tab (pinned). Live = 6, limit 5 -> demand 1, but the
@@ -685,7 +780,7 @@ mod tests {
     fn groups_go_least_recently_used_group_first_by_their_newest_tab() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(1),
-            ..policy()
+            ..disabled_policy()
         };
         // Group 0's newest tab (idle 5) is newer than group 1's newest
         // (idle 8), even though group 0 also holds the oldest tab of all.
@@ -704,7 +799,7 @@ mod tests {
     fn a_group_pinned_by_an_ineligible_tab_falls_back_to_per_tab_lru_last() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(1),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [
             // Group 0 pinned by the active tab: its background tabs are
@@ -736,7 +831,7 @@ mod tests {
     fn reclaim_order_stops_at_the_demand_between_groups() {
         let policy = SuspensionPolicy {
             max_live_tabs: Some(3),
-            ..policy()
+            ..disabled_policy()
         };
         // Two emptyable one-tab groups and a pinned group. Live = 5,
         // limit 3 -> demand 2: both single-tab groups, nothing from the
@@ -762,7 +857,7 @@ mod tests {
             idle_after: Some(Duration::ZERO),
             max_live_tabs: Some(1),
             memory_budget_bytes: Some(1),
-            ..policy()
+            ..disabled_policy()
         };
         let candidates = [active(0, 0)];
         let memory = Some(MemorySample {

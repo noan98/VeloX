@@ -233,6 +233,17 @@ fn launch_and_wait(
 /// on `velox: ...` log lines afterwards. A file rather than a pipe: nothing
 /// here reads the pipe while the child runs, so a chatty WebKitGTK could
 /// otherwise fill it and block the child forever.
+///
+/// `VELOX_MEMORY_BUDGET_MB=0` is set unconditionally *before* `extra_env`
+/// (so a test can still override it): since Issue #184 / docs/decisions.md
+/// D90 the memory-budget signal defaults to on (700 MiB), and these fixture
+/// pages plus a real WebKitGTK toolbar/content webview routinely sit well
+/// above that in this sandboxed/Xvfb environment (`docs/memory-analysis.md`
+/// §11: ~409 MiB for a *single* tab here) — leaving the default on would
+/// make every test in this file an unwitting, non-deterministic suspension
+/// test. Only `memory_budget_signal_suspends_a_background_tab_end_to_end`
+/// below overrides this back on (to a value guaranteed to be exceeded)
+/// specifically to exercise the default end to end.
 fn launch_and_wait_with(
     perf_output: &Path,
     data_dir: &Path,
@@ -250,7 +261,8 @@ fn launch_and_wait_with(
         .env("VELOX_PERF_OUTPUT", perf_output)
         .env("VELOX_DATA_DIR", data_dir)
         .env("VELOX_HOMEPAGE", homepage)
-        .env("VELOX_AUTOMATION_SCRIPT", script_path);
+        .env("VELOX_AUTOMATION_SCRIPT", script_path)
+        .env("VELOX_MEMORY_BUDGET_MB", "0");
     for (key, value) in extra_env {
         command.env(key, value);
     }
@@ -1217,14 +1229,87 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
 
     // The two manual no-op `suspend` commands must not have produced an
     // error line (only an out-of-range index does), and the sampler must
-    // not have started (no memory budget was set).
+    // not have started (`launch_and_wait_with` sets `VELOX_MEMORY_BUDGET_MB
+    // =0`, explicitly overriding D90's on-by-default memory signal, so this
+    // test's suspensions are driven by the live-tab cap alone).
     assert!(
         !stderr.contains("automation: suspend"),
         "in-range `suspend` on the active/already-suspended tab must be silent:\n{stderr}"
     );
     assert!(
         !stderr.contains("memory sampling for tab suspension"),
-        "no memory budget => no sampler:\n{stderr}"
+        "memory budget explicitly off => no sampler:\n{stderr}"
+    );
+}
+
+/// Guarantees the memory-budget signal (Issue #184, docs/decisions.md D90)
+/// actually suspends a background tab end to end through the real event
+/// loop — sampler thread -> `UserEvent::MemorySampled` ->
+/// `suspension::plan` -> suspend — not just at the unit level
+/// (`browser::suspension::tests`, which never touches
+/// `browser::metrics::sample_process_tree_rss` for real). An absurdly low
+/// budget (1 MiB) makes this deterministic regardless of the real PSS this
+/// machine happens to produce, the same way the live-tab-cap test above
+/// uses `VELOX_MAX_LIVE_TABS=2` rather than depending on a specific real
+/// tab count.
+#[test]
+fn memory_budget_signal_suspends_a_background_tab_end_to_end() {
+    skip_without_gui!("memory_budget_signal_suspends_a_background_tab_end_to_end");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("memory-suspension");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let stderr_path = dir.join("stderr.log");
+    let homepage = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+
+    // Open a second tab (so there is a background tab to suspend), then
+    // wait long enough for several 100ms memory samples to arrive and be
+    // swept before quitting.
+    let script = format!("wait_load\nopen {page_a}\nwait_load\nwait 600\nquit\n");
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+        &[
+            ("VELOX_MEMORY_BUDGET_MB", Path::new("1")),
+            ("VELOX_MEMORY_CHECK_INTERVAL_MS", Path::new("100")),
+        ],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the memory-suspension test. \
+             Perf records: {:?}\nstderr:\n{stderr}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let records = &launch.perf_records;
+    let suspends: Vec<_> = events_named(records, "tab_suspend").collect();
+    assert!(
+        !suspends.is_empty(),
+        "expected at least one automatic suspension from the 1 MiB budget: \
+         {records:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        suspends
+            .iter()
+            .all(|r| r["reason"].as_str() == Some("memory")),
+        "every suspension here must be driven by the memory-budget signal, \
+         not the (unset here) live-tab cap or idle timer: {suspends:?}"
     );
 }
 
