@@ -22,6 +22,7 @@ pub mod history;
 pub mod input_history;
 pub mod metrics;
 pub mod navigation;
+pub mod network_activity;
 pub mod omnibox;
 pub mod omnibox_candidates;
 pub mod perf_log;
@@ -52,6 +53,7 @@ pub use history::{
     HistoryGroup, HistoryStore,
 };
 pub use input_history::{InputHistoryEntry, InputHistoryStore};
+pub use network_activity::{classify, is_polling, NetworkActivityClass, MIN_SAMPLES_FOR_POLLING};
 pub use omnibox::{Candidate, CandidateKind, CandidateSource};
 pub use omnibox_candidates::{HistoryBookmarkSource, InputHistorySource};
 pub use session::{SavedTab, SessionSnapshot};

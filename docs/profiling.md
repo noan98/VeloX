@@ -491,6 +491,32 @@ VELOX_MAX_TABS_PER_PROCESS=1 xvfb-run -a --server-args="-screen 0 1280x900x24" \
 なる。ビーコンは「CPU が少ない」と「完全に止まっている」を区別するために
 使う — 詳細は `docs/decisions.md` D58。
 
+## 3.6 バックグラウンドタブのネットワーク活動の観測 (Issue #65)
+
+CPU (§3.5) と同じ「外から測る」考え方をネットワーク要求に広げたもの。
+ただし CPU と違い、VeloX 自身が記録できる相当物が無い —
+`docs/decisions.md` D17/D59 のとおり、wry 0.56 がリクエスト単位の横取り
+フックを公開しているのは Windows (WebView2) だけで、この開発環境
+(Linux/WebKitGTK) では VeloX の中からリクエストを一切観測できない。その
+ため `scripts/profile/network_activity.py` は VeloX の外に立てたローカル
+HTTP/WebSocket サーバのアクセスログだけで数える。
+
+```sh
+printf 'wait 1500\nopen about:blank\nwait 16000\nquit\n' > /tmp/bg.txt
+xvfb-run -a --server-args="-screen 0 1280x900x24" dbus-run-session -- \
+  python3 scripts/profile/network_activity.py \
+    --velox target/release/velox --script /tmp/bg.txt \
+    --label background --settle-secs 6 --window-secs 16
+```
+
+**負荷源**: `scripts/bench/pages/network_activity.html` が 4 種類の
+バックグラウンド通信パターン (Issue #65 の分類に対応) を別々のパスに
+向けて発生させる — 2 秒おきの `fetch`/`XHR` ポーリング、3 秒おきの
+`<img>` 差し替え (background resource loading)、1 回だけの
+`<link rel=prefetch>`、2 秒おきの WebSocket 心拍 (保護対象)。
+`?poll_ms=` でポーリング間隔を上書きできる。結果と考察は
+`docs/performance-targets.md` §15、設計判断は `docs/decisions.md` D80。
+
 ## 4. profiling プロファイルとベンチマーク baseline の紐付け
 
 `docs/benchmarking.md` の「baseline の保存形式」と同じ方針を踏襲する:
