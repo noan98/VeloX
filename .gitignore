@@ -18,6 +18,14 @@ target
 __pycache__/
 *.pyc
 
+# Performance Dashboard (Issue #71): `results/history/**/*.jsonl` (the raw
+# recorded measurements) IS tracked, same policy as `results/baseline/`.
+# The rendered report is a regenerable build output, not source data, so it
+# is ignored, same policy as `target/` above. Regenerate with
+# `python3 scripts/dashboard/report.py` (see docs/performance-dashboard.md).
+results/history/*.html
+results/history/*.md
+
 # RustRover
 #  JetBrains specific template is maintained in a separate JetBrains.gitignore that can
 #  be found at https://github.com/github/gitignore/blob/main/Global/JetBrains.gitignore
