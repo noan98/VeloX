@@ -88,6 +88,21 @@ pub enum MetricKey {
     StartupToolbarReadyMs,
     StartupFirstLoadMs,
     PageLoadMs,
+    /// `LoadStarted` → `LoadFinished` portion of one `page_load` event
+    /// (Issue #69, `docs/decisions.md` D87) — the engine's own resource
+    /// loading/parsing/rendering, black-box per Epic #57 rule 3. Absent
+    /// from a trial's aggregated metrics for any `page_load` event whose
+    /// `LoadStarted` never fired, same "no fabricated 0" rule as
+    /// [`MetricKey::PssTotalBytes`].
+    PageLoadEngineMs,
+    /// `NavigationStarted` → `LoadStarted` portion of the same event.
+    /// **Not a VeloX-attributable duration on its own** — see
+    /// `metrics::PageLoadTimer`'s doc comment and D87: `LoadStarted` fires
+    /// only once the engine has connected/sent the request/started
+    /// receiving the response, so this bundles VeloX's own event handling
+    /// with real engine/network time. Same absence rule as
+    /// [`MetricKey::PageLoadEngineMs`].
+    PageLoadDispatchMs,
     TabCreateMs,
     TabSwitchMs,
     /// Restore cost of a suspended tab (Issue #63): `tab_resume` events'
@@ -121,13 +136,15 @@ impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 14] = [
+    pub const ALL: [MetricKey; 16] = [
         MetricKey::StartupWindowCreatedMs,
         MetricKey::StartupRustSetupDoneMs,
         MetricKey::StartupToolbarScriptStartedMs,
         MetricKey::StartupToolbarReadyMs,
         MetricKey::StartupFirstLoadMs,
         MetricKey::PageLoadMs,
+        MetricKey::PageLoadEngineMs,
+        MetricKey::PageLoadDispatchMs,
         MetricKey::TabCreateMs,
         MetricKey::TabSwitchMs,
         MetricKey::TabResumeMs,
@@ -148,6 +165,8 @@ impl MetricKey {
             MetricKey::StartupToolbarReadyMs => "startup_toolbar_ready_ms",
             MetricKey::StartupFirstLoadMs => "startup_first_load_ms",
             MetricKey::PageLoadMs => "page_load_ms",
+            MetricKey::PageLoadEngineMs => "page_load_engine_ms",
+            MetricKey::PageLoadDispatchMs => "page_load_dispatch_ms",
             MetricKey::TabCreateMs => "tab_create_ms",
             MetricKey::TabSwitchMs => "tab_switch_ms",
             MetricKey::TabResumeMs => "tab_resume_ms",
@@ -191,6 +210,8 @@ impl MetricKey {
             | MetricKey::StartupToolbarReadyMs
             | MetricKey::StartupFirstLoadMs
             | MetricKey::PageLoadMs
+            | MetricKey::PageLoadEngineMs
+            | MetricKey::PageLoadDispatchMs
             | MetricKey::TabCreateMs
             | MetricKey::TabSwitchMs
             | MetricKey::TabResumeMs => 20.0, // milliseconds
@@ -210,7 +231,9 @@ impl MetricKey {
             | MetricKey::StartupToolbarScriptStartedMs
             | MetricKey::StartupToolbarReadyMs
             | MetricKey::StartupFirstLoadMs => "startup",
-            MetricKey::PageLoadMs => "page_load",
+            MetricKey::PageLoadMs | MetricKey::PageLoadEngineMs | MetricKey::PageLoadDispatchMs => {
+                "page_load"
+            }
             MetricKey::TabCreateMs => "tab_create",
             MetricKey::TabSwitchMs => "tab_switch",
             MetricKey::TabResumeMs => "tab_resume",
@@ -232,6 +255,8 @@ impl MetricKey {
             MetricKey::StartupToolbarReadyMs => "toolbar_ready_ms",
             MetricKey::StartupFirstLoadMs => "first_load_ms",
             MetricKey::PageLoadMs => "duration_ms",
+            MetricKey::PageLoadEngineMs => "engine_duration_ms",
+            MetricKey::PageLoadDispatchMs => "dispatch_duration_ms",
             MetricKey::TabCreateMs => "duration_ms",
             MetricKey::TabSwitchMs => "duration_ms",
             MetricKey::TabResumeMs => "duration_ms",

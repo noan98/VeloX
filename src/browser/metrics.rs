@@ -167,12 +167,39 @@ pub fn format_duration(duration: Duration) -> String {
 // Page load timing
 // ---------------------------------------------------------------------
 
-/// Brackets one page load: `start()` on `NavigationStarted`, `finish()` on
-/// `LoadFinished`. A fresh timer (or one that was never started) reports no
-/// duration on `finish`.
+/// Brackets one page load: `start()` on `NavigationStarted`, an optional
+/// mid-checkpoint `mark_load_started()` on `LoadStarted`
+/// (`PageLoadEvent::Started` — WebKitGTK's `LoadEvent::Committed`, see
+/// `docs/decisions.md` D87), `finish()` on `LoadFinished`. A fresh timer (or
+/// one that was never started) reports no outcome on `finish`.
+///
+/// The mid-checkpoint exists to answer Issue #69's "段階的な計測" acceptance
+/// criterion: split the one `NavigationStarted` → `LoadFinished` span this
+/// project measured through Issue #13 into `NavigationStarted` →
+/// `LoadStarted` ([`PageLoadOutcome::dispatch`]) and `LoadStarted` →
+/// `LoadFinished` ([`PageLoadOutcome::engine`] — resource
+/// loading/parsing/rendering after the load is committed, black-box per
+/// Epic #57 rule 3). `LoadStarted` is optional and best-effort: some loads
+/// never reach it (e.g. a load cancelled after `NavigationStarted`), so
+/// `engine` is `None` in that case rather than a misleading `0`.
+///
+/// **`dispatch` is *not* "VeloX's own cost".** `NavigationStarted` fires
+/// from `with_navigation_handler`, before the engine has done any network
+/// work for this load; `LoadStarted` (WebKitGTK's `LoadEvent::Committed`)
+/// fires only once the engine has connected, sent the request, and started
+/// receiving the response — so `dispatch` bundles VeloX's own event
+/// handling (`app::record_perf_event`'s `NavigationStarted`/`LoadStarted`
+/// arms, `sync_tab_strip`) together with the engine's connect/request/
+/// response-head time, and this project measured `dispatch` as the
+/// *larger* of the two halves even against a loopback HTTP server with no
+/// real DNS/TLS cost (`docs/decisions.md` D87). Cross-reference Issue #66's
+/// `ipc` timing (sub-millisecond even in the worst case measured) to see
+/// that VeloX's own Rust-side share of `dispatch` is small — the rest is
+/// engine/network time this project cannot attribute away from the engine.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct PageLoadTimer {
     started_at: Option<Instant>,
+    load_started_at: Option<Instant>,
 }
 
 impl PageLoadTimer {
@@ -181,18 +208,57 @@ impl PageLoadTimer {
     }
 
     /// Mark the start of a page load. A load already in flight (e.g. a
-    /// redirect re-triggering navigation) is simply restarted from `now`.
+    /// redirect re-triggering navigation) is simply restarted from `now`,
+    /// discarding any `load_started` mark it had picked up so far.
     pub fn start(&mut self, now: Instant) {
         self.started_at = Some(now);
+        self.load_started_at = None;
     }
 
-    /// Mark the end of a page load, returning its duration if `start` was
-    /// called first. Consumes the start mark, so a stray `finish` without a
+    /// Mark the `LoadStarted` mid-checkpoint. A no-op if `start` was never
+    /// called (this timer is not tracking a load right now) or if this
+    /// checkpoint already fired since the last `start` — only the first
+    /// call per load counts, matching [`StartupTimestamps`]'s
+    /// `get_or_insert` pattern.
+    pub fn mark_load_started(&mut self, now: Instant) {
+        if self.started_at.is_some() {
+            self.load_started_at.get_or_insert(now);
+        }
+    }
+
+    /// Mark the end of a page load, returning its outcome if `start` was
+    /// called first. Consumes both marks, so a stray `finish` without a
     /// matching `start` (or a repeated `finish`) returns `None`.
-    pub fn finish(&mut self, now: Instant) -> Option<Duration> {
-        self.started_at
-            .take()
-            .map(|start| now.saturating_duration_since(start))
+    pub fn finish(&mut self, now: Instant) -> Option<PageLoadOutcome> {
+        let start = self.started_at.take()?;
+        let load_started_at = self.load_started_at.take();
+        Some(PageLoadOutcome {
+            total: now.saturating_duration_since(start),
+            engine: load_started_at.map(|load_started| now.saturating_duration_since(load_started)),
+        })
+    }
+}
+
+/// One page load's timing, as reported by [`PageLoadTimer::finish`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageLoadOutcome {
+    /// `NavigationStarted` → `LoadFinished`, unchanged from what this
+    /// project has always reported as `page_load_ms`.
+    pub total: Duration,
+    /// `LoadStarted` → `LoadFinished`, when `LoadStarted` fired for this
+    /// load. This is the portion Epic #57 rule 3 puts off-limits (engine
+    /// resource loading/parsing/rendering).
+    pub engine: Option<Duration>,
+}
+
+impl PageLoadOutcome {
+    /// `total` minus `engine`, when `engine` is known — **not** a
+    /// VeloX-attributable duration on its own, see [`PageLoadTimer`]'s doc
+    /// comment. Not simply "the rest" when `engine` is `None` — there is
+    /// nothing to subtract from, so this is `None` too rather than silently
+    /// reporting the full `total` as `dispatch` time.
+    pub fn dispatch(&self) -> Option<Duration> {
+        self.engine.map(|engine| self.total.saturating_sub(engine))
     }
 }
 
@@ -534,6 +600,11 @@ pub enum PerfRecord {
     PageLoad {
         url: String,
         duration: Duration,
+        /// `LoadStarted` → `LoadFinished` (Issue #69), when `LoadStarted`
+        /// fired for this load — see [`PageLoadOutcome`]. `None` keeps this
+        /// record identical to what this project has always logged (Issue
+        /// #13 through #66).
+        engine: Option<Duration>,
     },
     TabLatency {
         kind: TabLatencyKind,
@@ -588,10 +659,14 @@ impl PerfRecord {
         PerfRecord::Startup(report)
     }
 
-    pub fn page_load(url: impl Into<String>, duration: Duration) -> Self {
+    /// `engine` is [`PageLoadOutcome::engine`] — pass `None` for a plain
+    /// total-only record (matching every `page_load` record before Issue
+    /// #69).
+    pub fn page_load(url: impl Into<String>, duration: Duration, engine: Option<Duration>) -> Self {
         PerfRecord::PageLoad {
             url: url.into(),
             duration,
+            engine,
         }
     }
 
@@ -687,7 +762,27 @@ impl PerfRecord {
     pub fn to_text(&self) -> String {
         match self {
             PerfRecord::Startup(report) => report.to_string(),
-            PerfRecord::PageLoad { url, duration } => format_page_load(url, *duration),
+            // Issue #69: `engine`/`dispatch` are appended, never inserted —
+            // an existing scraper matching the original `format_page_load`
+            // prefix still works, same convention as the `rss` line's
+            // `pss_mib` addition (Issue #108/D42) and the `startup` line's
+            // sub-checkpoints (Issue #59/D43). Absent (`None`) when
+            // `LoadStarted` never fired for this load.
+            PerfRecord::PageLoad {
+                url,
+                duration,
+                engine,
+            } => {
+                let base = format_page_load(url, *duration);
+                match (engine, engine.map(|e| duration.saturating_sub(e))) {
+                    (Some(engine), Some(dispatch)) => format!(
+                        "{base} engine_duration={} dispatch_duration={}",
+                        format_duration(*engine),
+                        format_duration(dispatch)
+                    ),
+                    _ => base,
+                }
+            }
             PerfRecord::TabLatency {
                 kind,
                 tab_id,
@@ -747,9 +842,24 @@ impl PerfRecord {
                     json!(ms(report.to_first_load_finished)),
                 );
             }
-            PerfRecord::PageLoad { url, duration } => {
+            PerfRecord::PageLoad {
+                url,
+                duration,
+                engine,
+            } => {
                 fields.insert("url".to_owned(), json!(url));
                 fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+                // Issue #69: `engine_duration_ms`/`dispatch_duration_ms`
+                // always appear (never an absent key), serializing to JSON
+                // `null` when `LoadStarted` never fired — same convention
+                // as `total_pss_bytes` (Issue #108/D42), so a consumer
+                // always sees the key and cannot mistake "unmeasured" for
+                // "0ms".
+                fields.insert("engine_duration_ms".to_owned(), json!(engine.map(ms)));
+                fields.insert(
+                    "dispatch_duration_ms".to_owned(),
+                    json!(engine.map(|e| ms(duration.saturating_sub(e)))),
+                );
             }
             PerfRecord::TabLatency {
                 tab_id, duration, ..
@@ -1150,7 +1260,10 @@ mod tests {
         let start = Instant::now();
         timer.start(start);
         let end = start + Duration::from_millis(42);
-        assert_eq!(timer.finish(end), Some(Duration::from_millis(42)));
+        let outcome = timer.finish(end).expect("start was called");
+        assert_eq!(outcome.total, Duration::from_millis(42));
+        assert_eq!(outcome.engine, None);
+        assert_eq!(outcome.dispatch(), None);
     }
 
     #[test]
@@ -1170,7 +1283,65 @@ mod tests {
         let second_start = first_start + Duration::from_millis(100);
         timer.start(second_start); // e.g. a redirect re-triggered navigation
         let end = second_start + Duration::from_millis(10);
-        assert_eq!(timer.finish(end), Some(Duration::from_millis(10)));
+        assert_eq!(
+            timer.finish(end).map(|o| o.total),
+            Some(Duration::from_millis(10))
+        );
+    }
+
+    #[test]
+    fn mark_load_started_without_start_is_ignored() {
+        // A `LoadStarted` for a tab this timer never `start`ed (e.g. it
+        // arrived after a stray/duplicate event) must not fabricate an
+        // `engine` duration out of nothing.
+        let mut timer = PageLoadTimer::new();
+        let now = Instant::now();
+        timer.mark_load_started(now);
+        assert_eq!(timer.finish(now), None);
+    }
+
+    #[test]
+    fn load_started_between_start_and_finish_splits_into_dispatch_and_engine() {
+        let mut timer = PageLoadTimer::new();
+        let start = Instant::now();
+        timer.start(start);
+        let load_started = start + Duration::from_millis(5);
+        timer.mark_load_started(load_started);
+        let end = start + Duration::from_millis(50);
+        let outcome = timer.finish(end).expect("start was called");
+        assert_eq!(outcome.total, Duration::from_millis(50));
+        assert_eq!(outcome.engine, Some(Duration::from_millis(45)));
+        assert_eq!(outcome.dispatch(), Some(Duration::from_millis(5)));
+    }
+
+    #[test]
+    fn only_the_first_load_started_call_counts() {
+        let mut timer = PageLoadTimer::new();
+        let start = Instant::now();
+        timer.start(start);
+        timer.mark_load_started(start + Duration::from_millis(5));
+        timer.mark_load_started(start + Duration::from_millis(20)); // ignored
+        let outcome = timer
+            .finish(start + Duration::from_millis(50))
+            .expect("start was called");
+        assert_eq!(outcome.engine, Some(Duration::from_millis(45)));
+    }
+
+    #[test]
+    fn restarting_clears_a_pending_load_started_mark() {
+        // A redirect that re-triggers `NavigationStarted` must not let a
+        // `LoadStarted` mark from the *previous* (abandoned) load leak into
+        // the new one's `engine` duration.
+        let mut timer = PageLoadTimer::new();
+        let first_start = Instant::now();
+        timer.start(first_start);
+        timer.mark_load_started(first_start + Duration::from_millis(5));
+        let second_start = first_start + Duration::from_millis(100);
+        timer.start(second_start);
+        let end = second_start + Duration::from_millis(10);
+        let outcome = timer.finish(end).expect("start was called");
+        assert_eq!(outcome.total, Duration::from_millis(10));
+        assert_eq!(outcome.engine, None);
     }
 
     #[test]
@@ -1482,12 +1653,32 @@ mod tests {
 
     #[test]
     fn perf_record_page_load_text_matches_legacy_format_function() {
-        let record = PerfRecord::page_load("https://example.com/", Duration::from_millis(250));
+        let record =
+            PerfRecord::page_load("https://example.com/", Duration::from_millis(250), None);
         assert_eq!(
             record.to_text(),
             format_page_load("https://example.com/", Duration::from_millis(250))
         );
         assert_eq!(record.event_name(), "page_load");
+    }
+
+    #[test]
+    fn perf_record_page_load_text_appends_engine_and_dispatch_when_present() {
+        // Issue #69: appended, not inserted — the base line stays exactly
+        // what `format_page_load` produces (previous test), so an existing
+        // scraper matching that prefix keeps working.
+        let record = PerfRecord::page_load(
+            "https://example.com/",
+            Duration::from_millis(250),
+            Some(Duration::from_millis(230)),
+        );
+        assert_eq!(
+            record.to_text(),
+            format!(
+                "{} engine_duration=230.0ms dispatch_duration=20.0ms",
+                format_page_load("https://example.com/", Duration::from_millis(250))
+            )
+        );
     }
 
     #[test]
@@ -1627,12 +1818,29 @@ mod tests {
 
     #[test]
     fn perf_record_json_always_has_event_and_ts_ms() {
-        let record = PerfRecord::page_load("https://example.com/", Duration::from_millis(250));
+        let record =
+            PerfRecord::page_load("https://example.com/", Duration::from_millis(250), None);
         let value = record.to_json(Duration::from_millis(1234));
         assert_eq!(value["event"], "page_load");
         assert_eq!(value["ts_ms"], 1234.0);
         assert_eq!(value["url"], "https://example.com/");
         assert_eq!(value["duration_ms"], 250.0);
+        // Issue #69: the key is always present, `null` (not absent) when
+        // `LoadStarted` never fired — same convention as `total_pss_bytes`.
+        assert!(value["engine_duration_ms"].is_null());
+        assert!(value["dispatch_duration_ms"].is_null());
+    }
+
+    #[test]
+    fn perf_record_json_reports_engine_and_dispatch_when_present() {
+        let record = PerfRecord::page_load(
+            "https://example.com/",
+            Duration::from_millis(250),
+            Some(Duration::from_millis(230)),
+        );
+        let value = record.to_json(Duration::ZERO);
+        assert_eq!(value["engine_duration_ms"], 230.0);
+        assert_eq!(value["dispatch_duration_ms"], 20.0);
     }
 
     #[test]

@@ -1016,3 +1016,155 @@ $XV env VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json \
 target/release/velox-bench ipc-summary --input $S/session.jsonl \
   --output $S/ipc-summary.json
 ```
+
+## 20. ページロードの段階計測 (Issue #69, 2026-09-07)
+
+**設計判断・調査の経緯は `docs/decisions.md` D87 を参照。** ここでは
+実測データと再現手順だけを記録する。この節の数値はすべて §1 の環境
+(Ubuntu 24.04.4 / WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、
+**Windows (WebView2) / macOS (WKWebView) の実力値ではない** — D87 の
+とおり `PageLoadEvent::Started`/`Finished` の意味づけは3バックエンド
+共通と wry のソースで確認したが、実際のミリ秒はこの環境固有。
+
+### 20.1 何を計測できるようにしたか
+
+`metrics::PageLoadTimer`(既存、Issue #13) に `mark_load_started` という
+任意のチェックポイントを追加し、`page_load` イベントの `duration_ms`
+(既存、`NavigationStarted → LoadFinished`) はそのままに、
+`engine_duration_ms`(`LoadStarted → LoadFinished`)・
+`dispatch_duration_ms`(`NavigationStarted → LoadStarted`、`duration_ms
+- engine_duration_ms`) を追加した。`LoadStarted` が来なかったロードは
+両方とも `null`。`browser::benchmark::MetricKey` に
+`PageLoadEngineMs`/`PageLoadDispatchMs` を追加済み。
+
+**`dispatch_duration_ms` は VeloX 自身のコストではない** — D87 で
+ソースを確認したとおり `LoadStarted` はエンジンがロードを commit した
+後 (接続・リクエスト送信・レスポンス受信開始後) に発火するため、この
+区間にはエンジン側のネットワーク待ちも混ざる。以下の数値を読むときは
+必ず D87 の但し書きと合わせて読むこと。
+
+### 20.2 `navigation` シナリオでの実測 (同一セッション内 before/after、各10試行=50サンプル)
+
+`before` = 本 Issue 着手前のコード (`461f435`)、`after` = 本 Issue の
+計装追加後 (挙動を変える変更はしていない、`page_load_ms` の計測経路も
+不変)。`minimal.html` に対して2ラウンドずつ実行 (交互実行、§13.5 の
+「実行順で最初の条件だけ不当に遅くなる」教訓を踏まえた順序):
+
+| ラウンド | ビルド | `page_load_ms` 中央値 | `page_load_engine_ms` 中央値 | `page_load_dispatch_ms` 中央値 |
+| --- | --- | ---: | ---: | ---: |
+| 1 | before | 6.15 | (フィールド無し) | (フィールド無し) |
+| 1 | after  | 5.95 | 1.40 | 4.65 |
+| 2 | before | 6.90 | (フィールド無し) | (フィールド無し) |
+| 2 | after  | 6.70 | 1.65 | 4.70 |
+
+`page_load_ms`(既存メトリクス) は before/after でほぼ同じ (5.95〜6.90ms
+の範囲内、`velox-bench gate` で回帰なしと判定 — §20.3) — 計装追加は
+`page_load_ms` の値にも計測経路にも影響していない。新しく見えるように
+なった内訳: **`dispatch`(4.65〜4.70ms) が `engine`(1.40〜1.65ms) より
+大きい** — ループバック HTTP サーバの `minimal.html`(ほぼ空、DNS/TLS
+コスト無し) に対してもこの関係が成り立つ。D87 が指摘するとおり、これは
+「VeloX のオーバーヘッドが半分以上」ではなく「エンジンの接続確立/
+リクエスト送受信の待ち時間がこの区間の大半」と読むべきで、根拠は
+#66/D81 が実測した IPC Rust 側コスト (sub-millisecond) との対比。
+
+より重いページ (`dom_heavy.html`、`after` ビルドのみ、10試行=50サンプル)
+で計測すると、この構造が裏付けられる:
+
+| メトリクス | `minimal.html` 中央値 | `dom_heavy.html` 中央値 |
+| --- | ---: | ---: |
+| `page_load_ms` | 5.95〜6.70 | 84.65 |
+| `page_load_engine_ms` | 1.40〜1.65 | 72.00 |
+| `page_load_dispatch_ms` | 4.65〜4.70 | 12.65 |
+
+ページが重くなるほど伸びるのは `engine`(1.4ms→72.0ms) であって
+`dispatch`(4.7ms→12.65ms、オーダーは同じ) ではない — ページの中身を
+処理するコストが `engine` 側に乗っている、という直感どおりの結果。
+
+### 20.3 `velox-bench gate` — 計装追加による回帰の有無
+
+```
+regression gate: scenario=navigation candidates=2 (warn>20.0% fail>60.0%)
+metric                             baseline       candidates (中央値/変化率)       判定       備考
+page_load_ms                           6.15     5.9(-3.3%), 6.7(+8.9%)       OK
+pss_process_count                      4.00     4.0(+0.0%), 4.0(+0.0%)       OK
+pss_total_bytes                106436608.00 95926784.0(-9.9%), 95651328.0(-10.1%)       OK
+rss_process_count                      4.00     4.0(+0.0%), 4.0(+0.0%)       OK
+rss_total_bytes                292995072.00 288542720.0(-1.5%), 291096576.0(-0.6%)       OK
+startup_first_load_ms                315.10 297.1(-5.7%), 312.2(-0.9%)       OK
+startup_rust_setup_done_ms           130.10 124.8(-4.1%), 128.6(-1.2%)       OK
+startup_toolbar_ready_ms             285.60 274.5(-3.9%), 283.0(-0.9%)       OK
+startup_toolbar_script_started_ms         285.45 274.3(-3.9%), 282.6(-1.0%)       OK
+startup_window_created_ms            129.95 124.5(-4.2%), 128.2(-1.3%)       OK
+candidate のみに存在: page_load_dispatch_ms, page_load_engine_ms
+
+総合判定: OK
+```
+
+baseline (`before` ラウンド1) に対し `after` の2ラウンドを候補として
+評価 — 総合判定 OK。`page_load_dispatch_ms`/`page_load_engine_ms` は
+baseline 側に存在しない新規メトリクスなので `gate` は個別の合否を出さず
+「candidate のみに存在」と表示する (`evaluate_gate` の既存仕様どおり) —
+挙動としては正しい。
+
+### 20.4 IPC (unnecessary UI/IPC work during navigation) の再確認
+
+`navigation` シナリオ相当の自動操作 (起動時ロード1回 + `navigate` 3回、
+`wait 300` ずつ) で `velox-bench ipc-summary` を実行 (1試行):
+
+| dir | name | count | total_bytes | median_ms | p95_ms |
+| --- | --- | ---: | ---: | ---: | ---: |
+| out | `set_tabs` | 14 | 2,383 | 0.000 | 1.175 |
+
+4回のロード (起動時1 + navigate 3) に対し `set_tabs` 14件 (≈3.5件/
+ロード) — `docs/performance-targets.md` §18 (#66) が報告した比率
+(「120件/約34回の操作」≈3.5) とオーダーが一致し、コストも
+sub-millisecond のまま。新しい削減対象は見つからなかった (D87)。
+
+### 20.5 DNS/connection/TLS timing 調査 (PoC 出力)
+
+wry のネイティブ API には無い。JS 標準の `PerformanceNavigationTiming`
+は WebKitGTK で動作を確認 (`http://127.0.0.1:8731/minimal.html` に対し):
+
+```
+{"entryType":"navigation","domainLookupStart":1,"domainLookupEnd":1,
+"connectStart":1,"connectEnd":1,"secureConnectionStart":0,
+"requestStart":1,"responseStart":2,"responseEnd":14,"fetchStart":1,
+"startTime":0,"protocol":"http/1.0"}
+```
+
+値がすべて 1ms 前後に潰れているのはループバック接続に実質的な DNS/TCP
+コストが無いため — この環境では意味のある DNS/TLS 数値は取れない。
+詳しい経緯・結論は D87 を参照。
+
+### 20.6 再現手順
+
+```sh
+S=/path/to/scratch
+cargo build --release
+(cd scripts/bench/pages && python3 -m http.server 8731 &)
+URL=http://127.0.0.1:8731/minimal.html
+XV='xvfb-run -a --server-args=-screen 0 1280x900x24 dbus-run-session --'
+
+# 20.2 ページロード段階計測
+$XV target/release/velox-bench run --scenario navigation --trials 10 \
+  --velox-bin target/release/velox --url $URL --output $S/navigation.json
+
+# 20.4 IPC
+cat > $S/nav_session.txt << 'SCRIPT'
+mark
+navigate http://127.0.0.1:8731/minimal.html?velox-bench-step=1
+wait 300
+navigate http://127.0.0.1:8731/minimal.html?velox-bench-step=2
+wait 300
+navigate http://127.0.0.1:8731/minimal.html?velox-bench-step=3
+wait 300
+quit
+SCRIPT
+$XV env VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json \
+  VELOX_PERF_OUTPUT=$S/nav_session.jsonl \
+  VELOX_HOMEPAGE=$URL \
+  VELOX_AUTOMATION_SCRIPT=$S/nav_session.txt \
+  target/release/velox
+target/release/velox-bench ipc-summary --input $S/nav_session.jsonl \
+  --output $S/ipc-summary.json
+```
