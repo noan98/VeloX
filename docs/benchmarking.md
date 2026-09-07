@@ -480,6 +480,11 @@ D88、実測結果は `docs/performance-targets.md` §21 を参照 — 初回実
 2026-09-07、Issue #180) が `windows-latest` ランナー上で success で完走し、
 `cold_startup` の実測値と GUI 起動可否 (起動できた) が記録済み。
 
+なおこの初回実行だけは `workflow_dispatch` ではなく、`perf-windows.yml` を
+追加した PR #179 に対する `pull_request` トリガー (後述の「`perf-windows.yml`
+自身を変更する PR でのみ検証目的で動く」経路) で走ったものである。`main` に
+マージされた現在は、下記のとおり `workflow_dispatch` で手動実行できる。
+
 これまでの節 (`run`/`aggregate`/`compare`/`gate`/`ipc-summary`) はすべて
 `velox-bench` のサブコマンド自体は OS を問わず同じであり、Linux 向けに
 書かれた例の `xvfb-run -a ... dbus-run-session -- ...` の部分だけが

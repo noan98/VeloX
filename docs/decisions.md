@@ -10340,6 +10340,13 @@ workflow には `velox.exe` を直接起動してプロセス一覧・perf ロ�
 > 10` も 10/10 試行が完走している。したがって「最大のリスクは未解決のまま」
 > という上記の記述は解消済み。詳細と実測値は
 > `docs/performance-targets.md` §21 を参照。
+>
+> この初回実行は `workflow_dispatch` ではなく、`perf-windows.yml` を追加した
+> PR #179 に対する `pull_request` トリガー (本 D88 が「`workflow_dispatch` は
+> main にマージされるまで Actions タブに現れない」ために付けた `paths` フィルタ
+> 経由の経路) で走った。**この検証経路を付けておいた判断が、まさに想定どおり
+> 機能した**ことになる — これが無ければ workflow の初回検証は「main にマージ
+> してから手動実行してみる」しかなく、起動不可だった場合の手戻りが大きかった。
 
 **このセッションで確認できたこと / できていないこと**:
 - 確認できた: `cargo fmt --check` / `cargo clippy --all-targets -D warnings` /

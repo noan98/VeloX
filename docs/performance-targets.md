@@ -1304,11 +1304,22 @@ target/release/velox-bench ipc-summary --input $S/nav_session.jsonl \
 ## 21. Windows (WebView2) の実測 (Issue #136)
 
 **設計判断・実装方針は `docs/decisions.md` D88 を参照。**
-`.github/workflows/perf-windows.yml` (`workflow_dispatch` 限定) の初回実行
+`.github/workflows/perf-windows.yml` の初回実行
 (run [`34127310212`](https://github.com/noan98/VeloX/actions/runs/34127310212)、
 ジョブ `velox-bench run (windows-latest)`、job id `101758900568`、
 2026-09-07) が `windows-latest` ランナー上で success で完走し、この節に
-Windows 側の実測値を記録できるようになった (Issue #180)。D88 が「最大の
+Windows 側の実測値を記録できるようになった (Issue #180)。
+
+**この初回実行は `workflow_dispatch` (手動実行) ではない。** `perf-windows.yml`
+は `workflow_dispatch` に加えて「`perf-windows.yml` 自身を変更する PR」でだけ
+`pull_request` トリガーでも走る (D88。`workflow_dispatch` は `main` にマージ
+されるまで Actions タブに現れず手動実行できないため、workflow 自身の検証手段
+として付けてある)。run 34127310212 はまさにその経路で、`perf-windows.yml` を
+新規追加した PR #179 に対する `pull_request` トリガーの自動実行として走った
+(ジョブログの checkout は `refs/remotes/pull/179/merge`、run のイベント種別も
+`pull_request`)。**したがって「手動実行された初回の計測」ではなく、
+「workflow 追加 PR 上での初回の検証実行」である。** 以後シナリオや試行回数を
+変えて測る場合は、`main` にマージ済みの `workflow_dispatch` から実行する。D88 が「最大の
 リスク」としていた `windows-latest` 上での GUI/WebView2 ウィンドウの起動
 可否は、この実行により**起動できた**で決着している (詳細は §21.3)。数値は
 すべて run 34127310212 のジョブログ・Actions Artifact に実在するものだけを
@@ -1341,6 +1352,7 @@ WebView2 Runtime)」ステップ (2026-09-07 13:25:58〜13:26:00 UTC) のログ�
 | VeloX ビルド | `cargo build --release` (`velox.exe` / `velox-bench.exe`)、commit `b92dc6825c65edda116a021390513f2fba12daf9` |
 | ディスプレイ | GitHub-hosted Windows ランナーの対話セッション (Xvfb 相当の仕組みは無いが、§21.3 のとおり GUI/WebView2 ウィンドウは実際に起動できることを確認した) |
 | 実行元 | [run 34127310212](https://github.com/noan98/VeloX/actions/runs/34127310212) / job `101758900568` (`velox-bench run (windows-latest)`) |
+| 実行トリガー | `pull_request` (PR #179 = `perf-windows.yml` を追加した PR)。**`workflow_dispatch` による手動実行ではない** — 節冒頭の説明を参照 |
 
 ### 21.2 シナリオ別の結果
 
