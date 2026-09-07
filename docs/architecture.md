@@ -995,7 +995,20 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
   bracketed by `metrics::PageLoadTimer` in `app::run`, writing one
   `page_load` record per load. Timers are kept per `TabId`, so a background
   tab loading concurrently with the active one does not overwrite its start
-  time.
+  time. Issue #69 added an optional mid-checkpoint, `UserEvent::LoadStarted`
+  (`PageLoadEvent::Started` — WebKitGTK's `LoadEvent::Committed`, WebView2's
+  `ContentLoading`, WKWebView's `didCommitNavigation`; identical mapping
+  across all three wry backends, confirmed from source), splitting the
+  record's `duration_ms` into `engine_duration_ms` (`LoadStarted` →
+  `LoadFinished`, black-box per Epic #57 rule 3) and `dispatch_duration_ms`
+  (`NavigationStarted` → `LoadStarted`). **`dispatch_duration_ms` is not a
+  VeloX-attributable cost** — `LoadStarted` fires only once the engine has
+  already connected and started receiving the response, so this bucket
+  bundles VeloX's own `NavigationStarted`/`LoadStarted` handling with real
+  engine/network time; see `docs/decisions.md` D87 for the measured split
+  (this project's own loopback-HTTP fixtures put `dispatch` *above*
+  `engine` for a near-empty page) and why no further optimization followed
+  from it.
 - **Tab create/switch time** (Issue #13): `ToolbarCommand::NewTab` and
   `ActivateTab` are handled synchronously in `app::handle_toolbar_command`
   (the new webview is usable, or the switch visible, by the time the
@@ -1077,6 +1090,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     ```text
     velox[perf] startup window_created=12.3ms rust_setup_done=12.4ms toolbar_script_started=44.9ms toolbar_ready=45.6ms first_page=120.0ms
     velox[perf] page_load url=https://example.com/ duration=250.0ms
+    velox[perf] page_load url=https://example.com/ duration=250.0ms engine_duration=230.0ms dispatch_duration=20.0ms
     velox[perf] tab_create id=3 duration=15.2ms
     velox[perf] tab_switch id=3 duration=3.1ms
     velox[perf] tab_resume id=3 duration=2.7ms
@@ -1091,7 +1105,11 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     were appended to the `rss` line, not inserted — an existing scraper
     matching the original prefix still works. `pss_mib=n/a` when PSS could
     not be read for any process in the tree. Issue #64 appended `cpu_s`
-    the same way, `n/a` on platforms where CPU time cannot be read.)
+    the same way, `n/a` on platforms where CPU time cannot be read. Issue
+    #69 appended `engine_duration`/`dispatch_duration` to the `page_load`
+    line the same way — absent entirely when `LoadStarted` never fired for
+    that load, not just the base `page_load url=... duration=...` line
+    unchanged.)
   - `json` emits one JSON object per line (JSON Lines) — **this is the
     format Issue #14's benchmark runner and Issue #36's CI regression check
     should parse.** No `velox[perf] ` prefix, so every line parses as JSON
@@ -1105,7 +1123,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     | `event`      | fields |
     |--------------|--------|
     | `startup`    | `window_created_ms`, `rust_setup_done_ms`, `toolbar_script_started_ms`, `toolbar_ready_ms`, `first_load_ms` (float ms) |
-    | `page_load`  | `url` (string), `duration_ms` (float ms) |
+    | `page_load`  | `url` (string), `duration_ms` (float ms), `engine_duration_ms`/`dispatch_duration_ms` (float ms or `null` — Issue #69, see D87) |
     | `tab_create` | `tab_id` (uint), `duration_ms` (float ms) |
     | `tab_switch` | `tab_id` (uint), `duration_ms` (float ms) |
     | `tab_resume` | `tab_id` (uint), `duration_ms` (float ms) — a switch that had to rebuild a suspended tab's webview (Issue #63); kept apart from `tab_switch` because the two are an order of magnitude apart |
