@@ -1049,7 +1049,7 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
   separate, untrusted IPC channel (devtools/keyboard-shortcut sentinels —
   see D18) is **not** instrumented here: it carries only a handful of fixed,
   short strings, nowhere near the toolbar channel's volume — see
-  `docs/performance-targets.md` §16 for the measured numbers this scope
+  `docs/performance-targets.md` §18 for the measured numbers this scope
   decision is based on. `browser::benchmark::summarize_ipc` (pure,
   unit-tested) aggregates `ipc` events from one or more perf logs into a
   per-`(direction, name)` table — count, total bytes, `duration_ms`

@@ -3241,9 +3241,9 @@ fn sync_bookmark_star(window: &BrowserWindow, state: &AppState, url: &str) {
 /// unconditionally regardless — real IPC traffic measured with `velox-bench
 /// ipc-summary` showed `set_history` among the largest Rust → JS payloads
 /// in an ordinary session even though the panel was never opened (see
-/// docs/performance-targets.md §16). This is the one place this issue found
+/// docs/performance-targets.md §18). This is the one place this issue found
 /// real, safe-to-cut redundant traffic (the tab strip's equally frequent
-/// `set_tabs` push is *not* gated this way — see §16 for why that one is
+/// `set_tabs` push is *not* gated this way — see §18 for why that one is
 /// intentional: the tab strip, unlike this panel, is always visible).
 ///
 /// Opening the panel (`ToolbarCommand::TogglePanel`) already refreshes it

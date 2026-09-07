@@ -699,7 +699,7 @@ $XV target/release/velox-bench run --scenario background_cpu --trials 3 \
   --velox-bin target/release/velox --url http://127.0.0.1:8731/busy.html
 ```
 
-## 16. IPC (WebView ↔ Rust) の計測結果 (Issue #66, 2026-09-07)
+## 18. IPC (WebView ↔ Rust) の計測結果 (Issue #66, 2026-09-07)
 
 **設計判断は `docs/decisions.md` D81 を参照。** ここでは実測データと
 結論だけを記録する。この節の数値はすべて §1 の環境 (Ubuntu 24.04.4 /
@@ -708,7 +708,7 @@ WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、**Windows
 `with_ipc_handler`) は OS 間でほぼ同じコードパスだが、未計測の OS へ
 そのまま外挿しないこと。
 
-### 16.1 何を計測できるようにしたか
+### 18.1 何を計測できるようにしたか
 
 `metrics::PerfRecord::Ipc` (Issue #66) が JS → Rust (`direction=in`、
 `ToolbarCommand`) と Rust → JS (`direction=out`、
@@ -720,12 +720,12 @@ WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、**Windows
 更新は含まない** — Epic #57 ルール 3 (WebView をブラックボックスとして
 扱う) のとおり、VeloX 側から測れるのはここまで。
 
-### 16.2 セッション実測 (`velox-bench ipc-summary`)
+### 18.2 セッション実測 (`velox-bench ipc-summary`)
 
 自動操作スクリプトでタブ 20 個 (`minimal.html`) を開き、10 回切替 + 2 回
 ナビゲーション + 2 回クローズを行う「20 タブセッション」と、タブ 3 個で
 同種の操作を行う「3 タブセッション」を 1 回ずつ実行 (各 1 試行、
-`VELOX_MAX_TABS_PER_PROCESS=4`、既定)。再現手順は §16.5。
+`VELOX_MAX_TABS_PER_PROCESS=4`、既定)。再現手順は §18.5。
 
 **20 タブセッション、修正前 (this issue 着手前のコード) の内訳
 (上位 5、`total_bytes` 降順)**:
@@ -742,7 +742,7 @@ WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、**Windows
 `in` 側は `script_started`(24 bytes)/`ready`(15 bytes) の 2 件のみ —
 16.4 で理由を説明する。
 
-### 16.3 高頻度イベントの特定と結論
+### 18.3 高頻度イベントの特定と結論
 
 - **`set_tabs` (タブストリップの全件再送信) が量・回数とも最大**
   (20 タブセッションで合計バイト数の 90%)。1 タブ操作 (open/navigate/
@@ -765,12 +765,12 @@ WebKitGTK 2.52.6 / Xvfb、GPU なし) での計測であり、**Windows
   無条件に呼ばれており、閲覧のたびに `config.history_panel_limit`
   (既定 200 件) 分の履歴を JSON 化して送っていた。履歴パネルは
   ほとんどの時間閉じているため、この送信の大部分は**誰にも見られない
-  DOM 更新**だった。§16.4 で before/after を示す。
+  DOM 更新**だった。§18.4 で before/after を示す。
 - それ以外の `out` イベント (`set_url`/`set_bookmark_active`/
   `set_loading`/`set_block_count` など) は 1 件あたり数十バイト、
   `duration_ms` はほぼ 0 — 削減の対象にならない規模。
 
-### 16.4 実施した削減と before/after (同一自動操作スクリプトでの比較)
+### 18.4 実施した削減と before/after (同一自動操作スクリプトでの比較)
 
 `app::refresh_history_panel_if_open` を追加し、`LoadFinished`/
 `PageTitleResolved`/`FaviconResolved` の 3 箇所を
@@ -804,7 +804,7 @@ xvfb-run + dbus-run-session)。履歴パネル自体の動作 (開いたとき�
 /`DeleteHistoryEntry`/`ClearHistory`/`SearchHistory` の呼び出し経路を
 変更していないため影響を受けない。
 
-### 16.5 結論
+### 18.5 結論
 
 - **IPC の回数・サイズ・時間を継続的に計測できる仕組み**: `metrics::
   PerfRecord::Ipc` + `browser::benchmark::summarize_ipc` +
@@ -812,7 +812,7 @@ xvfb-run + dbus-run-session)。履歴パネル自体の動作 (開いたとき�
   このまま (追加の型を作らず) 使える。
 - **高頻度イベントの特定**: `set_tabs`(常時表示、意図的、コスト無視できる)、
   `set_history`(閉じたパネルへの無駄な送信、削減済み)。
-- **不要イベントの削減**: `set_history` の無条件送信を撤廃 (§16.4)。
+- **不要イベントの削減**: `set_history` の無条件送信を撤廃 (§18.4)。
 - **batching の要否**: **導入しなかった。** `set_tabs` を含むすべての
   `out` イベントの `duration_ms` が sub-millisecond (worst case でも
   3.5ms) であり、複数イベントをまとめて 1 回の `evaluate_script`
@@ -838,7 +838,7 @@ xvfb-run + dbus-run-session)。履歴パネル自体の動作 (開いたとき�
   再現できない高頻度パスは**未計測**として残す (`docs/decisions.md`
   D81)。
 
-### 16.6 再現手順
+### 18.6 再現手順
 
 ```sh
 S=/path/to/scratch

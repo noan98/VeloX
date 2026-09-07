@@ -8758,7 +8758,7 @@ Issue #66 (Epic #57 Phase 3)。「WebView ↔ Rust の IPC コストを計測し
 不要な通信と payload を削減する」という課題に対して、**まず継続的に
 計測できる仕組みを作り、その実測データだけで削減判断をした** — Epic #57
 ルール 1 (ベンチマークなしの最適化をしない) を、#60/#64 と同じやり方で
-守った。数値・再現手順は `docs/performance-targets.md` §16、使い方は
+守った。数値・再現手順は `docs/performance-targets.md` §18、使い方は
 `docs/benchmarking.md` §6 を参照。ここには設計判断とその理由だけを残す。
 
 ### 計測をどこに追加したか — 既存の1本の choke point ずつに載せた
@@ -8836,7 +8836,7 @@ Issue #66 (Epic #57 Phase 3)。「WebView ↔ Rust の IPC コストを計測し
 の特定の `name` (例えば `set_tabs` の `total_bytes`) を新しい
 `MetricKey` として追加すれば `evaluate_gate` の枠組みにそのまま乗る。
 
-### 実測して分かったこと・下した判断 (数値は §16)
+### 実測して分かったこと・下した判断 (数値は §18)
 
 - `set_tabs` (タブストリップ全件再送信) が量・回数とも最大だが、20 タブ
   という最も重いケースでも Rust 側コストは sub-millisecond (中央値
@@ -8853,7 +8853,7 @@ Issue #66 (Epic #57 Phase 3)。「WebView ↔ Rust の IPC コストを計測し
   `refresh_history_panel` を呼ぶ薄いラッパー) を追加し、上記 3 箇所を
   これに差し替えた。パネルを開く操作 (`TogglePanel`) は既存のまま
   無条件に更新するので、**パネルを開いた瞬間の表示内容は変わらない**。
-  同一の自動操作スクリプトでの before/after 実測 (§16.4): 20 タブ
+  同一の自動操作スクリプトでの before/after 実測 (§18.4): 20 タブ
   セッションで `set_history` 67→1 件 (-98.5%)、15,723→555 bytes
   (-96.5%)、ipc イベント総数は 502→430 件 (-14.3%)。
 - **batching は導入しなかった。** 上記 2 点とも、削減判断は「送るか

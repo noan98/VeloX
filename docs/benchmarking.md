@@ -448,7 +448,7 @@ in   ready                           1           15      0.000      0.000
   はメッセージ本体が数十バイトの固定形状の JSON であることがコード上明らか
   (`ui::toolbar::ToolbarCommand`) なので、自動化スクリプトでは測れないと
   いう限界を D81 に明記した。実測データと結論は
-  `docs/performance-targets.md` §16 を参照。
+  `docs/performance-targets.md` §18 を参照。
 
 ## 結果ファイルのフォーマット
 
