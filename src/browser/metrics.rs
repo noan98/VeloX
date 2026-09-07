@@ -406,8 +406,19 @@ impl std::error::Error for RssError {
 /// - Other Unix (macOS, *BSD): shells out to `ps` for RSS,
 ///   best-effort/untested by this project's CI (Linux-only). PSS has no
 ///   equivalent here, so `total_pss_bytes` is always `None`.
-/// - Windows: not implemented yet; returns [`RssError::Unsupported`] (no
-///   RSS *or* PSS).
+/// - Windows (Issue #136, D88 in `docs/decisions.md`): `CreateToolhelp32Snapshot`
+///   walks the process tree (PID/PPID), `GetProcessMemoryInfo`'s
+///   `WorkingSetSize` gives RSS, and `GetProcessTimes` gives CPU time — all
+///   best-effort per process (a process this project's own, non-elevated
+///   process cannot `OpenProcess` simply contributes no RSS/CPU, mirroring
+///   the Linux/`ps` fallbacks' "exclude, don't fail the whole sample"
+///   policy). **PSS has no Windows equivalent and is not attempted**:
+///   `total_pss_bytes` is always `None` here, exactly as on non-Linux Unix.
+///   See D88 for why (a self-computed `QueryWorkingSetEx` approximation was
+///   investigated and rejected for this project, not attempted here) — and
+///   note its warning that a Windows PSS-shaped number must never be
+///   compared against a Linux PSS number even if one existed, since the two
+///   would be computed by entirely different methods.
 pub fn sample_process_tree_rss(root_pid: u32) -> Result<RssSample, RssError> {
     let processes = imp::process_map()?;
     build_sample(root_pid, &processes)
@@ -932,6 +943,28 @@ fn ms(duration: Duration) -> f64 {
     (duration.as_secs_f64() * 1000.0 * 10.0).round() / 10.0
 }
 
+/// Convert a Windows `FILETIME`'s low/high 32-bit halves — 100ns ticks
+/// since 1601-01-01, per `GetProcessTimes`'s `lpKernelTime`/`lpUserTime` —
+/// into seconds (Issue #136). Plain arithmetic on two `u32`s rather than
+/// the `windows::Win32::Foundation::FILETIME` type itself, so this stays
+/// unit-testable on every platform this project's CI runs on (Linux) even
+/// though `FILETIME` is only available when building for Windows (`windows`
+/// is a `cfg(windows)` dependency, see `Cargo.toml`) — the Windows `imp`
+/// module below is the only caller, and it does the
+/// `FILETIME` → `(u32, u32)` unpacking right at the FFI boundary.
+///
+/// `#[cfg(any(test, target_os = "windows"))]`: its only non-test caller is
+/// the Windows `imp` module below, so on every other platform this would
+/// otherwise be dead code (`cargo clippy --all-targets -D warnings`'s
+/// `dead_code` lint) outside of `cfg(test)` builds, where the tests at the
+/// bottom of this file call it directly to verify the arithmetic without
+/// needing the Windows-only `imp` module at all.
+#[cfg(any(test, target_os = "windows"))]
+fn filetime_ticks_to_seconds(low: u32, high: u32) -> f64 {
+    let ticks = ((high as u64) << 32) | low as u64;
+    ticks as f64 * 1e-7
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use super::{HashMap, ProcInfo};
@@ -1174,12 +1207,180 @@ mod imp {
     }
 }
 
-#[cfg(not(any(target_os = "linux", unix)))]
+#[cfg(target_os = "windows")]
+mod imp {
+    use super::{filetime_ticks_to_seconds, HashMap, ProcInfo};
+    use std::io;
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+    };
+
+    /// Closes a Win32 `HANDLE` on drop. `CreateToolhelp32Snapshot` and
+    /// `OpenProcess` (the only two handle sources in this module) both
+    /// return an *owning* handle on success — nothing else holds or closes
+    /// it — so a thin RAII wrapper is enough to guarantee it is closed
+    /// exactly once, on every exit path (including the early `?`/`return`s
+    /// below), without a manual `CloseHandle` at each one.
+    struct OwnedHandle(HANDLE);
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was obtained from `CreateToolhelp32Snapshot`
+            // or `OpenProcess` (see the two call sites below) and has not
+            // been closed anywhere else — this `Drop` impl is the only
+            // place that closes it, and it runs at most once per
+            // `OwnedHandle` value.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Windows process-tree walk (Issue #136). `CreateToolhelp32Snapshot` +
+    /// `Process32First/NextW` is the Windows equivalent of iterating
+    /// `/proc` on Linux (see that `imp::process_map` above): the snapshot's
+    /// `PROCESSENTRY32W` entries already carry each process's PID and
+    /// parent PID (`th32ProcessID`/`th32ParentProcessID`), so no extra call
+    /// is needed for the tree shape itself. RSS and CPU time each need one
+    /// more per-process API (`GetProcessMemoryInfo`, `GetProcessTimes`),
+    /// both of which need an open handle — see [`query_process`].
+    ///
+    /// PSS has no Windows equivalent and is not attempted here; every
+    /// [`ProcInfo::pss_bytes`] this returns is `None` — see the module docs
+    /// on [`super::sample_process_tree_rss`] and D88 in `docs/decisions.md`
+    /// for the investigation and why.
+    pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
+        // SAFETY: a plain FFI call into kernel32 with no caller-provided
+        // buffers — it takes a system-wide snapshot and returns a handle to
+        // it (or an error, via `windows_core::Result`, mapped below). The
+        // returned handle is immediately wrapped in `OwnedHandle` so it is
+        // closed on every return path out of this function.
+        let snapshot = OwnedHandle(
+            unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) }.map_err(to_io_error)?,
+        );
+
+        let mut map = HashMap::new();
+        let mut entry = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+
+        // SAFETY: `snapshot.0` is the valid `TH32CS_SNAPPROCESS` handle
+        // just created above (still open — `OwnedHandle` has not been
+        // dropped yet); `entry` is a stack-allocated `PROCESSENTRY32W` with
+        // `dwSize` set as `Process32FirstW` requires, and we pass a valid
+        // `*mut` to it that the call fills in on success.
+        let mut has_entry = unsafe { Process32FirstW(snapshot.0, &mut entry) }.is_ok();
+
+        while has_entry {
+            let pid = entry.th32ProcessID;
+            let (rss_bytes, cpu_seconds) = query_process(pid);
+            map.insert(
+                pid,
+                ProcInfo {
+                    ppid: entry.th32ParentProcessID,
+                    rss_bytes: rss_bytes.unwrap_or(0),
+                    pss_bytes: None,
+                    cpu_seconds,
+                },
+            );
+
+            // SAFETY: same still-open snapshot handle and the same `entry`
+            // buffer as above, reused across iterations per the
+            // Toolhelp32 API's contract.
+            has_entry = unsafe { Process32NextW(snapshot.0, &mut entry) }.is_ok();
+        }
+
+        Ok(map)
+    }
+
+    /// Best-effort RSS + CPU time for one process: `OpenProcess` with the
+    /// minimal access rights `GetProcessMemoryInfo`/`GetProcessTimes`
+    /// need (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`, never
+    /// `PROCESS_ALL_ACCESS`). A process VeloX cannot open — a
+    /// higher-privileged or another user's process, since this project does
+    /// not expect to run elevated — simply contributes no RSS/CPU rather
+    /// than failing the whole sample, mirroring how the Linux
+    /// implementation treats an unreadable `/proc/<pid>/status`
+    /// (`build_sample`'s summation already treats a missing map entry —
+    /// which never happens here since a `ProcInfo` is inserted regardless —
+    /// and a `None` field the same permissive way).
+    fn query_process(pid: u32) -> (Option<u64>, Option<f64>) {
+        // SAFETY: a plain FFI call; the access mask requested is the
+        // minimal one documented above, `bInheritHandle = false` so this
+        // handle is not inherited by any child process VeloX later spawns,
+        // and the returned handle (on success) is immediately wrapped in
+        // `OwnedHandle` so it is always closed before this function
+        // returns.
+        let handle = match unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                false,
+                pid,
+            )
+        } {
+            Ok(handle) => OwnedHandle(handle),
+            Err(_) => return (None, None),
+        };
+
+        let rss_bytes = {
+            let mut counters = PROCESS_MEMORY_COUNTERS {
+                cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+                ..Default::default()
+            };
+            // SAFETY: `handle.0` was just opened above and is still valid
+            // (not dropped until this block's `counters` has been read);
+            // `counters` is a stack buffer sized exactly as `cb` states,
+            // matching what `GetProcessMemoryInfo` requires.
+            unsafe { GetProcessMemoryInfo(handle.0, &mut counters, counters.cb) }
+                .ok()
+                .map(|()| counters.WorkingSetSize as u64)
+        };
+
+        let cpu_seconds = {
+            let mut creation = FILETIME::default();
+            let mut exit = FILETIME::default();
+            let mut kernel = FILETIME::default();
+            let mut user = FILETIME::default();
+            // SAFETY: `handle.0` is still valid, as above; the four
+            // `FILETIME` out-parameters are stack-allocated and correctly
+            // sized for what `GetProcessTimes` writes into them.
+            unsafe { GetProcessTimes(handle.0, &mut creation, &mut exit, &mut kernel, &mut user) }
+                .ok()
+                .map(|()| {
+                    filetime_ticks_to_seconds(kernel.dwLowDateTime, kernel.dwHighDateTime)
+                        + filetime_ticks_to_seconds(user.dwLowDateTime, user.dwHighDateTime)
+                })
+        };
+
+        (rss_bytes, cpu_seconds)
+    }
+
+    /// A `windows::core::Error` (an `HRESULT` plus an optional message) as
+    /// [`super::RssError::Io`]. `.message()` renders a human-readable
+    /// description (falling back to a generic one for the `HRESULT` alone
+    /// when no extended `IErrorInfo` is attached) — preserved as the
+    /// `io::Error`'s text via `io::Error::other`, since `io::Error::
+    /// from_raw_os_error` expects a raw Win32 error code, not the `HRESULT`
+    /// this crate's errors carry, and would misdecode it.
+    fn to_io_error(err: windows::core::Error) -> super::RssError {
+        super::RssError::Io(io::Error::other(err.message()))
+    }
+}
+
+#[cfg(not(any(target_os = "linux", unix, target_os = "windows")))]
 mod imp {
     use super::{HashMap, ProcInfo};
 
-    /// No sampling strategy implemented yet (e.g. Windows). Callers get a
-    /// clean [`super::RssError::Unsupported`] instead of a panic.
+    /// No sampling strategy implemented yet (an OS other than Linux, other
+    /// Unix, or Windows). Callers get a clean [`super::RssError::Unsupported`]
+    /// instead of a panic.
     pub(super) fn process_map() -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         Err(super::RssError::Unsupported)
     }
@@ -1936,5 +2137,34 @@ mod tests {
     fn ms_rounds_to_one_decimal_place() {
         assert_eq!(ms(Duration::from_micros(1_549)), 1.5);
         assert_eq!(ms(Duration::ZERO), 0.0);
+    }
+
+    // -- filetime_ticks_to_seconds (Issue #136, Windows CPU time) --------
+    //
+    // Pure arithmetic, so this runs on every platform this project's CI
+    // exercises (Linux) even though the only caller (`imp::query_process`)
+    // is `#[cfg(target_os = "windows")]` — see the function's doc comment.
+
+    #[test]
+    fn filetime_ticks_to_seconds_converts_low_half_only() {
+        // 10_000_000 ticks * 100ns/tick = 1.0 second exactly.
+        assert_eq!(filetime_ticks_to_seconds(10_000_000, 0), 1.0);
+        assert_eq!(filetime_ticks_to_seconds(0, 0), 0.0);
+    }
+
+    #[test]
+    fn filetime_ticks_to_seconds_combines_high_and_low_halves() {
+        // high=1 contributes 2^32 ticks = 429.4967296 seconds; low=0 adds
+        // nothing on top.
+        let expected = (1u64 << 32) as f64 * 1e-7;
+        assert_eq!(filetime_ticks_to_seconds(0, 1), expected);
+    }
+
+    #[test]
+    fn filetime_ticks_to_seconds_matches_manual_tick_math_for_arbitrary_input() {
+        let low = 123_456_789u32;
+        let high = 7u32;
+        let ticks = ((high as u64) << 32) | low as u64;
+        assert_eq!(filetime_ticks_to_seconds(low, high), ticks as f64 * 1e-7);
     }
 }

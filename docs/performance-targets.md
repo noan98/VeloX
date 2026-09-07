@@ -1168,3 +1168,59 @@ $XV env VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json \
 target/release/velox-bench ipc-summary --input $S/nav_session.jsonl \
   --output $S/ipc-summary.json
 ```
+## 21. Windows (WebView2) の実測 (Issue #136)
+
+**設計判断・実装方針は `docs/decisions.md` D88 を参照。** この節は Windows
+側の実測結果を記録する場所として用意した — **現時点ではまだ 1 つも数値が
+入っていない。** 理由は D88 のとおり: この節を書いている環境は Linux
+コンテナで Windows 実機が無く、`.github/workflows/perf-windows.yml`
+(`workflow_dispatch` 限定) を実際に `windows-latest` ランナー上で実行して
+初めて数値が取れる。以下は**その実行後に埋めるプレースホルダ**であり、
+架空の数値は一切書いていない。
+
+> ⚠️ **この節の数値を、§1〜§20 の Linux (WebKitGTK/Xvfb) の数値と直接比較
+> しないこと。** OS が異なれば WebView 実装 (WebView2 vs WebKitGTK) も
+> プロセスモデルも別物であり、Epic #57 絶対ルール5「OS ごとに結果を分ける」
+> のとおり比較は成立しない。特に **PSS 相当は Windows では実装していない
+> (D88)** — `pss_total_bytes` は Windows の結果には常に含まれず、
+> `total_rss_bytes` のみが入る。将来 Windows 側に PSS 相当の値を追加した
+> としても、Linux の PSS (`smaps_rollup` 由来) とは算出方法が全く異なるため
+> 直接比較してはならない (D88 参照)。
+
+### 21.1 測定環境 (`perf-windows.yml` 実行後に記入)
+
+| 項目 | 値 |
+| --- | --- |
+| ランナー | `windows-latest` (GitHub-hosted) |
+| OS ビルド番号 | *(TBD — `perf-windows.yml` の「実行環境の情報を記録」ステップのログ参照)* |
+| CPU | *(TBD)* |
+| メモリ | *(TBD)* |
+| WebView2 Runtime バージョン | *(TBD)* |
+| rustc | *(TBD)* |
+| VeloX ビルド | `cargo build --release` (`velox.exe` / `velox-bench.exe`) |
+| ディスプレイ | GitHub-hosted Windows ランナーの対話セッション (Xvfb 相当の仕組みは無い。GUI/WebView2 ウィンドウが起動できるか自体が未検証 — D88 参照) |
+
+### 21.2 シナリオ別の結果 (`perf-windows.yml` 実行後に記入)
+
+`velox-bench run` の `--scenario`/`--trials`/`--url` を workflow_dispatch の
+入力パラメータとして指定した実行結果を、シナリオごとに追記していく。形式は
+§4/§13 等の既存の節にならい、`velox-bench` の `metrics` キー
+(`docs/benchmarking.md` 「計測される生データとの対応」表) をそのまま使う。
+
+*(まだ実行結果が無いため、表は未作成。初回実行後、このセクションに
+`cold_startup` を最初のシナリオとして追記する想定。)*
+
+### 21.3 GUI 起動可否の検証結果 (`perf-windows.yml` 実行後に記入)
+
+D88 が「最大のリスク」と位置付けた、`windows-latest` ランナー上で VeloX
+(WebView2 ウィンドウ) が起動できるかどうかの結果をここに記録する。
+`perf-windows.yml` の診断ステップ (`velox.exe` を直接起動し、プロセス一覧と
+perf ログの有無を確認する) の結果を貼ること。
+
+- 起動できた場合: 何回目の実行で確認できたか、`startup` perf レコードが
+  実際に書けたかを記録する。
+- 起動できなかった場合: 何を試して、どう失敗したか (プロセスが即終了した/
+  ハングした/perf レコードが 1 件も書けなかった、等) を記録し、セルフホスト
+  ランナー等の方式再検討が必要という結論をここに残す。**無理に通そうとした
+  形跡 (数値の捏造・失敗の隠蔽) を残さないこと** — D88 および #59 が同じ
+  方針を採っている。

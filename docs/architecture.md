@@ -1036,8 +1036,14 @@ the lines — mirrors `persistence.rs`'s role for history/bookmarks.
   available), PSS from `/proc/<pid>/smaps_rollup` (`Pss:`, best-effort —
   `None` per process whose rollup could not be read, never treated as
   zero). Other Unix falls back to parsing `ps` output for RSS only (no PSS
-  equivalent there); Windows is not implemented yet (`RssError::Unsupported`,
-  neither RSS nor PSS).
+  equivalent there). Windows (Issue #136, D88) walks the process tree with
+  `CreateToolhelp32Snapshot`/`Process32First/NextW` and reads RSS per
+  process via `GetProcessMemoryInfo`'s `WorkingSetSize` — PSS has no
+  Windows equivalent and is not attempted (`total_pss_bytes` is always
+  `None` there, same as the non-Linux Unix fallback); see D88 for the
+  investigation into a `QueryWorkingSetEx`-based approximation and why it
+  was not implemented. `RssError::Unsupported` (neither RSS nor PSS) is
+  now reserved for any other, less common platform.
 - **IPC traffic** (Issue #66): every toolbar IPC message in both directions
   is counted, sized, and timed — `metrics::IpcDirection::In` (JS → Rust, a
   `ToolbarCommand`) and `::Out` (Rust → JS, one

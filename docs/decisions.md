@@ -9999,3 +9999,153 @@ DNS/TLS を伴う外部サイトへの到達性がある環境が用意できれ
 `NavigationStarted`/`LoadStarted` の両方で呼ばれる件 (重複呼び出し) は
 実害なしと判断して変更していないが、将来 `Tab` の状態更新が重くなる
 場合はここも見直し対象になる。
+## D88: Windows で性能を実測できるようにする (#136) — `sample_process_tree_rss` に Toolhelp32/PSAPI 実装を追加し、PSS 相当は「実装しない」と結論。`perf-windows.yml` (`workflow_dispatch` 限定) を追加
+
+**Scope**: Issue #136。#57 (Phase 3 Epic) の絶対ルール5「OS ごとに結果を分ける」を
+守るには Windows 側の実測手段が要るが、`browser::metrics::sample_process_tree_rss`
+は Windows で `RssError::Unsupported` を返すだけで RSS すら取得できていなかった
+(D42 が PSS を追加した時点でも Windows 側は「Windows has neither」のまま)。この
+Issue は (1) Windows で RSS/CPU を取得できるようにする実装、(2) PSS 相当の取得
+可否を調査して結論を出すこと、(3) `windows-latest` 上で `velox-bench` を手動実行
+できる workflow、の 3 つを扱う。
+
+**この環境の決定的な制約**: 作業は Linux コンテナ上で行っており、Windows 実機は
+無い。検証手段は `cargo check --target x86_64-pc-windows-msvc --all-targets`
+(D61 が明記するとおりリンクを伴わない型チェックのみ) と、OS 非依存な純粋ロジック
+の `cargo test` だけ。**Windows 上で実際に RSS/CPU が正しい値を返すことは、この
+セッションでは一切確認できていない。** `perf-windows.yml` を実際に CI (windows
+-latest ランナー) 上で走らせて検証するのは、この PR がマージ経路に乗ってから
+(親セッション以降) になる。
+
+### RSS/CPU の実装方針
+
+**API**: `CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS)` + `Process32First/NextW`
+でプロセスツリー (PID/PPID) を走査する — Linux 版が `/proc` を読むのと同じ役割。
+各プロセスの RSS は `GetProcessMemoryInfo` の `WorkingSetSize`、CPU 時間は
+`GetProcessTimes` の kernel+user `FILETIME` から取る。いずれも `OpenProcess` で
+得たハンドルが要る。
+
+**候補の比較**: Issue 本文が挙げた 3 候補のうち `CreateToolhelp32Snapshot` は
+プロセスツリー走査に必須 (これ以外にプロセス一覧+親子関係を取る標準的な手段が無
+い)。`GetProcessMemoryInfo` の `WorkingSetSize` は RSS 相当として最も素直で公式
+に文書化された値であり、`QueryWorkingSetEx` を自前でページ単位に集計するより
+遥かに単純・低リスクなので RSS はこちらを採用した。
+
+**依存クレート**: 新規追加なし。本リポジトリは D59/D76 で既に
+`[target.'cfg(windows)'.dependencies] windows = "0.61"` に依存しているため (COM
+の `ICoreWebView2`/Shell ダイアログ用)、`windows-sys` を新たに足すのではなく、
+同じ `windows` クレートのフィーチャーフラグを 4 つ有効化するだけで済ませた
+(`Win32_Foundation` / `Win32_System_Diagnostics_ToolHelp` /
+`Win32_System_ProcessStatus` / `Win32_System_Threading`)。いずれも純粋な Win32
+API で COM/WinRT の生成を伴わないため、既存フィーチャーとの相互作用のリスクも
+無い。CLAUDE.md「依存クレートは必要最小限に保つ」に沿い、クレート数を増やさず
+既存依存の適用範囲を広げる形を選んだ。
+
+**`unsafe` の使用**: `src/browser/metrics.rs` の `#[cfg(target_os = "windows")]
+mod imp` に 6 箇所 (`CreateToolhelp32Snapshot`/`Process32FirstW`/
+`Process32NextW`/`OpenProcess`/`GetProcessMemoryInfo`/`GetProcessTimes` の各
+FFI 呼び出し、および `Drop` 内の `CloseHandle`)。すべて `windows` クレートが
+`unsafe fn` として公開している薄い FFI ラッパーの呼び出しで、各箇所に「何を保証
+しているか」を `// SAFETY:` コメントで明記した — 具体的には (a) 呼び出し先に渡す
+バッファはすべてスタック上に正しいサイズ・`dwSize`/`cb` で確保されていること、
+(b) ハンドルは呼び出し時点でまだ有効 (`OwnedHandle` という RAII ガードを導入し、
+`CreateToolhelp32Snapshot`/`OpenProcess` が返すハンドルを即座にラップして
+`Drop` で必ず 1 回だけ `CloseHandle` する — 早期 `return`/`?` を含むどの経路でも
+リークしない)。`OpenProcess` は `PROCESS_QUERY_LIMITED_INFORMATION |
+PROCESS_VM_READ` のみを要求し、`PROCESS_ALL_ACCESS` は使わない (最小権限)。
+VeloX は通常権限で動く前提であり、より高い権限のプロセス (システムプロセス等)
+を `OpenProcess` できない場合はエラーではなく「そのプロセスの RSS/CPU を単に
+含めない」扱いとした — Linux 側の `/proc/<pid>/status` が読めないプロセスを
+スキップする既存方針とそろえている。
+
+**Windows 版の失敗時挙動**: プロセスの `OpenProcess`/`GetProcessMemoryInfo`/
+`GetProcessTimes` いずれかが失敗しても、そのプロセスは PID/PPID のみでツリーに
+残り (RSS 0、CPU `None`)、サンプル全体は失敗しない。`CreateToolhelp32Snapshot`
+自体が失敗した場合のみ `RssError::Io` を返す (Linux 版が `/proc` 自体を開けない
+場合に倣った)。
+
+### PSS 相当の取得可否 — 調査した上で「実装しない」と結論
+
+Issue が挙げた候補は「`QueryWorkingSetEx` でページごとの `Shared`/`ShareCount` を
+取得し、共有ページを共有プロセス数で割って合算する」という自前計算。**これを
+検討した上で、今回は実装しないことにした。** 理由:
+
+1. **正確な PSS には「対象プロセスだけでなく、その共有ページを持つ全プロセスの
+   ワーキングセット」を横断的に見る必要がある。** `QueryWorkingSetEx` の
+   `VM_COUNTERS_EX`/`PSAPI_WORKING_SET_EX_INFORMATION` は「このプロセスの
+   ワーキングセット中のこのページが何個のプロセスで共有されているか
+   (`ShareCount`)」までは返すが、Linux の `smaps_rollup`/`Pss:` のようにカーネル
+   側で計算済みの値ではない — `ShareCount` を使って `1/ShareCount` を足し上げる
+   近似は Issue 本文も「要検証」と明記しているとおり、Windows のページ共有モデル
+   (プロトタイプ PTE、AWE、メモリマップドファイル等) に対してどこまで正確かが
+   自明ではない。
+2. **実機で検証する手段がこのセッションには無い。** 型チェック
+   (`cargo check --target x86_64-pc-windows-msvc`) は API 呼び出しのシグネチャが
+   合っていることしか保証せず、`QueryWorkingSetEx` が実際に返す値の妥当性は
+   Windows 実機でしか確認できない。検証できない計算式をそのまま実装として残す
+   ことは、CLAUDE.md が求める「検証できていないことを検証できていないと明記
+   する」誠実さの要件と相容れない — 「動くはず」の実装を残すより、「実装しない」
+   という判断とその理由を明記する方が、後で実際に Windows 上で必要になったとき
+   に再検討しやすい。
+3. **RSS が既に取れている。** PSS が無くても `total_rss_bytes` は
+   `GetProcessMemoryInfo` から確実に取得できるため (Issue も「PSS 相当は無理に
+   実装しなくて構わない」と明記)、Windows でも「何も測れない」状態からは脱却
+   できる。
+
+結果として、Windows 版の `RssSample::total_pss_bytes` は非 Linux Unix (macOS/
+*BSD の `ps` フォールバック) と同じく常に `None`。将来 Windows 上でメモリ最適化
+の効果を細かく見る必要が生じ、RSS だけでは Chromium/Edge との比較 (D41 が示した
+「RSS 合計はプロセス数の多いブラウザを不当に不利にする」問題) が避けられなく
+なった時点で、`QueryWorkingSetEx` アプローチを実機で検証しながら再挑戦するのが
+妥当。
+
+> ⚠️ **将来 Windows で PSS 相当を実装したとしても、Linux の PSS
+> (`smaps_rollup` の `Pss:`) と直接比較してはならない。** 算出方法が全く異なる
+> ため、OS をまたいだ数値比較は成立しない。Windows 上で Chromium/Edge と横並び
+> に測る用途に限られる。`docs/performance-targets.md` にも同じ注意を記載した。
+
+### `perf-windows.yml` (`workflow_dispatch` 限定)
+
+`.github/workflows/perf-windows.yml` を新規作成。`release-windows.yml`
+(`workflow_dispatch` + Windows ビルドの先例) に倣い、`on:` は
+`workflow_dispatch` (シナリオ/試行回数/URL を入力パラメータ化) に加えて、
+**この workflow 自身を変更する PR に限り** `pull_request: paths:
+.github/workflows/perf-windows.yml` を付けた — `workflow_dispatch` は main に
+マージされるまで Actions タブに現れないため、workflow 自身の変更を検証する唯一
+の手段としている (`release-windows.yml` が採用済みの同じパターン)。PR ごとの
+自動実行や性能回帰ゲートとしては使わない (Linux の `perf-gate.yml` が既に担保
+しており、Issue のスコープ外)。
+
+`cargo build --release` の後、既定では `scripts/bench/pages/` の固定ページを
+loopback (`python -m http.server`) で配信し `--url` に渡す (Linux の
+`perf-gate.yml`/`docs/benchmarking.md` と同じ「ネットワーク非依存の固定ページ
+で測る」方針) — `workflow_dispatch` の `url` 入力を明示的に指定すればそちらを
+使う。結果 JSON は Actions Artifact として保存し (`velox-bench aggregate`/
+`compare`/`gate` に後からかけられる形式そのまま)、実行環境の情報 (OS ビルド
+番号・CPU・メモリ・WebView2 Runtime バージョン) を `Get-CimInstance`/レジストリ
+照会でログと Job Summary に残す (`docs/performance-targets.md` §1 の「測定環境を
+固定して記録する」要件)。
+
+**最大のリスク (`windows-latest` で GUI/WebView2 ウィンドウが起動できるか) は
+未解決のまま**。Linux は Xvfb で仮想ディスプレイを用意しているが、Windows
+ランナーには同種の仕組みが無く、GitHub ホスト型 Windows ランナーが GUI プロセス
+を起動できる対話セッションを持っているかはこのセッションでは検証できない。
+workflow には `velox.exe` を直接起動してプロセス一覧・perf ログの有無を確認する
+診断ステップ (`continue-on-error: true`、Linux 側 `perf-gate.yml` の
+"Diagnose VeloX under Xvfb" ステップと同じ形) を含めたが、**これが実際に機能する
+かどうかはこの PR が CI 上で走って初めて分かる。** 起動できなかった場合は
+「何を試して、どう失敗したか」を記録し、セルフホストランナー等の方式再検討が
+必要という結論を残すのが正しい進め方であり、この時点で無理に通そうとしていない
+(#59 が同じ形で結論づけたのと同様)。
+
+**このセッションで確認できたこと / できていないこと**:
+- 確認できた: `cargo fmt --check` / `cargo clippy --all-targets -D warnings` /
+  `xvfb-run ... dbus-run-session -- cargo test` (972 件、Windows 実装追加前の
+  969 件 + `filetime_ticks_to_seconds` の単体テスト 3 件) / `cargo build` /
+  `cargo check --target x86_64-pc-windows-msvc --all-targets` はすべて green。
+  Linux 側の `sample_process_tree_rss`/既存テストの挙動は変更していない。
+- 確認できていない: Windows 実機/CI 上での実際の RSS/CPU 値の妥当性、
+  `windows-latest` ランナーでの VeloX (WebView2) ウィンドウ起動可否、
+  `velox-bench run` の完走、結果 JSON の実際の中身。`docs/performance-targets.md`
+  §21 には Windows の数値をまだ書けないため、CI 実行後に埋めるプレースホルダの
+  みを記載した。
