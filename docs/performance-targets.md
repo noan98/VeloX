@@ -699,6 +699,31 @@ $XV target/release/velox-bench run --scenario background_cpu --trials 3 \
   --velox-bin target/release/velox --url http://127.0.0.1:8731/busy.html
 ```
 
+## 17. Performance Dashboard (Issue #71, 2026-09-07)
+
+**設計・実装の詳細は [docs/performance-dashboard.md](performance-dashboard.md)
+を、設計判断は `docs/decisions.md` D82 を参照。** ここでは §10 (回帰ゲート)
+との関係だけを記す。
+
+`velox-bench gate` (§10) は CI が PR をブロックするかどうかを**同一ジョブ内で
+測った baseline/candidate** から判定する。それに対し Performance Dashboard
+(`scripts/dashboard/`) は、**過去の計測結果を `results/history/` に追記保存し、
+人間が経時トレンドを一覧できる静的レポートを生成する**別の役目を持つ —
+CI のブロッキング判定を置き換えるものではない。
+
+保存形式は `velox-bench run`/`aggregate`/`gate` が使う `BenchmarkResult`
+JSON をそのまま包んだものにしてあり (§7 の保存形式と地続き)、perf-gate の
+出力形式とダッシュボードの保存形式が食い違わないようにしてある。
+
+**この文書 §10/D46 が明らかにした「異なるセッション/マシンの数値を比較して
+はならない」という原則は、ダッシュボードの設計そのものに組み込まれている**:
+比較 (差分の計算・折れ線での接続) は明示的に同一とマークされた
+「セッション」の中でだけ行われ、セッションを跨いだ点は時系列上に並べて
+表示はするが、線ではつながず、差分も計算しない。判定ロジックそのものも
+独自実装ではなく `velox-bench gate` (`evaluate_gate`) をそのまま呼び出す
+ため、CI と同じ閾値 (`GateThresholds` 既定値 warn=20%/fail=60% + メトリクス
+ごとの最小絶対差) が二重管理にならない。詳細は
+`docs/performance-dashboard.md` §2/§5 を参照。
 ## 18. IPC (WebView ↔ Rust) の計測結果 (Issue #66, 2026-09-07)
 
 **設計判断は `docs/decisions.md` D81 を参照。** ここでは実測データと
