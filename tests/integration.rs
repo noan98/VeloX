@@ -1229,7 +1229,24 @@ fn restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch() {
     let perf_output_2 = dir.join("perf2.jsonl");
     // `switch 0` targets the restored `home` tab, which must start
     // suspended for this to exercise a resume rather than a plain switch.
-    let script_2 = "wait 800\nswitch 0\nwait 800\nquit\n";
+    //
+    // The wait *after* `switch 0` was 800ms and went red on a CI runner
+    // while this test still passed locally: `tab_resume` was recorded
+    // (ts=1370.6, duration=231.4ms) but no `page_load` for `home` followed
+    // it before `quit` ran. Resuming a suspended tab has to spawn a fresh
+    // `WebKitWebProcess`, and #60/D57 measured exactly that spawn as the
+    // dominant cost of tab work (docs/performance-targets.md §13) — the
+    // 231.4ms `tab_resume` only covers the Rust-side transition, not the
+    // load that follows it. `AutomationCommand` has no "wait until the
+    // load completes" primitive, only a wall-clock `wait <ms>`, so the
+    // margin is the only lever, and 800ms left too little of it.
+    //
+    // Raised rather than lowered to a value that merely happens to pass,
+    // for the same reason as `visiting_pages_persists_history_json` above
+    // (b303a78): this test asserts *that a resume reloads the tab's own
+    // URL*, and a timing constant must never be the thing that decides
+    // whether the assertion is reached.
+    let script_2 = "wait 800\nswitch 0\nwait 2000\nquit\n";
     let script_path_2 = write_script(&dir, script_2);
     // `write_script` always writes to the same `script.txt` inside `dir`;
     // launch 1 already consumed its own copy, so this just overwrites it
