@@ -1686,11 +1686,12 @@ MB=0` (OFF)」で比較した。既定の `memory_check_interval` は当時 2 �
 
 `/proc` 全体を 2 秒ごとに 1 回歩くサンプラ自体のコストは 1 コア換算で約
 1〜1.3 ポイント。**この節は当初「実用上無視できる」と結論したが、Issue
-#187 でこれを誤りと判定し覆した。** 1 タブのアイドル状態で CPU が OFF 比
-12 倍というのは看過すべきでない差であり、`memory_check_interval` の既定を
-見直した。詳細と間隔別の実測は **§23.2.1** を参照。
+#187/#189 でこれを誤りと判定し覆した。** 1 タブのアイドル状態で CPU が OFF
+比 12 倍というのは看過すべきでない差であり、`memory_check_interval` の
+既定見直しと `process_map` 自体の最適化の両方を行った。詳細は
+**§23.2.1**・**§23.2.2** を参照。
 
-#### 23.2.1 `memory_check_interval` の間隔別実測 (Issue #187)
+#### 23.2.1 `process_map` の二段階化と `memory_check_interval` の間隔別実測 (Issue #187/#189)
 
 `smaps_rollup` 読み取り自体のコストを直接計測するため、
 `browser::metrics::imp::process_map()` (Linux) と同じ手順 (`/proc` を
@@ -1708,49 +1709,89 @@ MB=0` (OFF)」で比較した。既定の `memory_check_interval` は当時 2 �
 
 `smaps_rollup` はアクセスできた 21/87 プロセス分だけで全体の 86% を占め、
 1 プロセスあたりのコストが `status`/`stat` (定数個のフィールドを読むだけ)
-とは桁違いに高いことを確認した — カーネルのページテーブル走査が支配的、
-という Issue #187 の見立てを裏付ける。
+とは桁違いに高いことを確認した。**このうち VeloX 自身のツリーは約 9
+プロセスだけで、残り約 12 プロセス分の `smaps_rollup` 読み取りは
+`build_sample` が最終的に捨てる無駄だった** — レビュー指摘を受け、
+`process_map` を「パス 1: 全プロセスの `status`/スナップショット列挙だけ
+で `root_pid` の子孫集合を確定 → パス 2: その子孫集合だけに
+`smaps_rollup`/`stat` (Windows は `OpenProcess`+`GetProcessMemoryInfo`/
+`GetProcessTimes`) を読む」という 2 パスに分割した (`build_sample` は
+無変更、意味論を変えない純粋な最適化)。
 
-次に `scripts/profile/cpu_usage.py` で間隔別のアイドル CPU を計測した
+二段階化の前後で、間隔別のアイドル CPU を `scripts/profile/cpu_usage.py`
 (idle 60 秒窓、`--settle-secs` 6〜8 秒、`VELOX_MEMORY_CHECK_INTERVAL_MS`
-だけを変えて比較):
+だけを変えて比較) で計測した:
 
-| 間隔 | 1 タブ CPU% | 3 タブ CPU% |
-| ---: | ---: | ---: |
-| 2000ms (旧既定) | 1.2%（0.70〜0.72 秒/60 秒、2 試行） | 1.4%（0.86 秒/60 秒） |
-| 5000ms | 0.5%（0.31 秒/60 秒） | 0.6%（0.38 秒/60 秒） |
-| **10000ms (新既定)** | **0.3%（0.16〜0.19 秒/60 秒、2 試行）** | **0.4%（0.25 秒/60 秒）** |
-| 30000ms | 0.2%（0.11 秒/60 秒） | 0.2%（0.11 秒/60 秒） |
-| (参考) OFF (`VELOX_MEMORY_BUDGET_MB=0`) | 0.1% | 0.2% |
+| 間隔 | 1 タブ (一段階) | 1 タブ (二段階) | 3 タブ (一段階) | 3 タブ (二段階) |
+| ---: | ---: | ---: | ---: | ---: |
+| 2000ms (旧既定) | 1.2〜1.3% | **0.8%** | 1.4% | **1.1%** |
+| 5000ms | 0.5〜0.6% | **0.4%** | 0.6% | **0.5%** |
+| 10000ms | 0.3% | **0.2%** | 0.4% | **0.3%** |
+| 30000ms | 0.2% | (未計測) | 0.2% | (未計測) |
+| (参考) OFF | 0.1% | 0.1% | 0.2% | 0.2% |
 
-コストは間隔にほぼ反比例する (2000→10000ms で -75%、単純反比例のモデル
-値は -80%) が、間隔を伸ばすほど固定オーバーヘッド (スレッド起床・イベント
-送出など、フルスキャン以外のコスト) の割合が相対的に増え、30 秒時点で
-OFF 時の床 (0.1〜0.2%) にほぼ到達する。**10 秒から 30 秒へのさらなる延長は
-CPU 面の追加の得が乏しい** (0.1〜0.2pt の差) 一方、検知が最大 30 秒遅れる
-のは体感上のデメリットになりうるため、**`DEFAULT_MEMORY_CHECK_INTERVAL`
-を 2 秒から 10 秒に変更した**。設計判断の詳細は `docs/decisions.md` D90
-(「#187: `memory_check_interval` の既定見直し」) を参照。
+2000ms で約 35%、5000ms で約 25〜30% の追加削減 (二段階化そのものの
+効果)。**結論として採用した間隔は 5 秒** (10 秒ではない) — 二段階化後の
+5000ms のコスト (1 タブ 0.4%・3 タブ 0.5%) が一段階読み時代の 10000ms
+とほぼ同等かそれ以上に下がったため、検知遅延を犠牲にしてまで 10 秒へ
+延ばす理由が無くなった。`SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`
+を最終的に **2 秒 → 5 秒** に変更 (旧既定比で 1 タブ CPU **1.2% → 0.4%、
+約 67% 削減**)。設計判断の詳細は `docs/decisions.md` D90
+(「#187/#189: `memory_check_interval` の既定見直し、および `process_map`
+の二段階化」) を参照。
 
-**10/20 タブでの削減効果が維持されるかの再確認** (`tab_scaling.py`、新
-既定 [700 MiB・10 秒間隔] を env 上書き無しで使用、3 試行の中央値):
+**10/20 タブでの削減効果・収束時間の再確認** (`tab_scaling.py`、新既定
+[メモリ予算 700 MiB・5 秒間隔・二段階読み] を使用、`--stabilize-secs` を
+振って比較):
 
 | stabilize 秒数 | 10 タブ PSS | 20 タブ PSS | 状態 |
 | ---: | ---: | ---: | --- |
-| 3 秒 (既定値、旧 2 秒間隔での §23.1 計測と同じ待ち時間) | 980.4 MiB | 1668.9 MiB | 未収束 (旧既定=無効時とほぼ同じ) |
-| 15 秒 | 464.1 MiB | 615.1 MiB | 収束済み |
-| 40 秒 | 463.4 MiB | 615.3 MiB | 収束済み (15 秒と同じ) |
+| 3 秒 (旧 2 秒間隔・一段階読みでの §23.1 計測と同じ待ち時間) | 466.5 MiB | 625.6 MiB (試行によりばらつき) | ほぼ収束 |
+| 8 秒 | 464.5 MiB | 621.0 MiB | 収束済み |
+| 15 秒 (script の新しい既定、§23.2.2 参照) | 463.9〜619.6 MiB | 同左 | 収束済み |
 
-**最終到達点は変わらない** (15 秒以上待てば §23.1 の 2 秒間隔の値
-[464.4/617.7 MiB] と誤差範囲で一致) が、**収束にかかる時間は正直に見て
-約 5 倍 (3 秒 → 15 秒) に伸びた**。実際の利用では「タブを開くのをやめて
-から最大 10 秒程度で休止が始まる」という遅延が生じるだけで、最終的な
-メモリ削減効果は損なわれていない。
+**最終到達点は変わらない** (§23.1 の 2 秒間隔の値 [464.4/617.7 MiB] と
+誤差範囲で一致)。二段階化 + 5 秒化により、10 秒間隔だった時点で必要だった
+15 秒という収束待ちが **8 秒で確実に収束**するまで短縮された (2 秒間隔・
+旧既定の「3 秒で収束」に近い水準まで回復) — CPU と検知遅延を両方改善する
+結果になった。
 
-**回帰ゲート** (`cold_startup`、baseline=旧既定 [2 秒間隔]、candidate=
-新既定 [10 秒間隔] ×2、各 8 試行): 総合判定 **OK** (`startup_toolbar_
-ready_ms` などはむしろ -2.8%〜-6.6% と改善方向、間隔を伸ばした分のノイズ
-低下と考えられる)。
+**回帰ゲート** (`cold_startup`、baseline=旧既定 [2 秒間隔・一段階読み]、
+candidate=新既定 [5 秒間隔・二段階読み] ×2、各 8 試行): 総合判定 **OK**
+(`startup_toolbar_ready_ms` は -0.7%〜-2.2%、`rss_total_bytes` は
+-23%〜-24% といずれも改善方向、悪化した指標は無い)。
+
+**Windows 版 `process_map` も同じ構造で二段階化したが未検証**: Windows
+実装 (D88/#136) も全プロセスに `OpenProcess`+`GetProcessMemoryInfo`/
+`GetProcessTimes` を無条件に呼ぶ同じ構造の無駄を持っていたため、同じ
+二段階化 (パス 1 はスナップショット列挙のみ、パス 2 で子孫集合だけに
+`OpenProcess` 系 API を呼ぶ) を適用した。**このコンテナには Windows 実機
+/CI が無く、実際の削減効果は測定できていない** — `cargo check --target
+x86_64-pc-windows-msvc --all-targets` による型チェックのみ確認済み
+(`docs/decisions.md` D90 の Revisit condition (7) 参照)。
+
+#### 23.2.2 `scripts/bench/tab_scaling.py` の既定待ち時間を間隔に追従させる (Issue #189、Codex 指摘)
+
+レビューで、`tab_scaling.py` の `--stabilize-secs` 既定値 (3.0 秒固定)
+が `memory_check_interval` の実際の値と無関係にハードコードされており、
+間隔を変えるたびに人手で追随させないと**静かに「休止前の PSS」を報告
+する**という指摘を受けた (§23.2.1 の「10 秒間隔・3 秒 stabilize で
+980.4/1668.9 MiB = 未収束」がまさにこれを裏付けていた)。
+
+対処として `tab_scaling.py` に `--memory-check-interval-ms` を新設した
+(既定値は `SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL` と同期させた
+Python 定数 `DEFAULT_MEMORY_CHECK_INTERVAL_MS = 5000`)。この値を VeloX
+の子プロセスに `VELOX_MEMORY_CHECK_INTERVAL_MS` として明示的に渡し
+(呼び出し元のシェルが既に設定していればそちらを優先)、`--stabilize-secs`
+未指定時はそこから `max(3.0, 3.0 * interval_secs)` で算出する — 「この
+待ち時間はこの間隔を前提にしている」という関係をスクリプト内で自己完結
+させた。実際に動かして確認: 既定 (5000ms) では「15.0 秒を既定値として
+使います」と表示され 20 タブで 619.6 MiB (収束済み) を報告、
+`--memory-check-interval-ms 2000` を明示すると「6.0 秒」と表示され 10
+タブで 465.4 MiB (収束済み) を報告 — env 経由の上書きと待ち時間算出の
+両方が連動して動くことを確認した。`scripts/bench/`・`scripts/profile/`
+の他のスクリプトを確認したが、同種の依存 (メモリサンプラ間隔への暗黙の
+固定待ち時間) は他に無かった。
 
 ### 23.3 `velox-bench gate`
 
@@ -1834,13 +1875,16 @@ target/release/velox-bench gate \
   --candidate "$S/tab_switch_20-candidate-1.json" --candidate "$S/tab_switch_20-candidate-2.json" \
   --warn-pct 20 --fail-pct 60 --output "$S/gate-report.json" --markdown-output "$S/gate-summary.md"
 
-# 23.2.1 (Issue #187): 間隔別のアイドル CPU。velox-after は §23.2/23.2.1 時点の
-# コード (DEFAULT_MEMORY_CHECK_INTERVAL=10s) でビルドしたバイナリ
+# 23.2.1 (Issue #187/#189): 間隔別のアイドル CPU。velox-onepass は process_map
+# 二段階化「前」(#187 時点)、velox-after は二段階化「後」(#189、DEFAULT_
+# MEMORY_CHECK_INTERVAL=5s) のコードでそれぞれビルドしたバイナリ
 printf 'wait 70000\nquit\n' > "$S/light1_70.txt"
-for interval in 2000 5000 10000 30000; do
-  VELOX_MEMORY_CHECK_INTERVAL_MS=$interval XV_RUN python3 scripts/profile/cpu_usage.py \
-    --velox "$S/velox-after" --script "$S/light1_70.txt" --homepage "file://$P/minimal.html" \
-    --settle-secs 6 --window-secs 60 --label "1tab_${interval}ms"
+for interval in 2000 5000 10000; do
+  for bin in velox-onepass velox-after; do
+    VELOX_MEMORY_CHECK_INTERVAL_MS=$interval XV_RUN python3 scripts/profile/cpu_usage.py \
+      --velox "$S/$bin" --script "$S/light1_70.txt" --homepage "file://$P/minimal.html" \
+      --settle-secs 6 --window-secs 60 --label "1tab_${bin}_${interval}ms"
+  done
 done
 
 # smaps_rollup 読み取りコストの分離 (process_map() を模した外部プローブ、Linux 専用)
@@ -1850,10 +1894,16 @@ done
 # `browser::metrics::imp::process_map()` (Linux, src/browser/metrics.rs) をそのまま
 # Python に書き写せば良い。
 
-# 10/20 タブでの収束確認 (stabilize-secs を変えて再計測)
+# 10/20 タブでの収束確認 (5 秒間隔・二段階読みの新既定、stabilize-secs を変えて再計測。
+# --memory-check-interval-ms/--stabilize-secs 未指定なら §23.2.2 のスクリプト側の
+# 変更により自動的に 15 秒が使われる)
 XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-after" \
-  --page minimal.html --tab-counts 10,20 --trials 3 --output "$S/after-10s-3s-stabilize.json"
+  --page minimal.html --tab-counts 10,20 --trials 3 --stabilize-secs 3 \
+  --output "$S/after-5s-3s-stabilize.json"
 XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-after" \
-  --page minimal.html --tab-counts 10,20 --trials 3 --stabilize-secs 15 \
-  --output "$S/after-10s-15s-stabilize.json"
+  --page minimal.html --tab-counts 10,20 --trials 3 --stabilize-secs 8 \
+  --output "$S/after-5s-8s-stabilize.json"
+XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-after" \
+  --page minimal.html --tab-counts 10,20 --trials 3 \
+  --output "$S/after-5s-auto-stabilize.json"  # 23.2.2: 既定 (自動算出 15 秒)
 ```

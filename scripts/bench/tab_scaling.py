@@ -68,6 +68,30 @@ from pathlib import Path
 
 PAGES_DIR = Path(__file__).resolve().parent / "pages"
 
+# `browser::suspension::SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`
+# (docs/decisions.md D90) と同期。この値は `--memory-check-interval-ms` で
+# 上書きでき、その場合は VeloX に渡す `VELOX_MEMORY_CHECK_INTERVAL_MS` と
+# `--stabilize-secs` の既定計算 (`default_stabilize_secs`) の両方に反映
+# される — Rust 側の既定が変わったら、この定数を書き換えるか
+# `--memory-check-interval-ms` を明示的に渡すこと。Issue #189 (Codex の
+# レビュー): これを直さずインターバルだけ変えると、このスクリプトの
+# `--stabilize-secs` 既定値が古い前提のまま「休止前の PSS」を報告して
+# しまう (§23.2.1 の実測がまさにこれを示した — 3 秒待ちは 10 秒間隔の下
+# では未収束の値を返していた)。
+DEFAULT_MEMORY_CHECK_INTERVAL_MS = 5000
+
+
+def default_stabilize_secs(memory_check_interval_ms: int) -> float:
+    """`--stabilize-secs` 未指定時の既定値を、実際に使う `memory_check_
+    interval` から算出する (Issue #189)。メモリ予算による休止は、タブを
+    開き終えてから少なくとも 1 回のサンプル + sweep を経ないと収束しない
+    ——`docs/decisions.md` D90 の実測では、間隔の 1.6〜3 倍程度待てば収束
+    することを確認した。安全側に 3 倍を採用し、極端に短い間隔 (テストで
+    明示的に数百 ms を指定した場合など) では下限 3.0 秒を保つ — この値は
+    このスクリプトの `--stabilize-secs` が元々使っていた定数そのもの。
+    """
+    return max(3.0, 3.0 * memory_check_interval_ms / 1000.0)
+
 
 def _pss_bytes(entry: Path) -> int | None:
     """`smaps_rollup` の `Pss:` 行 (kB) をバイトで返す。読めなければ `None`。
@@ -142,7 +166,7 @@ def free_port() -> int:
 
 def measure_velox(binary: str, url: str, tabs: int, data_dir: Path,
                    settle_per_open_ms: int, stabilize_secs: float,
-                   timeout: float) -> dict | None:
+                   timeout: float, memory_check_interval_ms: int) -> dict | None:
     """VeloX を自動操作スクリプトで `tabs` 個のタブまで開かせ、安定後に 1 回採る。"""
     lines = [f"open {url}" for _ in range(tabs - 1)]
     # 1 個ずつ確実に開かせるため、各 open の間に短い wait を挟む
@@ -165,6 +189,18 @@ def measure_velox(binary: str, url: str, tabs: int, data_dir: Path,
 
     env = {**os.environ, "VELOX_DATA_DIR": str(data_dir),
            "VELOX_AUTOMATION_SCRIPT": script_path, "VELOX_HOMEPAGE": url}
+    # Issue #189 (Codex のレビュー指摘): メモリ予算による休止が収束するまでの
+    # 待ち時間 (`stabilize_secs`、呼び出し元で本関数の引数と同じ値から算出
+    # 済み — `default_stabilize_secs` 参照) は、VeloX が実際に使う
+    # `memory_check_interval` に依存する。呼び出し元のシェルが
+    # `VELOX_MEMORY_CHECK_INTERVAL_MS` を明示的に設定済みならそれを尊重し
+    # (辞書展開で `os.environ` を先に置いているので上書きしない)、そうで
+    # なければこの関数の引数 (既定は Rust 側の `SuspensionPolicy::
+    # DEFAULT_MEMORY_CHECK_INTERVAL` と同期した定数) を明示的に渡す —
+    # 「この待ち時間はこの間隔を前提にしている」という関係をスクリプト内で
+    # 自己完結させ、Rust 側の既定値が将来変わっても呼び出し元のこの 1 行を
+    # 直すだけで済むようにする。
+    env.setdefault("VELOX_MEMORY_CHECK_INTERVAL_MS", str(memory_check_interval_ms))
     proc = subprocess.Popen([binary], env=env,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
@@ -232,8 +268,19 @@ def main() -> int:
     parser.add_argument("--trials", type=int, default=3)
     parser.add_argument("--settle-per-open-ms", type=int, default=300,
                          help="VeloX: 各 open の後に空ける待ち時間 (既定 300ms)")
-    parser.add_argument("--stabilize-secs", type=float, default=3.0,
-                         help="全タブを開き終えてから PSS を採るまでの待ち時間")
+    parser.add_argument("--memory-check-interval-ms", type=int,
+                         default=DEFAULT_MEMORY_CHECK_INTERVAL_MS,
+                         help="VeloX に渡す VELOX_MEMORY_CHECK_INTERVAL_MS (既定 "
+                              f"{DEFAULT_MEMORY_CHECK_INTERVAL_MS}ms — "
+                              "browser::suspension::SuspensionPolicy::"
+                              "DEFAULT_MEMORY_CHECK_INTERVAL と同期。呼び出し元の"
+                              "シェルが VELOX_MEMORY_CHECK_INTERVAL_MS を既に設定"
+                              "している場合はそちらが優先される)")
+    parser.add_argument("--stabilize-secs", type=float, default=None,
+                         help="全タブを開き終えてから PSS を採るまでの待ち時間 "
+                              "(既定: --memory-check-interval-ms から算出 — Issue "
+                              "#189、休止が収束するのに必要な時間はメモリサンプラの"
+                              "間隔に依存するため、明示しない限り固定値にはしない)")
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--output")
     args = parser.parse_args()
@@ -241,6 +288,20 @@ def main() -> int:
     if not os.environ.get("DISPLAY"):
         print("DISPLAY が未設定です。xvfb-run 経由で実行してください。", file=sys.stderr)
         return 2
+
+    # Issue #189: 呼び出し元のシェルが既に VELOX_MEMORY_CHECK_INTERVAL_MS を
+    # 設定していれば、実際に使われるのはそちらの値 (measure_velox の
+    # env.setdefault が優先する) — stabilize-secs の既定計算もそれに合わせる。
+    effective_interval_ms = int(
+        os.environ.get("VELOX_MEMORY_CHECK_INTERVAL_MS", args.memory_check_interval_ms)
+    )
+    if args.stabilize_secs is None:
+        args.stabilize_secs = default_stabilize_secs(effective_interval_ms)
+        print(
+            f"--stabilize-secs 未指定のため memory_check_interval="
+            f"{effective_interval_ms}ms から {args.stabilize_secs:.1f} 秒を既定値と"
+            "して使います。"
+        )
 
     tab_counts = [int(x) for x in args.tab_counts.split(",") if x.strip()]
     port = free_port()
@@ -257,6 +318,7 @@ def main() -> int:
                 result = measure_velox(
                     args.velox, url, tabs, data_dir,
                     args.settle_per_open_ms, args.stabilize_secs, args.timeout,
+                    args.memory_check_interval_ms,
                 )
                 if result is None:
                     print(f"  velox tabs={tabs} trial={trial}: 計測失敗 (早期終了)")
