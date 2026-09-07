@@ -7,14 +7,37 @@ name: Auto Merge
 #
 # 動作の流れ:
 #   1. 他の workflow (CI / perf-gate / release-windows / dependency-audit)
-#      が完了するたびに起動 (workflow_run)。取りこぼし防止のため 30 分
+#      が完了するたびに起動 (workflow_run)。取りこぼし防止のため 10 分
 #      ごとの定期実行と手動実行も可。
 #   2. `main` 向けの open な PR を全件走査し、PR ごとに head commit の
 #      check-runs と commit status を集める (この workflow 自身は除外)。
 #   3. 1 つでも未完了があれば待つ (何もしない)。1 つでも失敗があれば
-#      スキップする。全部が success/skipped/neutral ならマージする。
+#      スキップする。
+#   4. Issue #188 (2026-09-07 方針変更): さらにレビュー状態を見る
+#      (`review_gate_decision.sh` / `check_review_gate.py`)。以下の
+#      いずれかに該当すればマージしない:
+#        - 未解決のレビュースレッドが残っている
+#        - CHANGES_REQUESTED が残っている
+#        - **Codex (`chatgpt-codex-connector[bot]`) が現在の head SHA を
+#          レビュー済みでない** (マージの必須要件。`CODEX_BYPASS_LABEL`
+#          で免除可能 — 下記参照)。Codex は push では再レビューしない
+#          ため、未レビューを検知すると `@codex review` を自動リクエスト
+#          する。Codex が利用上限に達した場合は、この PR の過去のレビュー
+#          で代替できなければ `@claude` へレビューを依頼する
+#          (`CLAUDE_REVIEWER_LOGINS` が設定されている場合のみ有効。既定は
+#          無効)。いずれのレビューも一度も無い PR は緩和しない。
+#        - head SHA の push 観測時刻が猶予期間 (既定15分、下記
+#          GRACE_PERIOD_MINUTES) を過ぎていない
+#      CodeRabbit は判定に含めない (Free プランの制限で実質機能せず、
+#      リポジトリへのアクセスも除外済み)。詳細は docs/decisions.md D91。
+#   5. 上記すべてを満たせばマージする。
 #
 # 対象外にしたい PR には `no-automerge` ラベルを付ける。Draft PR も対象外。
+# `CODEX_BYPASS_LABEL` (既定 `automerge-without-codex`) は Codex レビュー
+# 要件だけを免除する — 未解決スレッド判定と CHANGES_REQUESTED 判定は
+# 免除されない (人間の明示的な差し戻しを尊重するため)。Codex 側の障害・
+# クォータ切れ・応答の文言変更でも全 PR が永久停止しないための最終手段の
+# 保険 (D91)。
 #
 # 注意: GITHUB_TOKEN でマージすると、マージ後の `main` への push では他の
 # workflow (ci.yml の push トリガなど) が起動しない (GitHub の仕様)。
@@ -29,13 +52,27 @@ on:
       # Issue #37: Dependency Audit (deny.toml) を追加。PR 向けには
       # Cargo.toml/Cargo.lock/deny.toml の変更時のみ走るので、対象外の
       # PR ではこの workflow_run が発火せず check-runs にも現れない
-      # (schedule 定期実行の fallback で最大 30 分遅れる程度)。
+      # (schedule 定期実行の fallback で最大 10 分遅れる程度)。
       # docs/decisions.md D63 参照。
       - Dependency Audit
     types: [completed]
+  # Issue #188 / docs/decisions.md D91: 猶予期間 (既定15分) を追加した分、
+  # 定期実行だけに頼るケース (workflow_run で拾えなかった PR) の最悪遅延が
+  # 増えないよう、30分間隔から10分間隔に詰めた。
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch: {}
+  # Issue #188 / D91: この workflow 自身、またはレビュー判定ロジック
+  # (check_review_gate.py / review_gate_decision.sh) を変更する PR に限り
+  # dry-run 検証ジョブを走らせる。`perf-windows.yml` が採った手法
+  # (D88) と同じパターン: workflow_dispatch は main にマージされるまで
+  # Actions タブに現れないため、workflow 自身の変更を検証する唯一の手段。
+  # 実際にマージはしない (下の dry-run-review-gate ジョブを参照)。
+  pull_request:
+    paths:
+      - ".github/workflows/auto-merge.yml"
+      - ".github/scripts/check_review_gate.py"
+      - ".github/scripts/review_gate_decision.sh"
 
 permissions:
   contents: write
@@ -50,6 +87,8 @@ permissions:
   issues: write
 
 # 同時に 2 つ走って同じ PR を二重にマージしようとしないよう直列化する。
+# dry-run-review-gate ジョブは読み取り専用でマージしないため、この
+# concurrency グループには参加させない (別ジョブなので自動的に対象外)。
 concurrency:
   group: auto-merge
   cancel-in-progress: false
@@ -61,11 +100,31 @@ env:
   SKIP_LABEL: no-automerge
   # 自動マージ対象のベースブランチ
   BASE_BRANCH: main
+  # Issue #188: head SHA の push 観測時刻からこの分数が経過するまで
+  # マージしない (レビューボットがまだ投稿していない場合の保険。git
+  # commit の committer date ではない — docs/decisions.md D91 参照)。
+  GRACE_PERIOD_MINUTES: 15
+  # Issue #188: このラベルが付いた PR は Codex レビュー必須要件のみを免除
+  # する (未解決スレッド判定・CHANGES_REQUESTED 判定は免除しない)。
+  CODEX_BYPASS_LABEL: automerge-without-codex
+  # Issue #188 (2026-09-07 ユーザ決定): Codex の利用上限到達時、この PR が
+  # 一度も Codex にレビューされていない場合のフォールバックとして
+  # `@claude` へレビューを依頼する。ここに設定したログイン名 (カンマ区切り)
+  # からの反応だけを「Claude のレビュー」として認める。**既定は空文字列
+  # = Claude フォールバックは常に不成立** (Codex の利用上限緩和のみで判断
+  # する安全側)。このリポジトリに `@claude` へ応答する仕組み
+  # (claude-code-action 等) が導入されているかは未確認であり、ログイン名を
+  # ハードコードしていない (docs/decisions.md D91 参照)。実際に運用する
+  # 場合は、応答する GitHub App/Actions のログイン名をここに設定すること。
+  CLAUDE_REVIEWER_LOGINS: ""
 
 jobs:
   auto-merge:
     name: Auto merge PRs whose checks all passed
     runs-on: ubuntu-latest
+    # pull_request トリガは dry-run-review-gate 専用 (下記)。実際にマージを
+    # 行うこのジョブは pull_request では絶対に起動しない。
+    if: github.event_name != 'pull_request'
     steps:
       # Issue #168: この job は元々リポジトリを checkout していなかった
       # (gh CLI と API しか使わないため必要が無かった)。マージ後の Issue
@@ -82,6 +141,15 @@ jobs:
           # この workflow 自身が check-run に現れた場合に除外するための名前
           SELF_WORKFLOW: ${{ github.workflow }}
           SELF_JOB: Auto merge PRs whose checks all passed
+          # Issue #188 / D91: `@claude` メンションの投稿専用。PR #193 で
+          # 実測したところ、GITHUB_TOKEN で投稿したメンションには Claude
+          # App が反応しなかった (Web UI から人間が投稿したメンションには
+          # 反応した)。そのため `@claude` の投稿だけは GH_TOKEN (上記の
+          # AUTO_MERGE_TOKEN||GITHUB_TOKEN フォールバック) を使わず、この
+          # 専用の PAT が設定されている場合のみ行う
+          # (review_gate_decision.sh 側で判定)。未設定なら secret 参照は
+          # 空文字列になる (GitHub Actions の仕様)。
+          AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -100,6 +168,8 @@ jobs:
             sha=$(echo "$pr" | jq -r '.headRefOid')
             draft=$(echo "$pr" | jq -r '.isDraft')
             has_skip=$(echo "$pr" | jq -r --arg l "$SKIP_LABEL" \
+                         '[.labels[].name] | index($l) != null')
+            has_codex_bypass=$(echo "$pr" | jq -r --arg l "$CODEX_BYPASS_LABEL" \
                          '[.labels[].name] | index($l) != null')
 
             echo "::group::PR #${number} ${title} (${sha:0:7})"
@@ -157,6 +227,39 @@ jobs:
               echo "skip: 成功/スキップ以外のチェックが ${failed} 件ある"
               echo "::endgroup::"; continue
             fi
+
+            echo "check-runs / commit status: all green"
+
+            # --- Issue #188: レビュー状態の判定 -------------------------
+            # check-runs / commit status には現れない Pull Request の
+            # レビュー (Codex の指摘、人間のレビュー) を見る。Codex が
+            # 現在の head SHA をレビュー済みであることも必須要件
+            # (CODEX_BYPASS_LABEL で免除可能)。判定ロジック本体は
+            # review_gate_decision.sh / check_review_gate.py に切り出して
+            # あり単体テストがある (docs/decisions.md D91)。GraphQL 呼び出し
+            # 自体の失敗も含めて常に「安全側 = マージしない」に倒す
+            # (取得できなかったので指摘ゼロとみなす、は絶対にしない)。
+            echo "レビュー状態を確認します (Issue #188):"
+            if [ "$has_codex_bypass" = "true" ]; then
+              echo "  '${CODEX_BYPASS_LABEL}' ラベルあり: Codex レビュー要件のみ免除 (未解決スレッド/CHANGES_REQUESTED は免除されません)"
+            fi
+            # 第4引数 "true": Codex がこの head SHA をまだレビューして
+            # いなければ実際に `@codex review` を自動投稿する (pull-requests:
+            # write が要る。この job のみが実際に投稿する — dry-run job は
+            # 読み取り専用のまま「投稿する判定になった」ことをログに出す
+            # だけ)。
+            review_gate_output=""
+            review_gate_rc=0
+            review_gate_output=$(bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$has_codex_bypass" "true") \
+              || review_gate_rc=$?
+            if [ -n "$review_gate_output" ]; then
+              echo "$review_gate_output" | sed 's/^/  /'
+            fi
+            if [ "$review_gate_rc" -ne 0 ]; then
+              echo "wait: レビュー状態が条件を満たさないためマージを見送ります"
+              echo "::endgroup::"; continue
+            fi
+            echo "  問題なし (未解決スレッド 0 件 / CHANGES_REQUESTED 0 件 / Codex レビュー条件を満たす / 猶予期間経過済み)"
 
             echo "all green: マージします (${MERGE_METHOD})"
             # --match-head-commit: 判定した commit から PR が進んでいたら
@@ -216,3 +319,62 @@ jobs:
             fi
             echo "::endgroup::"
           done
+
+  # Issue #188 / docs/decisions.md D91: この workflow 自身、またはレビュー
+  # 判定ロジックを変更する PR に限り、上の on.pull_request.paths フィルタで
+  # 起動する dry-run 検証ジョブ。実際の auto-merge ジョブとは別ジョブに分け、
+  # permissions を読み取り専用に絞ってある。理由: pull_request トリガは
+  # (pull_request_target と異なり) PR ブランチ側の workflow 定義で実行される
+  # — D55 が本 workflow で pull_request トリガそのものを避けた理由と同じ
+  # リスクが、この検証ジョブにも本質的には残る。auto-merge ジョブが持つ
+  # `contents: write` / `pull-requests: write` / `issues: write` を万一にも
+  # 渡さないよう、job 単位の permissions で明示的に読み取り専用へ絞り込み、
+  # `gh pr merge` や `gh issue close` の類は一切呼ばない (呼び出しているのは
+  # review_gate_decision.sh の読み取り専用 API だけ)。これにより、たとえ
+  # このジョブの中身が PR 側で改変されても、書き込み系の操作はできない。
+  dry-run-review-gate:
+    name: (dry-run) レビュー判定ロジックの検証
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+      # review_gate_decision.sh が head SHA の push 観測時刻を取得するため
+      # に check-suites API (commits/{sha}/check-suites) を呼ぶ (D91)。
+      checks: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: レビュー判定ロジックを検証実行する (マージは一切行わない)
+        env:
+          # 意図的に secrets.AUTO_MERGE_TOKEN は使わない — このジョブは
+          # 読み取りのみを行う検証用であり、書き込み権限を持つ PAT を
+          # 渡す理由が無い。GITHUB_TOKEN も上の permissions により
+          # 読み取りスコープに制限されている。
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          number="${{ github.event.pull_request.number }}"
+          sha="${{ github.event.pull_request.head.sha }}"
+          codex_bypass=$(echo '${{ toJSON(github.event.pull_request.labels) }}' \
+            | jq -r --arg l "$CODEX_BYPASS_LABEL" '[.[].name] | index($l) != null')
+          echo "::group::PR #${number} (${sha:0:7}) のレビュー判定を検証 (dry-run: マージは行いません)"
+          if [ "$codex_bypass" = "true" ]; then
+            echo "  '${CODEX_BYPASS_LABEL}' ラベルあり: Codex レビュー要件のみ免除"
+          fi
+          rc=0
+          # 第4引数 "false": このジョブは読み取り専用 (permissions に
+          # pull-requests: write が無い) なので、Codex 未レビューを検知
+          # しても実際には `@codex review` を投稿しない (投稿する判定に
+          # なったことだけがログに出る)。
+          bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$codex_bypass" "false" | sed 's/^/  /' || rc=$?
+          if [ "$rc" -eq 0 ]; then
+            echo "判定結果: マージ可 (レビュー起因のブロック要因なし)"
+          elif [ "$rc" -eq 1 ]; then
+            echo "判定結果: マージ見送り (上記の理由による)"
+          else
+            echo "判定結果: 判定失敗 (rc=${rc}、API 呼び出し自体のエラー。上記の ::warning:: を参照)"
+            exit 1
+          fi
+          echo "::endgroup::"

@@ -11127,3 +11127,649 @@ condition (2) 「実サイトでの推奨値」が解消されるまで見送っ
 同時に開いて全部メモリを圧迫させる利用が実際に問題になった場合は、案 3
 か、あるいは 1 パスで複数ウィンドウにサンプルを配る折衷案 (例: 上位 K 個)
 を再検討する。
+
+## D91: auto-merge がレビューを見ずにマージしていた問題 (#188) — 未解決スレッド / CHANGES_REQUESTED / Codex の head SHA レビューを必須要件化、`automerge-without-codex` で Codex 要件のみ免除
+
+**対象**: Issue #188。D55 で導入した `auto-merge.yml` は head commit の
+check-runs / commit status しか見ておらず、**Pull Request のレビューを
+一切考慮せずにマージしていた**。Codex (`chatgpt-codex-connector[bot]`) は
+check-run を登録しないため、auto-merge からは「レビューが存在しない」のと
+区別が付かず、指摘が出ていてもそのままマージされていた。
+
+実際に PR #185 では 15:31:14 の作成から 15:35:32 (2 分以上前) に Codex が
+`src/browser/suspension.rs` へ P2 の指摘 (実在のバグ、Issue #186) を投稿
+していたにもかかわらず、15:37:55 に auto-merge がマージした。続く PR #189
+でも Codex は別の実在の問題を指摘しており、**この Issue の調査時点で Codex
+は 3 PR 中 3 PR (#185/#189/#190) すべてで有効な指摘を出している**
+(#190 は 35 行のドキュメント追加のみの小さな PR で、指摘が出にくいことを
+狙って作った検証用 PR だったが、それでも P2 の指摘が出た — 詳細は後述)。
+**「マージ前に一定時間待つ」だけでは防げない**: レビューはマージの数分前
+には既に存在していた。「未解決の指摘があればマージしない」という判定が
+必要だった。
+
+本 Issue は当初「Codex を必須条件にしない」方針で起票されたが、実装途中で
+ユーザの判断により**「Codex のレビューをマージの必須要件にする」方針へ
+変更**された (Issue 本文 2026-09-07 更新)。CodeRabbit は Free プランの
+制限 (1 時間 1 レビュー、行単位の指摘を出さず要約のみ) により実質機能して
+おらず、**リポジトリへのアクセスも除外済み**のため判定に含めない。
+
+> ⚠️⚠️ **この仕組みを将来触る人が最初に知るべき、Codex についての2つの
+> 前提** (2026-09-07、PR #192 自身の運用で判明。決定9で対応):
+>
+> 1. **Codex は push では再レビューしない。** Codex 自身の説明文
+>    (“Reviews are triggered when you open a pull request for review /
+>    mark a draft as ready / comment `@codex review`.”) のとおり、
+>    **push はレビューのトリガーに含まれていない。** 実際に PR #190
+>    (Codex がレビューした commit `9bb0dd7551` の後に push `f97b8d9`)
+>    、PR #192 自身 (Codex がレビューした commit `f34617bbdc` の後に
+>    push `12fb45e`→`3dabf31`、5分以上経過) のいずれでも、push 後の
+>    再レビューは一度も観測されなかった。**「指摘に対応して push しただけ」
+>    では Codex の head SHA レビュー要件は永久に満たされない**
+>    (実際にこの PR 自身が、自分が実装した判定によって一時的にマージ
+>    不能になった)。
+> 2. **Codex には利用上限がある。** `@codex review` とコメントすれば
+>    再レビューを手動で起動できるが、上限に達すると Codex は
+>    “You have reached your Codex usage limits for code reviews.”
+>    (実測: PR #192 で `@codex review` をコメントした際に返された) を
+>    返し、それ以上レビューしない。CodeRabbit を判定から除外した理由
+>    (Free プランの制限で実質機能しない) と同種の制約が Codex にもある。
+>
+> この2つを踏まえ、決定9で「未レビューを検知したら `@codex review` を
+> 自動投稿する (同じ head SHA には1回だけ)」「利用上限到達を検知したら
+> 要件を緩和する (ただし一度もレビューされていない PR は緩和しない)」
+> を実装した。
+
+### 決定
+
+1. **判定ロジックは `.github/scripts/check_review_gate.py` に切り出し、
+   `test_check_review_gate.py` (41 件の `unittest`) でテストする。**
+   `extract_closing_issues.py` + D83 と同じ流儀 — workflow の YAML には
+   ロジックをベタ書きしない。GitHub API から取得した GraphQL レスポンス
+   の形をそのまま模したデータでテストできる。判定は `evaluate_review_gate()`
+   1 関数に集約し、以下 4 条件のいずれか 1 つでも該当すれば `blocked=True`
+   (マージしない) を返す。
+   1. **未解決のレビュースレッド** (`reviewThreads[].isResolved == false`
+      が 1 件以上)。人間・ボットを問わず適用。ログには「未解決のレビュー
+      スレッドが N 件: `path (author)`, ...」の形でファイル・投稿者を
+      出す (#168 の教訓 — 原因がログから読めないと同じ事故を繰り返す)。
+   2. **`CHANGES_REQUESTED`** がレビュアーごとの最新レビュー状態
+      (GraphQL `latestReviews`) に残っている。レビュアー名をログに出す。
+   3. **Codex が現在の head SHA をレビュー済みでない** (下記参照。
+      `codex_bypass=True` で免除可能)。
+   4. **head SHA の push 観測時刻 (`head_push_observed_at`、下記の決定7
+      参照) から猶予期間 (既定15分、workflow の `env.GRACE_PERIOD_MINUTES`)
+      が経過していない。** レビューボットがまだ投稿していない場合の保険。
+   いずれの GraphQL 呼び出し (`review_threads`/`latest_reviews` が `None`)
+   もページング不足 (`pageInfo.hasNextPage == true` で全件を確認できない)
+   も、**常に安全側 (blocked) に倒す**。「取得できなかったので指摘ゼロと
+   みなす」は絶対にしない — Issue の絶対要件。
+
+2. **Codex の head SHA レビュー判定は3つのシグナルの OR。** 「Codex の
+   レビューが存在する」だけでは、**古いコミットへのレビューが残っている
+   だけ**のケースを見逃す (push 後に再レビューされていない状態でマージ
+   してしまう)。そこで以下のいずれか1つでも現在の head SHA を指せば
+   「レビュー済み」とみなす (`check_review_gate.py` の
+   `_codex_reviewed_head_sha`/`_codex_reacted_after`):
+   - **a. `latestReviews[].commit.oid` (GraphQL) が head SHA と完全一致。**
+     最も確実なシグナル。GraphQL の `PullRequestReview.commit` は
+     レビューが実際に付けられたコミットを指す (レビュー後に新しい commit
+     が push されても更新されない)。
+   - **b. レビュー本文の `Reviewed commit:` 行から取り出した短縮 SHA が
+     head SHA の接頭辞と一致する。** これは a への追加の裏付け (フォール
+     バック) として実装した。実データで確認済み: PR #185/#189/#190 の
+     3 件すべてで `**Reviewed commit:** \`<10桁の16進>\`` という形式
+     (太字マーカー + バッククォート付き) で、値は head SHA の**先頭10桁**
+     と一致していた (`9bb0dd755129c1bc...` → `9bb0dd7551` など)。**完全
+     一致ではなく「head SHA が短縮 SHA で始まるか」で判定する**
+     (`str.startswith`)。正規表現 `_REVIEWED_COMMIT_RE` は太字マーカー
+     (`**`) とバッククォートの有無ゆらぎの両方を許容する。
+   - **c. Codex による 👍 リアクション (PR 本体への `THUMBS_UP`、GraphQL
+     `pullRequest.reactions`) の `createdAt` が **head SHA の push 観測
+     時刻 (`head_push_observed_at`、決定7参照)** 以降。** Codex の説明文
+     (“If Codex has suggestions, it will comment; otherwise it will react
+     with 👍.”) に基づく代替シグナル。**リアクションは commit に紐付か
+     ない (1 ユーザ 1 個)** ため、古い push に対する 👍 が新しい push 後も
+     残り続ける — そのため単独では「どの push に対する反応か」を厳密に
+     特定できず、`createdAt` が push 観測時刻以降であることを条件に加えて
+     弱めのシグナルとして扱う。
+   > ✅ **シグナル c (👍 リアクション) は PR #191 (0 バイトのファイル
+   > 1 本だけを追加する、意図的に「批評対象が何もない」PR) で実測に
+   > 成功し、Codex の公式説明どおりの挙動を確認した。** #190
+   > (`docs/README.md` を35行追加) までは 3/3 件で Codex が指摘を出して
+   > いたため「指摘ゼロ」のケースが観測できずにいたが、差分の内容が
+   > 空 (0 バイトのファイル) の PR #191 では次の結果になった:
+   >
+   > | 項目 | PR #191 の結果 |
+   > | --- | --- |
+   > | レビュー (`get_reviews`) | 0 件 |
+   > | コメント (`get_comments`) | 0 件 |
+   > | PR 本体へのリアクション | `+1: 1` |
+   >
+   > **指摘ゼロのとき Codex はレビュー・コメントを一切残さず、PR 本体
+   > (issue) への 👍 リアクションのみを付ける**ことを確認した (レビュー
+   > やレビューコメントに付くのではない — シグナル c が
+   > `pullRequest.reactions` [issue 本体] を見る設計になっているのは
+   > この観測と一致している)。参考値: PR #191 head SHA
+   > `e4c8811bcb7298a12247f5c0712bd510cab658b5`、PR 作成
+   > `2026-09-07T16:21:12Z`。
+   >
+   > **残る限界**: この観測に使ったツールはリアクションの**集計値**
+   > (`+1: 1` 等) しか返さず、**投稿者が実際に `chatgpt-codex-connector
+   > [bot]` であることを API 上で直接確認できていない。** CodeRabbit を
+   > 除外した後、本リポジトリで稼働しているレビューボットは Codex のみ
+   > であり、かつレビュー/コメントを一切出さなかった PR にだけ +1 が
+   > 付いている状況証拠から Codex によるものとみて差し支えないと判断した
+   > が、断定はできていない。**そのため `check_review_gate.py` の実装は
+   > 集計値ではなく `user.login` の完全一致 (決定7の P2 参照) だけを
+   > 対象にする。** 万一 👍 の投稿者が別ユーザだった場合に誤ってマージ可と
+   > 判定しないための必須の防御であり、実装済みであることを確認済み。
+   > この防御がないと第三者の 👍 でマージが通ってしまう。
+
+3. **`automerge-without-codex` ラベルで Codex レビュー必須要件のみを免除
+   する (workflow の `env.CODEX_BYPASS_LABEL`)。** 「指摘ゼロのとき Codex
+   が何を残すか」は PR #191 の観測 (上記シグナル c 参照) で確認できたが、
+   それでもこのラベルは残す。理由: (a) リアクションの投稿者が Codex か
+   どうかを集計値からは断定できていない残余の不確実性がある、(b) Codex
+   側の障害・クォータ切れ・設定変更 (レビューが呼ばれなくなる) は今後も
+   起こりうる。**Codex を必須要件にする以上、Codex が応答しなければ全 PR
+   が永久にマージされなくなるリスクがある** — このラベルはその安全弁。
+   - **未解決スレッド判定・`CHANGES_REQUESTED` 判定は免除しない。** それ
+     らは人間の明示的な差し戻し (あるいは Codex 以外のレビュアーの指摘)
+     を尊重するためのものであり、Codex の可用性とは無関係。
+   - `no-automerge` (完全に自動マージ対象外にする) とは役割が異なる:
+     `automerge-without-codex` は「Codex 抜きでよいので他の条件が揃えば
+     マージしてよい」、`no-automerge` は「一切自動マージしない」。
+
+4. **未解決スレッドは `isOutdated` を無視し `isResolved` のみで判定する
+   — 運用上の重要な注意点。** PR #190 で実測: レビュー対象の行を修正して
+   push すると GitHub 上でスレッドは `isOutdated: true` になるが、
+   **`isResolved` は自動では `true` にならない**。明示的に「Resolve
+   conversation」を押す (または API で resolve する) までスレッドは
+   未解決のまま残り、**auto-merge は永久にブロックし続ける。**
+   `check_review_gate.py` はそもそも `isOutdated` を取得・参照していない
+   ため、この挙動と一致している (`isResolved` だけを見る設計で正しい)。
+   **運用上の注意**: Codex や人間の指摘に対応してコードを push しただけ
+   ではマージされるようにならない。**指摘に対応した後は、PR 上で該当
+   スレッドを明示的に resolve する必要がある。** (Codex 自身がスレッドを
+   自動 resolve する挙動があるかどうかは、この Issue の調査でも未確認 —
+   仮に Codex が resolve しない場合、対応後の resolve は毎回人間の作業に
+   なる。)
+
+5. **`schedule` を `*/30` から `*/10` (10分間隔) に詰めた。** 猶予期間
+   (既定15分) を追加した分、`workflow_run` で拾えなかった PR が定期実行
+   だけに頼るケースの最悪マージ遅延が増える (30分間隔のままだと最悪
+   45分程度)。Issue 本文が提示した2案 (a. 間隔を詰める、b. レビュー
+   イベントで再実行する仕組みを作る) のうち **a を採用**した。理由:
+   - b (`pull_request_review`/`pull_request_review_thread` イベントを
+     追加のトリガにする) は、レビュー解消・CHANGES_REQUESTED 解除の反映
+     を速くできる利点はあるが、`auto-merge` job は `contents: write` /
+     `pull-requests: write` / `issues: write` という強い権限を持つ job
+     であり、新しいイベント種別をトリガに追加するたびに「このイベントは
+     PR 側の workflow 定義で実行されないか」を再検証するコストが生まれる
+     (D55 が `pull_request` トリガそのものを避けた理由と同種のリスク)。
+   - a (`schedule` を詰める) は既存の設計 (D55: 「PR ごとの走査で、
+     イベントの payload に依存しない」) をそのまま使い回せ、追加のリスク
+     が無い。定期実行の負荷は GitHub Actions の無料枠に対して軽微
+     (1 job、数秒〜数十秒程度)。
+   - **残る制約**: レビュー解消 (スレッドの resolve、`CHANGES_REQUESTED`
+     の解除) や Codex の新しいレビュー到着は、`workflow_run` (他の
+     CI/perf-gate/release-windows/dependency-audit の完了) にたまたま
+     便乗しない限り、**最大 10 分程度の遅延**で auto-merge に反映される。
+     これは Issue の完了条件 (「指摘ゼロの PR が停滞しないこと」) を
+     10 分程度の遅延はあるが満たしている、と判断した。将来この遅延が
+     問題になった場合は b (レビューイベントをトリガに追加) を再検討する。
+
+6. **workflow 自体の検証に dry-run 専用 job (`dry-run-review-gate`) を
+   追加した — D88 の「`pull_request` + `paths` フィルタで自分自身を変更
+   する PR でのみ検証実行する」パターンを踏襲。** `on.pull_request.paths`
+   に `auto-merge.yml` 自身と `check_review_gate.py` /
+   `review_gate_decision.sh` を指定し、これらを変更する PR に限って
+   起動する。`workflow_dispatch` は `main` にマージされるまで Actions
+   タブに現れないため、workflow 自身の変更を検証する唯一の手段になる
+   (D88 と同じ理由)。
+   - **本番の `auto-merge` job とは完全に別の job に分離し、job 単位の
+     `permissions` を `contents: read` / `pull-requests: read` のみに
+     絞った。** `pull_request` トリガは (`pull_request_target` と異なり)
+     **PR ブランチ側の workflow 定義で実行される** — これは D55 が
+     `auto-merge.yml` 全体で `pull_request` トリガそのものを避けた理由
+     と同種のリスクであり、dry-run job にも本質的に残る。`auto-merge`
+     job が持つ `contents: write` / `pull-requests: write` /
+     `issues: write` を万一にも dry-run job に渡さないよう、明示的な
+     job 単位 `permissions` で読み取り専用に絞り込んだ (job 単位の
+     `permissions` は workflow 単位の設定を完全に置き換える)。これにより
+     PR 側でこの job の中身が改変されても、書き込み系の操作
+     (`gh pr merge`/`gh issue close` など) は一切できない。
+   - `secrets.AUTO_MERGE_TOKEN` は dry-run job では意図的に使わず、
+     `secrets.GITHUB_TOKEN` (読み取りスコープに制限済み) のみを渡す。
+   - dry-run job は `review_gate_decision.sh` を呼ぶだけで、`gh pr merge`
+     は一切呼ばない。判定結果 (ブロック理由の有無) をログに出すのみ。
+   - **残る残余リスク**: 同一リポジトリ内のブランチ (フォークでない) から
+     の PR では、GitHub は宣言された `permissions` をそのまま尊重する
+     ため、理論上は PR 側でこの job の `permissions` 自体を書き換えて
+     権限を要求し直すことができる (フォーク PR には GitHub 側の読み取り
+     専用強制があるが、同一リポジトリ内のブランチには効かない)。本
+     リポジトリは単一オーナー (`noan98`) のプライベートリポジトリで、
+     ブランチを作成できるのは信頼できるコラボレータのみという前提の下
+     では実害は小さいと判断したが、将来コラボレータが増える場合はこの
+     残余リスクを再評価すること。
+
+7. **PR #192 (この実装 PR 自身) に Codex が指摘した P1/P2 の2件を、実装に
+   反映した。** 皮肉にも、この Issue が「Codex の指摘を見落とさない
+   ようにする」ための実装自体に、Codex が実在の脆弱性を2件見つけた。
+   いずれも「Codex を必須要件にする」判定ロジックの正しさを直接損なう
+   欠陥だったため、両方とも修正した。
+
+   - **P1 (最重要): 猶予期間とシグナル c の基準時刻に committer date を
+     使ってはいけない。** 初版の実装は `head_committed_date` (git commit
+     の committer date) を、猶予期間の起点とシグナル c (👍 リアクション)
+     の基準時刻の**両方**に使っていた。しかし committer date は「commit
+     をローカルで作った時刻」であり「GitHub に push された時刻」ではない
+     — ローカルで数時間前に作った commit を今 push する、cherry-pick/
+     rebase で古い commit を持ち込む、といった特殊な操作ではない普通の
+     git 操作で committer date は容易に過去の日時になる。この状態では
+     (a) 以前の head に付いた Codex の 👍 の `createdAt` が新しい (実は
+     古い日時の) committer date より後になり、誤って「現在の SHA を
+     レビュー済み」と判定されてしまい、(b) 猶予期間も同時に即座に満たさ
+     れてしまう — **2つの防御が同一の操作可能なタイムスタンプに依存し、
+     同時に破られる**という、判定ロジックの中核に関わる欠陥だった。
+     **対処**: `head_committed_date` を `head_push_observed_at` にリネーム
+     し、値の取得元を **head SHA に対する check-suite の作成時刻の最小値**
+     (`repos/{owner}/{repo}/commits/{sha}/check-suites` の `created_at`)
+     に変更した。push を受けて GitHub 自身がサーバ側で作成するものなので
+     attacker が直接操作できない (本リポジトリは PR で必ず CI
+     [`ci.yml`] が走るため、check-suite は実用上必ず作成される)。取得
+     できなかった場合 (check-suite が1件も無い等) は **committer date へ
+     のフォールバックはせず**、安全側 (マージしない) に倒す — フォール
+     バック自体がこの脆弱性を再現するため。`dry-run-review-gate` job の
+     `permissions` に `checks: read` を追加した (`auto-merge` job は既に
+     決定1で `checks: read` を持っていたため変更不要)。
+     > ⚠️ **この方式は「head SHA に対して check-suite が作成されている」
+     > ことに依存する、という前提を明記しておく。** 本リポジトリは PR
+     > で必ず CI (`ci.yml`) が走るため実用上は問題にならないが、CI を
+     > 持たないリポジトリや、push 直後で GitHub 側の check-suite 作成が
+     > まだ反映されていない極めて早いタイミングでは取得できない場合が
+     > ある。**その場合は意図的に安全側 (マージしない) に倒す設計であり、
+     > 副作用として「(その PR に対する) CI が始まるまでマージされない」
+     > という挙動になる。** これは望ましい挙動と判断した (「push 観測を
+     > 確認できない = レビューボットがまだ push を認識していない可能性が
+     > 排除できない」ため) 上での意図した設計であり、取りこぼしではない。
+   - **P2: Codex ログインの判定は前方一致ではなく完全一致にする。**
+     初版の実装 (`_is_codex_login`) はログイン名が `chatgpt-codex-
+     connector` で**始まるか** (`str.startswith`) で判定していた。この
+     ため `chatgpt-codex-connector-review` のような別名アカウントが
+     レビューを出せば (本 PR のコメント権限を持つ第三者が実際に作成
+     できる)、Codex レビュー必須要件をすり抜けられてしまう。**対処**:
+     既知の Codex ログイン名の完全一致許可リスト
+     (`_CODEX_LOGINS = frozenset({"chatgpt-codex-connector[bot]"})`、
+     大小文字は無視) で判定する `_is_codex_author` に置き換えた。GraphQL
+     クエリで取得できる場合は追加で `__typename == "Bot"` であることも
+     要求する (`author { login __typename }` — 通常の `User` アカウントが
+     たまたま同名を名乗ることはできない [GitHub がログイン名の重複を
+     禁止する] が、多層防御として追加した)。
+   - **テスト**: `test_check_review_gate.py` に
+     `PushObservedAtSecurityRegressionTest` (P1: 呼び出し側が正しい
+     push 観測時刻を渡した場合に、古い head に付いた 👍 が正しく拒否され
+     ることを確認 — 関数自体は committer date と push 観測時刻を区別する
+     情報を持たないため、修正の本体である `review_gate_decision.sh` 側の
+     データソース変更と対で見る必要がある) と `CodexLoginExactMatchTest`
+     (P2: `chatgpt-codex-connector-review` 等の別名ログインが**前方一致の
+     ままだと PASS してしまい [脆弱性を再現]、完全一致に直したことで
+     BLOCKED [FAIL→修正後 PASS] になる**ことを確認する回帰テスト) を
+     追加した。
+   - PR #192 上の Codex のレビュースレッド2件 (P1: discussion_r3951397804
+     / P2: discussion_r3951397806) は、修正を返信・push した上で明示的に
+     resolve した (決定4の運用注意のとおり、push しただけでは
+     `isResolved` は自動で `true` にならない)。
+
+8. **GraphQL に必要な権限は `pull-requests: read` で足り、既存の
+   `permissions.pull-requests: write` (D55/D83 で既に付与済み) に包含
+   される。** 追加の `permissions` 変更は不要だった (ただし決定7の P1
+   対応で `checks: read` を dry-run job に追加している)。GraphQL 呼び出し
+   自体が失敗した場合 (権限不足の 403 等) は `gh` の生のエラー出力を
+   `::warning::` に含めて安全側ブロックする — #168 で `issues` 権限が
+   抜けて 404 になった際にエラーメッセージだけでは原因が分からなかった
+   教訓を踏まえた (`review_gate_decision.sh` 内のコメント参照)。
+
+9. **PR #192 自身の運用で判明した「Codex は push で再レビューしない」
+   「Codex には利用上限がある」の2点に対応した (上の ⚠️⚠️ 参照)。**
+   ユーザの決定に基づき、「通常は厳格に必須。ただし Codex が『利用上限』
+   を返した場合に限り、自動で緩める」という方針で実装した。
+
+   - **`@codex review` の自動リクエスト (1 head SHA につき1回のみ)。**
+     条件3の a/b/c いずれのシグナルにも一致しない場合、
+     `pullRequest.comments` (直近100件、GraphQL) を走査し、現在の
+     head SHA を埋め込んだマーカー
+     (`<!-- auto-merge:codex-review-request:<head SHA> -->`) を含む
+     コメントが既に存在するかを調べる。**無ければ**
+     `codex_review_request_needed=True` を返し、`auto-merge` job
+     (`pull-requests: write` を持つ本番 job のみ) が実際に
+     `@codex review` + マーカーをコメント投稿する
+     (`codex_review_request_comment_body()` に本文組み立てを一元化し、
+     bash 側で文字列を再構築しない)。**マーカーは head SHA 固有**なので、
+     新しい push で head SHA が変われば別のマーカーとして扱われ、
+     自動的に「1 push につき1回」の再リクエストが起こる (恒久的な
+     バイパスにはならない)。`dry-run-review-gate` job は
+     `pull-requests: write` を持たない (決定6) ため、投稿する判定に
+     なったことをログに出すだけで実際には投稿しない
+     (`allow_codex_request_post` 引数で制御。本番 job のみ `true`)。
+   - **利用上限到達時の緩和は「1. 依頼コメントが存在し、2. その依頼
+     コメントより後に Codex 本人 (完全一致で照合) が利用上限メッセージ
+     (`"reached your codex usage limits"` を含む、大小無視の部分一致)
+     を投稿している」の両方を満たす場合に限る。** 「依頼コメントより
+     後」を要求するのは、過去の別のリクエストに対する古い上限メッセージ
+     を使い回させないため。緩和が発動すると、条件3を「この PR の
+     `latestReviews` にレビュアーが Codex であるエントリが1件でもあれば
+     良い (head SHA と一致しなくてよい)」に変える。**この PR が一度も
+     Codex にレビューされていない場合は緩和しない** (未レビューのまま
+     通してしまうため) — `evaluate_review_gate()` は
+     `any_codex_review` が空なら緩和せず通常どおりブロックする。
+     > 📝 **この「一度も Codex にレビューされていない場合」の扱いは、
+     > 決定10 (Claude フォールバック) によって拡張された。** 本決定
+     > (決定9) 時点では単純にブロックしていたが、その後 PR #193 で
+     > 実際にこの状態が発生したのを受け、ユーザの決定により「Claude に
+     > レビューを依頼する」という第2のフォールバック経路が追加された。
+     > 詳細は決定10を参照。この決定9のテキスト自体は当時の記述のまま
+     > 残し、変更点は決定10に切り出す形にした。
+   - **未解決スレッド判定 (条件1) と `CHANGES_REQUESTED` 判定 (条件2)
+     は、条件3の緩和と完全に独立している。** 実装上、緩和は条件3の
+     ブロック理由を追加しないだけであり、条件1/2は常にそれぞれ独立して
+     評価される。そのため「利用上限到達 + 未解決スレッドあり」では
+     全体としては引き続きブロックされる (`test_usage_limit_but_
+     unresolved_thread_still_blocks`)。
+   - **緩和が発動したら `::warning::` で必ず目立たせる。** 黙って
+     緩めない、というユーザの明示的な指示どおり、`codex_relaxed`/
+     `codex_relaxed_detail` を `evaluate_review_gate()` の戻り値に含め、
+     `review_gate_decision.sh` が `blocked` の値に関わらず (relaxed した
+     結果ブロックされていなくても) `::warning::PR #<番号>: <detail>` を
+     必ず出力する。
+   - **上限メッセージの検出は文字列マッチであり、Codex 側の文言が変われば
+     検出できなくなる。** その場合は緩和が発動せず「厳格なまま待ち続ける」
+     = 安全側に倒れる (誤ってマージされる方向には壊れない)。この限界は
+     意図的に許容した — 検出精度を上げるための公式 API 等は Codex 側に
+     存在しないため。
+   - **`pr_comments` (GraphQL 呼び出し) が取得できなかった場合は、
+     リクエストも緩和も行わず安全側でブロックする。** 「取得できな
+     かったのでリクエスト不要とみなす」は、重複リクエストを防ぐための
+     判定が信頼できないまま投稿しない/しないでおく、という意味で安全側
+     の選択。
+   - **テスト**: `test_check_review_gate.py` の
+     `CodexUsageLimitAndAutoRequestTest` (11件) で、リクエスト要否判定・
+     重複防止・緩和条件 (別 commit でのレビューあり/未解決スレッドあり/
+     一度もレビューなし/上限メッセージの投稿者が Codex 以外/上限
+     メッセージが依頼コメントより前) を網羅した。この機能はこの PR で
+     新規追加したものであり、旧実装 (`codex_review_request_needed`/
+     `codex_relaxed` キーを持たない `evaluate_review_gate`) に対しては
+     必ず `KeyError` で失敗するため、「修正前に失敗し修正後に通る」
+     テストという位置付けになる。
+
+10. **Codex の利用上限到達時、この PR が一度も Codex にレビューされて
+    いない場合 (決定9の `any_codex_review` が空) のフォールバックとして
+    `@claude` メンションでレビューを依頼する仕様に変更した (2026-09-07、
+    ユーザの決定)。** きっかけは PR #193 — 作成直後に Codex が利用上限
+    メッセージを返し、一度もレビューされないままの状態が実際に発生した。
+    決定9のままではこの状態は永久にブロックされ続けるため、決定9を
+    置き換えるのではなく**第2のフォールバック経路として追加**した。
+    実装は「A. 決定9の Codex 緩和 (この PR の過去のレビューで代替) を
+    まず試し、それが無理な場合のみ B. Claude フォールバックを試す」
+    という順序 (`check_review_gate.py` の `evaluate_review_gate()` 内、
+    利用上限検知ブランチ)。
+
+    - **最大の設計課題は「Claude のレビューを何で識別するか」だった。**
+      Codex (`chatgpt-codex-connector[bot]`) と異なり、**このリポジトリ
+      には Claude 関連の workflow が無く**、`@claude` メンションに応答
+      する仕組み (Claude GitHub App / `claude-code-action` 等) が導入
+      されているかは**未確認**。そのため応答時のログイン名もレビュー
+      形式 (review/comment/何も残さない) も分かっていない。**ログイン名
+      をハードコードしない**という Codex 判定 (`_CODEX_LOGINS`) と対照的
+      な方針を採った: `claude_logins` 引数 (workflow の
+      `env.CLAUDE_REVIEWER_LOGINS`、カンマ区切り) で明示的に設定された
+      ログインのみを許可する。**既定値は空文字列 = 空集合であり、Claude
+      経路は常に不成立になる** (`_claude_reviewed_or_commented()` は
+      `claude_logins` が空なら即 `False` を返す)。「未設定なのに何となく
+      通る」実装を避けるため、`test_claude_allowlist_unset_does_not_
+      satisfy_even_with_matching_comment` で「head SHA に一致する
+      `claude[bot]` からのレビューが実際に存在していても、許可リストが
+      空なら考慮されない」ことを明示的に確認した。
+    - **判定シグナルは2つの OR** (`_claude_reviewed_or_commented()`):
+      (i) `latestReviews[].commit.oid` が head SHA と完全一致する Claude
+      のレビュー (Codex のシグナル a と同じ発想)、(ii) `@claude` 依頼
+      コメント (マーカー `<!-- auto-merge:claude-review-request:<head
+      SHA> -->`) より**後**に Claude ログインが投稿したコメント。(ii) を
+      入れた理由: Claude が正式なレビュー (`PullRequestReview`) ではなく
+      単なるコメントで応答する可能性を排除できないため。Codex と異なり
+      `__typename == "Bot"` は要求しない (`_is_login_in()` — Claude 側の
+      実装が Bot か User か不明なため、ログイン名の完全一致だけで判定)。
+    - **`@claude` への依頼コメントも、Codex と同じマーカー方式で
+      head SHA ごとに1回だけ投稿する** (`_CLAUDE_REQUEST_MARKER_RE`/
+      `claude_review_request_comment_body()`)。コメント本文には
+      **依頼理由** (Codex が利用上限に達しており、この head が未レビュー
+      であること) と **PR タイトル**を含める (ユーザの明示的な指示 —
+      「レビュアーが文脈を掴めない依頼にしないこと」)。PR タイトルは
+      `review_gate_decision.sh` の GraphQL クエリに `pullRequest.title`
+      を追加して取得し (`prTitle` として payload に渡す)、新たな API
+      呼び出しは増やしていない。
+    - **投稿は本番の `auto-merge` job のみが行う。** `dry-run-review-gate`
+      job は `pull-requests: write` を持たない (決定6) ため、
+      `claude_review_request_needed` が `True` でも実際には投稿せず
+      「投稿する判定になった」ことをログに出すだけ — Codex の
+      `allow_codex_request_post` 引数をそのまま流用した (実質的には
+      「このジョブはコメントを投稿してよいか」を表すフラグなので、
+      Codex/Claude 両方の投稿可否を1つの引数で共用している)。
+    - **未解決スレッド判定 (条件1) と `CHANGES_REQUESTED` 判定 (条件2) は、
+      Claude フォールバックでも一切緩めない。** 決定9と同じく、これらは
+      条件3とは独立に評価される。`test_usage_limit_with_unresolved_
+      thread_still_blocks_even_with_claude_review` で、Claude のレビュー
+      があっても未解決スレッドがあれば全体としてはブロックされ続ける
+      ことを確認した。
+    - **緩和が発動したら `claude_relaxed`/`claude_relaxed_detail` を
+      `::warning::` として出力する** (決定9の `codex_relaxed` と同じ
+      流儀。`review_gate_decision.sh` で両方を個別にチェックする — 両者
+      は互いに排他 [A が成立すれば B は試さない] だが、コードの単純さの
+      ため個別の `if` にしてある)。
+    > ⚠️⚠️ **決定10 執筆時点では「`@claude` メンションが実際に応答を得ら
+    > れるかは一切検証できていない」としていたが、その後 PR #193 で
+    > 実地検証が行われ、状況が更新された。詳細は決定11を参照。** 要点だけ
+    > 先に書くと: **Claude App 自体は導入済みで動作している**が、
+    > **`GITHUB_TOKEN` で投稿したメンションには反応しなかった** (Web UI
+    > から人間が投稿したメンションには反応した)。そのため決定11で
+    > `@claude` の投稿を `AUTO_MERGE_TOKEN` (PAT) 専用にし、未設定なら
+    > 投稿しない構成にした。`AUTO_MERGE_TOKEN` が未設定のままなら、
+    > 「Codex が利用上限に達し、かつこの PR が一度もレビューされていない」
+    > 状態は `automerge-without-codex` ラベルを付けるまで止まる。
+
+11. **PR #192 の dry-run job が実際に failure になった (`jq: invalid JSON
+    text passed to --argjson`)。原因は決定10で追加した CSV→JSON 変換の
+    バグで、しかも既定設定 (`CLAUDE_REVIEWER_LOGINS: ""`) で必ず再現する
+    ものだった。あわせて、`@claude` メンションの投稿トークンについても
+    実測に基づき修正した。**
+
+    - **バグの内容**: `review_gate_decision.sh` が
+      `printf '%s' "${CLAUDE_REVIEWER_LOGINS:-}" | jq -R '...'` という形で
+      カンマ区切り文字列を JSON 配列に変換していた。`printf '%s' ""` は
+      **改行を含まない 0 バイト出力**になり、`jq -R` は入力を行単位で
+      読むため、**入力に完全な行が1つも無いと何も出力しない** (jq の
+      raw-input モードの仕様)。結果 `claude_logins_json` が空文字列に
+      なり、後段の `jq -n --argjson claudeLogins "$claude_logins_json"`
+      が「invalid JSON」で失敗していた。`CLAUDE_REVIEWER_LOGINS` の既定値
+      そのものが空文字列 (`auto-merge.yml` の `env`) なので、**設定を
+      一切いじらない既定状態で必ずクラッシュする**バグだった — 決定10の
+      「未設定なら Claude 経路は不成立 (安全にブロック)」という意図とは
+      まったく違う、動作不能という結果になっていた。
+    - **修正**: `jq -n --arg s "${CLAUDE_REVIEWER_LOGINS:-}" '$s |
+      split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length >
+      0))'` に変更した。`jq -n` は標準入力を一切読まないため、`$s` が
+      空文字列でも確実に有効な JSON (`[]`) を返す。前後の空白除去
+      (`gsub`) も追加し、`"a, b"` のような区切りでも壊れないようにした。
+    - **点検**: リポジトリ内の他のスクリプト・workflow に同種の
+      `printf | jq -R` パターンが無いかを確認し、無いことを確認した
+      (`.github/workflows/auto-merge.yml` の他の `--argjson` 呼び出しは
+      いずれも `jq -s` [slurp モード。空入力でも確実に `[]` を返す] か、
+      REST レスポンスから `--jq` で直接抽出した値であり、この脆弱性の
+      パターンには該当しない)。
+    - **テスト**: `.github/scripts/test_review_gate_decision.sh` を新規
+      追加した (`review_gate_decision.sh` 自体のシェルレベルの統合テスト
+      — 判定ロジック本体は `test_check_review_gate.py` で別途網羅済み
+      のため、ここでは shell ラッパー固有の挙動だけを見る)。`gh` を
+      スタブに差し替え、`CLAUDE_REVIEWER_LOGINS` が未設定/空文字列/
+      空白のみ/カンマのみ (`",,"`) のときにクラッシュせず空配列として
+      扱われることを確認する。**実際に旧実装 (`printf | jq -R`) に戻して
+      実行し、未設定/空文字列の2ケースで `invalid JSON` の再現と fail を
+      確認**したうえで、修正版に戻して全件 pass することを確認した
+      (修正前に失敗し修正後に通る回帰テスト)。
+
+    **発見: `GITHUB_TOKEN` で投稿した `@claude` メンションは Claude App
+    に無視される可能性が高い (PR #193 での実測)。**
+
+    | コメント | 投稿経路 | Claude App の反応 |
+    | --- | --- | --- |
+    | API トークンで投稿した `@claude` レビュー依頼 | API (`GITHUB_TOKEN`
+    相当) | 反応なし (リアクション0件) |
+    | Web UI から人間が投稿した `@claude` メンション | Web UI | 👀
+    リアクションが付いた |
+
+    > 📝 **これは「反応しなかった」という否定的観測でしかなく、Claude
+    > App 側の仕様を断定するものではない。** GITHUB_TOKEN 経由の投稿が
+    > 反応されない理由 (Actions からの投稿を意図的に無視している、
+    > たまたまこの1回だけ反応が遅れた、等) は特定できていない。ただし
+    > `auto-merge.yml` が既に警告している「`GITHUB_TOKEN` でのマージ・
+    > push は GitHub 側のそれ以上の自動処理を誘発しない」という既知の
+    > 制約 (D55) と構造が似ており、慎重を期して安全側の対応を取った。
+
+    - **対処**: `@claude` の投稿だけは `AUTO_MERGE_TOKEN` (PAT) を明示的
+      に使うようにした (`review_gate_decision.sh` 内で、その1回の
+      `gh pr comment` 呼び出しにだけ `GH_TOKEN="$AUTO_MERGE_TOKEN"` を
+      前置する)。**`AUTO_MERGE_TOKEN` が未設定なら投稿しない**
+      (「反応されないまま空打ちする」より「投稿しない」方が安全 — レビュー
+      依頼が実際に届いたと誤認させないため)。`@codex review` の投稿は
+      これまでどおり `GH_TOKEN` (`AUTO_MERGE_TOKEN||GITHUB_TOKEN` の
+      フォールバック) のままにした — こちらは GITHUB_TOKEN 経由でも
+      Codex が実際に反応することを確認済みであり (この PR 自身で複数回
+      観測)、アプリごとに挙動が異なるため Claude 側だけ個別に対処した。
+      `auto-merge.yml` の `Merge eligible pull requests` ステップに
+      `AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}` を追加した
+      (未設定なら空文字列になる — GitHub Actions の仕様)。
+
+### 実装
+
+- `.github/scripts/check_review_gate.py` — 判定ロジック本体
+  (`evaluate_review_gate()`)。GitHub API のレスポンス形をそのまま引数に
+  取るため、GraphQL 呼び出しをモックせずに単体テストできる。
+  `codex_review_request_comment_body()`/`claude_review_request_comment_
+  body()` にそれぞれの自動投稿コメント本文組み立てを一元化 (bash 側で
+  文字列を再構築しない)。
+- `.github/scripts/test_check_review_gate.py` — 94 件の `unittest`。
+  PR #185 の実タイムライン (未解決スレッド + 猶予期間でブロック、Codex
+  自体は head SHA をレビュー済みなのでブロック理由には含まれない) を
+  再現する回帰テストも含む。
+- `.github/scripts/review_gate_decision.sh` — GraphQL/REST 呼び出し
+  (`gh api graphql`/`gh api repos/.../commits/...`/`gh pr comment`) →
+  JSON 整形 → `check_review_gate.py` 呼び出し、という薄い shell
+  ラッパー。GraphQL クエリに `pullRequest.title` を追加し、Claude への
+  依頼コメントに PR タイトルを含められるようにした。`auto-merge` job
+  (本番、`allow_codex_request_post=true`) と `dry-run-review-gate` job
+  (検証、同 `false`) の両方から同じスクリプトを呼ぶ (ロジックの二重管理
+  を避ける)。終了コード 0=マージ可 / 1=ブロック理由あり / 2=API 呼び
+  出し自体が失敗、を返す。
+- `.github/scripts/test_review_gate_decision.sh` — 決定11で新規追加。
+  `review_gate_decision.sh` 自体の shell レベル統合テスト
+  (`gh` スタブ使用)。
+- `.github/workflows/auto-merge.yml` — 上記を呼び出す形に変更。
+  `env.CLAUDE_REVIEWER_LOGINS` (既定は空文字列) と、`Merge eligible pull
+  requests` ステップの `env.AUTO_MERGE_TOKEN` (決定11) を追加。
+
+### 動作確認
+
+`check_review_gate.py`/`test_check_review_gate.py` は 94 件の `unittest`
+全件 pass を確認した (`python3 -m unittest test_check_review_gate -v`)。
+内訳: 条件1〜4の基本ケース (28件)、Codex 必須判定の基本シグナル a/b/c
+(17件)、決定7 P1/P2 の回帰テスト (8件)、決定9 の `@codex review` 自動
+リクエスト・利用上限緩和 (11件)、**決定10 の Claude フォールバック
+(`ClaudeFallbackTest`、9件)**、複数理由・PR #185 回帰など (21件)。
+
+`review_gate_decision.sh` は `gh` コマンドをスタブに差し替えたローカル
+統合テストで、(a) Codex が head SHA を正しくレビュー済みのケース (exit 0)、
+(b) Codex のレビューが無いケース (exit 1、bypass ラベル無し) と
+`automerge-without-codex` 相当の第3引数で免除されるケース (exit 0)、
+(c) GraphQL 呼び出し自体が失敗するケース (exit 2、`::warning::` に生の
+エラーを含む)、(d) `@codex review` 未投稿時に実際に `gh pr comment` を
+呼ぶケース (`allow_codex_request_post=true`) とログのみに留めるケース
+(同 `false`、dry-run 相当)、(e) 利用上限到達を検知して緩和が発動し
+`::warning::` を出しつつ `exit 0` になるケース、**(f) 利用上限到達 + 未
+レビューで `CLAUDE_REVIEWER_LOGINS` 設定時に実際に `@claude` への依頼を
+投稿するケース、(g) 同条件で dry-run (`allow_codex_request_post=false`)
+のときは `gh pr comment` を一切呼ばないことを確認するケース**、の7系統
+を確認した。
+
+**`dry-run-review-gate` job は、PR #192 (この Issue の実装 PR 自身、
+`.github/workflows/auto-merge.yml` を変更している) 上で GitHub Actions
+上で実際に起動している。** commit `f34617bbdc` (P1/P2 修正前) の時点では
+success で完走し、GraphQL 呼び出しの成功・ブロック理由を最初の1件で
+打ち切らず該当する全件出力できることを確認した:
+
+```
+wait: Codex のレビュー待ち (head SHA `f34617b` に対するレビュー/👍リアクションが見つかりません)
+wait: head commit からまだ 0.9分 しか経過していません (猶予期間 15分、あと 14.1分)
+判定結果: マージ見送り (上記の理由による)
+```
+
+これにより「workflow 自身の変更を、マージ前に検証する」という決定6の
+目的 (D88 のパターン踏襲) は実際に機能することを確認できた — そして
+**決定10 (Claude フォールバック) を追加した commit `05c7918` では、まさに
+この dry-run job が実際に failure になり、決定11のバグ (`jq: invalid
+JSON text passed to --argjson`) をマージ前に検出した。** 「workflow 自身
+の変更をマージ前に検証する」という決定6の狙いが、ここでも実地で機能した
+ことになる。決定11の修正後、再度 dry-run job が success で完走すること
+を commit ハッシュとともに確認する (下記 Revisit condition (5) 参照)。
+**本番の `auto-merge` job (実際にマージを行う側) は、`main` にマージされ
+`workflow_run`/`schedule` で起動するまで検証できていない** (D83 と
+同じ制約 — この job は `pull_request` イベントでは起動しない設計のため、
+PR の段階では検証できない)。
+
+### Revisit condition
+
+(1) PR #191 の観測はリアクションの**集計値**しか確認できておらず投稿者を
+断定できていない (上記シグナル c 参照)。実運用で auto-merge が実際に
+`chatgpt-codex-connector[bot]` からの 👍 でシグナル c を満たして
+マージした最初のケースが出た際、ログ (`review_gate_decision.sh` の出力)
+で本当に想定どおり判定できていたかを一度確認する。(2) この PR (workflow
+自身の変更) がマージされた時点で、`dry-run-review-gate` job が実際に
+GitHub Actions 上で正しく起動・完走したかを確認する — 最初の実地検証に
+なる。**2026-09-07 時点の経緯**: commit `f34617bbdc` (P1/P2 修正前) では
+success 完走を確認したが、その後 commit `05c7918` (決定10、Claude
+フォールバック追加) で実際に failure になり、決定11のバグ (`jq:
+invalid JSON`) をマージ前に検出した。決定11の修正 push 後、再度
+success で完走することをこの PR のマージ前に確認すること (「workflow
+自身の変更をマージ前に検証する」という決定6の目的が実際に機能して
+いるかの最終確認)。(3) レビュー解消の反映が最大10分
+遅延する制約 (決定5) が実運用で問題になった場合は、
+`pull_request_review`/`pull_request_review_thread` トリガの追加を
+再検討する。(4) 将来コラボレータが増えてブランチ内 PR の信頼性前提が
+崩れる場合、dry-run job の残余リスク (決定6) を再評価する。(5) 決定9
+(`@codex review` 自動リクエスト・利用上限緩和) は本番の `auto-merge` job
+がまだ実地で走っていないため、**実際に GitHub Actions 上でコメントが
+投稿されるか・重複投稿を防げているか・緩和が想定どおり発動するかは
+未検証。** この PR がマージされた後、最初に「Codex 未レビューで自動
+リクエストが必要になった PR」が現れた際に、コメントが正しく1回だけ
+投稿されるか (同じ head SHA への push が続いても再投稿されないか) を
+確認すること。(6) 上限メッセージの文言検出は文字列マッチであり脆い
+(決定9)。Codex 側の文言が変わった場合は緩和が発動しなくなる (安全側)
+ため実害は無いが、気づかないまま `automerge-without-codex` に頼る運用が
+続くと不便なので、上限到達が疑われる PR が長期間ブロックされたままに
+なっていないかは折に触れて確認するとよい。(7) **決定10 (Claude
+フォールバック) を実際に機能させるには、このリポジトリに `@claude` に
+応答する GitHub App/Actions workflow (`claude-code-action` 等) を導入
+する必要があるかもしれない。** これは本 PR のスコープ外。導入する場合は
+実際の応答者のログイン名を確認したうえで `env.CLAUDE_REVIEWER_LOGINS`
+に設定すること (ハードコードされた既定値は無い — 決定10参照)。導入
+しない場合、「Codex が利用上限に達し、かつ PR が一度もレビューされて
+いない」状態は `automerge-without-codex` ラベルを付けるまで止まり続ける
+仕様であることを、運用開始後に一度確認しておくとよい (PR #193 で実際に
+発生した状態)。(8) **決定11の `AUTO_MERGE_TOKEN` 専用化が実際に Claude
+App の反応を引き出せるかは、この PR の範囲では検証できていない**
+(`AUTO_MERGE_TOKEN` シークレット自体がこのセッションから登録・確認
+できないため)。`AUTO_MERGE_TOKEN` が実際に登録されている環境で、
+Claude フォールバックが発動した最初のケースにおいて、投稿された
+`@claude` メンションに実際に反応があったかを確認すること。反応が無い
+場合、PAT を使っても反応しない別の要因 (トークンの権限スコープ、
+Claude App 側のインストール範囲など) がある可能性があり、追加調査が
+必要になる。
