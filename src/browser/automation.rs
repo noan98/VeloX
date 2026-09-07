@@ -37,6 +37,13 @@
 //! mark              # mark the start of the measured phase (drops everything logged before it)
 //! navigate <url>    # navigate the active tab
 //! wait <ms>         # sleep before the next command (<= MAX_WAIT_MS)
+//! wait_load [timeout_ms]  # wait for the active tab's in-progress page load
+//!                   # to finish (Issue #169); returns immediately if it is
+//!                   # already not loading. Waits at most timeout_ms
+//!                   # (default DEFAULT_WAIT_LOAD_TIMEOUT_MS, capped at
+//!                   # MAX_WAIT_MS like `wait`) before giving up and moving
+//!                   # on — never hangs, but times out with a stderr
+//!                   # message naming what it was waiting for.
 //! quit              # exit the application
 //! ```
 //!
@@ -55,6 +62,17 @@ use crate::browser::navigation;
 /// indefinitely. 120 seconds comfortably covers the slowest scenario this
 /// issue generates (`tabs_50`, see [`generate_bench_script`]) with headroom.
 pub const MAX_WAIT_MS: u64 = 120_000;
+
+/// `wait_load`'s timeout when no `timeout_ms` argument is given (Issue
+/// #169). Generous relative to the actual cost this covers — even the
+/// "cold" case of waking a fresh `WebKitWebProcess` measures 14.6-16.1ms
+/// (docs/performance-targets.md §13) — so this is headroom against a slow
+/// CI runner, not a tuned-to-the-millisecond value: unlike the fixed
+/// `wait <ms>` this command replaces, a `wait_load` that resolves early
+/// (the common case) never actually sleeps this long, so a generous default
+/// costs nothing when things are healthy and only matters when something
+/// is actually stuck.
+pub const DEFAULT_WAIT_LOAD_TIMEOUT_MS: u64 = 10_000;
 
 /// One parsed automation command. Carries no line number itself —
 /// [`parse_script`] reports that separately via [`AutomationError`] — since
@@ -114,6 +132,17 @@ pub enum AutomationCommand {
     /// `wait <ms>` — sleep for `ms` milliseconds before the next command.
     /// Never exceeds [`MAX_WAIT_MS`] (enforced at parse time).
     Wait { ms: u64 },
+    /// `wait_load [timeout_ms]` (Issue #169) — wait for the active tab's
+    /// current page load to finish, instead of sleeping a fixed amount of
+    /// real time. Resolves immediately if the tab is not currently loading
+    /// (matching what a plain `wait <ms>` placed right after an `open`/
+    /// `navigate`/`switch` was really trying to express). Waits at most
+    /// `timeout_ms` — [`DEFAULT_WAIT_LOAD_TIMEOUT_MS`] when omitted, never
+    /// more than [`MAX_WAIT_MS`] (enforced at parse time, same cap as
+    /// `wait`) — before giving up; see `app::AutomationWaitState` for how
+    /// the wait itself is implemented without blocking the main event
+    /// loop.
+    WaitLoad { timeout_ms: u64 },
     /// `quit` — exit the application.
     Quit,
 }
@@ -201,6 +230,9 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
         "wait" => Ok(AutomationCommand::Wait {
             ms: parse_wait(line, rest)?,
         }),
+        "wait_load" => Ok(AutomationCommand::WaitLoad {
+            timeout_ms: parse_wait_load(line, rest)?,
+        }),
         "mark" => {
             if rest.is_empty() {
                 Ok(AutomationCommand::Mark)
@@ -254,6 +286,30 @@ fn parse_wait(line: usize, rest: &str) -> Result<u64, AutomationError> {
         return Err(err(
             line,
             format!("wait は最大 {MAX_WAIT_MS}ms までです (指定値: {ms}ms)"),
+        ));
+    }
+    Ok(ms)
+}
+
+/// `wait_load`'s argument is optional, unlike `wait`'s — an empty `rest`
+/// means "use [`DEFAULT_WAIT_LOAD_TIMEOUT_MS`]", not an error. When given,
+/// it is validated exactly like `wait`'s `ms` (non-negative integer,
+/// `<= MAX_WAIT_MS`), sharing the same cap so a script cannot use
+/// `wait_load` to sidestep the ceiling `wait` is bound by.
+fn parse_wait_load(line: usize, rest: &str) -> Result<u64, AutomationError> {
+    if rest.is_empty() {
+        return Ok(DEFAULT_WAIT_LOAD_TIMEOUT_MS);
+    }
+    let ms: u64 = rest.parse().map_err(|_| {
+        err(
+            line,
+            format!("wait_load の timeout_ms は非負整数で指定してください: {rest:?}"),
+        )
+    })?;
+    if ms > MAX_WAIT_MS {
+        return Err(err(
+            line,
+            format!("wait_load は最大 {MAX_WAIT_MS}ms までです (指定値: {ms}ms)"),
         ));
     }
     Ok(ms)
@@ -597,6 +653,7 @@ mod tests {
             suspend 0\n\
             navigate https://example.com/other\n\
             wait 500\n\
+            wait_load 3000\n\
             quit\n";
         let commands = parse_script(script).unwrap();
         assert_eq!(
@@ -612,6 +669,7 @@ mod tests {
                     url: "https://example.com/other".to_owned()
                 },
                 AutomationCommand::Wait { ms: 500 },
+                AutomationCommand::WaitLoad { timeout_ms: 3000 },
                 AutomationCommand::Quit,
             ]
         );
@@ -918,6 +976,59 @@ mod tests {
     fn wait_exactly_at_the_cap_is_accepted() {
         let commands = parse_script(&format!("wait {MAX_WAIT_MS}\n")).unwrap();
         assert_eq!(commands, vec![AutomationCommand::Wait { ms: MAX_WAIT_MS }]);
+    }
+
+    // -- wait_load (Issue #169) -------------------------------------------
+
+    #[test]
+    fn wait_load_without_an_argument_uses_the_default_timeout() {
+        let commands = parse_script("wait_load\n").unwrap();
+        assert_eq!(
+            commands,
+            vec![AutomationCommand::WaitLoad {
+                timeout_ms: DEFAULT_WAIT_LOAD_TIMEOUT_MS
+            }]
+        );
+    }
+
+    #[test]
+    fn wait_load_with_an_argument_uses_it() {
+        let commands = parse_script("wait_load 2500\n").unwrap();
+        assert_eq!(
+            commands,
+            vec![AutomationCommand::WaitLoad { timeout_ms: 2500 }]
+        );
+    }
+
+    #[test]
+    fn wait_load_with_a_non_numeric_argument_is_rejected() {
+        let err = parse_script("wait_load abc\n").unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains("wait_load"), "{}", err.message);
+    }
+
+    #[test]
+    fn wait_load_with_a_negative_argument_is_rejected() {
+        let err = parse_script("wait_load -1\n").unwrap_err();
+        assert_eq!(err.line, 1);
+    }
+
+    #[test]
+    fn wait_load_beyond_the_cap_is_rejected() {
+        let err = parse_script(&format!("wait_load {}\n", MAX_WAIT_MS + 1)).unwrap_err();
+        assert_eq!(err.line, 1);
+        assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
+    }
+
+    #[test]
+    fn wait_load_exactly_at_the_cap_is_accepted() {
+        let commands = parse_script(&format!("wait_load {MAX_WAIT_MS}\n")).unwrap();
+        assert_eq!(
+            commands,
+            vec![AutomationCommand::WaitLoad {
+                timeout_ms: MAX_WAIT_MS
+            }]
+        );
     }
 
     #[test]

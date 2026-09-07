@@ -12,11 +12,34 @@
 //! **Driving mechanism**: `VELOX_AUTOMATION_SCRIPT` (Issue #112,
 //! docs/decisions.md D44) — the file-driven automation hook `velox-bench`
 //! already uses. These tests write their own small scripts in the
-//! documented `open`/`switch`/`close`/`navigate`/`wait`/`quit` format and
-//! hand them to `velox` the exact same way. No new control channel is
-//! introduced — see D44 for why a listening socket/RPC server was
-//! deliberately rejected as VeloX's automation mechanism, and D47 for why
-//! these tests reuse it rather than inventing a second one.
+//! documented `open`/`switch`/`close`/`navigate`/`wait`/`wait_load`/`quit`
+//! format and hand them to `velox` the exact same way. No new control
+//! channel is introduced — see D44 for why a listening socket/RPC server
+//! was deliberately rejected as VeloX's automation mechanism, and D47 for
+//! why these tests reuse it rather than inventing a second one.
+//!
+//! **`wait_load`, not a fixed `wait <ms>`, for "let the page finish
+//! loading" (Issue #169, D84)**: every `wait <ms>` below that used to stand
+//! in for "the page/tab this script just told VeloX to load has finished
+//! loading" now uses `wait_load` instead — it blocks until the active
+//! tab's `LoadFinished` actually arrives (or returns at once if it already
+//! has), rather than sleeping a fixed guess at how long that might take.
+//! Three of these fixed waits went red on a CI runner before this existed
+//! (`visiting_pages_persists_history_json`,
+//! `restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch`,
+//! `repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load`
+//! — see each test's own comment for that history) because a slower
+//! runner's load simply did not finish inside whatever margin the constant
+//! happened to encode; `wait_load` removes that margin as a variable
+//! entirely. A handful of waits are deliberately left as plain `wait <ms>`
+//! — either because they are not about a page load at all (settling after
+//! a `close`/`suspend`), or because what they wait for is broader than one
+//! tab's `LoadFinished`, which is all `wait_load` promises: two `navigate`s
+//! that trigger a file download rather than a normal page load (see
+//! `downloads_with_several_tabs_open_are_handled_exactly_once`'s own
+//! comment) and the very first wait of all, which also needs the toolbar
+//! webview's independent `ready` handshake (see
+//! `startup_completes_and_records_a_startup_event`'s own comment).
 //!
 //! **Preflight / skipping**: every test starts by calling
 //! `skip_without_gui!()`, which checks the real process environment
@@ -298,8 +321,22 @@ fn startup_completes_and_records_a_startup_event() {
     let perf_output = dir.join("perf.jsonl");
     let data_dir = dir.join("data");
     let homepage = fixture_url("minimal.html");
-    // Enough time for the first (tiny, local) page load to finish before
-    // asking the process to quit.
+    // Deliberately *not* `wait_load` here (unlike almost everywhere else in
+    // this file — see the module doc comment): this test's assertion needs
+    // the `startup` perf record, which `mark_startup` only writes once
+    // *every* checkpoint has landed — the content tab's `LoadFinished`
+    // *and* the toolbar webview's own `ready` handshake
+    // (`ToolbarCommand::Ready`, a separate webview `wait_load` knows
+    // nothing about). Converting this to `wait_load` was tried while
+    // verifying this issue's changes and intermittently failed the
+    // assertion below under the same kind of load the rest of this file's
+    // conversions were fixing — not because `wait_load` misbehaved, but
+    // because it faithfully returns the moment the *page* is done, which
+    // can be before the toolbar's independent JS init finishes on a loaded
+    // runner. That is a real, pre-existing race in `mark_startup`, outside
+    // this primitive's scope (Issue #169 only ever promised to wait for a
+    // page load) — left as `wait <ms>` on purpose rather than papered over
+    // with a bigger timeout.
     let script_path = write_script(&dir, "wait 1500\nquit\n");
 
     let launch = launch_and_wait(
@@ -372,15 +409,15 @@ fn tab_operations_produce_expected_tab_create_and_tab_switch_records() {
     // tab once more -> close 2 drops `b`.
     let script = format!(
         "open {page_a}\n\
-         wait 400\n\
+         wait_load\n\
          open {page_b}\n\
-         wait 400\n\
+         wait_load\n\
          switch 0\n\
-         wait 300\n\
+         wait_load\n\
          switch 1\n\
-         wait 300\n\
+         wait_load\n\
          switch 2\n\
-         wait 300\n\
+         wait_load\n\
          close 2\n\
          wait 300\n\
          quit\n"
@@ -466,43 +503,37 @@ fn repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load() {
     // `scripts/bench/tab_churn.py`'s round shape at a scale a unit-test
     // timeout can afford.
     //
-    // The per-round waits started at 300ms/150ms and went red on a CI
-    // runner (only 4 of the expected 7 `page_load` records arrived) while
-    // passing locally. Opening a tab has to spawn a fresh
-    // `WebKitWebProcess`, and #60/D57 measured that spawn as the dominant
-    // cost of tab work (docs/performance-targets.md §13), so 300ms was far
-    // too little for the load to finish and be recorded before `close 1`
-    // ran. `AutomationCommand` has no "wait until the load completes"
-    // primitive, only a wall-clock `wait <ms>`, so the margin is the only
-    // lever — the same lever, for the same reason, as
+    // A fixed `wait <ms>` here (300ms/150ms originally, then 1500ms — see
+    // git history) went red on a CI runner (only 4 of the expected 7
+    // `page_load` records arrived) while passing locally: opening a tab has
+    // to spawn a fresh `WebKitWebProcess`, and #60/D57 measured that spawn
+    // as the dominant cost of tab work (docs/performance-targets.md §13),
+    // so no fixed margin was ever really safe against a slow enough
+    // runner — only a bigger one, which is not a fix, only a smaller
+    // chance of failing (the same lever, for the same reason, as
     // `visiting_pages_persists_history_json` (b303a78) and
-    // `restoring_the_previous_session_...` (PR #164). Raised to that
-    // test's 1500ms rather than lowered to a value that merely happens to
-    // pass: this test asserts *that every round's load is recorded*, and a
-    // timing constant must never decide whether the assertion is reached.
+    // `restoring_the_previous_session_...` (PR #164)). `wait_load` (Issue
+    // #169, D84) replaces the margin entirely: it blocks on the actual
+    // `LoadFinished` for the tab `open` just created instead of guessing
+    // how long that takes.
     const ROUNDS: usize = 6;
     let mut script = String::new();
     for _ in 0..ROUNDS {
-        script.push_str(&format!("open {page}\nwait 1500\nclose 1\nwait 300\n"));
+        script.push_str(&format!("open {page}\nwait_load\nclose 1\nwait 300\n"));
     }
     script.push_str("quit\n");
     let script_path = write_script(&dir, &script);
 
-    // The script itself now sleeps ~10.8s (6 rounds x 1800ms), so the old
-    // 30s budget left little room on top of it for a loaded runner's
-    // startup and teardown. 60s keeps the same intent — "velox exits on
-    // its own, it did not hang" — without the budget itself becoming the
-    // thing that fails.
     let launch = launch_and_wait(
         &perf_output,
         &data_dir,
         &homepage,
         &script_path,
-        Duration::from_secs(60),
+        Duration::from_secs(30),
     );
     let Some(status) = launch.exit_status else {
         panic!(
-            "velox did not exit on its own within 60s while running {ROUNDS} tab open/close \
+            "velox did not exit on its own within 30s while running {ROUNDS} tab open/close \
              cycles. Perf records observed before the forced kill: {:?}",
             launch.perf_records
         );
@@ -569,13 +600,13 @@ fn new_window_retargets_automation_and_shuts_down_cleanly() {
     // again and is still open when `quit` runs.
     let script = format!(
         "new_window\n\
-         wait 500\n\
+         wait_load\n\
          open {page_a}\n\
-         wait 400\n\
+         wait_load\n\
          switch 0\n\
-         wait 300\n\
+         wait_load\n\
          switch 1\n\
-         wait 300\n\
+         wait_load\n\
          quit\n"
     );
     let script_path = write_script(&dir, &script);
@@ -663,17 +694,16 @@ fn visiting_pages_persists_history_json() {
     // navigating away, so both visits land as separate history entries in
     // a deterministic order.
     //
-    // The second wait was 700ms and went red on a CI runner while this test
-    // still passed locally: only `minimal.html` reached history.json, so the
-    // navigation to `text.html` had not finished loading (and been recorded
-    // by the `LoadFinished` handler) before `quit` ran. `AutomationCommand`
-    // has no "wait until the load completes" primitive — only a wall-clock
-    // `wait <ms>` — so the only lever here is the margin, and 700ms left too
-    // little of it for a loaded runner. Raised to match the first wait
-    // rather than reduced to a value that merely happens to pass: this test
-    // asserts *what* lands in history.json, and its timing constants should
-    // never be the thing that decides whether the assertion is reached.
-    let script = format!("wait 1000\nnavigate {second_page}\nwait 1500\nquit\n");
+    // This is the test that motivated Issue #169/D84's `wait_load`: with a
+    // fixed `wait 700` here, this went red on a CI runner while passing
+    // locally — only `minimal.html` reached history.json, because the
+    // navigation to `text.html` had not finished loading (and been
+    // recorded by the `LoadFinished` handler) before `quit` ran. Raising
+    // the constant (as this test used to) only ever narrows the odds of
+    // that happening again on a slower runner, it does not remove them;
+    // `wait_load` blocks on the actual `LoadFinished` instead, so there is
+    // no margin left to be too small.
+    let script = format!("wait_load\nnavigate {second_page}\nwait_load\nquit\n");
     let script_path = write_script(&dir, &script);
 
     let launch = launch_and_wait(
@@ -762,13 +792,13 @@ fn a_private_windows_page_visit_never_reaches_history_json() {
     // opened private by `new_private_window`, then navigates to
     // `private_page` — that visit must never appear.
     let script = format!(
-        "wait 1000\n\
+        "wait_load\n\
          navigate {normal_page}\n\
-         wait 700\n\
+         wait_load\n\
          new_private_window\n\
-         wait 500\n\
+         wait_load\n\
          navigate {private_page}\n\
-         wait 700\n\
+         wait_load\n\
          quit\n"
     );
     let script_path = write_script(&dir, &script);
@@ -862,10 +892,21 @@ fn downloads_with_several_tabs_open_are_handled_exactly_once() {
     // the same download twice from the active tab, with a detour through
     // `minimal.html` in between so the second `navigate` is a real
     // navigation and not a same-URL no-op.
+    //
+    // The two `open`s and the middle `navigate {homepage}` load an actual
+    // page, so those waits use `wait_load` (Issue #169/D84) like everywhere
+    // else in this file. The two `navigate {download_page}` waits stay a
+    // fixed `wait <ms>`, deliberately: that navigation gets intercepted by
+    // `with_download_started_handler` (D28) and diverted into a download
+    // rather than rendered, and whether WebKitGTK still fires this tab's
+    // ordinary `LoadFinished` for a navigation resolved that way is not
+    // something this change verified — `wait_load` blocking on an event
+    // that might never come is exactly the kind of hang Issue #169 exists
+    // to prevent, not reintroduce, so this pair is left as-is on purpose.
     let script = format!(
-        "open {homepage}\nwait 1000\nopen {homepage}\nwait 1000\n\
+        "open {homepage}\nwait_load\nopen {homepage}\nwait_load\n\
          navigate {download_page}\nwait 2500\n\
-         navigate {homepage}\nwait 700\n\
+         navigate {homepage}\nwait_load\n\
          navigate {download_page}\nwait 2500\nquit\n"
     );
     let script_path = write_script(&dir, &script);
@@ -1044,16 +1085,16 @@ fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     //                          now 3 live again -> `a` (idle longest of the
     //                          background tabs) is suspended.
     let script = format!(
-        "wait 800\n\
+        "wait_load\n\
          open {page_a}\n\
-         wait 600\n\
+         wait_load\n\
          open {page_b}\n\
-         wait 800\n\
+         wait_load\n\
          suspend 2\n\
          suspend 0\n\
          wait 200\n\
          switch 0\n\
-         wait 1200\n\
+         wait_load\n\
          quit\n"
     );
     let script_path = write_script(&dir, &script);
@@ -1208,7 +1249,7 @@ fn restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch() {
     // --- Launch 1: open a second tab, then quit — no `restore` setting
     //     needed here (there is nothing to restore from yet). ---
     let perf_output_1 = dir.join("perf1.jsonl");
-    let script_1 = format!("wait 800\nopen {page_a}\nwait 600\nquit\n");
+    let script_1 = format!("wait_load\nopen {page_a}\nwait_load\nquit\n");
     let script_path_1 = write_script(&dir, &script_1);
     let launch_1 = launch_and_wait(
         &perf_output_1,
@@ -1250,23 +1291,19 @@ fn restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch() {
     // `switch 0` targets the restored `home` tab, which must start
     // suspended for this to exercise a resume rather than a plain switch.
     //
-    // The wait *after* `switch 0` was 800ms and went red on a CI runner
-    // while this test still passed locally: `tab_resume` was recorded
-    // (ts=1370.6, duration=231.4ms) but no `page_load` for `home` followed
-    // it before `quit` ran. Resuming a suspended tab has to spawn a fresh
-    // `WebKitWebProcess`, and #60/D57 measured exactly that spawn as the
-    // dominant cost of tab work (docs/performance-targets.md §13) — the
-    // 231.4ms `tab_resume` only covers the Rust-side transition, not the
-    // load that follows it. `AutomationCommand` has no "wait until the
-    // load completes" primitive, only a wall-clock `wait <ms>`, so the
-    // margin is the only lever, and 800ms left too little of it.
-    //
-    // Raised rather than lowered to a value that merely happens to pass,
-    // for the same reason as `visiting_pages_persists_history_json` above
-    // (b303a78): this test asserts *that a resume reloads the tab's own
-    // URL*, and a timing constant must never be the thing that decides
-    // whether the assertion is reached.
-    let script_2 = "wait 800\nswitch 0\nwait 2000\nquit\n";
+    // The wait *after* `switch 0` used to be a fixed `wait 800` and went
+    // red on a CI runner while this test still passed locally: `tab_resume`
+    // was recorded (ts=1370.6, duration=231.4ms) but no `page_load` for
+    // `home` followed it before `quit` ran. Resuming a suspended tab has to
+    // spawn a fresh `WebKitWebProcess`, and #60/D57 measured exactly that
+    // spawn as the dominant cost of tab work (docs/performance-targets.md
+    // §13) — the 231.4ms `tab_resume` only covers the Rust-side
+    // transition, not the load that follows it. This is the second of the
+    // two regressions that motivated Issue #169/D84's `wait_load`: it
+    // blocks on the resumed tab's actual `LoadFinished` instead of a fixed
+    // margin, so there is no constant left to be too small on a slower
+    // runner.
+    let script_2 = "wait_load\nswitch 0\nwait_load\nquit\n";
     let script_path_2 = write_script(&dir, script_2);
     // `write_script` always writes to the same `script.txt` inside `dir`;
     // launch 1 already consumed its own copy, so this just overwrites it
@@ -1347,12 +1384,12 @@ fn mark_excludes_warm_up_tabs_from_the_aggregated_metrics() {
 
     // Three tabs opened as warm-up, then the marker, then two more.
     let script = format!(
-        "open {page}\nwait 400\n\
-         open {page}\nwait 400\n\
-         open {page}\nwait 400\n\
+        "open {page}\nwait_load\n\
+         open {page}\nwait_load\n\
+         open {page}\nwait_load\n\
          mark\n\
-         open {page}\nwait 400\n\
-         open {page}\nwait 400\n\
+         open {page}\nwait_load\n\
+         open {page}\nwait_load\n\
          quit\n"
     );
     let script_path = write_script(&dir, &script);
