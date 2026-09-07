@@ -218,9 +218,14 @@ jobs:
             if [ "$has_codex_bypass" = "true" ]; then
               echo "  '${CODEX_BYPASS_LABEL}' ラベルあり: Codex レビュー要件のみ免除 (未解決スレッド/CHANGES_REQUESTED は免除されません)"
             fi
+            # 第4引数 "true": Codex がこの head SHA をまだレビューして
+            # いなければ実際に `@codex review` を自動投稿する (pull-requests:
+            # write が要る。この job のみが実際に投稿する — dry-run job は
+            # 読み取り専用のまま「投稿する判定になった」ことをログに出す
+            # だけ)。
             review_gate_output=""
             review_gate_rc=0
-            review_gate_output=$(bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$has_codex_bypass") \
+            review_gate_output=$(bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$has_codex_bypass" "true") \
               || review_gate_rc=$?
             if [ -n "$review_gate_output" ]; then
               echo "$review_gate_output" | sed 's/^/  /'
@@ -334,7 +339,11 @@ jobs:
             echo "  '${CODEX_BYPASS_LABEL}' ラベルあり: Codex レビュー要件のみ免除"
           fi
           rc=0
-          bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$codex_bypass" | sed 's/^/  /' || rc=$?
+          # 第4引数 "false": このジョブは読み取り専用 (permissions に
+          # pull-requests: write が無い) なので、Codex 未レビューを検知
+          # しても実際には `@codex review` を投稿しない (投稿する判定に
+          # なったことだけがログに出る)。
+          bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$codex_bypass" "false" | sed 's/^/  /' || rc=$?
           if [ "$rc" -eq 0 ]; then
             echo "判定結果: マージ可 (レビュー起因のブロック要因なし)"
           elif [ "$rc" -eq 1 ]; then

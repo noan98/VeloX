@@ -10824,6 +10824,32 @@ check-run を登録しないため、auto-merge からは「レビューが存�
 制限 (1 時間 1 レビュー、行単位の指摘を出さず要約のみ) により実質機能して
 おらず、**リポジトリへのアクセスも除外済み**のため判定に含めない。
 
+> ⚠️⚠️ **この仕組みを将来触る人が最初に知るべき、Codex についての2つの
+> 前提** (2026-09-07、PR #192 自身の運用で判明。決定9で対応):
+>
+> 1. **Codex は push では再レビューしない。** Codex 自身の説明文
+>    (“Reviews are triggered when you open a pull request for review /
+>    mark a draft as ready / comment `@codex review`.”) のとおり、
+>    **push はレビューのトリガーに含まれていない。** 実際に PR #190
+>    (Codex がレビューした commit `9bb0dd7551` の後に push `f97b8d9`)
+>    、PR #192 自身 (Codex がレビューした commit `f34617bbdc` の後に
+>    push `12fb45e`→`3dabf31`、5分以上経過) のいずれでも、push 後の
+>    再レビューは一度も観測されなかった。**「指摘に対応して push しただけ」
+>    では Codex の head SHA レビュー要件は永久に満たされない**
+>    (実際にこの PR 自身が、自分が実装した判定によって一時的にマージ
+>    不能になった)。
+> 2. **Codex には利用上限がある。** `@codex review` とコメントすれば
+>    再レビューを手動で起動できるが、上限に達すると Codex は
+>    “You have reached your Codex usage limits for code reviews.”
+>    (実測: PR #192 で `@codex review` をコメントした際に返された) を
+>    返し、それ以上レビューしない。CodeRabbit を判定から除外した理由
+>    (Free プランの制限で実質機能しない) と同種の制約が Codex にもある。
+>
+> この2つを踏まえ、決定9で「未レビューを検知したら `@codex review` を
+> 自動投稿する (同じ head SHA には1回だけ)」「利用上限到達を検知したら
+> 要件を緩和する (ただし一度もレビューされていない PR は緩和しない)」
+> を実装した。
+
 ### 決定
 
 1. **判定ロジックは `.github/scripts/check_review_gate.py` に切り出し、
@@ -11075,33 +11101,108 @@ check-run を登録しないため、auto-merge からは「レビューが存�
    抜けて 404 になった際にエラーメッセージだけでは原因が分からなかった
    教訓を踏まえた (`review_gate_decision.sh` 内のコメント参照)。
 
+9. **PR #192 自身の運用で判明した「Codex は push で再レビューしない」
+   「Codex には利用上限がある」の2点に対応した (上の ⚠️⚠️ 参照)。**
+   ユーザの決定に基づき、「通常は厳格に必須。ただし Codex が『利用上限』
+   を返した場合に限り、自動で緩める」という方針で実装した。
+
+   - **`@codex review` の自動リクエスト (1 head SHA につき1回のみ)。**
+     条件3の a/b/c いずれのシグナルにも一致しない場合、
+     `pullRequest.comments` (直近100件、GraphQL) を走査し、現在の
+     head SHA を埋め込んだマーカー
+     (`<!-- auto-merge:codex-review-request:<head SHA> -->`) を含む
+     コメントが既に存在するかを調べる。**無ければ**
+     `codex_review_request_needed=True` を返し、`auto-merge` job
+     (`pull-requests: write` を持つ本番 job のみ) が実際に
+     `@codex review` + マーカーをコメント投稿する
+     (`codex_review_request_comment_body()` に本文組み立てを一元化し、
+     bash 側で文字列を再構築しない)。**マーカーは head SHA 固有**なので、
+     新しい push で head SHA が変われば別のマーカーとして扱われ、
+     自動的に「1 push につき1回」の再リクエストが起こる (恒久的な
+     バイパスにはならない)。`dry-run-review-gate` job は
+     `pull-requests: write` を持たない (決定6) ため、投稿する判定に
+     なったことをログに出すだけで実際には投稿しない
+     (`allow_codex_request_post` 引数で制御。本番 job のみ `true`)。
+   - **利用上限到達時の緩和は「1. 依頼コメントが存在し、2. その依頼
+     コメントより後に Codex 本人 (完全一致で照合) が利用上限メッセージ
+     (`"reached your codex usage limits"` を含む、大小無視の部分一致)
+     を投稿している」の両方を満たす場合に限る。** 「依頼コメントより
+     後」を要求するのは、過去の別のリクエストに対する古い上限メッセージ
+     を使い回させないため。緩和が発動すると、条件3を「この PR の
+     `latestReviews` にレビュアーが Codex であるエントリが1件でもあれば
+     良い (head SHA と一致しなくてよい)」に変える。**この PR が一度も
+     Codex にレビューされていない場合は緩和しない** (未レビューのまま
+     通してしまうため) — `evaluate_review_gate()` は
+     `any_codex_review` が空なら緩和せず通常どおりブロックする。
+   - **未解決スレッド判定 (条件1) と `CHANGES_REQUESTED` 判定 (条件2)
+     は、条件3の緩和と完全に独立している。** 実装上、緩和は条件3の
+     ブロック理由を追加しないだけであり、条件1/2は常にそれぞれ独立して
+     評価される。そのため「利用上限到達 + 未解決スレッドあり」では
+     全体としては引き続きブロックされる (`test_usage_limit_but_
+     unresolved_thread_still_blocks`)。
+   - **緩和が発動したら `::warning::` で必ず目立たせる。** 黙って
+     緩めない、というユーザの明示的な指示どおり、`codex_relaxed`/
+     `codex_relaxed_detail` を `evaluate_review_gate()` の戻り値に含め、
+     `review_gate_decision.sh` が `blocked` の値に関わらず (relaxed した
+     結果ブロックされていなくても) `::warning::PR #<番号>: <detail>` を
+     必ず出力する。
+   - **上限メッセージの検出は文字列マッチであり、Codex 側の文言が変われば
+     検出できなくなる。** その場合は緩和が発動せず「厳格なまま待ち続ける」
+     = 安全側に倒れる (誤ってマージされる方向には壊れない)。この限界は
+     意図的に許容した — 検出精度を上げるための公式 API 等は Codex 側に
+     存在しないため。
+   - **`pr_comments` (GraphQL 呼び出し) が取得できなかった場合は、
+     リクエストも緩和も行わず安全側でブロックする。** 「取得できな
+     かったのでリクエスト不要とみなす」は、重複リクエストを防ぐための
+     判定が信頼できないまま投稿しない/しないでおく、という意味で安全側
+     の選択。
+   - **テスト**: `test_check_review_gate.py` の
+     `CodexUsageLimitAndAutoRequestTest` (11件) で、リクエスト要否判定・
+     重複防止・緩和条件 (別 commit でのレビューあり/未解決スレッドあり/
+     一度もレビューなし/上限メッセージの投稿者が Codex 以外/上限
+     メッセージが依頼コメントより前) を網羅した。この機能はこの PR で
+     新規追加したものであり、旧実装 (`codex_review_request_needed`/
+     `codex_relaxed` キーを持たない `evaluate_review_gate`) に対しては
+     必ず `KeyError` で失敗するため、「修正前に失敗し修正後に通る」
+     テストという位置付けになる。
+
 ### 実装
 
 - `.github/scripts/check_review_gate.py` — 判定ロジック本体
   (`evaluate_review_gate()`)。GitHub API のレスポンス形をそのまま引数に
   取るため、GraphQL 呼び出しをモックせずに単体テストできる。
-- `.github/scripts/test_check_review_gate.py` — 41 件の `unittest`。
+  `codex_review_request_comment_body()` に `@codex review` 自動投稿の
+  コメント本文組み立てを一元化 (bash 側で文字列を再構築しない)。
+- `.github/scripts/test_check_review_gate.py` — 85 件の `unittest`。
   PR #185 の実タイムライン (未解決スレッド + 猶予期間でブロック、Codex
   自体は head SHA をレビュー済みなのでブロック理由には含まれない) を
   再現する回帰テストも含む。
 - `.github/scripts/review_gate_decision.sh` — GraphQL/REST 呼び出し
-  (`gh api graphql`/`gh api repos/.../commits/...`) → JSON 整形 →
-  `check_review_gate.py` 呼び出し、という薄い shell ラッパー。
-  `auto-merge` job (本番) と `dry-run-review-gate` job (検証) の両方から
-  同じスクリプトを呼ぶ (ロジックの二重管理を避ける)。終了コード
-  0=マージ可 / 1=ブロック理由あり / 2=API 呼び出し自体が失敗、を返す。
+  (`gh api graphql`/`gh api repos/.../commits/...`/`gh pr comment`) →
+  JSON 整形 → `check_review_gate.py` 呼び出し、という薄い shell
+  ラッパー。`auto-merge` job (本番、`allow_codex_request_post=true`) と
+  `dry-run-review-gate` job (検証、同 `false`) の両方から同じスクリプト
+  を呼ぶ (ロジックの二重管理を避ける)。終了コード 0=マージ可 /
+  1=ブロック理由あり / 2=API 呼び出し自体が失敗、を返す。
 - `.github/workflows/auto-merge.yml` — 上記を呼び出す形に変更。
 
 ### 動作確認
 
-`check_review_gate.py`/`test_check_review_gate.py` は 41 件の `unittest`
+`check_review_gate.py`/`test_check_review_gate.py` は 85 件の `unittest`
 全件 pass を確認した (`python3 -m unittest test_check_review_gate -v`)。
+内訳: 条件1〜4の基本ケース (28件)、Codex 必須判定の基本シグナル a/b/c
+(17件)、決定7 P1/P2 の回帰テスト (8件)、決定9 の `@codex review` 自動
+リクエスト・利用上限緩和 (11件)、複数理由・PR #185 回帰など (21件)。
+
 `review_gate_decision.sh` は `gh` コマンドをスタブに差し替えたローカル
 統合テストで、(a) Codex が head SHA を正しくレビュー済みのケース (exit 0)、
 (b) Codex のレビューが無いケース (exit 1、bypass ラベル無し) と
 `automerge-without-codex` 相当の第3引数で免除されるケース (exit 0)、
 (c) GraphQL 呼び出し自体が失敗するケース (exit 2、`::warning::` に生の
-エラーを含む) の3系統を確認した。
+エラーを含む)、(d) `@codex review` 未投稿時に実際に `gh pr comment` を
+呼ぶケース (`allow_codex_request_post=true`) とログのみに留めるケース
+(同 `false`、dry-run 相当)、(e) 利用上限到達を検知して緩和が発動し
+`::warning::` を出しつつ `exit 0` になるケース、の5系統を確認した。
 
 **`dry-run-review-gate` job は、PR #192 (この Issue の実装 PR 自身、
 `.github/workflows/auto-merge.yml` を変更している) 上で GitHub Actions
@@ -11136,4 +11237,15 @@ GitHub Actions 上で正しく起動・完走したかを確認する — 最初
 遅延する制約 (決定5) が実運用で問題になった場合は、
 `pull_request_review`/`pull_request_review_thread` トリガの追加を
 再検討する。(4) 将来コラボレータが増えてブランチ内 PR の信頼性前提が
-崩れる場合、dry-run job の残余リスク (決定6) を再評価する。
+崩れる場合、dry-run job の残余リスク (決定6) を再評価する。(5) 決定9
+(`@codex review` 自動リクエスト・利用上限緩和) は本番の `auto-merge` job
+がまだ実地で走っていないため、**実際に GitHub Actions 上でコメントが
+投稿されるか・重複投稿を防げているか・緩和が想定どおり発動するかは
+未検証。** この PR がマージされた後、最初に「Codex 未レビューで自動
+リクエストが必要になった PR」が現れた際に、コメントが正しく1回だけ
+投稿されるか (同じ head SHA への push が続いても再投稿されないか) を
+確認すること。(6) 上限メッセージの文言検出は文字列マッチであり脆い
+(決定9)。Codex 側の文言が変わった場合は緩和が発動しなくなる (安全側)
+ため実害は無いが、気づかないまま `automerge-without-codex` に頼る運用が
+続くと不便なので、上限到達が疑われる PR が長期間ブロックされたままに
+なっていないかは折に触れて確認するとよい。

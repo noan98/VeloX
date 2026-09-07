@@ -6,7 +6,7 @@
 または (このディレクトリから):
     python3 -m unittest test_check_review_gate -v
 
-Issue #188 の完了条件・PR #185 / #189 / #191 の実例をそのまま網羅する。
+Issue #188 の完了条件・PR #185 / #189 / #191 / #192 の実例をそのまま網羅する。
 
 テスト方針: 「未解決スレッド」「CHANGES_REQUESTED」「猶予期間」の3条件を
 検証するテストクラスは `codex_bypass=True` を既定にして Codex 必須判定を
@@ -17,7 +17,13 @@ Issue #188 の完了条件・PR #185 / #189 / #191 の実例をそのまま網�
 指摘 (PR #192、docs/decisions.md D91) を受けて追加した回帰テスト:
 Codex ログイン判定の前方一致 (別名アカウントによるなりすまし) と、猶予期間
 /シグナルcの基準時刻に committer date を使う設計 (attacker が操作可能な
-タイムスタンプ) の2件の脆弱性を防ぐ。
+タイムスタンプ) の2件の脆弱性を防ぐ。`CodexUsageLimitAndAutoRequestTest`
+は同じく PR #192 の運用で判明した2つの前提 (Codex は push では再レビュー
+しない/Codex には利用上限がある) への対応 (`@codex review` の自動リクエスト
+と、利用上限到達時の緩和) を検証する — この機能自体が新規追加のため、
+旧実装 (この機能を持たない `evaluate_review_gate`) に対しては
+`codex_review_request_needed`/`codex_relaxed` キーが無く `KeyError` で
+必ず失敗する、という意味で「修正前に失敗し修正後に通る」テスト群になる。
 """
 
 from __future__ import annotations
@@ -36,6 +42,7 @@ _CODEX_LOGIN = "chatgpt-codex-connector[bot]"
 _EMPTY_THREADS = {"pageInfo": {"hasNextPage": False}, "nodes": []}
 _EMPTY_REVIEWS = {"pageInfo": {"hasNextPage": False}, "nodes": []}
 _EMPTY_REACTIONS = {"pageInfo": {"hasNextPage": False}, "nodes": []}
+_EMPTY_PR_COMMENTS = {"nodes": []}
 
 
 def _evaluate(
@@ -47,6 +54,7 @@ def _evaluate(
     reactions=_EMPTY_REACTIONS,
     head_sha=_HEAD_SHA,
     codex_bypass=True,
+    pr_comments=_EMPTY_PR_COMMENTS,
 ):
     """条件1/2/4 (Codex 非依存の条件) を検証するための既定ヘルパー。
 
@@ -62,6 +70,7 @@ def _evaluate(
         reactions=reactions,
         head_sha=head_sha,
         codex_bypass=codex_bypass,
+        pr_comments=pr_comments,
     )
 
 
@@ -313,9 +322,11 @@ class CodexReviewRequiredTest(unittest.TestCase):
         return {"pageInfo": {"hasNextPage": False}, "nodes": [node]}
 
     def test_no_codex_review_at_all_blocked(self) -> None:
+        # pr_comments が空 (まだ @codex review をリクエストしていない) ため
+        # 「自動リクエストする」判定になる (docs/decisions.md D91)。
         result = _evaluate(reviews=_EMPTY_REVIEWS, codex_bypass=False)
         self.assertTrue(result["blocked"])
-        self.assertIn("Codex のレビュー待ち", result["reasons"][0])
+        self.assertTrue(result["codex_review_request_needed"])
         self.assertIn(_HEAD_SHA[:7], result["reasons"][0])
 
     def test_codex_review_matches_head_sha_via_commit_oid_not_blocked(self) -> None:
@@ -325,12 +336,13 @@ class CodexReviewRequiredTest(unittest.TestCase):
 
     def test_codex_review_on_stale_commit_blocked(self) -> None:
         # PR #185 のケース: Codex がレビューしたのは古いコミットで、
-        # その後 push された新しい head SHA には未対応。
+        # その後 push された新しい head SHA には未対応。まだ自動リクエスト
+        # していないため、リクエストする判定になる。
         stale_sha = "0" * 40
         reviews = self._reviews_with_codex(commit={"oid": stale_sha})
         result = _evaluate(reviews=reviews, codex_bypass=False)
         self.assertTrue(result["blocked"])
-        self.assertIn("Codex のレビュー待ち", result["reasons"][0])
+        self.assertTrue(result["codex_review_request_needed"])
 
     def test_codex_review_matches_via_reviewed_commit_body_text(self) -> None:
         # commit.oid が (何らかの理由で) 欠けていても、本文の
@@ -475,6 +487,259 @@ class CodexReviewRequiredTest(unittest.TestCase):
         self.assertFalse(result["blocked"])
 
 
+class CodexUsageLimitAndAutoRequestTest(unittest.TestCase):
+    """PR #192 の運用で判明した2つの前提への対応 (docs/decisions.md D91):
+
+    1. Codex は push では再レビューしない (open/ready/`@codex review` の
+       コメントでしか起動しない) — 未レビューの head SHA を検知したら
+       `@codex review` を自動リクエストする (`codex_review_request_needed`)。
+       同じ head SHA には1回だけリクエストする (マーカーコメントで重複
+       防止)。
+    2. Codex には利用上限がある — 上限到達メッセージを検知した場合に限り、
+       「この PR のいずれかの commit を Codex がレビュー済み」に条件3を
+       緩和する (`codex_relaxed`)。ただし一度もレビューされていない PR は
+       緩和しない。未解決スレッド判定・CHANGES_REQUESTED 判定は独立した
+       条件のため、緩和の影響を受けない。
+    """
+
+    def _request_marker_comment(self, head_sha: str, created_at: str) -> dict:
+        return {
+            "author": {"login": "github-actions[bot]", "__typename": "Bot"},
+            "body": (
+                "@codex review\n\n"
+                f"<!-- auto-merge:codex-review-request:{head_sha} -->\n"
+            ),
+            "createdAt": created_at,
+        }
+
+    def _usage_limit_comment(
+        self, created_at: str, login: str = _CODEX_LOGIN, typename: str = "Bot"
+    ) -> dict:
+        return {
+            "author": {"login": login, "__typename": typename},
+            "body": (
+                "You have reached your Codex usage limits for code "
+                "reviews. You can see your limits in the Codex usage "
+                "dashboard."
+            ),
+            "createdAt": created_at,
+        }
+
+    def test_no_codex_review_yet_requests_review(self) -> None:
+        # head SHA に Codex レビューが無く、まだリクエストもしていない
+        # -> @codex review を投稿する判定になる。
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=_EMPTY_PR_COMMENTS,
+            codex_bypass=False,
+        )
+        self.assertTrue(result["blocked"])
+        self.assertTrue(result["codex_review_request_needed"])
+        self.assertFalse(result["codex_relaxed"])
+
+    def test_already_requested_for_this_head_sha_does_not_repost(self) -> None:
+        # 同じ head SHA に対して既にリクエスト済み (マーカーあり、上限
+        # メッセージはまだ無い) -> 再投稿しない (request_needed=False) が、
+        # 応答待ちとしてブロックは継続する。
+        pr_comments = {
+            "nodes": [
+                self._request_marker_comment(_HEAD_SHA, "2026-09-07T16:00:00Z")
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS, pr_comments=pr_comments, codex_bypass=False
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_review_request_needed"])
+        self.assertFalse(result["codex_relaxed"])
+        self.assertTrue(
+            any("自動リクエスト済み" in r for r in result["reasons"])
+        )
+
+    def test_usage_limit_with_other_commit_reviewed_and_no_unresolved_threads_relaxes(
+        self,
+    ) -> None:
+        # 上限メッセージあり + この PR の別 commit に Codex レビューあり +
+        # 未解決スレッド無し -> 緩和してマージ可。
+        pr_comments = {
+            "nodes": [
+                self._request_marker_comment(_HEAD_SHA, "2026-09-07T16:00:00Z"),
+                self._usage_limit_comment("2026-09-07T16:01:00Z"),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": "9" * 40},  # 現在の head SHA とは別
+                }
+            ],
+        }
+        result = _evaluate(
+            threads=_EMPTY_THREADS,
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+        )
+        self.assertFalse(result["blocked"])
+        self.assertTrue(result["codex_relaxed"])
+        self.assertIsNotNone(result["codex_relaxed_detail"])
+
+    def test_usage_limit_but_unresolved_thread_still_blocks(self) -> None:
+        # 上限メッセージあり + 未解決スレッドあり -> ブロック (条件1は
+        # 緩和の対象外、独立して評価される)。
+        pr_comments = {
+            "nodes": [
+                self._request_marker_comment(_HEAD_SHA, "2026-09-07T16:00:00Z"),
+                self._usage_limit_comment("2026-09-07T16:01:00Z"),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": "9" * 40},
+                }
+            ],
+        }
+        threads = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "nodes": [{"path": "a.rs", "author": {"login": "octocat"}}]
+                    },
+                }
+            ],
+        }
+        result = _evaluate(
+            threads=threads,
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+        )
+        self.assertTrue(result["blocked"])
+        self.assertTrue(
+            any("未解決のレビュースレッド" in r for r in result["reasons"])
+        )
+
+    def test_usage_limit_but_pr_never_reviewed_by_codex_blocks(self) -> None:
+        # 上限メッセージあり + この PR に Codex レビューが1件も無い
+        # -> 緩和せずブロック (一度も見ていない PR を通さない)。
+        pr_comments = {
+            "nodes": [
+                self._request_marker_comment(_HEAD_SHA, "2026-09-07T16:00:00Z"),
+                self._usage_limit_comment("2026-09-07T16:01:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS, pr_comments=pr_comments, codex_bypass=False
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_relaxed"])
+        self.assertTrue(
+            any("一度も Codex にレビューされて" in r for r in result["reasons"])
+        )
+
+    def test_usage_limit_message_from_non_codex_author_ignored(self) -> None:
+        # 上限メッセージの投稿者が Codex 以外 (なりすまし/第三者の悪戯) の
+        # 場合は緩和しない — 応答待ちのまま。
+        pr_comments = {
+            "nodes": [
+                self._request_marker_comment(_HEAD_SHA, "2026-09-07T16:00:00Z"),
+                self._usage_limit_comment(
+                    "2026-09-07T16:01:00Z", login="octocat", typename="User"
+                ),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": "9" * 40},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews, pr_comments=pr_comments, codex_bypass=False
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_relaxed"])
+        self.assertFalse(result["codex_review_request_needed"])
+
+    def test_usage_limit_before_request_comment_ignored(self) -> None:
+        # 上限メッセージが「現在の head への @codex review リクエスト」より
+        # 前に投稿されたものだと緩和条件を満たさない (過去の別のリクエスト
+        # に対する上限メッセージを使い回さない)。
+        pr_comments = {
+            "nodes": [
+                self._usage_limit_comment("2026-09-07T15:00:00Z"),  # リクエスト前
+                self._request_marker_comment(_HEAD_SHA, "2026-09-07T16:00:00Z"),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": "9" * 40},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews, pr_comments=pr_comments, codex_bypass=False
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_relaxed"])
+
+    def test_pr_comments_fetch_failure_blocks_safely_and_does_not_request(
+        self,
+    ) -> None:
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS, pr_comments=None, codex_bypass=False
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_review_request_needed"])
+        self.assertFalse(result["codex_relaxed"])
+
+    def test_different_head_sha_requires_new_request(self) -> None:
+        # head SHA が変わった (新しい push) 場合、古い head SHA へのマーカー
+        # は一致しないため、新しい head SHA に対して改めてリクエストが
+        # 必要になる (1 push = 1 リクエスト、永続的な緩和にはならない)。
+        old_sha = "1" * 40
+        pr_comments = {
+            "nodes": [
+                self._request_marker_comment(old_sha, "2026-09-07T16:00:00Z"),
+                self._usage_limit_comment("2026-09-07T16:01:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            head_sha=_HEAD_SHA,  # old_sha とは異なる新しい head
+            codex_bypass=False,
+        )
+        self.assertTrue(result["blocked"])
+        self.assertTrue(result["codex_review_request_needed"])
+
+    def test_request_comment_body_contains_trigger_and_marker(self) -> None:
+        from check_review_gate import codex_review_request_comment_body
+
+        body = codex_review_request_comment_body(_HEAD_SHA)
+        self.assertIn("@codex review", body)
+        self.assertIn(
+            f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->", body
+        )
+
+
 class CodexLoginExactMatchTest(unittest.TestCase):
     """P2 (2026-09-07 の Codex レビュー指摘、PR #192): ログイン判定は完全
     一致でなければならない。前方一致だと `chatgpt-codex-connector-review`
@@ -502,7 +767,10 @@ class CodexLoginExactMatchTest(unittest.TestCase):
         }
         result = _evaluate(reviews=reviews, codex_bypass=False)
         self.assertTrue(result["blocked"])
-        self.assertIn("Codex のレビュー待ち", result["reasons"][0])
+        # 別名アカウントのレビューは無視され、正規の Codex は未レビュー
+        # 扱いになるため「自動リクエストする」判定になる。
+        self.assertTrue(result["codex_review_request_needed"])
+        self.assertIn(_HEAD_SHA[:7], result["reasons"][0])
 
     def test_lookalike_login_thumbs_up_not_accepted(self) -> None:
         reactions = {
@@ -642,14 +910,14 @@ class PushObservedAtSecurityRegressionTest(unittest.TestCase):
             reactions=stale_reaction,
             head_sha=_HEAD_SHA,
             codex_bypass=False,
+            pr_comments=_EMPTY_PR_COMMENTS,
         )
         self.assertTrue(result["blocked"])
-        # Codex 待ち (古い👍は不成立) + 猶予期間 (6分しか経っていない) の
-        # 2件がともに正しくブロック理由になっていること。
+        # Codex 待ち (古い👍は不成立 -> 自動リクエストする判定) + 猶予期間
+        # (6分しか経っていない) の2件がともに正しくブロック理由になって
+        # いること。
         self.assertEqual(len(result["reasons"]), 2)
-        self.assertTrue(
-            any("Codex のレビュー待ち" in r for r in result["reasons"])
-        )
+        self.assertTrue(result["codex_review_request_needed"])
         self.assertTrue(any("猶予期間" in r for r in result["reasons"]))
 
     def test_reaction_after_recent_push_is_accepted(self) -> None:
@@ -676,6 +944,7 @@ class PushObservedAtSecurityRegressionTest(unittest.TestCase):
             reactions=fresh_reaction,
             head_sha=_HEAD_SHA,
             codex_bypass=False,
+            pr_comments=_EMPTY_PR_COMMENTS,
         )
         self.assertFalse(result["blocked"])
 
@@ -730,9 +999,11 @@ class MultipleReasonsTest(unittest.TestCase):
             reactions=_EMPTY_REACTIONS,
             head_sha=_HEAD_SHA,
             codex_bypass=False,
+            pr_comments=_EMPTY_PR_COMMENTS,
         )
         self.assertTrue(result["blocked"])
         self.assertEqual(len(result["reasons"]), 4)
+        self.assertTrue(result["codex_review_request_needed"])
 
 
 class PR185RegressionTest(unittest.TestCase):
@@ -782,12 +1053,13 @@ class PR185RegressionTest(unittest.TestCase):
             reactions=_EMPTY_REACTIONS,
             head_sha=_HEAD_SHA,
             codex_bypass=False,
+            pr_comments=_EMPTY_PR_COMMENTS,
         )
         self.assertTrue(result["blocked"])
         self.assertEqual(len(result["reasons"]), 2)  # 未解決スレッド + 猶予期間
-        self.assertFalse(
-            any("Codex のレビュー待ち" in r for r in result["reasons"])
-        )
+        # Codex 自体は head SHA を正しくレビュー済みなので、自動リクエストは
+        # 不要 (条件3はブロック理由に含まれない)。
+        self.assertFalse(result["codex_review_request_needed"])
 
 
 if __name__ == "__main__":

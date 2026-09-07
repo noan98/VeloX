@@ -11,6 +11,24 @@ GitHub API から切り離してテスト可能にしたもの
 docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベタ書き
 しない。
 
+> ⚠️⚠️ **この仕組みを触る人がまず知っておくべき Codex の2つの前提**
+> (2026-09-07、PR #192 の運用で判明。docs/decisions.md D91 に詳細):
+>
+> 1. **Codex は push では再レビューしない。** Codex 自身の説明文どおり、
+>    レビューが起動するのは「PR を open する」「draft を ready にする」
+>    「`@codex review` とコメントする」の3つだけで、**push はトリガに
+>    含まれない。** そのため「指摘に対応して push しただけ」では
+>    Codex は何もせず、head SHA は永遠に未レビューのままになる。
+>    本モジュールはこれを補うため、未レビューの head SHA を検知したら
+>    `@codex review` を自動投稿する (下記「Codex 再レビューのリクエスト」
+>    参照)。
+> 2. **Codex には利用上限がある。** 上限に達すると `@codex review` に
+>    対して "You have reached your Codex usage limits" 系のメッセージを
+>    返し、それ以上レビューしない。CodeRabbit を判定から除外した理由
+>    (Free プランの制限で実質機能しない) と同種の問題が Codex にもある。
+>    本モジュールはこれを検知した場合に限り要件を緩和する (下記
+>    「利用上限到達時の緩和」参照)。
+
 判定する4条件 (いずれか1つでも該当すればマージを見送る = blocked):
 
 1. 未解決のレビュースレッド (`reviewThreads[].isResolved == false`) が
@@ -38,6 +56,35 @@ docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベ
         に対するものか」を厳密には特定できない。あくまで「push 観測時刻
         より後に Codex が何らかの反応をした」ことの弱い代理指標として
         扱う。
+
+   **Codex 再レビューのリクエスト**: 上記 a/b/c のいずれにも一致しない
+   場合 (Codex がこの head SHA をまだレビューしていない)、`pr_comments`
+   の中に「この head SHA に対する再レビュー依頼コメント」(`@codex review`
+   + マーカー `<!-- auto-merge:codex-review-request:<head SHA> -->`) が
+   既に存在するかを調べる。**存在しなければ `codex_review_request_needed`
+   を `True` にして返す**(実際にコメントを投稿するのは呼び出し側
+   `review_gate_decision.sh`/workflow の責務 — 本関数はネットワーク呼び
+   出しを行わない)。**同じ head SHA に対しては1回しかリクエストしない**
+   (マーカーに head SHA を埋め込んでいるので、既に投稿済みなら再投稿
+   しない)。
+
+   **利用上限到達時の緩和**: 依頼コメントが既にあり、かつそのコメントより
+   **後**に Codex (完全一致で照合、なりすまし防止) が利用上限メッセージ
+   (`"reached your codex usage limits"` を含む、大小無視) を投稿している
+   場合に限り、条件3を「**この PR のいずれかの commit を Codex がレビュー
+   済み** (head SHA と一致しなくてよい)」に緩和する。ただし **この PR が
+   一度も Codex にレビューされていない場合は緩和しない** (未レビューの
+   まま通してしまうため)。**未解決スレッド判定 (条件1) と
+   `CHANGES_REQUESTED` 判定 (条件2) は緩和の対象外** — これらは互いに
+   独立した条件として評価されるため、緩和は条件3にしか影響しない。
+   緩和が発動した場合は `codex_relaxed`/`codex_relaxed_detail` を返す
+   (呼び出し側で `::warning::` として目立たせるため。黙って緩めない)。
+
+   > ⚠️ 利用上限メッセージの検出は **Codex 側のメッセージ文言との文字列
+   > マッチ**であり、Codex がこの文言を変更すると検出できなくなる。その
+   > 場合は緩和が発動せず「厳格なまま待ち続ける」= 安全側に倒れる (誤って
+   > マージされる方向には壊れない)。
+
    Codex ログインの照合は **完全一致** (許可リスト `_CODEX_LOGINS`) で行う
    — `chatgpt-codex-connector-review` のような別名アカウントが前方一致で
    すり抜けないようにするため (2026-09-07 の Codex レビュー指摘、PR #192
@@ -69,9 +116,9 @@ docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベ
 出していた場合でも、それは 1. の未解決スレッド判定で拾われる。
 
 GraphQL のページング (`pageInfo.hasNextPage == true`) で全件を確認できな
-かった場合、および `head_push_observed_at` が取得できなかった場合は、
-安全側 (マージしない = blocked) に倒す。「取得できなかったので指摘
-ゼロとみなす」は絶対にしない。
+かった場合、および `head_push_observed_at`/`pr_comments` が取得できな
+かった場合は、安全側 (マージしない = blocked) に倒す。「取得できなかった
+ので指摘ゼロとみなす」は絶対にしない。
 """
 
 from __future__ import annotations
@@ -97,6 +144,34 @@ _CODEX_LOGINS = frozenset({"chatgpt-codex-connector[bot]"})
 _REVIEWED_COMMIT_RE = re.compile(
     r"Reviewed commit:?\**\s*`?([0-9a-fA-F]{7,40})`?", re.IGNORECASE
 )
+
+# auto-merge が「この head SHA に対して @codex review をリクエスト済み」
+# を識別するためのマーカー。head SHA (40桁 hex) を埋め込む。同じ head SHA
+# に対して2回以上投稿しないための重複防止に使う。
+_REQUEST_MARKER_RE = re.compile(
+    r"<!--\s*auto-merge:codex-review-request:([0-9a-fA-F]{40})\s*-->"
+)
+
+
+def codex_review_request_comment_body(head_sha: str) -> str:
+    """`@codex review` を自動投稿する際のコメント本文を組み立てる。
+
+    `review_gate_decision.sh` が実際に `gh pr comment` で投稿する際に使う。
+    マーカーに head SHA を埋め込むことで、同じ head SHA への重複投稿を
+    `_find_request_marker` で検出できるようにする。
+    """
+    return (
+        "@codex review\n\n"
+        f"<!-- auto-merge:codex-review-request:{head_sha} -->\n"
+        "<sub>auto-merge (Issue #188): Codex がこの head SHA をまだ"
+        "レビューしていないため自動的にリクエストしました。"
+        "docs/decisions.md D91 参照。</sub>"
+    )
+
+
+# Codex の利用上限メッセージに含まれる定型文言 (実測: "You have reached
+# your Codex usage limits for code reviews.")。大小無視の部分一致。
+_USAGE_LIMIT_PHRASE = "reached your codex usage limits"
 
 
 def _parse_iso8601(value: str) -> datetime:
@@ -192,6 +267,47 @@ def _codex_reacted_after(
     return False
 
 
+def _find_request_marker(
+    comment_nodes: list[dict[str, Any]], head_sha: str
+) -> dict[str, Any] | None:
+    """`head_sha` に対する `@codex review` 自動リクエストコメントを探す。
+
+    投稿者は問わない (`AUTO_MERGE_TOKEN`/`GITHUB_TOKEN` どちらでも投稿
+    され得るため、マーカー文字列だけで判定する)。複数見つかった場合は
+    最新 (`createdAt` が最大) のものを返す。
+    """
+    matches = []
+    for c in comment_nodes:
+        body = c.get("body") or ""
+        m = _REQUEST_MARKER_RE.search(body)
+        if m and m.group(1).lower() == head_sha.lower():
+            matches.append(c)
+    if not matches:
+        return None
+    return max(matches, key=lambda c: c.get("createdAt") or "")
+
+
+def _find_codex_usage_limit_after(
+    comment_nodes: list[dict[str, Any]],
+    after_iso: str,
+    codex_logins: frozenset[str],
+) -> bool:
+    """`after_iso` より後に Codex 本人が利用上限メッセージを残したか判定する。"""
+    after_at = _parse_iso8601(after_iso)
+    for c in comment_nodes:
+        if not _is_codex_author(c.get("author"), codex_logins):
+            continue
+        created_at = c.get("createdAt")
+        if not created_at:
+            continue
+        body = (c.get("body") or "").lower()
+        if _USAGE_LIMIT_PHRASE not in body:
+            continue
+        if _parse_iso8601(created_at) > after_at:
+            return True
+    return False
+
+
 def evaluate_review_gate(
     review_threads: dict[str, Any] | None,
     latest_reviews: dict[str, Any] | None,
@@ -202,6 +318,7 @@ def evaluate_review_gate(
     head_sha: str | None = None,
     codex_bypass: bool = False,
     codex_logins: frozenset[str] = _CODEX_LOGINS,
+    pr_comments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """マージしてよいかを判定する。
 
@@ -239,13 +356,29 @@ def evaluate_review_gate(
             CHANGES_REQUESTED 判定は免除しない。
         codex_logins: Codex の既知ログイン名の完全一致許可リスト (テスト用
             に差し替え可能)。前方一致・部分一致は使わない。
+        pr_comments: GraphQL `pullRequest.comments` connection
+            (`{"nodes": [{"author": {"login": str, "__typename": str},
+            "body": str, "createdAt": str}, ...]}`)。`@codex review` の
+            自動リクエストの重複防止と、Codex の利用上限メッセージの検出に
+            使う。`None` は「取得できなかった」を表し、この機能に関しては
+            安全側 (リクエストもしない・緩和もしない) に倒す。
 
     Returns:
-        `{"blocked": bool, "reasons": [str, ...]}`。`reasons` はログ出力
-        用の日本語メッセージ (先頭が "wait: ")。`blocked` は
-        `len(reasons) > 0` と等価。
+        `{"blocked": bool, "reasons": [str, ...],
+        "codex_review_request_needed": bool, "codex_relaxed": bool,
+        "codex_relaxed_detail": str | None}`。`reasons` はログ出力用の
+        日本語メッセージ (先頭が "wait: ")。`blocked` は
+        `len(reasons) > 0` と等価。`codex_review_request_needed` が
+        `True` の場合、呼び出し側は `codex_review_request_comment_body()`
+        の内容で `@codex review` を投稿すべき (本関数自体は投稿しない)。
+        `codex_relaxed` が `True` の場合、呼び出し側は
+        `codex_relaxed_detail` を `::warning::` として目立たせて出力
+        すべき。
     """
     reasons: list[str] = []
+    codex_review_request_needed = False
+    codex_relaxed = False
+    codex_relaxed_detail: str | None = None
 
     # --- 1. 未解決のレビュースレッド -----------------------------------
     threads_page_info = (review_threads or {}).get("pageInfo") or {}
@@ -329,12 +462,69 @@ def evaluate_review_gate(
                 matched = _codex_reacted_after(
                     reaction_nodes, head_push_observed_at, codex_logins
                 )
-            if not matched:
-                head_short = head_sha[:7]
-                detail = f"head SHA `{head_short}` に対するレビュー/👍リアクションが見つかりません"
-                if hint:
-                    detail += f" (直近の Codex レビューは commit `{hint}` に対するものでした)"
-                reasons.append(f"wait: Codex のレビュー待ち ({detail})")
+
+            if not matched and pr_comments is not None:
+                hint_suffix = (
+                    f" (直近の Codex レビューは commit `{hint}` に対する"
+                    "ものでした)"
+                    if hint
+                    else ""
+                )
+                comment_nodes = pr_comments.get("nodes") or []
+                request_comment = _find_request_marker(comment_nodes, head_sha)
+                if request_comment is None:
+                    # まだこの head SHA への @codex review リクエストを
+                    # 投稿していない。呼び出し側に投稿させる。
+                    codex_review_request_needed = True
+                    head_short = head_sha[:7]
+                    reasons.append(
+                        "wait: Codex が現在の head SHA をまだレビューして"
+                        f"いません (head SHA `{head_short}`){hint_suffix}。"
+                        "@codex review を自動リクエストします"
+                    )
+                else:
+                    request_created_at = request_comment.get("createdAt") or ""
+                    limit_reached = (
+                        bool(request_created_at)
+                        and _find_codex_usage_limit_after(
+                            comment_nodes, request_created_at, codex_logins
+                        )
+                    )
+                    if not limit_reached:
+                        head_short = head_sha[:7]
+                        reasons.append(
+                            "wait: Codex に @codex review を自動リクエスト"
+                            f"済みです (head SHA `{head_short}`){hint_suffix}。"
+                            "応答を待っています"
+                        )
+                    else:
+                        any_codex_review = any(
+                            _is_codex_author(r.get("author"), codex_logins)
+                            for r in latest_reviews_nodes
+                        )
+                        head_short = head_sha[:7]
+                        if any_codex_review:
+                            matched = True
+                            codex_relaxed = True
+                            codex_relaxed_detail = (
+                                "Codex の利用上限到達を検知したため、"
+                                f"head SHA `{head_short}` への再レビュー"
+                                "要件を緩和しました (この PR の過去のレビュー"
+                                "で代替。未解決スレッド/CHANGES_REQUESTED の"
+                                "判定は引き続き有効です)"
+                            )
+                        else:
+                            reasons.append(
+                                "wait: Codex の利用上限到達を検知しましたが、"
+                                "この PR は一度も Codex にレビューされて"
+                                f"いません (head SHA `{head_short}`)。安全側で"
+                                "マージを見送ります"
+                            )
+            elif not matched and pr_comments is None:
+                reasons.append(
+                    "wait: PR コメントの取得に失敗したため、Codex 再レビュー"
+                    "のリクエスト要否を判定できません (安全側でスキップ)"
+                )
 
     # --- 4. 猶予期間 -----------------------------------------------------
     # head_push_observed_at は「GitHub がサーバ側で head SHA の push を
@@ -357,7 +547,13 @@ def evaluate_review_gate(
                 f"あと {remaining:.1f}分)"
             )
 
-    return {"blocked": len(reasons) > 0, "reasons": reasons}
+    return {
+        "blocked": len(reasons) > 0,
+        "reasons": reasons,
+        "codex_review_request_needed": codex_review_request_needed,
+        "codex_relaxed": codex_relaxed,
+        "codex_relaxed_detail": codex_relaxed_detail,
+    }
 
 
 def main(argv: list[str]) -> int:
@@ -365,11 +561,12 @@ def main(argv: list[str]) -> int:
     判定結果を JSON で標準出力に書く。
 
     payload の形は `{"reviewThreads": ..., "latestReviews": ...,
-    "reactions": ..., "headSha": ..., "headPushObservedAt": ..., "now": ...,
-    "gracePeriodMinutes": ..., "codexBypass": ...}`。`now`/
-    `gracePeriodMinutes` を省略した場合はそれぞれ現在時刻/15分を使う。
-    `headPushObservedAt` には GitHub がサーバ側で観測した時刻を渡すこと
-    (git committer date ではない — モジュール docstring の警告を参照)。
+    "reactions": ..., "prComments": ..., "headSha": ...,
+    "headPushObservedAt": ..., "now": ..., "gracePeriodMinutes": ...,
+    "codexBypass": ...}`。`now`/`gracePeriodMinutes` を省略した場合は
+    それぞれ現在時刻/15分を使う。`headPushObservedAt` には GitHub が
+    サーバ側で観測した時刻を渡すこと (git committer date ではない —
+    モジュール docstring の警告を参照)。
     """
     if len(argv) > 1:
         with open(argv[1], "r", encoding="utf-8") as f:
@@ -377,6 +574,7 @@ def main(argv: list[str]) -> int:
     else:
         payload = json.load(sys.stdin)
 
+    head_sha = payload.get("headSha") or None
     result = evaluate_review_gate(
         review_threads=payload.get("reviewThreads"),
         latest_reviews=payload.get("latestReviews"),
@@ -384,9 +582,17 @@ def main(argv: list[str]) -> int:
         now=payload.get("now") or datetime.now(timezone.utc).isoformat(),
         grace_period_minutes=int(payload.get("gracePeriodMinutes", 15)),
         reactions=payload.get("reactions"),
-        head_sha=payload.get("headSha") or None,
+        head_sha=head_sha,
         codex_bypass=bool(payload.get("codexBypass", False)),
+        pr_comments=payload.get("prComments"),
     )
+    # 呼び出し側 (review_gate_decision.sh) が実際に `@codex review` を投稿
+    # する際に使うコメント本文。マーカー文字列の組み立て方をここに一元化
+    # しておき、bash 側で文字列を再構築しない (DRY)。
+    if result["codex_review_request_needed"] and head_sha:
+        result["codex_review_request_comment_body"] = codex_review_request_comment_body(
+            head_sha
+        )
     json.dump(result, sys.stdout, ensure_ascii=False)
     sys.stdout.write("\n")
     return 0
