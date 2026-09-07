@@ -42,6 +42,12 @@ permissions:
   pull-requests: write
   checks: read
   statuses: read
+  # Issue #168: マージ後の Issue クローズに必要。この `permissions` ブロック
+  # は明示的に列挙する形なので、ここに書かれていないスコープは GITHUB_TOKEN
+  # に一切与えられない。`issues` が抜けていたため `gh issue view` が 404 を
+  # 返し、「Issue が見つかりません」という警告になっていた (実際には存在して
+  # いて、権限が無かっただけ)。
+  issues: write
 
 # 同時に 2 つ走って同じ PR を二重にマージしようとしないよう直列化する。
 concurrency:
@@ -183,8 +189,15 @@ jobs:
               if [ -n "$issues" ]; then
                 echo "$issues" | while read -r issue; do
                   [ -z "$issue" ] && continue
-                  state=$(gh issue view "$issue" --json state --jq '.state' 2>/dev/null) \
-                    || { echo "::warning::Issue #${issue} が見つかりません (PR #${number} 本文の Closes 参照)"; continue; }
+                  # gh の stderr は捨てないこと: 「存在しない」と「権限が
+                  # 無い」はどちらもここで失敗するが、原因はまったく違う。
+                  # 実際に #168 の初回リリースでは `issues` 権限が無くて
+                  # 404 になっていたのに、メッセージが「見つかりません」
+                  # だったため原因がログから読み取れなかった。
+                  if ! state=$(gh issue view "$issue" --json state --jq '.state' 2>&1); then
+                    echo "::warning::Issue #${issue} の状態を取得できませんでした (PR #${number} 本文の Closes 参照): ${state}"
+                    continue
+                  fi
                   if [ "$state" = "CLOSED" ]; then
                     echo "skip: Issue #${issue} は既に closed (PR #${number})"
                     continue
