@@ -10331,6 +10331,16 @@ workflow には `velox.exe` を直接起動してプロセス一覧・perf ロ�
 必要という結論を残すのが正しい進め方であり、この時点で無理に通そうとしていない
 (#59 が同じ形で結論づけたのと同様)。
 
+> **追記 (2026-09-07、Issue #180)**: `perf-windows.yml` の初回実行
+> (run [`34127310212`](https://github.com/noan98/VeloX/actions/runs/34127310212)、
+> job `101758900568`) で上記の診断ステップが実際に走り、**起動できた**ことが
+> 確定した — `msedgewebview2.exe` 7 プロセス + `velox.exe` 1 プロセスが起動し、
+> `velox.exe` の `MainWindowTitle` が `VeloX` になっていることを確認、perf ログ
+> も実際に 34 件書けた。続く `velox-bench run --scenario cold_startup --trials
+> 10` も 10/10 試行が完走している。したがって「最大のリスクは未解決のまま」
+> という上記の記述は解消済み。詳細と実測値は
+> `docs/performance-targets.md` §21 を参照。
+
 **このセッションで確認できたこと / できていないこと**:
 - 確認できた: `cargo fmt --check` / `cargo clippy --all-targets -D warnings` /
   `xvfb-run ... dbus-run-session -- cargo test` (972 件、Windows 実装追加前の
@@ -10342,3 +10352,10 @@ workflow には `velox.exe` を直接起動してプロセス一覧・perf ロ�
   `velox-bench run` の完走、結果 JSON の実際の中身。`docs/performance-targets.md`
   §21 には Windows の数値をまだ書けないため、CI 実行後に埋めるプレースホルダの
   みを記載した。
+- **追記 (2026-09-07、Issue #180)**: 上記のうち「`windows-latest` ランナーでの
+  VeloX (WebView2) ウィンドウ起動可否」「`velox-bench run` の完走」「結果 JSON
+  の実際の中身」は、Issue #136 マージ後の初回ワークフロー実行 (run
+  `34127310212`) で確認でき、`docs/performance-targets.md` §21 に記録した。
+  ただし「Windows 実機上での RSS/CPU 値の妥当性」は依然として未確認のまま —
+  今回確認できたのは GitHub-hosted (共有・仮想化、CPU 2 コア) ランナー上の
+  数値であり、Windows 実機の実力値ではない。
