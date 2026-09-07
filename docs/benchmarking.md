@@ -99,6 +99,13 @@ suspend <index>   # position <index> のタブを休止する (Issue #63。ア�
 mark              # ここまでを準備 (warm-up) として集計から捨てる (Issue #60)
 navigate <url>    # アクティブタブを <url> へ遷移させる
 wait <ms>         # 次のコマンドまで <ms> ミリ秒待つ (上限 120000ms = automation::MAX_WAIT_MS)
+wait_load [timeout_ms]  # アクティブタブの読み込み中のページロードが完了する
+                  # まで待つ (Issue #169、docs/decisions.md D84)。既に読み込み
+                  # 完了していれば即座に次へ進む。timeout_ms 省略時は
+                  # automation::DEFAULT_WAIT_LOAD_TIMEOUT_MS (10000ms)、
+                  # 指定時も上限は wait と同じ MAX_WAIT_MS。超過すると
+                  # 何を待っていたかを stderr に出してタイムアウトし、次の
+                  # コマンドへ進む (ハングしない)
 quit              # アプリケーションを終了する
 ```
 
@@ -108,9 +115,9 @@ quit              # アプリケーションを終了する
 `<index>` は実行時点の tab strip 上の位置 (0 始まり) — スクリプトの各行が
 実行される順にタブが増減していくので、`close 1` は「その時点で 2 番目に
 あるタブ」を指す。範囲外の `index` は panic ではなく無視 (stderr に警告)
-される。不正な行 (未知のコマンド・引数欠落・数値パース失敗・`wait` の上限
-超過) はパース時点で全体を拒否し、行番号付きのエラーを stderr に出す —
-一部だけ実行される、ということはない。
+される。不正な行 (未知のコマンド・引数欠落・数値パース失敗・`wait`/
+`wait_load` の上限超過) はパース時点で全体を拒否し、行番号付きのエラーを
+stderr に出す — 一部だけ実行される、ということはない。
 
 手で使う例:
 

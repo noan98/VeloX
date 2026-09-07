@@ -9471,3 +9471,153 @@ Actions 上でしか起きないため)。この PR がマージされた際の�
 `AUTO_MERGE_TOKEN` (PAT) が登録された場合、GitHub 標準の自動クローズと本対応
 が同時に動くことになるが、決定 3 の冪等性により害はない想定。実際に PAT が
 登録された際は、二重クローズやエラーが出ていないかログで一度確認するとよい。
+## D84: 統合テストの固定 wait を根治する — `AutomationCommand::WaitLoad` を「main スレッドの状態機械 + 通知チャネル」で実装し、D44 の枠内 (新規制御チャネルなし) に収める
+
+**対象**: Issue #169。`tests/integration.rs` の各テストは「ページの読み込みが
+終わったはず」を `wait <ms>` という実時間スリープだけで表現しており、CI で
+3 回 flake した (PR #162/#163/#166、いずれも「待ち時間を伸ばす」対症療法で
+対処済み — Issue 本文の表を参照)。#60/D57 が実測したとおり、タブを開く/
+休止タブを復帰させるコストは新しい `WebKitWebProcess` を起こすかどうかで
+約 2 倍変わり (`page_load_ms` 6.5〜9.2ms vs 14.6〜16.1ms)、環境負荷でさらに
+広がる。「何 ms 待てば十分か」は環境依存の量であり、定数化できる性質のもの
+ではなかった。
+
+**追加したコマンド**: `wait_load [timeout_ms]`。`browser::automation::
+AutomationCommand::WaitLoad { timeout_ms: u64 }` として追加し、
+`parse_script` に対応するパーサ (`parse_wait_load`) と単体テスト
+(引数なし/あり/不正値/上限超過/上限ちょうど) を追加した。`timeout_ms` 省略
+時は `automation::DEFAULT_WAIT_LOAD_TIMEOUT_MS` (10000ms)、指定時も上限は
+既存の `wait` と同じ `MAX_WAIT_MS` (120000ms) — 新しい上限定数は増やして
+いない。意味は「アクティブタブの進行中のページロードが終わるまで待つ。
+既に終わっていれば即座に次へ進む」。`velox-bench`
+(`browser::automation::generate_bench_script`) はこの Issue で一切変更して
+いない — 既存シナリオの生成スクリプトに `wait_load` が混ざることはなく、
+挙動・計測値は変わらない (下記「動作確認」参照)。
+
+**設計 — D44 の枠内に収める (新規制御チャネルなし)**: D44 が明記している
+とおり VeloX の自動操作はファイル駆動のスクリプトであり、待ち受け
+ソケット/RPC サーバは意図的に採用していない。`wait_load` もこの制約の中で
+実装した — スクリプトの書式・`VELOX_AUTOMATION_SCRIPT` という 1 つの
+入力経路は変えていない。実行時の課題は「イベントループはメインスレッドの
+`UserEvent` ディスパッチに集約されておりロックを持たない」
+(docs/architecture.md) という制約の中で、自動操作スレッド
+(`spawn_automation`) をブロックして `LoadFinished` を待つとデッドロックする
+(待っている間に `LoadFinished` イベント自体を処理できない) ことだった。
+解決策は Issue が示唆したとおり「メインスレッド側に状態機械を持たせる」:
+
+1. `app::AutomationWaitState { pending: Option<AutomationWait>, notify:
+   mpsc::Sender<()> }` を `run()` の中で 1 つだけ作り (`page_load_timers`
+   と同じ流儀で `&mut` を各関数に通す)、`spawn_automation` には対応する
+   `mpsc::Receiver<()>` を渡す。`pending` は「今どのタブの読み込みを
+   待っているか (`window_id`/`tab_id`/`deadline`)」を持つ — 自動操作
+   スクリプトは 1 度に 1 つの `wait_load` しか実行しない (後述) ので
+   `Option` 1 枠で足りる。
+2. 自動操作スレッド (`spawn_automation`) は `WaitLoad` に出会うと、他の
+   コマンドと同じくイベントを `proxy.send_event` で送った**あと**、
+   `automation_wait_rx.recv()` でブロックする。メインスレッドは通常どおり
+   `LoadFinished`/`ToolbarMessage`/... を処理し続けられる — ブロックして
+   いるのは自動操作スレッドだけ。
+3. メインスレッドの `handle_automation_command` は `WaitLoad` を受けると
+   `Tabs::active().is_loading()` を見る。`false` (既に読み込み完了) なら
+   即座に `notify.send(())` して次へ進ませる。`true` なら `pending` に
+   `window_id`/`tab_id`/`Instant::now() + timeout_ms` を書き込んで戻る —
+   ここではブロックしない。
+4. `pending` を解消する経路は 2 つだけ、どちらも「解消したら必ず
+   `pending = None` にしてから 1 回だけ `notify.send(())` する」という
+   不変条件を守る (自動操作スレッド側の `recv()` は「1 回の `wait_load`
+   につき通知はちょうど 1 回」という前提でブロックしているため、この
+   不変条件が崩れると次の `wait_load` が古い通知を誤って受け取る):
+   - `resolve_automation_wait_if_matching` — `handle_user_event` の
+     `LoadFinished` 節の先頭で呼び、`pending` が同じ `window_id`/`tab_id`
+     を指していれば解消する。
+   - `poll_automation_wait_timeout` — `run()` のイベントループ末尾、
+     既存のタブ休止スイープ (`sweep_tabs`) の直後に毎パス呼ぶ。
+     `deadline` を過ぎていれば「何を待っていたか」(window/tab/URL、
+     取得できれば) を stderr に出して解消する。過ぎていなければ
+     `sweep_tabs` の戻り値と同じ枠組みで `ControlFlow::WaitUntil` の
+     候補に `deadline` を加える — 次のイベントを待つだけでは
+     `deadline` ちょうどに起きられないため。
+5. ウィンドウが既に無くなっている場合 (`ui_windows.get_mut(automation_
+   window)` が `None`) の `WaitLoad` は、`handle_automation_command` に
+   到達する前に `UserEvent::Automation(command)` の分岐で即座に通知して
+   打ち切る — 待つ対象が無い自動操作スレッドを永遠にブロックさせない
+   ためのガード。
+
+この設計はロックを一切増やしていない (`mpsc::channel` のみ) — `AppState`
+に持たせず `page_load_timers` と並ぶ独立した `&mut` 引数にしたのも、既存の
+「状態はメインスレッドの引数として明示的に流す」流儀を崩さないため。
+
+**`tests/integration.rs` の置き換え**: 「読み込みが終わるのを待つ」意図の
+`wait <ms>` を `wait_load` に置き換えた (対象はほぼ全テスト — module doc
+comment に一覧の方針を書いた)。意図的に置き換えなかったもの:
+- `downloads_with_several_tabs_open_are_handled_exactly_once` の
+  `navigate <download_page>` 直後の 2 箇所。ダウンロードとして横取り
+  される遷移で通常の `LoadFinished` が届くかどうかを検証しておらず、
+  届かない場合 `wait_load` は「ハングしないが必ずタイムアウトする」動作に
+  なる — 実害は無いが無駄にタイムアウトを踏むだけなので、確認が取れる
+  までは元の `wait <ms>` のままにした。
+- `startup_completes_and_records_a_startup_event` の唯一の `wait`。
+  **これは実装中に `wait_load` へ置き換えて検証した結果、判明した本物の
+  発見**: このテストが待つべきなのは「ページの読み込み完了」だけでなく
+  「`startup` perf レコードの生成」であり、`app::mark_startup`/
+  `metrics::StartupTimestamps::report` はコンテンツタブの `LoadFinished`
+  **に加えて**トゥールバー Webview 独自の `ready` ハンドシェイク
+  (`ToolbarCommand::Ready`) も揃わないと `startup` レコードを書かない。
+  `wait_load` はコンテンツタブの `LoadFinished` しか見ないため、負荷の
+  かかった環境でトゥールバーの JS 初期化がページ読み込みより遅く終わる
+  瞬間があると、`wait_load` が早すぎるタイミングで `quit` を通してしまい
+  `startup` レコードが出力される前にプロセスが終了する — 実際に本
+  セッションのコンテナ上で `cargo test --test integration` を連続実行して
+  2/5 回この形で red になることを確認した (詳細は「動作確認」)。これは
+  `wait_load` 自体のバグではなく、`mark_startup` 側の**既存の**競合状態
+  (古い固定 `wait 1500` がたまたま覆い隠していただけ) であり、Issue #169
+  の primitive の対象外 (issue はページロード完了を待つ命令のみを要求)
+  なので、このテストの `wait` は元の `wait 1500` のまま残し、コメントで
+  理由を明記した。この既存の競合状態自体は D84 の対象外として残す
+  (下記 Revisit condition)。
+
+**動作確認**: `cargo fmt --check` / `cargo clippy --all-targets -- -D
+warnings` / `cargo test --lib` (963 件) / `cargo check --target
+x86_64-pc-windows-msvc --all-targets` (D61、`cfg` 分岐は増やしていないが
+念のため実行) はすべて green。統合テスト
+(`VELOX_INTEGRATION_REQUIRE_GUI=1 xvfb-run ... dbus-run-session --
+cargo test`) は 11 件全 green を確認し、置き換え後の完全な統合テスト
+一式を**連続 10 回以上**実行してすべて green だったこと (上記の
+`startup_completes_and_records_a_startup_event` の発見・修正を挟んだ
+前後それぞれで確認)、`AutomationCommand::WaitLoad` のタイムアウト経路は
+実際に到達不能な (accept はするが応答を返さない) ローカル TCP リスナーへ
+`navigate` させて手動で発火させ、ハングせずプロセスが自力で終了 (`quit`
+まで到達) すること、stderr に
+`wait_load はタイムアウトしました (window=..., tab=..., url=Some("..."))`
+という「何を待っていたか」が分かるメッセージが出ることを確認した。
+`velox-bench run --scenario tab_create` を実際に 1 試行走らせ、
+`page_load_ms` 中央値 8.55ms など従来と同オーダーの数値が出ることを確認
+した (生成ロジック自体は無変更なので、この確認は「配線が壊れていないか」
+の smoke test)。
+
+所要時間の実測 (before は元の `tests/integration.rs` を一時的に復元し
+同じビルドで計測、after は置き換え後):
+
+| テスト | before | after |
+| --- | --- | --- |
+| `visiting_pages_persists_history_json` | 2.76s | 0.41s |
+| `restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch` | 4.63s | 0.91s |
+| `repeated_tab_open_close_cycles_exit_cleanly_and_record_every_page_load` | 11.04s | 2.46s |
+| 統合テスト一式 (11 件、`--test-threads=1`) | 41.11s | 約 13〜15s |
+
+### Revisit condition
+
+(1) `startup_completes_and_records_a_startup_event` が踏んだ
+`mark_startup`/`StartupTimestamps::report` の競合状態 (トゥールバー
+`ready` とコンテンツタブ `LoadFinished` の到着順序に依存する) は、
+`wait_load` の副作用として見つかっただけで本 Issue のスコープ外 — 別
+Issue で `StartupTimestamps` 側の設計 (例えば `report()` が揃うまで
+`quit` 自体を遅延させる、あるいは `wait_load` とは別の「起動完了を待つ」
+primitive を用意する) を検討すること。(2)
+`downloads_with_several_tabs_open_are_handled_exactly_once` の
+ダウンロード遷移が `LoadFinished` を発火させるかどうかは未確認のまま
+— 確認できれば残り 2 箇所の `wait <ms>` も `wait_load` に置き換えられる
+可能性がある。(3) `wait_load` は「1 スクリプトにつき同時に 1 つの
+待ちしか無い」という前提 (`AutomationWaitState::pending` が `Option` 1 枠)
+に依存している — 将来 `velox-bench`/統合テストが複数ウィンドウを並行して
+待つような使い方を必要とした場合は、この前提から見直すこと。
