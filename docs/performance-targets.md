@@ -1677,7 +1677,7 @@ Issue #184 の acceptance criterion: 「休止が発生しない軽量ケース�
 cpu_usage.py` (`/proc/<pid>/stat` の utime+stime を起動直後と 30 秒後の 2
 点だけ外部から読み、差分を取る — 測定自体のコストが被測定側に乗らない) で、
 アイドル 30 秒窓の CPU% を「既定 (メモリ監視 ON)」と「`VELOX_MEMORY_BUDGET_
-MB=0` (OFF)」で比較した。既定の `memory_check_interval` は 2 秒。
+MB=0` (OFF)」で比較した。既定の `memory_check_interval` は当時 2 秒。
 
 | ケース | 既定 ON (CPU%) | `VELOX_MEMORY_BUDGET_MB=0` (CPU%) | 差分 |
 | --- | ---: | ---: | ---: |
@@ -1685,9 +1685,72 @@ MB=0` (OFF)」で比較した。既定の `memory_check_interval` は 2 秒。
 | 3 タブ | 1.5%（0.44 秒/30 秒） | 0.2%（0.05 秒/30 秒） | 約 +1.3pt |
 
 `/proc` 全体を 2 秒ごとに 1 回歩くサンプラ自体のコストは 1 コア換算で約
-1〜1.3 ポイント。**厳密にはゼロではない**が、アイドル中のデスクトップ
-アプリとしては実用上無視できる水準と判断した。この数値からは `memory_
-check_interval` の既定 (2 秒) を変える理由は出てこない。
+1〜1.3 ポイント。**この節は当初「実用上無視できる」と結論したが、Issue
+#187 でこれを誤りと判定し覆した。** 1 タブのアイドル状態で CPU が OFF 比
+12 倍というのは看過すべきでない差であり、`memory_check_interval` の既定を
+見直した。詳細と間隔別の実測は **§23.2.1** を参照。
+
+#### 23.2.1 `memory_check_interval` の間隔別実測 (Issue #187)
+
+`smaps_rollup` 読み取り自体のコストを直接計測するため、
+`browser::metrics::imp::process_map()` (Linux) と同じ手順 (`/proc` を
+列挙し各 PID の `status`/`smaps_rollup`/`stat` を読む) を踏む外部プローブ
+を書いて、フルスキャン 1 回の壁時計時間を計測した (VeloX を 1 タブで起動
+した状態、20 試行の中央値、このコンテナ、プロセス総数 88、うち
+`smaps_rollup` が読めたもの 21):
+
+| 内訳 | 時間 (中央値) | 全体比 |
+| --- | ---: | ---: |
+| フルスキャン合計 | 17.008ms | 100% |
+| `status` 読み取り (全 87 プロセス) | 1.208ms | 7.1% |
+| **`smaps_rollup` 読み取り (21 プロセスのみ)** | **14.568ms** | **85.7%** |
+| `stat` 読み取り (全 87 プロセス) | 1.138ms | 6.7% |
+
+`smaps_rollup` はアクセスできた 21/87 プロセス分だけで全体の 86% を占め、
+1 プロセスあたりのコストが `status`/`stat` (定数個のフィールドを読むだけ)
+とは桁違いに高いことを確認した — カーネルのページテーブル走査が支配的、
+という Issue #187 の見立てを裏付ける。
+
+次に `scripts/profile/cpu_usage.py` で間隔別のアイドル CPU を計測した
+(idle 60 秒窓、`--settle-secs` 6〜8 秒、`VELOX_MEMORY_CHECK_INTERVAL_MS`
+だけを変えて比較):
+
+| 間隔 | 1 タブ CPU% | 3 タブ CPU% |
+| ---: | ---: | ---: |
+| 2000ms (旧既定) | 1.2%（0.70〜0.72 秒/60 秒、2 試行） | 1.4%（0.86 秒/60 秒） |
+| 5000ms | 0.5%（0.31 秒/60 秒） | 0.6%（0.38 秒/60 秒） |
+| **10000ms (新既定)** | **0.3%（0.16〜0.19 秒/60 秒、2 試行）** | **0.4%（0.25 秒/60 秒）** |
+| 30000ms | 0.2%（0.11 秒/60 秒） | 0.2%（0.11 秒/60 秒） |
+| (参考) OFF (`VELOX_MEMORY_BUDGET_MB=0`) | 0.1% | 0.2% |
+
+コストは間隔にほぼ反比例する (2000→10000ms で -75%、単純反比例のモデル
+値は -80%) が、間隔を伸ばすほど固定オーバーヘッド (スレッド起床・イベント
+送出など、フルスキャン以外のコスト) の割合が相対的に増え、30 秒時点で
+OFF 時の床 (0.1〜0.2%) にほぼ到達する。**10 秒から 30 秒へのさらなる延長は
+CPU 面の追加の得が乏しい** (0.1〜0.2pt の差) 一方、検知が最大 30 秒遅れる
+のは体感上のデメリットになりうるため、**`DEFAULT_MEMORY_CHECK_INTERVAL`
+を 2 秒から 10 秒に変更した**。設計判断の詳細は `docs/decisions.md` D90
+(「#187: `memory_check_interval` の既定見直し」) を参照。
+
+**10/20 タブでの削減効果が維持されるかの再確認** (`tab_scaling.py`、新
+既定 [700 MiB・10 秒間隔] を env 上書き無しで使用、3 試行の中央値):
+
+| stabilize 秒数 | 10 タブ PSS | 20 タブ PSS | 状態 |
+| ---: | ---: | ---: | --- |
+| 3 秒 (既定値、旧 2 秒間隔での §23.1 計測と同じ待ち時間) | 980.4 MiB | 1668.9 MiB | 未収束 (旧既定=無効時とほぼ同じ) |
+| 15 秒 | 464.1 MiB | 615.1 MiB | 収束済み |
+| 40 秒 | 463.4 MiB | 615.3 MiB | 収束済み (15 秒と同じ) |
+
+**最終到達点は変わらない** (15 秒以上待てば §23.1 の 2 秒間隔の値
+[464.4/617.7 MiB] と誤差範囲で一致) が、**収束にかかる時間は正直に見て
+約 5 倍 (3 秒 → 15 秒) に伸びた**。実際の利用では「タブを開くのをやめて
+から最大 10 秒程度で休止が始まる」という遅延が生じるだけで、最終的な
+メモリ削減効果は損なわれていない。
+
+**回帰ゲート** (`cold_startup`、baseline=旧既定 [2 秒間隔]、candidate=
+新既定 [10 秒間隔] ×2、各 8 試行): 総合判定 **OK** (`startup_toolbar_
+ready_ms` などはむしろ -2.8%〜-6.6% と改善方向、間隔を伸ばした分のノイズ
+低下と考えられる)。
 
 ### 23.3 `velox-bench gate`
 
@@ -1770,4 +1833,27 @@ target/release/velox-bench gate \
   --baseline "$S/tab_switch_20-baseline.json" \
   --candidate "$S/tab_switch_20-candidate-1.json" --candidate "$S/tab_switch_20-candidate-2.json" \
   --warn-pct 20 --fail-pct 60 --output "$S/gate-report.json" --markdown-output "$S/gate-summary.md"
+
+# 23.2.1 (Issue #187): 間隔別のアイドル CPU。velox-after は §23.2/23.2.1 時点の
+# コード (DEFAULT_MEMORY_CHECK_INTERVAL=10s) でビルドしたバイナリ
+printf 'wait 70000\nquit\n' > "$S/light1_70.txt"
+for interval in 2000 5000 10000 30000; do
+  VELOX_MEMORY_CHECK_INTERVAL_MS=$interval XV_RUN python3 scripts/profile/cpu_usage.py \
+    --velox "$S/velox-after" --script "$S/light1_70.txt" --homepage "file://$P/minimal.html" \
+    --settle-secs 6 --window-secs 60 --label "1tab_${interval}ms"
+done
+
+# smaps_rollup 読み取りコストの分離 (process_map() を模した外部プローブ、Linux 専用)
+# scripts/profile/ には存在しないため、本節のためだけに一時スクリプトとして書いた:
+# /proc を列挙 -> 各 PID の status/smaps_rollup/stat を開いて読むだけの Python 20 試行、
+# VeloX を 1 タブで起動した状態で並行実行。詳細な実装は本節の数値の再現時に
+# `browser::metrics::imp::process_map()` (Linux, src/browser/metrics.rs) をそのまま
+# Python に書き写せば良い。
+
+# 10/20 タブでの収束確認 (stabilize-secs を変えて再計測)
+XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-after" \
+  --page minimal.html --tab-counts 10,20 --trials 3 --output "$S/after-10s-3s-stabilize.json"
+XV_RUN python3 scripts/bench/tab_scaling.py --velox "$S/velox-after" \
+  --page minimal.html --tab-counts 10,20 --trials 3 --stabilize-secs 15 \
+  --output "$S/after-10s-15s-stabilize.json"
 ```

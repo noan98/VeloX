@@ -60,9 +60,10 @@ const DEFAULT_HOMEPAGE: &str = "https://www.google.com/";
 const DEFAULT_MAX_TABS_PER_WEB_PROCESS: usize = 4;
 
 /// Kept in sync with `browser::suspension::SuspensionPolicy::
-/// DEFAULT_MEMORY_CHECK_INTERVAL` (2 seconds), in milliseconds since that is
-/// the unit every other Performance-tab field here uses.
-const DEFAULT_MEMORY_CHECK_INTERVAL_MS: u64 = 2000;
+/// DEFAULT_MEMORY_CHECK_INTERVAL` (10 seconds as of Issue #187,
+/// docs/decisions.md D90), in milliseconds since that is the unit every
+/// other Performance-tab field here uses.
+const DEFAULT_MEMORY_CHECK_INTERVAL_MS: u64 = 10_000;
 
 const SEARCH_ENGINE_PRESETS: &[&str] = &["duckduckgo", "google", "bing", "startpage", "ecosia"];
 const CUSTOM_SEARCH_ENGINE_PRESET: &str = "custom";

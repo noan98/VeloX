@@ -124,12 +124,25 @@ pub struct SuspensionPolicy {
 }
 
 impl SuspensionPolicy {
-    /// The default interval between memory samples. Two seconds is slow
-    /// enough that walking `/proc` (every process on the machine, see
-    /// `metrics::sample_process_tree_rss`) is negligible, and fast enough
-    /// that a burst of new tabs is reined in within a few seconds rather
-    /// than sitting over budget for a long time.
-    pub const DEFAULT_MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+    /// The default interval between memory samples. **10 seconds as of
+    /// Issue #187 (docs/decisions.md D90)** — the original 2-second default
+    /// (D56) turned out not to be "negligible": walking `/proc` for every
+    /// process on the machine (not just VeloX's own tree,
+    /// `metrics::sample_process_tree_rss` -> `process_map`) to read each
+    /// one's `smaps_rollup` for PSS is individually expensive (kernel page-
+    /// table walk per process), and #184 (D90) made this run by default for
+    /// every user. Measured idle CPU at 2s was 1.2% (1 tab) / 1.5% (3
+    /// tabs) — a real, order-of-magnitude cost, not noise. #187 measured
+    /// CPU at 2s/5s/10s/30s and found it scales close to inversely with the
+    /// interval, converging toward the sampler-off floor (~0.1-0.2%) by
+    /// 10-30s with diminishing returns past 10s (`docs/decisions.md` D90,
+    /// `docs/performance-targets.md` §23). 10s was chosen because the
+    /// memory-budget signal has no latency requirement — a suspension
+    /// sweep firing a few seconds to tens of seconds later than it could
+    /// have only delays *when* memory is reclaimed, never whether it is —
+    /// while still reacting within roughly the same order of magnitude as
+    /// before to a burst of newly opened tabs.
+    pub const DEFAULT_MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(10);
 
     /// Whether any signal is on at all. When `false`, the event loop has
     /// nothing to sweep and no deadline to wake up for.
