@@ -10798,3 +10798,241 @@ condition (2) 「実サイトでの推奨値」が解消されるまで見送っ
 ない限り `tab_switch_ms`/`tab_create_ms` が `tab_resume_ms`/`page_load_*`
 に置き換わりうる点を、次にこれらのシナリオを触る Issue のために記録して
 おく (上記実測の「`tab_switch_20` は比較不能になった」参照)。
+
+## D91: auto-merge がレビューを見ずにマージしていた問題 (#188) — 未解決スレッド / CHANGES_REQUESTED / Codex の head SHA レビューを必須要件化、`automerge-without-codex` で Codex 要件のみ免除
+
+**対象**: Issue #188。D55 で導入した `auto-merge.yml` は head commit の
+check-runs / commit status しか見ておらず、**Pull Request のレビューを
+一切考慮せずにマージしていた**。Codex (`chatgpt-codex-connector[bot]`) は
+check-run を登録しないため、auto-merge からは「レビューが存在しない」のと
+区別が付かず、指摘が出ていてもそのままマージされていた。
+
+実際に PR #185 では 15:31:14 の作成から 15:35:32 (2 分以上前) に Codex が
+`src/browser/suspension.rs` へ P2 の指摘 (実在のバグ、Issue #186) を投稿
+していたにもかかわらず、15:37:55 に auto-merge がマージした。続く PR #189
+でも Codex は別の実在の問題を指摘しており、**この Issue の調査時点で Codex
+は 3 PR 中 3 PR (#185/#189/#190) すべてで有効な指摘を出している**
+(#190 は 35 行のドキュメント追加のみの小さな PR で、指摘が出にくいことを
+狙って作った検証用 PR だったが、それでも P2 の指摘が出た — 詳細は後述)。
+**「マージ前に一定時間待つ」だけでは防げない**: レビューはマージの数分前
+には既に存在していた。「未解決の指摘があればマージしない」という判定が
+必要だった。
+
+本 Issue は当初「Codex を必須条件にしない」方針で起票されたが、実装途中で
+ユーザの判断により**「Codex のレビューをマージの必須要件にする」方針へ
+変更**された (Issue 本文 2026-09-07 更新)。CodeRabbit は Free プランの
+制限 (1 時間 1 レビュー、行単位の指摘を出さず要約のみ) により実質機能して
+おらず、**リポジトリへのアクセスも除外済み**のため判定に含めない。
+
+### 決定
+
+1. **判定ロジックは `.github/scripts/check_review_gate.py` に切り出し、
+   `test_check_review_gate.py` (41 件の `unittest`) でテストする。**
+   `extract_closing_issues.py` + D83 と同じ流儀 — workflow の YAML には
+   ロジックをベタ書きしない。GitHub API から取得した GraphQL レスポンス
+   の形をそのまま模したデータでテストできる。判定は `evaluate_review_gate()`
+   1 関数に集約し、以下 4 条件のいずれか 1 つでも該当すれば `blocked=True`
+   (マージしない) を返す。
+   1. **未解決のレビュースレッド** (`reviewThreads[].isResolved == false`
+      が 1 件以上)。人間・ボットを問わず適用。ログには「未解決のレビュー
+      スレッドが N 件: `path (author)`, ...」の形でファイル・投稿者を
+      出す (#168 の教訓 — 原因がログから読めないと同じ事故を繰り返す)。
+   2. **`CHANGES_REQUESTED`** がレビュアーごとの最新レビュー状態
+      (GraphQL `latestReviews`) に残っている。レビュアー名をログに出す。
+   3. **Codex が現在の head SHA をレビュー済みでない** (下記参照。
+      `codex_bypass=True` で免除可能)。
+   4. **head commit の committer date から猶予期間 (既定15分、workflow の
+      `env.GRACE_PERIOD_MINUTES`) が経過していない。** レビューボットが
+      まだ投稿していない場合の保険。
+   いずれの GraphQL 呼び出し (`review_threads`/`latest_reviews` が `None`)
+   もページング不足 (`pageInfo.hasNextPage == true` で全件を確認できない)
+   も、**常に安全側 (blocked) に倒す**。「取得できなかったので指摘ゼロと
+   みなす」は絶対にしない — Issue の絶対要件。
+
+2. **Codex の head SHA レビュー判定は3つのシグナルの OR。** 「Codex の
+   レビューが存在する」だけでは、**古いコミットへのレビューが残っている
+   だけ**のケースを見逃す (push 後に再レビューされていない状態でマージ
+   してしまう)。そこで以下のいずれか1つでも現在の head SHA を指せば
+   「レビュー済み」とみなす (`check_review_gate.py` の
+   `_codex_reviewed_head_sha`/`_codex_reacted_after_commit`):
+   - **a. `latestReviews[].commit.oid` (GraphQL) が head SHA と完全一致。**
+     最も確実なシグナル。GraphQL の `PullRequestReview.commit` は
+     レビューが実際に付けられたコミットを指す (レビュー後に新しい commit
+     が push されても更新されない)。
+   - **b. レビュー本文の `Reviewed commit:` 行から取り出した短縮 SHA が
+     head SHA の接頭辞と一致する。** これは a への追加の裏付け (フォール
+     バック) として実装した。実データで確認済み: PR #185/#189/#190 の
+     3 件すべてで `**Reviewed commit:** \`<10桁の16進>\`` という形式
+     (太字マーカー + バッククォート付き) で、値は head SHA の**先頭10桁**
+     と一致していた (`9bb0dd755129c1bc...` → `9bb0dd7551` など)。**完全
+     一致ではなく「head SHA が短縮 SHA で始まるか」で判定する**
+     (`str.startswith`)。正規表現 `_REVIEWED_COMMIT_RE` は太字マーカー
+     (`**`) とバッククォートの有無ゆらぎの両方を許容する。
+   - **c. Codex による 👍 リアクション (PR 本体への `THUMBS_UP`、GraphQL
+     `pullRequest.reactions`) の `createdAt` が head commit の committer
+     date 以降。** Codex の説明文 (“If Codex has suggestions, it will
+     comment; otherwise it will react with 👍.”) に基づく代替シグナル。
+     **リアクションは commit に紐付かない (1 ユーザ 1 個)** ため、古い
+     push に対する 👍 が新しい push 後も残り続ける — そのため単独では
+     「どの push に対する反応か」を厳密に特定できず、`createdAt` が
+     head commit の日時以降であることを条件に加えて弱めのシグナルとして
+     扱う。
+   > ⚠️ **シグナル c (👍 リアクション) は実データで一度も観測されていない
+   > 未検証の分岐である。** Issue #188 の調査で「指摘ゼロの PR で Codex が
+   > 何を残すか」を確認するため、検証専用 PR #190 (`docs/README.md` を
+   > 35 行追加するだけの、意図的に指摘が出にくい変更) を作成して観測した
+   > が、**それでも Codex は P2 の指摘を出した** (しかも指摘の内容は正しい
+   > ものだった)。結果として **この調査時点で Codex がレビューした 3 PR
+   > (#185/#189/#190) は 3/3 件とも指摘ありで、「指摘ゼロ」のケースが
+   > 一度も観測できていない。** シグナル c は Codex の公式説明文どおりに
+   > 実装したものであり、実際にこのリポジトリでその挙動が発生した際の
+   > 検証はまだ済んでいない。**運用開始後、最初に「指摘ゼロ」の PR が
+   > 出た際に、Codex が実際に 👍 リアクションを付けるか・シグナル c が
+   > 正しく機能するかを確認すること。** もし 👍 が付かない (別の場所に
+   > 何かを残す、あるいは何も残さない) ことが判明した場合は、
+   > `check_review_gate.py` のシグナル c を実際の挙動に合わせて修正する
+   > 必要がある。それまでの間は 3 の `automerge-without-codex` ラベルが
+   > 唯一の保険になる。
+
+3. **`automerge-without-codex` ラベルで Codex レビュー必須要件のみを免除
+   する (workflow の `env.CODEX_BYPASS_LABEL`)。** 上記のとおり「指摘ゼロ
+   のとき Codex が何を残すか」が未検証であることに加え、Codex 側の障害・
+   クォータ切れ・設定変更 (レビューが呼ばれなくなる) も起こりうる。
+   **Codex を必須要件にする以上、Codex が応答しなければ全 PR が永久に
+   マージされなくなるリスクがある** — このラベルはその安全弁。
+   - **未解決スレッド判定・`CHANGES_REQUESTED` 判定は免除しない。** それ
+     らは人間の明示的な差し戻し (あるいは Codex 以外のレビュアーの指摘)
+     を尊重するためのものであり、Codex の可用性とは無関係。
+   - `no-automerge` (完全に自動マージ対象外にする) とは役割が異なる:
+     `automerge-without-codex` は「Codex 抜きでよいので他の条件が揃えば
+     マージしてよい」、`no-automerge` は「一切自動マージしない」。
+
+4. **未解決スレッドは `isOutdated` を無視し `isResolved` のみで判定する
+   — 運用上の重要な注意点。** PR #190 で実測: レビュー対象の行を修正して
+   push すると GitHub 上でスレッドは `isOutdated: true` になるが、
+   **`isResolved` は自動では `true` にならない**。明示的に「Resolve
+   conversation」を押す (または API で resolve する) までスレッドは
+   未解決のまま残り、**auto-merge は永久にブロックし続ける。**
+   `check_review_gate.py` はそもそも `isOutdated` を取得・参照していない
+   ため、この挙動と一致している (`isResolved` だけを見る設計で正しい)。
+   **運用上の注意**: Codex や人間の指摘に対応してコードを push しただけ
+   ではマージされるようにならない。**指摘に対応した後は、PR 上で該当
+   スレッドを明示的に resolve する必要がある。** (Codex 自身がスレッドを
+   自動 resolve する挙動があるかどうかは、この Issue の調査でも未確認 —
+   仮に Codex が resolve しない場合、対応後の resolve は毎回人間の作業に
+   なる。)
+
+5. **`schedule` を `*/30` から `*/10` (10分間隔) に詰めた。** 猶予期間
+   (既定15分) を追加した分、`workflow_run` で拾えなかった PR が定期実行
+   だけに頼るケースの最悪マージ遅延が増える (30分間隔のままだと最悪
+   45分程度)。Issue 本文が提示した2案 (a. 間隔を詰める、b. レビュー
+   イベントで再実行する仕組みを作る) のうち **a を採用**した。理由:
+   - b (`pull_request_review`/`pull_request_review_thread` イベントを
+     追加のトリガにする) は、レビュー解消・CHANGES_REQUESTED 解除の反映
+     を速くできる利点はあるが、`auto-merge` job は `contents: write` /
+     `pull-requests: write` / `issues: write` という強い権限を持つ job
+     であり、新しいイベント種別をトリガに追加するたびに「このイベントは
+     PR 側の workflow 定義で実行されないか」を再検証するコストが生まれる
+     (D55 が `pull_request` トリガそのものを避けた理由と同種のリスク)。
+   - a (`schedule` を詰める) は既存の設計 (D55: 「PR ごとの走査で、
+     イベントの payload に依存しない」) をそのまま使い回せ、追加のリスク
+     が無い。定期実行の負荷は GitHub Actions の無料枠に対して軽微
+     (1 job、数秒〜数十秒程度)。
+   - **残る制約**: レビュー解消 (スレッドの resolve、`CHANGES_REQUESTED`
+     の解除) や Codex の新しいレビュー到着は、`workflow_run` (他の
+     CI/perf-gate/release-windows/dependency-audit の完了) にたまたま
+     便乗しない限り、**最大 10 分程度の遅延**で auto-merge に反映される。
+     これは Issue の完了条件 (「指摘ゼロの PR が停滞しないこと」) を
+     10 分程度の遅延はあるが満たしている、と判断した。将来この遅延が
+     問題になった場合は b (レビューイベントをトリガに追加) を再検討する。
+
+6. **workflow 自体の検証に dry-run 専用 job (`dry-run-review-gate`) を
+   追加した — D88 の「`pull_request` + `paths` フィルタで自分自身を変更
+   する PR でのみ検証実行する」パターンを踏襲。** `on.pull_request.paths`
+   に `auto-merge.yml` 自身と `check_review_gate.py` /
+   `review_gate_decision.sh` を指定し、これらを変更する PR に限って
+   起動する。`workflow_dispatch` は `main` にマージされるまで Actions
+   タブに現れないため、workflow 自身の変更を検証する唯一の手段になる
+   (D88 と同じ理由)。
+   - **本番の `auto-merge` job とは完全に別の job に分離し、job 単位の
+     `permissions` を `contents: read` / `pull-requests: read` のみに
+     絞った。** `pull_request` トリガは (`pull_request_target` と異なり)
+     **PR ブランチ側の workflow 定義で実行される** — これは D55 が
+     `auto-merge.yml` 全体で `pull_request` トリガそのものを避けた理由
+     と同種のリスクであり、dry-run job にも本質的に残る。`auto-merge`
+     job が持つ `contents: write` / `pull-requests: write` /
+     `issues: write` を万一にも dry-run job に渡さないよう、明示的な
+     job 単位 `permissions` で読み取り専用に絞り込んだ (job 単位の
+     `permissions` は workflow 単位の設定を完全に置き換える)。これにより
+     PR 側でこの job の中身が改変されても、書き込み系の操作
+     (`gh pr merge`/`gh issue close` など) は一切できない。
+   - `secrets.AUTO_MERGE_TOKEN` は dry-run job では意図的に使わず、
+     `secrets.GITHUB_TOKEN` (読み取りスコープに制限済み) のみを渡す。
+   - dry-run job は `review_gate_decision.sh` を呼ぶだけで、`gh pr merge`
+     は一切呼ばない。判定結果 (ブロック理由の有無) をログに出すのみ。
+   - **残る残余リスク**: 同一リポジトリ内のブランチ (フォークでない) から
+     の PR では、GitHub は宣言された `permissions` をそのまま尊重する
+     ため、理論上は PR 側でこの job の `permissions` 自体を書き換えて
+     権限を要求し直すことができる (フォーク PR には GitHub 側の読み取り
+     専用強制があるが、同一リポジトリ内のブランチには効かない)。本
+     リポジトリは単一オーナー (`noan98`) のプライベートリポジトリで、
+     ブランチを作成できるのは信頼できるコラボレータのみという前提の下
+     では実害は小さいと判断したが、将来コラボレータが増える場合はこの
+     残余リスクを再評価すること。
+
+7. **GraphQL に必要な権限は `pull-requests: read` で足り、既存の
+   `permissions.pull-requests: write` (D55/D83 で既に付与済み) に包含
+   される。** 追加の `permissions` 変更は不要だった。GraphQL 呼び出し
+   自体が失敗した場合 (権限不足の 403 等) は `gh` の生のエラー出力を
+   `::warning::` に含めて安全側ブロックする — #168 で `issues` 権限が
+   抜けて 404 になった際にエラーメッセージだけでは原因が分からなかった
+   教訓を踏まえた (`review_gate_decision.sh` 内のコメント参照)。
+
+### 実装
+
+- `.github/scripts/check_review_gate.py` — 判定ロジック本体
+  (`evaluate_review_gate()`)。GitHub API のレスポンス形をそのまま引数に
+  取るため、GraphQL 呼び出しをモックせずに単体テストできる。
+- `.github/scripts/test_check_review_gate.py` — 41 件の `unittest`。
+  PR #185 の実タイムライン (未解決スレッド + 猶予期間でブロック、Codex
+  自体は head SHA をレビュー済みなのでブロック理由には含まれない) を
+  再現する回帰テストも含む。
+- `.github/scripts/review_gate_decision.sh` — GraphQL/REST 呼び出し
+  (`gh api graphql`/`gh api repos/.../commits/...`) → JSON 整形 →
+  `check_review_gate.py` 呼び出し、という薄い shell ラッパー。
+  `auto-merge` job (本番) と `dry-run-review-gate` job (検証) の両方から
+  同じスクリプトを呼ぶ (ロジックの二重管理を避ける)。終了コード
+  0=マージ可 / 1=ブロック理由あり / 2=API 呼び出し自体が失敗、を返す。
+- `.github/workflows/auto-merge.yml` — 上記を呼び出す形に変更。
+
+### 動作確認
+
+`check_review_gate.py`/`test_check_review_gate.py` は 41 件の `unittest`
+全件 pass を確認した (`python3 -m unittest test_check_review_gate -v`)。
+`review_gate_decision.sh` は `gh` コマンドをスタブに差し替えたローカル
+統合テストで、(a) Codex が head SHA を正しくレビュー済みのケース (exit 0)、
+(b) Codex のレビューが無いケース (exit 1、bypass ラベル無し) と
+`automerge-without-codex` 相当の第3引数で免除されるケース (exit 0)、
+(c) GraphQL 呼び出し自体が失敗するケース (exit 2、`::warning::` に生の
+エラーを含む) の3系統を確認した。
+
+**一方、`auto-merge.yml` 側 (dry-run job・本番 job の両方) は、実際に
+GitHub Actions 上で PR に対して走るまで本番環境で検証できていない**
+(D83 と同じ制約 — workflow の実行そのものは GitHub Actions 上でしか
+起きない)。この PR 自身が `dry-run-review-gate` job の対象
+(`.github/workflows/auto-merge.yml` を変更する PR) になるため、この PR
+が実際に GitHub Actions 上で dry-run job を走らせた結果が最初の実地検証
+になる。
+
+### Revisit condition
+
+(1) 運用開始後、最初に「指摘ゼロ」の PR (Codex が P2 未満の指摘を一切
+出さない PR) が出た際に、Codex が実際に 👍 リアクションを付けるか・
+シグナル c が正しく `blocked=False` を返すかを確認する。付かない場合は
+シグナル c を実際の挙動に合わせて修正すること。(2) この PR (workflow 自身
+の変更) がマージされた時点で、`dry-run-review-gate` job が実際に
+GitHub Actions 上で正しく起動・完走したかを確認する — 最初の実地検証に
+なる。(3) レビュー解消の反映が最大10分遅延する制約 (決定5) が実運用で
+問題になった場合は、`pull_request_review`/`pull_request_review_thread`
+トリガの追加を再検討する。(4) 将来コラボレータが増えてブランチ内 PR の
+信頼性前提が崩れる場合、dry-run job の残余リスク (決定6) を再評価する。
