@@ -692,3 +692,10 @@ commit、実行日時、試行回数)」に対応する。`metrics` はレコー
   指定する。並行して他の要因でタブの並び順が変わる状況 (今の VeloX には
   無いが、将来ドラッグ&ドロップでの並べ替え等が入った場合) には対応して
   いない — スクリプトの各行は「その時点の並び」を前提に書く。
+- **`background_cpu` (Issue #64) のようなネットワーク版シナリオは無い。**
+  `cpu_percent` は VeloX 自身の `/proc` サンプラが記録できるが、
+  リクエスト単位のイベントは wry 0.56 経由では Windows 以外観測できない
+  (`docs/decisions.md` D17/D59/D80)。バックグラウンドタブのネットワーク
+  活動は `velox-bench` ではなく `scripts/profile/network_activity.py`
+  (VeloX の外に立てたローカルサーバのアクセスログで数える) で測る —
+  `docs/profiling.md` §3.6、結果は `docs/performance-targets.md` §15。
