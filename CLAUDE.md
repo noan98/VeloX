@@ -79,6 +79,18 @@
   ただし子 Issue の一部だけを解消する (Epic がまだ完了しない) PR には Epic の
   `Closes` を入れないでください。早期クローズになります。その場合は子 Issue の
   キーワードのみ記載し、Epic は残った子が片付いた最後の PR で閉じます。
+- **本リポジトリの PR は基本的に `.github/workflows/auto-merge.yml` が
+  `GITHUB_TOKEN` でマージします。** `GITHUB_TOKEN` によるマージは GitHub 側の
+  それ以上の自動処理を誘発しない仕様のため、GitHub 標準の自動クローズは
+  素通りします。これを補うため、auto-merge.yml はマージ成功後に PR 本文から
+  クロージングキーワードを自分で抽出し (`.github/scripts/extract_closing_issues.py`、
+  上記と同じキーワード・除外規則をサポート)、`gh issue close --reason completed`
+  で明示的に閉じます (Issue #168、docs/decisions.md D83)。**つまり Issue の
+  自動クローズは GitHub 本体ではなく auto-merge.yml が代行しています** —
+  この節に書いたキーワードの書き方さえ守れば、通常は挙動を意識する必要は
+  ありません。手動でマージした場合 (`AUTO_MERGE_TOKEN` 未使用の auto-merge 経由
+  でない直接マージなど) はこの代行が働かないため、その場合は前述のとおり
+  手動で Issue をクローズしてください。
 
 ## コマンド
 

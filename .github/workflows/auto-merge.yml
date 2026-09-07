@@ -61,6 +61,14 @@ jobs:
     name: Auto merge PRs whose checks all passed
     runs-on: ubuntu-latest
     steps:
+      # Issue #168: この job は元々リポジトリを checkout していなかった
+      # (gh CLI と API しか使わないため必要が無かった)。マージ後の Issue
+      # クローズが `.github/scripts/extract_closing_issues.py` を実行する
+      # ようになったので、checkout が必須になった。これが無いとスクリプト
+      # が見つからず、抽出結果が空になって「1 件も閉じないまま成功する」
+      # という、まさにこの Issue が直そうとしている症状に戻ってしまう。
+      - uses: actions/checkout@v7
+
       - name: Merge eligible pull requests
         env:
           GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
@@ -150,6 +158,44 @@ jobs:
             if gh pr merge "$number" "--${MERGE_METHOD}" \
                  --match-head-commit "$sha" --delete-branch; then
               echo "merged: PR #${number}"
+
+              # --- Issue #168 -------------------------------------------
+              # GITHUB_TOKEN でのマージは GitHub 側のそれ以上の自動処理
+              # (Closes キーワードによる Issue 自動クローズ) を誘発しない
+              # ため、ここで明示的に閉じる。AUTO_MERGE_TOKEN (PAT) が
+              # 登録されて本物の自動クローズが効くようになった場合でも、
+              # 対象 Issue は既に closed のはずなので下の冪等チェックで
+              # 何もせず skip になる (二重クローズしない)。
+              # 抽出ロジック本体は .github/scripts/extract_closing_issues.py
+              # に切り出してあり、単体テストがある
+              # (.github/scripts/test_extract_closing_issues.py)。
+              # 抽出の失敗 (スクリプトが無い・python が落ちる等) を握り
+              # つぶさないこと: 黙って空を返すと「1 件も閉じないまま成功」
+              # に見え、この Issue が直そうとしている症状と区別が付かない。
+              # 1 件の PR の失敗で他の PR のマージまで止める必要は無いので、
+              # 警告を出して次へ進む。
+              body=$(gh pr view "$number" --json body --jq '.body // ""')
+              if ! issues=$(printf '%s' "$body" | \
+                   python3 .github/scripts/extract_closing_issues.py); then
+                echo "::warning::PR #${number} 本文からの Closes 抽出に失敗しました (Issue は閉じられていません)"
+                issues=""
+              fi
+              if [ -n "$issues" ]; then
+                echo "$issues" | while read -r issue; do
+                  [ -z "$issue" ] && continue
+                  state=$(gh issue view "$issue" --json state --jq '.state' 2>/dev/null) \
+                    || { echo "::warning::Issue #${issue} が見つかりません (PR #${number} 本文の Closes 参照)"; continue; }
+                  if [ "$state" = "CLOSED" ]; then
+                    echo "skip: Issue #${issue} は既に closed (PR #${number})"
+                    continue
+                  fi
+                  if gh issue close "$issue" --reason completed; then
+                    echo "closed: Issue #${issue} (PR #${number} の Closes キーワードにより)"
+                  else
+                    echo "::warning::Issue #${issue} のクローズに失敗しました (PR #${number})"
+                  fi
+                done
+              fi
             else
               # ブランチ保護 (レビュー必須など) や競合でマージできない場合。
               # 他の PR の処理は続ける。
