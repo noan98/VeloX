@@ -124,12 +124,35 @@ pub struct SuspensionPolicy {
 }
 
 impl SuspensionPolicy {
-    /// The default interval between memory samples. Two seconds is slow
-    /// enough that walking `/proc` (every process on the machine, see
-    /// `metrics::sample_process_tree_rss`) is negligible, and fast enough
-    /// that a burst of new tabs is reined in within a few seconds rather
-    /// than sitting over budget for a long time.
-    pub const DEFAULT_MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+    /// The default interval between memory samples. **5 seconds as of
+    /// Issue #187/#189 (docs/decisions.md D90)** — the original 2-second
+    /// default (D56) turned out not to be "negligible": walking `/proc` for
+    /// every process on the machine (not just VeloX's own tree,
+    /// `metrics::sample_process_tree_rss` -> `process_map`) to read each
+    /// one's `smaps_rollup` for PSS is individually expensive (kernel page-
+    /// table walk per process), and #184 (D90) made this run by default for
+    /// every user. Measured idle CPU at 2s was 1.2% (1 tab) / 1.5% (3
+    /// tabs) — a real, order-of-magnitude cost, not noise.
+    ///
+    /// Two independent levers reduced this, in order: (1) `process_map`
+    /// itself was made two-pass (#189) — the expensive `smaps_rollup`/`stat`
+    /// reads now happen only for `root_pid`'s own descendants, not every
+    /// process on the machine (measured ~85% of the whole scan's cost was
+    /// `smaps_rollup` reads for processes never even in VeloX's tree), which
+    /// alone cut idle CPU by roughly a third at any given interval; (2) the
+    /// interval itself, which #187 measured at 2s/5s/10s/30s and found
+    /// scales close to inversely, converging toward the sampler-off floor
+    /// (~0.1-0.2%) with diminishing returns past 5-10s once the two-pass fix
+    /// was in place. **5s** was chosen (not 10s, #187's first answer before
+    /// #189's two-pass fix) because it now reaches CPU roughly equal to what
+    /// 10s cost before the fix, while halving how long a memory-budget
+    /// sweep can lag behind a burst of newly opened tabs — the memory-budget
+    /// signal has no latency requirement (a sweep firing a few seconds
+    /// later only delays *when* memory is reclaimed, never whether it is),
+    /// so there was no reason to pay for slower reaction once the CPU cost
+    /// itself was no longer the deciding factor. Full numbers:
+    /// `docs/decisions.md` D90, `docs/performance-targets.md` §23.
+    pub const DEFAULT_MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
     /// Whether any signal is on at all. When `false`, the event loop has
     /// nothing to sweep and no deadline to wake up for.
