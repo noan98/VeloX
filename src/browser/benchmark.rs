@@ -880,8 +880,42 @@ pub fn compare(
 // the baseline (including a baseline with no metrics at all — e.g. a run
 // that collected zero records) cannot be evaluated and is reported in
 // [`GateReport::only_in_candidates`] rather than guessed at; the reverse
-// (baseline-only) goes in [`GateReport::only_in_baseline`]. Neither
-// contributes to [`GateReport::overall`].
+// (baseline-only) goes in [`GateReport::only_in_baseline`]. A
+// candidate-only metric is a normal thing for a PR to introduce, so it
+// does not contribute to [`GateReport::overall`]; a *baseline*-only one is
+// not (see the input preconditions below).
+//
+// **Input preconditions** (Issue #196): every mitigation above assumes the
+// two sides are actually comparable. `evaluate_gate` therefore checks that
+// assumption itself rather than trusting its caller, and records each
+// violation as a [`GateInputProblem`] that feeds [`GateReport::overall`]
+// alongside the per-metric verdicts:
+//
+// - **Scenario mismatch / OS mismatch** ([`Severity::Fail`]): comparing
+//   `cold_startup` against `tabs_20`, or a Linux result against a Windows
+//   one, is meaningless — Epic #57's absolute rule 5 ("record results per
+//   OS") and `docs/performance-targets.md` §10 both say so. Before this
+//   check, `gate` happily compared whatever metric names the two files
+//   happened to share, so a mistyped `--baseline` path produced a
+//   confident-looking verdict off unrelated numbers.
+// - **A candidate with no metrics at all** ([`Severity::Fail`]): an empty
+//   candidate cannot regress against anything, so every baseline metric
+//   fell into `only_in_baseline` and `overall` came out
+//   [`Severity::Ok`] — a silent pass for a run that measured nothing.
+// - **No comparable metrics at all** ([`Severity::Fail`]): same failure
+//   mode one level up. A gate that compared zero metrics must not report
+//   `Ok`; there is no evidence either way.
+// - **Baseline metrics missing from every candidate**
+//   ([`Severity::Warn`], i.e. non-blocking): a metric the baseline
+//   measured and no candidate did is either an incomplete candidate run or
+//   a deliberately removed metric. Both are worth a human's glance, but
+//   neither is reliably a regression, so this stops at `Warn`.
+//
+// The CI workflow (`.github/workflows/perf-gate.yml`) already passed
+// same-OS, same-scenario files, so none of these fire there today. They
+// exist because `gate` is a general-purpose CLI that anyone can point at
+// two arbitrary result files, and "OK" from a regression gate has to mean
+// "measured and compared", not "found nothing to compare".
 
 /// A regression gate's verdict for one metric, or for a whole
 /// [`GateReport`] (as the worst of its metrics' verdicts).
@@ -909,6 +943,97 @@ pub enum Severity {
 /// so a slightly short run still gates normally, while a pathologically
 /// small one (e.g. every trial but one failed to spawn) does not.
 pub const MIN_TRIALS_FOR_CONFIDENT_GATE: usize = 5;
+
+/// A violation of one of [`evaluate_gate`]'s input preconditions — see the
+/// module-level "Input preconditions" notes (Issue #196).
+///
+/// These sit *beside* the per-metric verdicts rather than replacing them:
+/// a report with a `ScenarioMismatch` still carries whatever metric
+/// comparisons were computable, so a human reading the report can see both
+/// the numbers and the reason they must not be trusted. Making
+/// `evaluate_gate` return `Err` instead would have thrown that context
+/// away, and would have made "the gate could not run" indistinguishable
+/// from "the gate crashed" in `velox-bench`'s exit codes (`2` is reserved
+/// for argument/IO errors).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum GateInputProblem {
+    /// The baseline and a candidate measured different scenarios.
+    ScenarioMismatch {
+        /// Index into `evaluate_gate`'s `candidates` slice, so a caller
+        /// with several `--candidate` files can tell which one is wrong.
+        candidate_index: usize,
+        baseline: String,
+        candidate: String,
+    },
+    /// The baseline and a candidate were measured on different operating
+    /// systems (Epic #57 absolute rule 5).
+    OsMismatch {
+        candidate_index: usize,
+        baseline: String,
+        candidate: String,
+    },
+    /// A candidate result carries no metrics at all — an empty or failed
+    /// run, which must never read as "no regression".
+    CandidateWithoutMetrics { candidate_index: usize },
+    /// Not one metric could be compared (an empty baseline, empty
+    /// candidates, or two results with no metric names in common).
+    NoComparableMetrics,
+    /// Metrics the baseline measured that no candidate measured. Same list
+    /// as [`GateReport::only_in_baseline`], surfaced here so it reaches
+    /// [`GateReport::overall`].
+    MetricsMissingFromCandidates { metrics: Vec<String> },
+}
+
+impl GateInputProblem {
+    /// How much this problem should weigh on [`GateReport::overall`]. See
+    /// the module-level "Input preconditions" notes for why the missing
+    /// metrics case stops at [`Severity::Warn`] while the rest are
+    /// [`Severity::Fail`].
+    pub fn severity(&self) -> Severity {
+        match self {
+            GateInputProblem::MetricsMissingFromCandidates { .. } => Severity::Warn,
+            _ => Severity::Fail,
+        }
+    }
+
+    /// A one-line human-readable description, in the same language as the
+    /// rest of `velox-bench`'s output.
+    pub fn describe(&self) -> String {
+        match self {
+            GateInputProblem::ScenarioMismatch {
+                candidate_index,
+                baseline,
+                candidate,
+            } => format!(
+                "candidate[{candidate_index}] のシナリオが baseline と異なります \
+                 (baseline={baseline} / candidate={candidate})"
+            ),
+            GateInputProblem::OsMismatch {
+                candidate_index,
+                baseline,
+                candidate,
+            } => format!(
+                "candidate[{candidate_index}] の OS が baseline と異なります \
+                 (baseline={baseline} / candidate={candidate}) — \
+                 OS をまたぐ比較は成立しません"
+            ),
+            GateInputProblem::CandidateWithoutMetrics { candidate_index } => format!(
+                "candidate[{candidate_index}] にメトリクスが 1 件もありません \
+                 (計測に失敗した結果ファイルの可能性があります)"
+            ),
+            GateInputProblem::NoComparableMetrics => {
+                "baseline と candidate に共通するメトリクスが 1 件もないため、\
+                 比較は行われていません"
+                    .to_owned()
+            }
+            GateInputProblem::MetricsMissingFromCandidates { metrics } => format!(
+                "baseline にはあるが candidate に無いメトリクス: {}",
+                metrics.join(", ")
+            ),
+        }
+    }
+}
 
 /// Percentage thresholds for [`evaluate_gate`]. See the module-level "Regression
 /// gate" section above for how these were chosen relative to this
@@ -982,10 +1107,19 @@ pub struct GateReport {
     pub only_in_baseline: Vec<String>,
     /// Metrics at least one candidate measured but the baseline did not.
     pub only_in_candidates: Vec<String>,
-    /// The worst [`Severity`] across [`Self::metrics`] — [`Severity::Ok`]
-    /// when `metrics` is empty (nothing to compare, e.g. an empty
-    /// baseline). This is the single value `velox-bench gate`'s exit code
-    /// encodes.
+    /// Input preconditions this comparison violated (Issue #196). Empty
+    /// for a well-formed baseline/candidate pairing; every entry
+    /// contributes its [`GateInputProblem::severity`] to [`Self::overall`].
+    #[serde(default)]
+    pub problems: Vec<GateInputProblem>,
+    /// The worst [`Severity`] across [`Self::metrics`] *and*
+    /// [`Self::problems`]. This is the single value `velox-bench gate`'s
+    /// exit code encodes.
+    ///
+    /// Note it is **not** [`Severity::Ok`] when `metrics` is empty: an
+    /// empty comparison raises [`GateInputProblem::NoComparableMetrics`],
+    /// so a gate that compared nothing fails rather than silently passing
+    /// (Issue #196 — this used to be the `Ok` case).
     pub overall: Severity,
 }
 
@@ -1025,10 +1159,17 @@ fn classify_pair(
 /// Evaluate a regression gate: `baseline` against one or more `candidates`
 /// (measurements of the same scenario/OS to compare against it — see the
 /// module-level "Regression gate" docs for why more than one is useful).
-/// `candidates` must be non-empty; an empty slice returns a report with no
-/// metrics (`overall: Severity::Ok`) rather than panicking, since "no
-/// candidates" is a caller bug best surfaced by `velox-bench` requiring
-/// `--candidate` at least once, not by a panic deep in pure logic.
+///
+/// "Same scenario/OS" is **checked, not assumed** (Issue #196): a mismatch,
+/// an empty candidate, or a pairing with no metrics in common is recorded
+/// in [`GateReport::problems`] and reflected in [`GateReport::overall`],
+/// so `gate` cannot report `Ok` for a comparison it never actually made.
+///
+/// `candidates` should be non-empty; an empty slice returns a report with
+/// no metrics and a [`GateInputProblem::NoComparableMetrics`] (i.e.
+/// [`Severity::Fail`]) rather than panicking, since "no candidates" is a
+/// caller bug best surfaced by `velox-bench` requiring `--candidate` at
+/// least once, not by a panic deep in pure logic.
 pub fn evaluate_gate(
     baseline: &BenchmarkResult,
     candidates: &[&BenchmarkResult],
@@ -1118,9 +1259,47 @@ pub fn evaluate_gate(
     only_in_baseline.sort();
     only_in_candidates.sort();
 
+    // Issue #196: the comparability checks. Deliberately run *after* the
+    // metric loop above rather than short-circuiting it — a report that
+    // says "these two files are not comparable" is more useful with the
+    // numbers still attached than without them.
+    let mut problems = Vec::new();
+    for (index, candidate) in candidates.iter().enumerate() {
+        if candidate.scenario != baseline.scenario {
+            problems.push(GateInputProblem::ScenarioMismatch {
+                candidate_index: index,
+                baseline: baseline.scenario.clone(),
+                candidate: candidate.scenario.clone(),
+            });
+        }
+        if candidate.environment.os != baseline.environment.os {
+            problems.push(GateInputProblem::OsMismatch {
+                candidate_index: index,
+                baseline: baseline.environment.os.clone(),
+                candidate: candidate.environment.os.clone(),
+            });
+        }
+        if candidate.metrics.is_empty() {
+            problems.push(GateInputProblem::CandidateWithoutMetrics {
+                candidate_index: index,
+            });
+        }
+    }
+    if metrics.is_empty() {
+        problems.push(GateInputProblem::NoComparableMetrics);
+    } else if !only_in_baseline.is_empty() {
+        // Only worth saying when *something* was comparable: when nothing
+        // was, `NoComparableMetrics` above already covers it and this
+        // would just restate the whole baseline metric list.
+        problems.push(GateInputProblem::MetricsMissingFromCandidates {
+            metrics: only_in_baseline.clone(),
+        });
+    }
+
     let overall = metrics
         .values()
         .map(|verdict| verdict.severity)
+        .chain(problems.iter().map(GateInputProblem::severity))
         .max()
         .unwrap_or(Severity::Ok);
 
@@ -1131,6 +1310,7 @@ pub fn evaluate_gate(
         metrics,
         only_in_baseline,
         only_in_candidates,
+        problems,
         overall,
     }
 }
@@ -1199,6 +1379,19 @@ pub fn render_gate_markdown(report: &GateReport) -> String {
             "\ncandidate のみに存在: {}\n",
             report.only_in_candidates.join(", ")
         ));
+    }
+    // Issue #196: listed last and unconditionally, so a `Fail` overall that
+    // came from a precondition (not from a metric) always has its reason
+    // visible in the same Job Summary the verdict is read from.
+    if !report.problems.is_empty() {
+        out.push_str("\n**入力の前提を満たしていません:**\n\n");
+        for problem in &report.problems {
+            out.push_str(&format!(
+                "- [{}] {}\n",
+                severity_label(problem.severity()),
+                problem.describe()
+            ));
+        }
     }
     out
 }
@@ -1434,16 +1627,21 @@ mod gate_tests {
         let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
         assert!(report.metrics.is_empty());
         assert_eq!(report.only_in_candidates, vec![KEY.to_owned()]);
-        assert_eq!(report.overall, Severity::Ok);
+        // The candidate-only metric itself is never guessed at — but the
+        // comparison as a whole measured nothing, which Issue #196 says
+        // must not read as a pass.
+        assert_eq!(report.problems, vec![GateInputProblem::NoComparableMetrics]);
+        assert_eq!(report.overall, Severity::Fail);
     }
 
     #[test]
-    fn empty_baseline_result_never_fails() {
+    fn empty_baseline_result_is_not_a_silent_pass() {
         // A baseline from a run that collected zero records (e.g. a
         // headless environment with no display — see
-        // `docs/benchmarking.md` "実行環境要件") must not silently gate
-        // everything as a pass *or* crash the gate; it should simply have
-        // nothing to compare.
+        // `docs/benchmarking.md` "実行環境要件") must not crash the gate,
+        // and must not gate everything through as a pass either: there is
+        // nothing to compare, so there is no evidence of "no regression".
+        // Issue #196 — this used to assert `Severity::Ok`.
         let baseline = result_with_stats("cold_startup", &[]);
         let candidate = result_with_stats(
             "cold_startup",
@@ -1453,8 +1651,11 @@ mod gate_tests {
             ],
         );
         let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
-        assert_eq!(report.overall, Severity::Ok);
+        assert_eq!(report.overall, Severity::Fail);
         assert_eq!(report.only_in_candidates.len(), 2);
+        assert!(report
+            .problems
+            .contains(&GateInputProblem::NoComparableMetrics));
     }
 
     #[test]
@@ -1475,15 +1676,18 @@ mod gate_tests {
     }
 
     #[test]
-    fn no_candidates_at_all_yields_an_empty_ok_report() {
+    fn no_candidates_at_all_fails_instead_of_panicking() {
         let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
         let report = evaluate_gate(&baseline, &[], &GateThresholds::default());
-        // Nothing was actually compared (no candidate had any data at
-        // all), so nothing can be Warn/Fail — but the baseline's metric
-        // is still visible via `only_in_baseline`, same as when a
-        // candidate exists but happens not to have measured it.
+        // Nothing was actually compared (there is no candidate at all), so
+        // no *metric* can be Warn/Fail — but the report as a whole fails
+        // rather than passing (Issue #196), and the baseline's metric is
+        // still visible via `only_in_baseline`. Still no panic: "no
+        // candidates" stays a caller bug `velox-bench` rejects at argument
+        // parsing, not a crash deep in pure logic.
         assert!(report.metrics.is_empty());
-        assert_eq!(report.overall, Severity::Ok);
+        assert_eq!(report.problems, vec![GateInputProblem::NoComparableMetrics]);
+        assert_eq!(report.overall, Severity::Fail);
         assert_eq!(report.only_in_baseline, vec![KEY.to_owned()]);
         assert_eq!(report.candidate_count, 0);
     }
@@ -1584,7 +1788,148 @@ mod gate_tests {
         let candidate = result_with_stats("cold_startup", &[]);
         let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
         let markdown = render_gate_markdown(&report);
-        assert!(markdown.contains("OK"));
+        assert!(markdown.contains("比較可能なメトリクスがありません"));
+        // Issue #196: the verdict is FAIL, and the reason for it has to be
+        // in the same rendered summary the verdict is read from.
+        assert!(markdown.contains("FAIL"));
+        assert!(markdown.contains("入力の前提を満たしていません"));
+    }
+
+    // -- input preconditions (Issue #196) ------------------------------------
+
+    #[test]
+    fn scenario_mismatch_fails_even_when_the_numbers_look_fine() {
+        // Identical medians: without the precondition check this is a
+        // confident-looking `Ok` computed from two unrelated scenarios.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("tabs_20", &[(KEY, stats_with(10, 500.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+        assert_eq!(
+            report.problems,
+            vec![GateInputProblem::ScenarioMismatch {
+                candidate_index: 0,
+                baseline: "cold_startup".to_owned(),
+                candidate: "tabs_20".to_owned(),
+            }]
+        );
+        assert_eq!(report.overall, Severity::Fail);
+    }
+
+    #[test]
+    fn os_mismatch_fails() {
+        // Epic #57 absolute rule 5: results are recorded per OS, and a
+        // Linux number is never a stand-in for a Windows one.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let mut candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
+        candidate.environment.os = "windows".to_owned();
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(
+            report.problems,
+            vec![GateInputProblem::OsMismatch {
+                candidate_index: 0,
+                baseline: "linux".to_owned(),
+                candidate: "windows".to_owned(),
+            }]
+        );
+        assert_eq!(report.overall, Severity::Fail);
+    }
+
+    #[test]
+    fn mismatch_names_the_offending_candidate_by_index() {
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let good = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
+        let bad = result_with_stats("tabs_5", &[(KEY, stats_with(10, 505.0))]);
+        let report = evaluate_gate(&baseline, &[&good, &bad], &GateThresholds::default());
+        assert_eq!(
+            report.problems,
+            vec![GateInputProblem::ScenarioMismatch {
+                candidate_index: 1,
+                baseline: "cold_startup".to_owned(),
+                candidate: "tabs_5".to_owned(),
+            }]
+        );
+        assert!(report.problems[0].describe().contains("candidate[1]"));
+    }
+
+    #[test]
+    fn candidate_with_no_metrics_at_all_fails() {
+        // The exact silent pass Issue #196 describes: every baseline
+        // metric lands in `only_in_baseline`, no metric verdict exists, and
+        // the old `overall` was `Ok`.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("cold_startup", &[]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert!(report.metrics.is_empty());
+        assert_eq!(report.only_in_baseline, vec![KEY.to_owned()]);
+        assert!(report
+            .problems
+            .contains(&GateInputProblem::CandidateWithoutMetrics { candidate_index: 0 }));
+        assert_eq!(report.overall, Severity::Fail);
+    }
+
+    #[test]
+    fn baseline_metric_missing_from_every_candidate_warns_but_does_not_block() {
+        // A partial gap (one metric of two) is either an incomplete
+        // candidate run or a deliberately removed metric — worth a look,
+        // not worth blocking a PR, so it stops at Warn.
+        let baseline = result_with_stats(
+            "cold_startup",
+            &[
+                (KEY, stats_with(10, 500.0)),
+                ("rss_total_bytes", stats_with(10, 100.0)),
+            ],
+        );
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Ok);
+        assert_eq!(
+            report.problems,
+            vec![GateInputProblem::MetricsMissingFromCandidates {
+                metrics: vec!["rss_total_bytes".to_owned()],
+            }]
+        );
+        assert_eq!(report.overall, Severity::Warn);
+    }
+
+    #[test]
+    fn a_metric_regression_still_outranks_a_warn_level_problem() {
+        let baseline = result_with_stats(
+            "cold_startup",
+            &[
+                (KEY, stats_with(10, 500.0)),
+                ("rss_total_bytes", stats_with(10, 100.0)),
+            ],
+        );
+        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        assert_eq!(report.metrics[KEY].severity, Severity::Fail);
+        assert_eq!(report.overall, Severity::Fail);
+    }
+
+    #[test]
+    fn a_well_formed_comparison_reports_no_problems() {
+        // The shape `perf-gate.yml` actually passes: same scenario, same
+        // OS, same metric set, two candidate runs. Nothing here may change
+        // its verdict just because the checks exist.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let first = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
+        let second = result_with_stats("cold_startup", &[(KEY, stats_with(10, 498.0))]);
+        let report = evaluate_gate(&baseline, &[&first, &second], &GateThresholds::default());
+        assert!(report.problems.is_empty());
+        assert_eq!(report.overall, Severity::Ok);
+    }
+
+    #[test]
+    fn gate_report_round_trips_through_json_with_problems() {
+        // `velox-bench gate --output` writes this, and the dashboard reads
+        // it back — the new field must survive the round trip.
+        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let candidate = result_with_stats("tabs_20", &[(KEY, stats_with(10, 500.0))]);
+        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let json = serde_json::to_string(&report).expect("serialize");
+        let parsed: GateReport = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, report);
     }
 }
 

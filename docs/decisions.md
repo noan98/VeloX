@@ -11858,6 +11858,183 @@ workflow 側でも断つべきと判断した)。
 (Issue #201 で `@codex review` について実測したのと同じ制約)。**`@claude` /
 `@codex review` のどちらも PAT 投稿が前提**である、と揃えて理解すること。
 
+**追記 (2026-09-08、Issue #194)**: `CLAUDE_REVIEWER_LOGINS` に
+**`claude[bot]`** を設定して Claude フォールバックを有効化した。**同時に、
+緩和シグナルから「依頼コメントより後の Claude のコメント」を削除した。**
+
+当初この経路は 2 つのシグナルの OR で成立していた。
+
+1. `latestReviews[].commit.oid` が head SHA と完全一致する Claude のレビュー
+2. `@claude` 依頼コメントより後に Claude ログインが投稿したコメント
+
+(2) は「Claude がレビューという形式を取らない可能性」に備えた
+フォールバックだったが、**そのまま有効化すると未レビューの PR が
+マージされる**ことが分かったため削除した。理由:
+
+- `anthropics/claude-code-action` は**起動直後に進捗コメントを投稿する**
+  (Issue #203 で実測。この二重起動が #203 の原因そのものだった)。
+- したがって (2) は「レビューが 1 文字も書かれていない時点」で成立する。
+- PR #198 では、起動後 **104ms・1 ターン・コスト 0 で `is_error: true`**
+  で終了した (= レビューが行われなかった) 例も観測されている。この場合
+  でも進捗コメントは残るため、(2) だけで Codex 再レビュー要件が緩和されて
+  しまう。
+- 進捗コメントは**同一コメントが編集され続ける**ため、`createdAt` からは
+  「進捗中」と「完了後」を区別できない。時刻ベースの回避策は成立しない。
+
+**残る唯一のシグナルは (1)** — 完了したレビューであることが曖昧さなく
+分かるのはレビューオブジェクトの存在だけである。Claude がレビュー
+オブジェクトを作らず本文コメントしか残さない実装だった場合、緩和は
+成立しなくなるが、そのときの挙動は「マージを見送る」= 安全側であり、
+`automerge-without-codex` ラベルによる手動対応に落ちるだけである。
+**逆向きの誤り (未レビューのままマージ) は取り返しがつかない。**
+
+`claude[bot]` (id 209825114、<https://github.com/apps/claude>) は PR #198
+で**実測した**ログイン名であり推測値ではない。判定は Codex と同じく
+完全一致で行う (前方一致だと別名アカウントがすり抜ける — PR #192 の
+Codex P2 指摘と同じ穴)。
+
+**この時点で未完了の設定 (いずれもリポジトリのシークレットであり、
+オーナーのみが設定できる)**:
+
+| 項目 | 状態 | 影響 |
+| --- | --- | --- |
+| `CLAUDE_CODE_OAUTH_TOKEN` | レビュー実行が `is_error: true` で失敗する (PR #198) | Claude がレビューを投稿できないため、緩和が成立しない |
+| `AUTO_MERGE_TOKEN` | **未設定** (PR #209 の auto-merge ログの `::warning::` で確認) | `@claude` / `@codex review` のどちらも自動投稿されない |
+
+つまり `CLAUDE_REVIEWER_LOGINS` の設定は**フォールバック成立の必要条件を
+1 つ満たしただけ**であり、上記 2 つが解消するまで経路は稼働しない。
+稼働後に (1) だけで実際に緩和が成立するか (= Claude がレビュー
+オブジェクトを作るか) を確認し、作らないことが分かった場合は、進捗
+コメントと完了レビューを確実に区別できる判別子を見つけてから (2) を
+復活させること — **見つからないまま復活させてはならない。**
+
+**追記 (2026-09-08、Issue #194 — `AUTO_MERGE_TOKEN` 登録後の実測)**:
+PAT を登録して経路を実際に動かしたところ、**Claude フォールバックは
+発火しなかった**。判明したことと未解明な点を分けて記録する。
+
+**判明したこと: PAT の有無が「反応する/しない」を分けていた。**
+2026-09-08 08:24:39 に auto-merge が `@codex review` を PAT で投稿し、
+**9 秒後の 08:24:48 に Codex が利用上限メッセージを返した** (PR #209)。
+投稿者は `github-actions[bot]` ではなく PAT 所有者になっている。
+`AUTO_MERGE_TOKEN` 未設定時の `::warning::` も消えた。**D91 本文の
+「GITHUB_TOKEN で投稿したコメントには反応しない」は、PAT 側からも
+裏付けが取れた。**
+
+**未解明: 利用上限メッセージが検知されない。** 上記の直後 (38 秒後と
+2 分 30 秒後の 2 回) に auto-merge を実行したが、どちらも判定は
+
+```
+wait: Codex に @codex review を自動リクエスト済みです (head SHA `875a36b`)。応答を待っています
+```
+
+で止まり、`@claude` への依頼は投稿されなかった。`_find_codex_usage_limit_after`
+が False を返している。**GraphQL の反映遅れではない** (2 分半後でも同じ)。
+
+同じ入力を模したペイロードを `check_review_gate.py` に流すと
+`claude_review_request_needed: true` が正しく返る。つまり**ロジックの
+誤りではなく、CI が GraphQL から受け取る実データが想定と違う**。
+候補は (a) `author.__typename` が `Bot` でない、(b) `author` が
+`null`、(c) 本文の定型文言の不一致、のいずれか。ログにはどれとも
+書かれていないため、この時点では特定できていない。
+
+**対応: 判定は変えず、診断だけ足した。** 上記の "応答を待っています"
+に、判定の材料を段階別に出す内訳を付けた
+(`_usage_limit_diagnostic`)。
+
+```
+[診断: コメント2件 / Codex ログイン一致1件 (__typename=User) / 著者判定通過0件 / 上限文言一致0件 / 依頼(...)より後0件]
+```
+
+「Codex がまだ返信していない」「ログイン名が一致しない」「`__typename`
+で落ちた」「文言が変わった」「時刻の前後関係で落ちた」を 1 行で区別
+できる。**次に同じ状態になったとき、この行を読めば原因が確定する。**
+
+なお `auto-merge.yml` の merge job は `workflow_dispatch` / `schedule` で
+**既定ブランチ (main) の内容を checkout して実行する**。したがって
+`CLAUDE_REVIEWER_LOGINS` の設定もこの診断も、**main にマージされるまで
+実際の判定には効かない** (dry-run job だけが PR のブランチで動く。
+D88 と同じ性質)。上記の実測が「main の版」で行われたものである点に
+注意すること。
+
+**追記 (2026-09-08、Issue #194 — 原因確定): GraphQL の `Bot` の `login` に
+は `[bot]` が付かない。許可リストが REST 表記だったため、Codex の判定が
+全滅していた。**
+
+前項の診断を仕込んで PR #209 で実行したところ、原因を一意に特定できた。
+
+```
+[診断: コメント7件 / 観測した著者=chatgpt-codex-connector,noan98
+ / Codex ログイン一致0件 (__typename=なし) / 著者判定通過0件
+ / 上限文言一致0件 / 依頼(2026-09-08T08:54:45Z)より後0件]
+```
+
+**GraphQL は `chatgpt-codex-connector` を返す。** REST が返す
+`chatgpt-codex-connector[bot]` とは綴りが違う。`check_review_gate.py` が
+読むのは GraphQL であるのに、許可リスト `_CODEX_LOGINS` は REST 表記で
+書かれており、しかも PR #192 の P2 対応で**前方一致から完全一致に変更**
+されていた。前方一致だった頃は
+`"chatgpt-codex-connector".startswith("chatgpt-codex-connector")` が真に
+なって偶然通っていたが、完全一致にした時点で
+`"chatgpt-codex-connector" != "chatgpt-codex-connector[bot]"` となり、
+**Codex のレビュー・コメント・👍 が 1 件も照合されなくなっていた。**
+
+影響範囲は Claude フォールバックだけではない。`_is_codex_author` を使う
+判定すべて — 「Codex が head SHA をレビュー済みか」「👍 を付けたか」
+「利用上限メッセージを出したか」 — が常に偽になっていた。**つまり
+PR #192 以降、この gate はすべての PR を「Codex 未レビュー」で止め続けて
+いた。** ユニットテストが素通りしたのは、テストデータの login を
+**REST 表記で書いていた**ためである (`CodexLoginExactMatchTest`)。
+
+### 対応
+
+`_normalize_login` を追加し、**小文字化 + 末尾 `[bot]` の除去**をしてから
+**完全一致**で比較する。**前方一致には戻さない** — PR #192 の P2 指摘
+(別名 `chatgpt-codex-connector-review` のすり抜け) はそのまま守られる。
+正規化しても `chatgpt-codex-connector-review` は
+`chatgpt-codex-connector` にならない。
+
+あわせて `_is_login_in` (Claude 用) にも `__typename == "Bot"` の要求を
+追加した。`[bot]` を落として比較するようになったことで、許可リストに
+`claude[bot]` と書いてあっても **`claude` という*ユーザ*アカウント**が
+一致し得るようになったためである。Claude の応答者が GitHub App (= Bot)
+であることは PR #198 で実測済み (id 209825114、
+<https://github.com/apps/claude>) なので、正規の経路は塞がない。
+
+回帰テストは GraphQL 表記 (`[bot]` 無し) で書いた — **テストデータの
+綴りを実データに合わせなかったことが、この不具合を 1 週間近く隠して
+いた原因そのもの**なので、そこを固定する。
+
+- Codex のレビュー / 利用上限メッセージが GraphQL 表記でも照合されること
+- Claude のレビューが GraphQL 表記 (`claude`) でも緩和を成立させること
+- `claude` という**ユーザ**アカウントでは緩和が成立しないこと
+- `chatgpt-codex-connector-review` は正規化後も一致しないこと
+
+### 検証 (2026-09-08 09:02、PR #209 head `1183f04`)
+
+修正入りのコードで dry-run 判定を実行し、**Claude フォールバックが実際に
+発火することを確認した。**
+
+| head | 判定 |
+| --- | --- |
+| `955dcfa` (修正前) | `wait: Codex に @codex review を自動リクエスト済みです。応答を待っています [診断: ... 観測した著者=chatgpt-codex-connector,noan98 / Codex ログイン一致0件 ...]` |
+| `1183f04` (修正後) | `info: (dry-run) @claude へのレビュー依頼を投稿する判定になりました` |
+
+同一の PR・同一のコメント列に対して、**コードの違いだけで判定が
+「Codex の応答待ち」から「Claude へレビュー依頼」に変わった。** つまり
+利用上限メッセージが正しく検知されるようになり、Codex に一度も
+レビューされていない PR であることも正しく判定されている。
+dry-run job なので実際の投稿は行っていない (第4引数 `"false"`)。
+
+**ただし本番の判定に効くのは main にマージされてからである。**
+`auto-merge.yml` の merge job は `workflow_dispatch` / `schedule` で
+既定ブランチの内容を checkout して実行するため (D88 と同じ性質)。
+それまでは Codex 判定が全滅した状態が続き、すべての PR が
+「Codex 未レビュー」で止まり続ける。
+
+残る未検証項目は `CLAUDE_CODE_OAUTH_TOKEN` によるレビュー実行そのもの
+(PR #198 で `is_error: true`)。main マージ後、実際に `@claude` が投稿
+されるようになった時点で新しいログが取れるので、そこで切り分ける。
+
 ## D92: 起動の `process_start` → `window_created` を 4 つの中間チェックポイントで分解する (#182) — 計測の追加のみで、最適化はまだ行わない
 
 **対象**: Issue #182 (P1: Windows Startup Performance — Window Creation /
@@ -12182,3 +12359,135 @@ session`)。作成時は CLAUDE.md の必須ルールどおり `cost:` と `bene
 (6) `max_live_tabs` / `idle_after` を既定にするかは、D56 Revisit
 condition (2) / D90 Revisit condition (3) のまま据え置く — 本 Issue は
 これを一切変更していない。
+
+---
+
+## D94: 回帰ゲートの入力前提を `gate` 自身が検証する (Issue #196) — シナリオ/OS 不一致・空 candidate を「OK」と言わせない
+
+**対象**: Issue #196 (`velox-bench gate` / `benchmark::evaluate_gate`、
+Epic #57 配下)。D46 (回帰ゲートの設計) は書き換えず、本節で補う。
+
+### 決定
+
+**`evaluate_gate` は「baseline と candidate が比較可能である」ことを
+呼び出し元に任せず、自分で検証する。** 違反は
+`GateInputProblem` として `GateReport::problems` に記録し、
+`GateReport::overall` に反映する。
+
+| 前提違反 | 判定 | 理由 |
+| --- | --- | --- |
+| `scenario` 不一致 | FAIL | `cold_startup` と `tabs_20` の比較は無意味 |
+| `environment.os` 不一致 | FAIL | Epic #57 絶対ルール 5 / `docs/performance-targets.md` §10 |
+| candidate のメトリクスが 0 件 | FAIL | 計測に失敗した結果は「回帰なし」ではない |
+| 比較できたメトリクスが 0 件 | FAIL | 比較していないものを OK とは言えない |
+| baseline にあり全 candidate に無いメトリクス | WARN | 計測漏れかメトリクス削除か区別できないので非ブロッキング |
+
+### なぜ必要だったか
+
+D46 が積み上げた緩和策 (2 段階の閾値・最小絶対差・多数決) は**すべて
+「両者が同じシナリオを同じ OS で測ったものである」ことを前提**にしている。
+その前提自体は誰も検査していなかった。結果として次の 2 つが「OK」に
+なり得た。
+
+1. **`--baseline` のファイル取り違え。** シナリオも OS も見ずに、
+   たまたま名前が一致するメトリクスだけを比較して、自信のありそうな
+   判定を出していた。
+2. **中身が空の candidate。** baseline の全メトリクスが
+   `only_in_baseline` に落ち、比較対象が 1 件も無いまま
+   `overall` は `Ok` (メトリクスが空なら `max()` が `None` → `Ok`)
+   になっていた。**回帰ゲートが最も出してはいけない誤りは、
+   計測できていないときに緑を返すことである。**
+
+CI (`.github/workflows/perf-gate.yml`) は同一ジョブ内で同一 OS・同一
+`cold_startup` を明示的に渡しているため、**この修正で既存 CI の判定は
+変わらない** (`a_well_formed_comparison_reports_no_problems` で固定した)。
+それでも入れたのは、`gate` が汎用 CLI として公開されており、手動
+ベンチマークの利用範囲が #178 / #183 以降広がっているためである。
+
+### なぜ `Result` ではなく `GateReport` の一部にしたか
+
+`evaluate_gate` が `Err` を返す設計も考えたが採らなかった。
+
+- **判定できたメトリクスの数値を捨てることになる。** 「この 2 つは
+  比較してはいけない」と言いつつ数値も見せたほうが、原因追跡が速い。
+- **`velox-bench` の終了コードの意味が壊れる。** `2` は引数/IO エラー用に
+  予約されている (`docs/benchmarking.md` §5)。「前提を満たさない」は
+  引数の形式エラーではなく**ゲートの判定結果**なので、`1` (FAIL) で
+  返すのが正しい。
+
+`GateReport::problems` は `#[serde(default)]` を付けてあるので、
+この変更以前に書き出された `gate-report.json` も読み戻せる。
+
+### 残る限界
+
+(1) 検証しているのは `scenario` と `environment.os` だけである。
+`cpu_count` や WebView のバージョン差は見ていない — 同一ジョブ内計測
+(D46) を守っている限り問題にならないが、**手動で 2 つのファイルを
+渡す場合、同じ OS 名でも同じマシンとは限らない**。§10 の原則
+(セッションをまたぐ比較をしない) は依然として人間が守る必要がある。
+(2) `only_in_candidates` (candidate にだけあるメトリクス) は
+`problems` に入れていない。PR が新しいメトリクスを追加するのは
+正常な変更であり、これを WARN にすると計測追加のたびに黄色くなる。
+(3) 「baseline にあり candidate に無い」を WARN に留めたため、
+**計測漏れは CI をブロックしない**。ブロックさせるには、シナリオごとに
+「必ず取れているべきメトリクス」の一覧が要る — 現状そのような定義は
+どこにも無く、作るなら `MetricKey` 側に持たせるのが筋である。
+
+---
+
+## D95: Issue #195 (metrics OFF で Toolbar IPC の JSON 二重パース) は現行コードには存在しなかった — 型で防がれている
+
+**対象**: Issue #195 (Epic #57 配下)。**`src/` に変更を加えていない。**
+Epic #57 のルール 1 (ベンチマーク無しに最適化しない) に従い、まず
+コードの実態を確認した結果、報告された問題が存在しないことが分かった。
+
+### 検証結果
+
+Issue #195 は「`record_perf_event` の `UserEvent::ToolbarMessage` 分岐が
+metrics OFF (`VELOX_PERF_METRICS` 未設定) でも実行され、
+`Instant::now()` と `toolbar::command_name` による余分な JSON パースが
+通常運用のホットパスに乗っている」と報告している。**現行 `main` では
+そうなっていない。**
+
+1. `perf_log` は `config.perf_metrics.then(|| build_perf_log(&config))`
+   で作られるため、metrics OFF では `None` である (`src/app.rs`)。
+2. `record_perf_event` の唯一の呼び出し元は
+   `if let Some(log) = perf_log.as_deref()` の内側にある。
+3. `record_perf_event` の引数は `perf_log: &PerfLog` であり
+   `Option<&PerfLog>` ではない。**metrics OFF でこの関数に入る経路は
+   型として存在しない** — 将来ゲートを外そうとしてもコンパイルが通らない。
+4. `UserEvent::ToolbarMessage` を処理する箇所はコード全体で 2 つだけ
+   (`record_perf_event` と `handle_user_event`) である。したがって
+   metrics OFF での `parse_command` 呼び出しは**1 回**、
+   `command_name` と `Instant::now()` は**0 回**である。
+
+さらに履歴上も、二重パースが `main` に乗っていた期間は無い。
+`command_name` を `record_perf_event` に入れた #66 のコミット
+(2026-09-07) の時点で、呼び出し元のゲートは既に入っていた
+(2026-09-06)。**PR #183 の「metrics ON の診断専用パス」という説明は
+実装と一致している。**
+
+### 対応
+
+**コード変更なし。回帰テストも追加していない。** 「metrics OFF で
+`record_perf_event` が呼ばれないこと」はテストで確かめるより型で
+保証されているほうが強く、実際そうなっている (上記 3)。
+
+metrics **ON** 側には、`command_name` が `serde_json::Value` を丸ごと
+組み立てるぶんのコストが残っている (`parse_command` と合わせて
+1 メッセージあたり 2 回のパース)。これは計測経路のみの負荷だが、
+`PerfRecord::Ipc` の `duration` を押し上げる=**計測値そのものを
+歪める**という意味では潰す価値がある。ただし Epic #57 ルール 1 に
+従い、**実測なしに手を入れない**。着手するなら
+`velox-bench ipc-summary` で `in` 方向の `median_ms` / `p95_ms` を
+先に採ること。
+
+### 残る限界
+
+(1) 上記は Rust 側の話である。Toolbar 側 (JS) が metrics OFF でも
+計測用のフィールドを載せているかどうかは見ていない。
+(2) metrics ON の 2 回パースを実際に潰す場合、`command_name` の
+「`parse_command` が失敗するメッセージにもラベルを付けられる」という
+性質 (その doc コメント参照) を壊さないこと。単純に
+`parse_command` の結果から名前を引く実装では、不正なメッセージが
+計測から消える。

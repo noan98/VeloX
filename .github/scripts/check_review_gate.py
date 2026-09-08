@@ -90,17 +90,17 @@ docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベ
    `claude_relaxed`/`claude_relaxed_detail` (B の場合) を返す (呼び出し側
    で `::warning::` として目立たせるため。黙って緩めない)。
 
-   **Claude フォールバック (`claude_logins`)**: `chatgpt-codex-connector`
-   と違い、Claude のレビューに応答する仕組み (GitHub App / Actions) が
-   このリポジトリに導入されているかは **未確認**であり、応答時のログイン
-   名やレビュー形式 (review/comment/何も残さない) も分かっていない。
-   そのため **ログイン名をハードコードしない**: `claude_logins`
+   **Claude フォールバック (`claude_logins`)**: 応答する仕組みは
+   `.github/workflows/claude.yml` (Issue #194) で導入済みで、その
+   ログイン名は PR #198 で **`claude[bot]`** と実測された。それでも
+   **ログイン名はハードコードしない**: `claude_logins`
    (workflow の `env.CLAUDE_REVIEWER_LOGINS`、カンマ区切り) で明示的に
    設定された場合のみ有効になり、**既定は空集合 = 常に不成立** (Codex の
    利用上限緩和 A のみで判断する、従来どおりの安全側)。判定シグナルは
-   OR: (i) `latestReviews[].commit.oid` が head SHA と完全一致する Claude
-   のレビュー、(ii) `@claude` 依頼コメントより後に Claude ログインが
-   投稿したコメント (レビューという形式を取らない可能性があるため)。
+   **`latestReviews[].commit.oid` が head SHA と完全一致する Claude の
+   レビュー 1 つだけ**である — 「依頼より後の Claude のコメント」は
+   進捗コメント (Issue #203) と完了レビューを区別できないため数えない
+   (理由は `_claude_reviewed_head_sha` の docstring)。
    Codex と異なり `__typename == "Bot"` は要求しない (Claude 側の実装が
    Bot か User か不明なため)。
 
@@ -244,6 +244,30 @@ def _parse_iso8601(value: str) -> datetime:
     return dt
 
 
+def _normalize_login(name: str | None) -> str:
+    """ログイン名を比較用に正規化する — 小文字化し、末尾の `[bot]` を落とす。
+
+    **なぜ必要か (Issue #194、PR #209 で実測)**: GitHub App の
+    ログイン名は API によって綴りが違う。REST は
+    `chatgpt-codex-connector[bot]` を返すが、**GraphQL の `Bot` アクタの
+    `login` は `[bot]` の無い `chatgpt-codex-connector` を返す。**
+    このスクリプトが読むのは GraphQL であり、許可リストは REST 表記で
+    書かれていたため、**Codex のコメント・レビュー・👍 が 1 件も
+    照合されていなかった** (PR #209 の診断:
+    `観測した著者=chatgpt-codex-connector,noan98 / Codex ログイン一致0件`)。
+
+    PR #192 の P2 指摘 (前方一致だと `chatgpt-codex-connector-review` の
+    ような別名がすり抜ける) は**そのまま守る**: ここで行うのは
+    「末尾の `[bot]` を落として**完全一致**」であり、前方一致には戻さない。
+    `chatgpt-codex-connector-review` は正規化しても
+    `chatgpt-codex-connector` にはならないので、依然として一致しない。
+    """
+    login = (name or "").lower()
+    if login.endswith("[bot]"):
+        login = login[: -len("[bot]")]
+    return login
+
+
 def _is_codex_author(
     author: dict[str, Any] | None, codex_logins: frozenset[str]
 ) -> bool:
@@ -257,8 +281,8 @@ def _is_codex_author(
     """
     if not author:
         return False
-    login = (author.get("login") or "").lower()
-    if login not in {l.lower() for l in codex_logins}:
+    login = _normalize_login(author.get("login"))
+    if login not in {_normalize_login(l) for l in codex_logins}:
         return False
     typename = author.get("__typename")
     if typename is not None and typename != "Bot":
@@ -348,32 +372,59 @@ def _find_request_marker(
 
 
 def _is_login_in(author: dict[str, Any] | None, allowed_logins: frozenset[str]) -> bool:
-    """`author`/`user` のログイン名が許可リストに完全一致 (大小無視) するか。
+    """`author`/`user` のログイン名が許可リストに一致するか
+    (大小無視、末尾 `[bot]` を正規化したうえでの**完全一致**)。
 
-    Codex 用の `_is_codex_author` と異なり `__typename` を要求しない —
-    Claude 側の実際の投稿者の種別 (Bot/User) が未確認のため。
+    `_is_codex_author` と同じく `__typename` が取れている場合は `Bot` で
+    あることも要求する。**Issue #194 でこれを追加した**: `[bot]` を
+    落として比較するようになったことで、許可リストに `claude[bot]` と
+    書いてあっても `claude` という**ユーザアカウント**が一致し得るように
+    なったため。Claude の応答者が GitHub App (= `Bot`) であることは
+    PR #198 で実測済み (login `claude[bot]`、id 209825114、
+    <https://github.com/apps/claude>) なので、Bot を要求しても正規の
+    経路は塞がない。
     """
     if not author or not allowed_logins:
         return False
-    login = (author.get("login") or "").lower()
-    return login in {l.lower() for l in allowed_logins}
+    login = _normalize_login(author.get("login"))
+    if login not in {_normalize_login(l) for l in allowed_logins}:
+        return False
+    typename = author.get("__typename")
+    if typename is not None and typename != "Bot":
+        return False
+    return True
 
 
-def _claude_reviewed_or_commented(
+def _claude_reviewed_head_sha(
     latest_reviews_nodes: list[dict[str, Any]],
-    comment_nodes: list[dict[str, Any]],
     head_sha: str,
     claude_logins: frozenset[str],
-    request_created_at: str | None,
 ) -> bool:
-    """Claude (許可リストに設定されたログイン) が現在の head SHA に反応
-    済みか判定する。
+    """Claude (許可リストに設定されたログイン) が現在の head SHA を
+    **レビュー済み**か判定する。
 
-    シグナルは2つの OR: (1) `latestReviews[].commit.oid` が head SHA と
-    完全一致するレビュー、(2) `@claude` 依頼コメント (`request_created_at`)
-    より後に Claude ログインが投稿したコメント (レビューという形式を
-    取らない可能性を考慮したフォールバック)。`claude_logins` が空 (未設定)
+    シグナルは1つだけ: `latestReviews[].commit.oid` が head SHA と完全
+    一致する、Claude ログインからのレビュー。`claude_logins` が空 (未設定)
     なら常に `False` (Claude 経路は無効)。
+
+    **「依頼コメントより後の Claude のコメント」は数えない (Issue #194)。**
+    当初はレビューという形式を取らない可能性を考慮したフォールバック
+    シグナルとして数えていたが、Issue #203 で
+    `anthropics/claude-code-action` が起動直後に進捗コメント
+    (「working…」) を投稿することが実測された。これを数えると、
+    **レビューが 1 文字も書かれていない時点で Codex 再レビュー要件が
+    緩和されてしまう。** PR #198 では実際に、起動後 104ms で
+    `is_error: true` で終了した (= レビューが行われなかった) 例も観測
+    されている。進捗コメントは同一コメントが編集され続けるため、
+    `createdAt` からは「進捗中」と「完了後」を区別できない。
+
+    したがって、**完了したレビューであることが曖昧さなく分かる唯一の
+    シグナル (レビューオブジェクトの存在) だけを採る。** これにより、
+    Claude がレビューオブジェクトを作らず本文コメントだけを残す実装
+    だった場合には緩和が成立しなくなるが、その場合の挙動は
+    「マージを見送る」= 安全側であり、`automerge-without-codex` ラベル
+    による手動対応に落ちるだけである。逆向きの誤り (未レビューのまま
+    マージ) は取り返しがつかない。
     """
     if not claude_logins:
         return False
@@ -384,15 +435,6 @@ def _claude_reviewed_or_commented(
         commit_oid = (r.get("commit") or {}).get("oid")
         if commit_oid and head_sha and commit_oid == head_sha:
             return True
-
-    if request_created_at:
-        after_at = _parse_iso8601(request_created_at)
-        for c in comment_nodes:
-            if not _is_login_in(c.get("author"), claude_logins):
-                continue
-            created_at = c.get("createdAt")
-            if created_at and _parse_iso8601(created_at) > after_at:
-                return True
 
     return False
 
@@ -416,6 +458,69 @@ def _find_codex_usage_limit_after(
         if _parse_iso8601(created_at) > after_at:
             return True
     return False
+
+
+def _usage_limit_diagnostic(
+    comment_nodes: list[dict[str, Any]],
+    after_iso: str,
+    codex_logins: frozenset[str],
+) -> str:
+    """`_find_codex_usage_limit_after` が False を返した理由を 1 行にまとめる
+    (Issue #194)。
+
+    判定には一切影響しない、ログ用の文字列を返すだけの関数。`@codex review`
+    を投稿したのに利用上限メッセージが検知されない、という状態が
+    PR #209 で観測されたが、当時のログからは「Codex がまだ返信していない」
+    のか「返信を取りこぼした」のかが区別できなかった。次に同じことが
+    起きたときに材料が残るようにする。
+
+    ログイン一致・`__typename`・投稿時刻・定型文言のどの段階で落ちたかが
+    分かるよう、段階ごとの件数と、Codex ログインのコメントで観測した
+    `__typename` の実値を出す。
+    """
+    total = len(comment_nodes)
+    # Issue #194 / PR #209: 「ログイン一致0件」だけでは `author` が null
+    # なのかログイン名が違うのかを区別できなかったため、実際に観測した
+    # 著者名も出す (GitHub 上で誰でも読める公開 PR のコメント著者のみ)。
+    seen_authors = sorted(
+        {
+            ((c.get("author") or {}).get("login") or "(author=null)")
+            for c in comment_nodes
+        }
+    )[:6]
+    by_login = [
+        c
+        for c in comment_nodes
+        if ((c.get("author") or {}).get("login") or "").lower()
+        in {l.lower() for l in codex_logins}
+    ]
+    typenames = sorted(
+        {
+            str((c.get("author") or {}).get("__typename"))
+            for c in by_login
+        }
+    )
+    accepted_author = [c for c in by_login if _is_codex_author(c.get("author"), codex_logins)]
+    with_phrase = [
+        c for c in accepted_author if _USAGE_LIMIT_PHRASE in (c.get("body") or "").lower()
+    ]
+    after_at = _parse_iso8601(after_iso) if after_iso else None
+    after_request = [
+        c
+        for c in with_phrase
+        if c.get("createdAt")
+        and after_at is not None
+        and _parse_iso8601(c["createdAt"]) > after_at
+    ]
+    return (
+        f" [診断: コメント{total}件"
+        f" / 観測した著者={','.join(seen_authors) or 'なし'}"
+        f" / Codex ログイン一致{len(by_login)}件"
+        f" (__typename={','.join(typenames) or 'なし'})"
+        f" / 著者判定通過{len(accepted_author)}件"
+        f" / 上限文言一致{len(with_phrase)}件"
+        f" / 依頼({after_iso or '不明'})より後{len(after_request)}件]"
+    )
 
 
 def evaluate_review_gate(
@@ -623,6 +728,16 @@ def evaluate_review_gate(
                             "wait: Codex に @codex review を自動リクエスト"
                             f"済みです (head SHA `{head_short}`){hint_suffix}。"
                             "応答を待っています"
+                            # Issue #194: この分岐に落ちたとき、それが
+                            # 「Codex がまだ何も返していない」のか
+                            # 「利用上限メッセージを返したのに検知でき
+                            # なかった」のかがログから区別できず、Claude
+                            # フォールバックが発火しない原因を追えなかった
+                            # (PR #209 で実測)。判定に使った材料をその場で
+                            # 出す。**判定は一切変えない** — 文言だけ。
+                            + _usage_limit_diagnostic(
+                                comment_nodes, request_created_at, codex_logins
+                            )
                         )
                     else:
                         # Codex が利用上限に達している。A. この PR の過去の
@@ -648,17 +763,10 @@ def evaluate_review_gate(
                             claude_request_comment = _find_request_marker(
                                 comment_nodes, head_sha, _CLAUDE_REQUEST_MARKER_RE
                             )
-                            claude_request_created_at = (
-                                claude_request_comment.get("createdAt")
-                                if claude_request_comment
-                                else None
-                            )
-                            claude_matched = _claude_reviewed_or_commented(
+                            claude_matched = _claude_reviewed_head_sha(
                                 latest_reviews_nodes,
-                                comment_nodes,
                                 head_sha,
                                 claude_logins,
-                                claude_request_created_at,
                             )
                             if claude_matched:
                                 matched = True
@@ -667,7 +775,7 @@ def evaluate_review_gate(
                                     "Codex の利用上限到達を検知し、この PR は"
                                     "Codex に一度もレビューされていないため、"
                                     f"head SHA `{head_short}` への再レビュー"
-                                    "要件を Claude のレビュー/コメントで代替"
+                                    "要件を Claude のレビューで代替"
                                     "しました (未解決スレッド/"
                                     "CHANGES_REQUESTED の判定は引き続き有効"
                                     "です)"

@@ -384,7 +384,7 @@ cargo run --release --bin velox-bench -- compare \
 **Issue #36/#72 の「性能回帰検知」を CI で実際にブロッキング判定できる
 形にしたサブコマンド。** ロジックは `benchmark::evaluate_gate`
 (`src/browser/benchmark.rs`、純粋 Rust、`cargo test` で境界値・同着・試行数
-不足・baseline 欠損を含めて検証済み)。**なぜ `compare` の単純な固定閾値では
+不足・baseline 欠損・入力前提違反 (後述) を含めて検証済み)。**なぜ `compare` の単純な固定閾値では
 足りないか、どう解決したかは `docs/decisions.md` D46 と
 `docs/performance-targets.md` §10 を参照。**
 
@@ -416,6 +416,29 @@ cargo run --release --bin velox-bench -- gate \
   **WARN に専用のコードを割ったのは `compare` の 0/1 の 2 値では
   「ノイズかもしれないので確認してほしい」と「確実に回帰している」を
   CI 上で区別できないため。**
+
+**入力の前提は `gate` 自身が検証する (Issue #196 / D94)**。閾値・最小
+絶対差・多数決といった判定ロジックは、いずれも「baseline と candidate が
+同じシナリオを同じ OS で測ったものである」ことを前提にしている。その
+前提が崩れている入力は、比較の前に FAIL/WARN として明示される。
+
+| 前提違反 | 判定 | 終了コード |
+| --- | --- | --- |
+| `scenario` が baseline と candidate で異なる | FAIL | `1` |
+| `environment.os` が異なる | FAIL | `1` |
+| candidate にメトリクスが 1 件も無い | FAIL | `1` |
+| 比較できたメトリクスが 1 件も無い | FAIL | `1` |
+| baseline にあり、どの candidate にも無いメトリクスがある | WARN | `3` |
+
+違反した理由は標準エラー出力と `--markdown-output` の両方に出る
+(`--output` の JSON では `GateReport::problems`)。**とくに「candidate が
+空」と「比較できたメトリクスが 0 件」は、以前は `overall: OK` になって
+いた** — 計測できていないのに緑を返すのは回帰ゲートとして最悪の誤りな
+ので、FAIL に変更した (D94)。
+
+なお `candidate` にだけ存在するメトリクス (PR が新しい計測を追加した
+場合) は前提違反として扱わない。判定には寄与せず、これまでどおり
+`candidate のみに存在:` として一覧されるだけである。
 
 **baseline に何を渡すべきか**: リポジトリに `results/baseline/` として
 コミットされている結果ファイルを直接 CI のブロッキング判定に使っては

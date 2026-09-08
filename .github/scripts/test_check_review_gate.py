@@ -958,9 +958,12 @@ class ClaudeFallbackTest(unittest.TestCase):
         self.assertFalse(result["claude_relaxed"])
         self.assertTrue(result["claude_review_request_needed"])
 
-    def test_claude_comment_fallback_signal_after_request(self) -> None:
-        # レビュー形式ではなく、単なるコメント (依頼より後) でも充足する
-        # (Claude の応答形式が未確認であるためのフォールバックシグナル)。
+    def test_claude_comment_after_request_does_not_relax(self) -> None:
+        # Issue #194: 依頼より後の Claude のコメントは緩和シグナルに
+        # しない。`claude-code-action` は起動直後に進捗コメント
+        # (Issue #203) を投稿するため、これを数えると「レビューが 1 文字も
+        # 書かれていない時点でマージ要件が緩和される」。同一コメントが
+        # 編集され続けるため createdAt では進捗中と完了後を区別できない。
         pr_comments = {
             "nodes": self._usage_limit_state_comments()
             + [
@@ -980,8 +983,137 @@ class ClaudeFallbackTest(unittest.TestCase):
             codex_bypass=False,
             claude_logins=frozenset({self._CLAUDE_LOGIN}),
         )
-        self.assertFalse(result["blocked"])
-        self.assertTrue(result["claude_relaxed"])
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+        # 依頼コメントは既にあるので再投稿はしない (応答待ち)。
+        self.assertFalse(result["claude_review_request_needed"])
+
+    def test_claude_progress_comment_does_not_relax(self) -> None:
+        # Issue #203 で実測された進捗コメントそのものの形。これが緩和を
+        # 成立させてしまうと、PR #198 のように起動後 104ms で
+        # is_error:true で終了した (= レビューが行われなかった) ケースでも
+        # マージ要件が満たされてしまう。
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                {
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "body": "Claude is working…",
+                    "createdAt": "2026-09-07T16:02:30Z",
+                },
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_claude_review_on_an_older_commit_does_not_relax(self) -> None:
+        # 緩和は「現在の head SHA へのレビュー」に限る。古い commit への
+        # レビューで通してしまうと、push 後の未レビュー差分が素通りする。
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "commit": {"oid": "0" * 40},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_waiting_reason_carries_a_usage_limit_diagnostic(self) -> None:
+        # Issue #194 / PR #209: 「@codex review は投稿済み、でも上限
+        # メッセージを検知していない」状態のとき、それが「まだ返信が
+        # 無い」のか「返信を取りこぼした」のかをログから区別できる
+        # ようにする。判定そのものは変えない。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                }
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        waiting = [r for r in result["reasons"] if "応答を待っています" in r]
+        self.assertEqual(len(waiting), 1)
+        self.assertIn("診断:", waiting[0])
+        self.assertIn("Codex ログイン一致0件", waiting[0])
+        # 実際に観測した著者名を出す (null かログイン名違いかの区別用)。
+        self.assertIn("観測した著者=noan98", waiting[0])
+
+    def test_usage_limit_diagnostic_distinguishes_a_rejected_author(self) -> None:
+        # ログイン名は一致するが `__typename` が Bot でないケース。
+        # 「Codex は返信しているが著者判定で落ちている」と読める
+        # 内訳が出ること。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                },
+                {
+                    "body": "You have reached your Codex usage limits for code reviews.",
+                    "createdAt": "2026-09-07T16:00:30Z",
+                    "author": {
+                        "login": "chatgpt-codex-connector[bot]",
+                        "__typename": "User",
+                    },
+                },
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        waiting = [r for r in result["reasons"] if "応答を待っています" in r]
+        self.assertEqual(len(waiting), 1)
+        self.assertIn("Codex ログイン一致1件", waiting[0])
+        self.assertIn("__typename=User", waiting[0])
+        self.assertIn("chatgpt-codex-connector[bot]", waiting[0])
+        self.assertIn("著者判定通過0件", waiting[0])
+        # 判定そのものは変わらない (安全側でブロックのまま)。
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_review_request_needed"])
 
     def test_request_comment_body_contains_title_and_marker(self) -> None:
         from check_review_gate import claude_review_request_comment_body
@@ -998,6 +1130,169 @@ class ClaudeFallbackTest(unittest.TestCase):
 
         body = claude_review_request_comment_body(_HEAD_SHA, None)
         self.assertIn("@claude", body)
+
+
+class GraphQLBotLoginSpellingTest(unittest.TestCase):
+    """Issue #194 / PR #209: GraphQL の `Bot` アクタの `login` には
+    `[bot]` が付かない。
+
+    REST は `chatgpt-codex-connector[bot]` を返すが、このスクリプトが
+    読む GraphQL は `chatgpt-codex-connector` を返す。許可リストは
+    REST 表記で書かれていたため、**Codex のコメント・レビュー・👍 が
+    1 件も照合されていなかった**。PR #209 の診断行で実測:
+
+        観測した著者=chatgpt-codex-connector,noan98 / Codex ログイン一致0件
+
+    このクラスの各テストは、`[bot]` の正規化が無いと FAIL する。
+    """
+
+    _GRAPHQL_CODEX = "chatgpt-codex-connector"  # `[bot]` なし
+
+    def test_graphql_spelling_counts_as_a_codex_review(self) -> None:
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": self._GRAPHQL_CODEX, "__typename": "Bot"},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertFalse(result["codex_review_request_needed"])
+
+    def test_graphql_spelling_usage_limit_triggers_claude_fallback(self) -> None:
+        # PR #209 で実際に起きていた状況そのもの。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                },
+                {
+                    "body": "You have reached your Codex usage limits for code reviews.",
+                    "createdAt": "2026-09-07T16:00:10Z",
+                    "author": {"login": self._GRAPHQL_CODEX, "__typename": "Bot"},
+                },
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({"claude[bot]"}),
+        )
+        self.assertTrue(result["claude_review_request_needed"])
+
+    def test_graphql_spelling_claude_review_relaxes(self) -> None:
+        # 許可リストは REST 表記 `claude[bot]`、実データは GraphQL 表記
+        # `claude`。正規化が無いと緩和が成立しない。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                },
+                {
+                    "body": "You have reached your Codex usage limits for code reviews.",
+                    "createdAt": "2026-09-07T16:00:10Z",
+                    "author": {"login": self._GRAPHQL_CODEX, "__typename": "Bot"},
+                },
+                {
+                    "body": (
+                        "@claude レビューをお願いします\n"
+                        f"<!-- auto-merge:claude-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:01:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                },
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": "claude", "__typename": "Bot"},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({"claude[bot]"}),
+        )
+        self.assertTrue(result["claude_relaxed"])
+
+    def test_a_human_user_named_claude_does_not_satisfy_the_gate(self) -> None:
+        # `[bot]` を落として比較するようにした副作用の封じ込め
+        # (Issue #194): `claude` という **ユーザ** アカウントのレビューは
+        # 許可リストに一致してはならない。`__typename == "Bot"` で弾く。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                },
+                {
+                    "body": "You have reached your Codex usage limits for code reviews.",
+                    "createdAt": "2026-09-07T16:00:10Z",
+                    "author": {"login": self._GRAPHQL_CODEX, "__typename": "Bot"},
+                },
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": "claude", "__typename": "User"},
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({"claude[bot]"}),
+        )
+        self.assertFalse(result["claude_relaxed"])
+        self.assertTrue(result["blocked"])
+
+    def test_lookalike_is_still_rejected_after_normalization(self) -> None:
+        # PR #192 の P2 指摘は守られたままであること。正規化しても
+        # `chatgpt-codex-connector-review` は一致しない。
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {
+                        "login": "chatgpt-codex-connector-review",
+                        "__typename": "Bot",
+                    },
+                    "commit": {"oid": _HEAD_SHA},
+                }
+            ],
+        }
+        result = _evaluate(reviews=reviews, codex_bypass=False)
+        self.assertTrue(result["codex_review_request_needed"])
 
 
 class CodexLoginExactMatchTest(unittest.TestCase):
