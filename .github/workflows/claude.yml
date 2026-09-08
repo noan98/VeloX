@@ -28,9 +28,22 @@ on:
 
 jobs:
   claude:
-    # メンションを含むコメントだけを対象にする。これが無いと全コメントで
-    # ジョブが起動してしまう。
-    if: contains(github.event.comment.body, '@claude')
+    # メンションを含む「人間の」コメントだけを対象にする。
+    #
+    # ⚠️ `contains(...)` だけでは足りない (Issue #203)。claude-code-action は
+    # bot のコメントを内部で拒否するが、**それは action の中の話であって
+    # workflow job の起動自体は防がれない**。実際 PR #198 では、Claude 自身が
+    # 投稿する "Claude Code is working…" コメントと Codex のコメントで
+    # job が 2 回余計に起動した (2026-09-08 実測)。実行時間の浪費であり、
+    # action 側の防御に依存しない形で workflow 側でも断つ。
+    #
+    # auto-merge (D91) の `@claude` 自動投稿とは衝突しない: あちらは
+    # AUTO_MERGE_TOKEN (PAT) で投稿するため投稿者は PAT 所有者 (人間の
+    # アカウント) になり `user.type` は `User` になる。逆に GITHUB_TOKEN で
+    # 投稿すると、この条件以前にそもそも workflow トリガが発火しない。
+    if: >-
+      github.event.comment.user.type != 'Bot' &&
+      contains(github.event.comment.body, '@claude')
     name: Respond to @claude mention
     runs-on: ubuntu-latest
     permissions:
