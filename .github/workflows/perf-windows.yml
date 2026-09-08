@@ -167,6 +167,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path results | Out-Null
           $summary | Out-File -FilePath "results\environment-info.md" -Encoding utf8
 
+          # Issue #208 (§26.4 事実 2)。`windows-latest` は run ごとに別
+          # スペックのマシン (2 論理コア/8 GiB と 4 論理コア/16 GiB の両方が
+          # 観測されている) が割り当てられるため、**どのランナーで測ったかを
+          # 結果のすぐ隣に出す。** これが違う run どうしの絶対値は比較できない。
+          "cpu=$($cpu.Name)" >> $env:GITHUB_OUTPUT
+          "cores=$($cpu.NumberOfLogicalProcessors)" >> $env:GITHUB_OUTPUT
+          "ram_gib=$mem" >> $env:GITHUB_OUTPUT
+
       - name: Build (release)
         run: cargo build --release
 
@@ -442,6 +450,9 @@ jobs:
         # 内訳表そのものは出せる)。
         env:
           COMPARE_ENV: ${{ steps.bench_run.outputs.compare_env }}
+          RUNNER_CPU: ${{ steps.env_info.outputs.cpu }}
+          RUNNER_CORES: ${{ steps.env_info.outputs.cores }}
+          RUNNER_RAM_GIB: ${{ steps.env_info.outputs.ram_gib }}
         run: |
           $ErrorActionPreference = "Continue"
           $files = @(Get-ChildItem -Path results -Filter "*-windows*.json" -ErrorAction SilentlyContinue |
@@ -513,6 +524,8 @@ jobs:
             $lines += "### A/B 比較 (Issue #208)"
             $lines += ""
             $lines += "A = 既定のまま / B = ``$env:COMPARE_ENV`` を設定して起動。同一ジョブ・同一ビルド・同一ランナーで交互に計測しているため、ランナー個体差やイメージ更新は相殺される。"
+            $lines += ""
+            $lines += "計測したランナー: $env:RUNNER_CPU / $env:RUNNER_CORES 論理コア / RAM $env:RUNNER_RAM_GIB GiB。**``windows-latest`` は run ごとに別スペックのマシンが割り当てられる (§26.4 事実 2)。この行が違う run どうしの絶対値を比較してはならない。**"
             $lines += ""
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
             $lines += ""
