@@ -958,9 +958,12 @@ class ClaudeFallbackTest(unittest.TestCase):
         self.assertFalse(result["claude_relaxed"])
         self.assertTrue(result["claude_review_request_needed"])
 
-    def test_claude_comment_fallback_signal_after_request(self) -> None:
-        # レビュー形式ではなく、単なるコメント (依頼より後) でも充足する
-        # (Claude の応答形式が未確認であるためのフォールバックシグナル)。
+    def test_claude_comment_after_request_does_not_relax(self) -> None:
+        # Issue #194: 依頼より後の Claude のコメントは緩和シグナルに
+        # しない。`claude-code-action` は起動直後に進捗コメント
+        # (Issue #203) を投稿するため、これを数えると「レビューが 1 文字も
+        # 書かれていない時点でマージ要件が緩和される」。同一コメントが
+        # 編集され続けるため createdAt では進捗中と完了後を区別できない。
         pr_comments = {
             "nodes": self._usage_limit_state_comments()
             + [
@@ -980,8 +983,67 @@ class ClaudeFallbackTest(unittest.TestCase):
             codex_bypass=False,
             claude_logins=frozenset({self._CLAUDE_LOGIN}),
         )
-        self.assertFalse(result["blocked"])
-        self.assertTrue(result["claude_relaxed"])
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+        # 依頼コメントは既にあるので再投稿はしない (応答待ち)。
+        self.assertFalse(result["claude_review_request_needed"])
+
+    def test_claude_progress_comment_does_not_relax(self) -> None:
+        # Issue #203 で実測された進捗コメントそのものの形。これが緩和を
+        # 成立させてしまうと、PR #198 のように起動後 104ms で
+        # is_error:true で終了した (= レビューが行われなかった) ケースでも
+        # マージ要件が満たされてしまう。
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                {
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "body": "Claude is working…",
+                    "createdAt": "2026-09-07T16:02:30Z",
+                },
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_claude_review_on_an_older_commit_does_not_relax(self) -> None:
+        # 緩和は「現在の head SHA へのレビュー」に限る。古い commit への
+        # レビューで通してしまうと、push 後の未レビュー差分が素通りする。
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": self._CLAUDE_LOGIN},
+                    "commit": {"oid": "0" * 40},
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
 
     def test_request_comment_body_contains_title_and_marker(self) -> None:
         from check_review_gate import claude_review_request_comment_body

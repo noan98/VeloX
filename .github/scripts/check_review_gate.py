@@ -90,17 +90,17 @@ docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベ
    `claude_relaxed`/`claude_relaxed_detail` (B の場合) を返す (呼び出し側
    で `::warning::` として目立たせるため。黙って緩めない)。
 
-   **Claude フォールバック (`claude_logins`)**: `chatgpt-codex-connector`
-   と違い、Claude のレビューに応答する仕組み (GitHub App / Actions) が
-   このリポジトリに導入されているかは **未確認**であり、応答時のログイン
-   名やレビュー形式 (review/comment/何も残さない) も分かっていない。
-   そのため **ログイン名をハードコードしない**: `claude_logins`
+   **Claude フォールバック (`claude_logins`)**: 応答する仕組みは
+   `.github/workflows/claude.yml` (Issue #194) で導入済みで、その
+   ログイン名は PR #198 で **`claude[bot]`** と実測された。それでも
+   **ログイン名はハードコードしない**: `claude_logins`
    (workflow の `env.CLAUDE_REVIEWER_LOGINS`、カンマ区切り) で明示的に
    設定された場合のみ有効になり、**既定は空集合 = 常に不成立** (Codex の
    利用上限緩和 A のみで判断する、従来どおりの安全側)。判定シグナルは
-   OR: (i) `latestReviews[].commit.oid` が head SHA と完全一致する Claude
-   のレビュー、(ii) `@claude` 依頼コメントより後に Claude ログインが
-   投稿したコメント (レビューという形式を取らない可能性があるため)。
+   **`latestReviews[].commit.oid` が head SHA と完全一致する Claude の
+   レビュー 1 つだけ**である — 「依頼より後の Claude のコメント」は
+   進捗コメント (Issue #203) と完了レビューを区別できないため数えない
+   (理由は `_claude_reviewed_head_sha` の docstring)。
    Codex と異なり `__typename == "Bot"` は要求しない (Claude 側の実装が
    Bot か User か不明なため)。
 
@@ -359,21 +359,36 @@ def _is_login_in(author: dict[str, Any] | None, allowed_logins: frozenset[str]) 
     return login in {l.lower() for l in allowed_logins}
 
 
-def _claude_reviewed_or_commented(
+def _claude_reviewed_head_sha(
     latest_reviews_nodes: list[dict[str, Any]],
-    comment_nodes: list[dict[str, Any]],
     head_sha: str,
     claude_logins: frozenset[str],
-    request_created_at: str | None,
 ) -> bool:
-    """Claude (許可リストに設定されたログイン) が現在の head SHA に反応
-    済みか判定する。
+    """Claude (許可リストに設定されたログイン) が現在の head SHA を
+    **レビュー済み**か判定する。
 
-    シグナルは2つの OR: (1) `latestReviews[].commit.oid` が head SHA と
-    完全一致するレビュー、(2) `@claude` 依頼コメント (`request_created_at`)
-    より後に Claude ログインが投稿したコメント (レビューという形式を
-    取らない可能性を考慮したフォールバック)。`claude_logins` が空 (未設定)
+    シグナルは1つだけ: `latestReviews[].commit.oid` が head SHA と完全
+    一致する、Claude ログインからのレビュー。`claude_logins` が空 (未設定)
     なら常に `False` (Claude 経路は無効)。
+
+    **「依頼コメントより後の Claude のコメント」は数えない (Issue #194)。**
+    当初はレビューという形式を取らない可能性を考慮したフォールバック
+    シグナルとして数えていたが、Issue #203 で
+    `anthropics/claude-code-action` が起動直後に進捗コメント
+    (「working…」) を投稿することが実測された。これを数えると、
+    **レビューが 1 文字も書かれていない時点で Codex 再レビュー要件が
+    緩和されてしまう。** PR #198 では実際に、起動後 104ms で
+    `is_error: true` で終了した (= レビューが行われなかった) 例も観測
+    されている。進捗コメントは同一コメントが編集され続けるため、
+    `createdAt` からは「進捗中」と「完了後」を区別できない。
+
+    したがって、**完了したレビューであることが曖昧さなく分かる唯一の
+    シグナル (レビューオブジェクトの存在) だけを採る。** これにより、
+    Claude がレビューオブジェクトを作らず本文コメントだけを残す実装
+    だった場合には緩和が成立しなくなるが、その場合の挙動は
+    「マージを見送る」= 安全側であり、`automerge-without-codex` ラベル
+    による手動対応に落ちるだけである。逆向きの誤り (未レビューのまま
+    マージ) は取り返しがつかない。
     """
     if not claude_logins:
         return False
@@ -384,15 +399,6 @@ def _claude_reviewed_or_commented(
         commit_oid = (r.get("commit") or {}).get("oid")
         if commit_oid and head_sha and commit_oid == head_sha:
             return True
-
-    if request_created_at:
-        after_at = _parse_iso8601(request_created_at)
-        for c in comment_nodes:
-            if not _is_login_in(c.get("author"), claude_logins):
-                continue
-            created_at = c.get("createdAt")
-            if created_at and _parse_iso8601(created_at) > after_at:
-                return True
 
     return False
 
@@ -648,17 +654,10 @@ def evaluate_review_gate(
                             claude_request_comment = _find_request_marker(
                                 comment_nodes, head_sha, _CLAUDE_REQUEST_MARKER_RE
                             )
-                            claude_request_created_at = (
-                                claude_request_comment.get("createdAt")
-                                if claude_request_comment
-                                else None
-                            )
-                            claude_matched = _claude_reviewed_or_commented(
+                            claude_matched = _claude_reviewed_head_sha(
                                 latest_reviews_nodes,
-                                comment_nodes,
                                 head_sha,
                                 claude_logins,
-                                claude_request_created_at,
                             )
                             if claude_matched:
                                 matched = True
@@ -667,7 +666,7 @@ def evaluate_review_gate(
                                     "Codex の利用上限到達を検知し、この PR は"
                                     "Codex に一度もレビューされていないため、"
                                     f"head SHA `{head_short}` への再レビュー"
-                                    "要件を Claude のレビュー/コメントで代替"
+                                    "要件を Claude のレビューで代替"
                                     "しました (未解決スレッド/"
                                     "CHANGES_REQUESTED の判定は引き続き有効"
                                     "です)"

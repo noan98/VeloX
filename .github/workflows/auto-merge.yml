@@ -107,16 +107,19 @@ env:
   # Issue #188: このラベルが付いた PR は Codex レビュー必須要件のみを免除
   # する (未解決スレッド判定・CHANGES_REQUESTED 判定は免除しない)。
   CODEX_BYPASS_LABEL: automerge-without-codex
-  # Issue #188 (2026-09-07 ユーザ決定): Codex の利用上限到達時、この PR が
-  # 一度も Codex にレビューされていない場合のフォールバックとして
+  # Issue #188 (2026-09-07 ユーザ決定) / Issue #194: Codex の利用上限到達時、
+  # この PR が一度も Codex にレビューされていない場合のフォールバックとして
   # `@claude` へレビューを依頼する。ここに設定したログイン名 (カンマ区切り)
-  # からの反応だけを「Claude のレビュー」として認める。**既定は空文字列
-  # = Claude フォールバックは常に不成立** (Codex の利用上限緩和のみで判断
-  # する安全側)。このリポジトリに `@claude` へ応答する仕組み
-  # (claude-code-action 等) が導入されているかは未確認であり、ログイン名を
-  # ハードコードしていない (docs/decisions.md D91 参照)。実際に運用する
-  # 場合は、応答する GitHub App/Actions のログイン名をここに設定すること。
-  CLAUDE_REVIEWER_LOGINS: ""
+  # からのレビューだけを「Claude のレビュー」として認める。**空文字列なら
+  # Claude フォールバックは常に不成立** (Codex の利用上限緩和のみで判断
+  # する安全側)。
+  #
+  # `claude[bot]` は **PR #198 で実測したログイン名** (id 209825114、
+  # https://github.com/apps/claude) であり、推測値ではない — Codex の P2
+  # 指摘 (前方一致で別名アカウントがすり抜ける) と同じ穴を作らないよう、
+  # 判定は完全一致で行う (docs/decisions.md D91 参照)。応答側の仕組みは
+  # `.github/workflows/claude.yml` (Issue #194)。
+  CLAUDE_REVIEWER_LOGINS: "claude[bot]"
 
 jobs:
   auto-merge:
