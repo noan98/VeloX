@@ -68,6 +68,10 @@ on:
           - tabs_10
           - tabs_20
           - tabs_50
+      scenarios:
+        description: "複数シナリオを 1 回の run で続けて計測する (カンマ区切り、例: tabs_1,tabs_5,tabs_10,tabs_20)。指定するとシナリオ選択より優先される。D96 の「Windows は run ごとに分ける」に従い、タブ数スケーリングのような複数点の比較はこれで同一 run に収める"
+        type: string
+        default: ""
       trials:
         description: "試行回数 (velox-bench run --trials)"
         type: string
@@ -333,6 +337,7 @@ jobs:
         # 入力はシェルへ直接展開せず環境変数で渡す (script injection 対策)。
         env:
           INPUT_SCENARIO: ${{ inputs.scenario }}
+          INPUT_SCENARIOS: ${{ inputs.scenarios }}
           INPUT_TRIALS: ${{ inputs.trials }}
           INPUT_COMPARE_ENV: ${{ inputs.compare_env }}
           INPUT_COMMON_ENV: ${{ inputs.common_env }}
@@ -343,6 +348,24 @@ jobs:
           $ErrorActionPreference = "Stop"
           $scenario = $env:INPUT_SCENARIO
           if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = "cold_startup" }
+
+          # Issue #197 / D93 子 Issue 案 A。タブ数スケーリングのように
+          # **複数の点を突き合わせたい計測は、同じ run の中で採らなければ
+          # ならない** (D96 決定 3: run ごとにランナーの機種が変わり、絶対値は
+          # 23% 動く)。`scenarios` はそのための入力で、指定されたシナリオを
+          # 1 つのジョブで順に計測する。各シナリオはそれぞれ A/B ペアを持つ。
+          $scenariosRaw = $env:INPUT_SCENARIOS
+          if (-not [string]::IsNullOrWhiteSpace($scenariosRaw)) {
+            $scenarioList = @($scenariosRaw -split ',' |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($scenarioList.Count -eq 0) {
+              throw "scenarios の書式が不正です: '$scenariosRaw' (カンマ区切りのシナリオ ID を指定してください)"
+            }
+          } else {
+            $scenarioList = @($scenario)
+          }
+          Write-Host "計測するシナリオ: $($scenarioList -join ', ')"
           $trials = $env:INPUT_TRIALS
           if ([string]::IsNullOrWhiteSpace($trials)) { $trials = "10" }
 
@@ -386,10 +409,10 @@ jobs:
             return $names
           }
 
-          function Invoke-Bench([string] $outfile, [string] $label) {
+          function Invoke-Bench([string] $sc, [string] $outfile, [string] $label) {
             Write-Host "=== $label -> $outfile ==="
             & target\release\velox-bench.exe run `
-              --scenario $scenario `
+              --scenario $sc `
               --trials $trials `
               --url "$env:BENCH_URL" `
               --output $outfile
@@ -418,20 +441,22 @@ jobs:
           $compareEnv | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "VELOX_EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          if ([string]::IsNullOrWhiteSpace($compareEnv)) {
-            # 従来どおりの単独計測。ファイル名も従来のまま
-            # (§21/§24 の結果と同じ名前で artifact に並ぶ)。
-            Invoke-Bench "results\$scenario-windows.json" "A (既定)"
-          } else {
-            Write-Host "A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
-            for ($r = 1; $r -le $repeats; $r++) {
-              Invoke-Bench "results\$scenario-windows-baseline-$r.json" "A (既定) #$r"
-              $names = Set-EnvFromSpec $compareEnv
-              try {
-                Invoke-Bench "results\$scenario-windows-compare-$r.json" "B ($compareEnv) #$r"
-              } finally {
-                foreach ($name in $names) {
-                  Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+          foreach ($sc in $scenarioList) {
+            if ([string]::IsNullOrWhiteSpace($compareEnv)) {
+              # 従来どおりの単独計測。ファイル名も従来のまま
+              # (§21/§24 の結果と同じ名前で artifact に並ぶ)。
+              Invoke-Bench $sc "results\$sc-windows.json" "[$sc] A (既定)"
+            } else {
+              Write-Host "[$sc] A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
+              for ($r = 1; $r -le $repeats; $r++) {
+                Invoke-Bench $sc "results\$sc-windows-baseline-$r.json" "[$sc] A (既定) #$r"
+                $names = Set-EnvFromSpec $compareEnv
+                try {
+                  Invoke-Bench $sc "results\$sc-windows-compare-$r.json" "[$sc] B ($compareEnv) #$r"
+                } finally {
+                  foreach ($name in $names) {
+                    Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+                  }
                 }
               }
             }
@@ -529,29 +554,47 @@ jobs:
             $lines += ""
           }
 
-          # --- Issue #208: A/B 比較 -------------------------------------
-          $baselineFiles = @($files | Where-Object { $_.Name -like "*-baseline-*" })
-          $compareFiles = @($files | Where-Object { $_.Name -like "*-compare-*" })
-          if ($baselineFiles.Count -gt 0 -and $compareFiles.Count -gt 0) {
-            function Get-Medians([object[]] $fileList, [string] $key) {
-              $values = @()
-              foreach ($f in $fileList) {
-                $parsed = Get-Content $f.FullName -Raw | ConvertFrom-Json
-                $stats = $parsed.metrics.($key)
-                if ($null -ne $stats) { $values += [double]$stats.median }
-              }
-              return $values
+          # --- Issue #208 / #197: シナリオごとの A/B 比較 ----------------
+          #
+          # ⚠️ **シナリオごとにグループ化する。** `scenarios` 入力で複数
+          # シナリオを 1 つの run で回せるようになったため (Issue #197 /
+          # D93 子 Issue 案 A)、全ファイルをまとめて baseline/compare の
+          # 2 群に分けると別シナリオの値が混ざってしまう。
+          function Get-Medians([object[]] $fileList, [string] $key) {
+            $values = @()
+            foreach ($f in $fileList) {
+              $parsed = Get-Content $f.FullName -Raw | ConvertFrom-Json
+              $stats = $parsed.metrics.($key)
+              if ($null -ne $stats) { $values += [double]$stats.median }
             }
-            $compareKeys = @(
-              "startup_native_window_ms",
-              "startup_toolbar_webview_ms",
-              "startup_window_created_ms",
-              "startup_toolbar_ready_ms",
-              "startup_first_load_ms",
-              "page_load_ms",
-              "rss_total_bytes"
-            )
-            $lines += "### A/B 比較 (Issue #208)"
+            return $values
+          }
+
+          # ファイル名 "<scenario>-windows-(baseline|compare)-<n>.json" から
+          # シナリオ名を取り出す。
+          $abPattern = '^(.+)-windows-(baseline|compare)-\d+\.json$'
+          $abFiles = @($files | Where-Object { $_.Name -match $abPattern })
+          $scenarioNames = @($abFiles | ForEach-Object {
+            if ($_.Name -match $abPattern) { $Matches[1] }
+          } | Select-Object -Unique)
+
+          # tabs_N は数値順に並べる (スケーリングを読むため)。それ以外は名前順。
+          $scenarioNames = @($scenarioNames | Sort-Object {
+            if ($_ -match '^tabs_(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
+          }, { $_ })
+
+          $compareKeys = @(
+            "startup_native_window_ms",
+            "startup_toolbar_webview_ms",
+            "startup_window_created_ms",
+            "startup_toolbar_ready_ms",
+            "startup_first_load_ms",
+            "page_load_ms",
+            "rss_total_bytes"
+          )
+
+          if ($scenarioNames.Count -gt 0) {
+            $lines += "### A/B 比較 (Issue #208 / #197)"
             $lines += ""
             $lines += "A = 既定のまま / B = ``$env:COMPARE_ENV`` を設定して起動。同一ジョブ・同一ビルド・同一ランナーで交互に計測しているため、ランナー個体差やイメージ更新は相殺される。"
             $lines += ""
@@ -562,6 +605,14 @@ jobs:
             $lines += "計測したランナー: $env:RUNNER_CPU / $env:RUNNER_CORES 論理コア / RAM $env:RUNNER_RAM_GIB GiB。**``windows-latest`` は run ごとに別スペックのマシンが割り当てられる (§26.4 事実 2)。この行が違う run どうしの絶対値を比較してはならない。**"
             $lines += ""
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
+            $lines += ""
+          }
+
+          foreach ($sc in $scenarioNames) {
+            $baselineFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-baseline-*" })
+            $compareFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-compare-*" })
+            if ($baselineFiles.Count -eq 0 -or $compareFiles.Count -eq 0) { continue }
+            $lines += "#### ``$sc``"
             $lines += ""
             $lines += "| メトリクス | A の各 run の median | A 平均 | B の各 run の median | B 平均 | 差 (B-A) | 比 (B/A) |"
             $lines += "| --- | --- | ---: | --- | ---: | ---: | ---: |"
@@ -581,6 +632,33 @@ jobs:
             $lines += ""
           }
 
+          # --- タブ数スケーリング (Issue #197 / D93 子 Issue 案 A) --------
+          #
+          # 複数シナリオを 1 run で回したときだけ出す。**同一 run 内なので
+          # ここに並ぶ値どうしは比較してよい** — それが `scenarios` 入力を
+          # 足した理由そのものである (D96 決定 3)。
+          $tabScenarios = @($scenarioNames | Where-Object { $_ -match '^tabs_\d+$' })
+          if ($tabScenarios.Count -gt 1) {
+            $lines += "### タブ数スケーリング (Issue #197)"
+            $lines += ""
+            $lines += "``rss_total_bytes`` の平均を MiB で示す。**同一 run 内の比較なので、この表の行どうしは並べて読んでよい。**"
+            $lines += ""
+            $lines += "| シナリオ | A (既定) MiB | B (compare_env) MiB | 差 (MiB) | 比 (B/A) |"
+            $lines += "| --- | ---: | ---: | ---: | ---: |"
+            foreach ($sc in $tabScenarios) {
+              $baselineFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-baseline-*" })
+              $compareFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-compare-*" })
+              $a = @(Get-Medians $baselineFiles "rss_total_bytes")
+              $b = @(Get-Medians $compareFiles "rss_total_bytes")
+              if ($a.Count -eq 0 -or $b.Count -eq 0) { continue }
+              $aMiB = ($a | Measure-Object -Average).Average / 1MB
+              $bMiB = ($b | Measure-Object -Average).Average / 1MB
+              $ratio = if ($aMiB -ne 0) { [math]::Round($bMiB / $aMiB, 3) } else { "n/a" }
+              $lines += "| $sc | $([math]::Round($aMiB, 1)) | $([math]::Round($bMiB, 1)) | $([math]::Round($bMiB - $aMiB, 1)) | $ratio |"
+            }
+            $lines += ""
+          }
+
           $summary = $lines -join "`n"
           Write-Host $summary
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
@@ -589,7 +667,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: velox-perf-windows-${{ inputs.scenario || 'cold_startup' }}
+          name: velox-perf-windows-${{ inputs.scenarios != '' && 'multi' || (inputs.scenario || 'cold_startup') }}
           path: |
             results/
             diag/
