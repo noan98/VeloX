@@ -50,7 +50,7 @@ use wry::{
 use crate::app::UserEvent;
 use crate::browser::context_menu;
 use crate::browser::downloads;
-use crate::browser::metrics::IpcDirection;
+use crate::browser::metrics::{self, IpcDirection};
 use crate::browser::perf_log::IpcLog;
 use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
@@ -1063,6 +1063,15 @@ impl BrowserWindow {
         // `app::open_new_window` pass `None` in that case) — see
         // `Self::eval_toolbar`.
         ipc_log: Option<IpcLog>,
+        // Issue #182 (D92): filled in with two intermediate timestamps when
+        // this is the process's *first* window and metrics are on, so that
+        // `app::run` can split `process_start` → `window_created` (644ms of
+        // Windows' 717ms `startup_first_load_ms`, see
+        // `docs/performance-targets.md` §21) into tao's native window,
+        // the engine's first-webview initialization, and the rest. `None`
+        // for every window opened later (`app::open_new_window`) and
+        // whenever metrics are off — see `metrics::WindowBuildTimings`.
+        mut build_timings: Option<&mut metrics::WindowBuildTimings>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let SitePolicies {
             blocklist,
@@ -1086,6 +1095,12 @@ impl BrowserWindow {
             ))
             .with_window_icon(load_window_icon())
             .build(event_loop)?;
+        // Issue #182: the native window (HWND / GtkWindow) now exists but
+        // has no webview yet, so everything after this point in `new` is
+        // engine cost rather than toolkit cost.
+        if let Some(timings) = build_timings.as_deref_mut() {
+            timings.native_window_built = Some(Instant::now());
+        }
 
         // On Linux/BSD, tao windows are gtk windows and wry webviews are gtk
         // widgets, so every webview goes in this `gtk::Fixed` container
@@ -1187,6 +1202,18 @@ impl BrowserWindow {
             DownloadHandlerHost::EachContentWebview => toolbar_builder,
         };
         let toolbar = attach(toolbar_builder)?;
+        // Issue #182: the process's first webview is up. On Windows that
+        // means the WebView2 environment has been created and
+        // `msedgewebview2.exe` spawned — a one-time cost the *second*
+        // webview (the content one, attached just below) does not pay
+        // again, which is exactly the split this checkpoint exists to show.
+        // D43 measured the same asymmetry on Linux/WebKitGTK from
+        // throw-away diagnostics; #182 makes it a permanent metric.
+        // Last use of `build_timings`, so this moves it out rather than
+        // reborrowing.
+        if let Some(timings) = build_timings {
+            timings.toolbar_webview_built = Some(Instant::now());
+        }
 
         let content_blocking_enabled = config.content_blocking_enabled;
         let content_builder = content_webview_builder(

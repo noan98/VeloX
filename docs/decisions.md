@@ -11843,6 +11843,173 @@ Claude App 側のインストール範囲など) がある可能性があり、�
   引き続き有効 (`AUTO_MERGE_TOKEN` が実際に登録された環境での実地確認が
   必要)。
 
+**追記 (2026-09-08、Issue #203)**: `.github/workflows/claude.yml` の起動条件に
+`github.event.comment.user.type != 'Bot'` を追加した。**`claude-code-action` が
+bot のコメントを拒否するのは action の内部であって、workflow job の起動自体は
+防がれない** — PR #198 で、Claude 自身の "Claude Code is working…" コメントと
+Codex のコメントによって job が 2 回余計に起動したのを実測した (無限ループには
+至らず skipped で止まったが、それは action 側の実装に依存した防御であり、
+workflow 側でも断つべきと判断した)。
+
+この条件は **auto-merge の `@claude` 自動投稿とは衝突しない**。上記のとおり
+`@claude` の投稿には `AUTO_MERGE_TOKEN` (PAT) を使うため、投稿者は PAT 所有者
+(人間のアカウント) になり `user.type` は `User` になる。逆に `GITHUB_TOKEN` で
+投稿する実装に戻すと、この条件以前に**そもそも workflow トリガが発火しない**
+(Issue #201 で `@codex review` について実測したのと同じ制約)。**`@claude` /
+`@codex review` のどちらも PAT 投稿が前提**である、と揃えて理解すること。
+
+## D92: 起動の `process_start` → `window_created` を 4 つの中間チェックポイントで分解する (#182) — 計測の追加のみで、最適化はまだ行わない
+
+**対象**: Issue #182 (P1: Windows Startup Performance — Window Creation /
+GUI Initialization Breakdown)。Epic #57 の一部。
+
+**背景**: Windows の初回実測 (Issue #136/#180、
+`docs/performance-targets.md` §21) で、`startup_first_load_ms` の中央値
+716.7ms のうち **`startup_window_created_ms` が 644.1ms** を占めることが
+判明した。`page_load_ms` は 54.1ms なので、ページロードは主要ボトルネック
+ではない。ところがこの 644ms は「プロセス開始から `BrowserWindow::new` が
+返るまで」という単一のバケツで、次のものが全部混ざっている:
+
+- tao のイベントループ生成 (`EventLoopBuilder::build()`)
+- VeloX 自身の Rust セットアップ (`settings.json`、ブロックリスト、
+  サイト権限、セッション復元、`Windows`/`Tabs` の構築)
+- tao のネイティブウィンドウ生成 (`WindowBuilder::build()`)
+- ツールバー webview の生成 = WebView2 環境の初期化
+- content webview の生成
+
+**この状態では「VeloX 側で何を直せば効くのか」が一切分からない。** Epic #57
+の絶対ルール 1「ベンチマーク無しに最適化しない」に従えば、最初にやるべき
+ことは最適化ではなく分解である。
+
+**判断**: `browser::metrics::StartupTimestamps` に 4 つの中間チェック
+ポイント (`event_loop_built` / `pre_window_setup_done` /
+`native_window_built` / `toolbar_webview_built`) を追加し、644ms を 5 区間に
+割る。**D43 (Issue #59) が `window_created` → `toolbar_ready` に対して行った
+のと同じ手法を、その手前の、より大きい区間に適用したもの**である。区間の
+定義と読み方は `docs/performance-targets.md` §24.1 を参照。
+
+意図的にこう決めた点:
+
+1. **恒久的なメトリクスにする (使い捨ての診断コードにしない)。** D43 は
+   `BrowserWindow::new` の内訳を一時的なタイムスタンプで測って捨てた。
+   その結果、Windows で同じ問いが立ったときに**もう一度同じ計装を書き直す
+   必要が生じた** — それが本 Issue である。今回は `MetricKey` に 4 つ
+   (`startup_event_loop_ms` / `startup_pre_window_setup_ms` /
+   `startup_native_window_ms` / `startup_toolbar_webview_ms`) を足し、
+   `velox-bench` と `perf-windows.yml` から通常のメトリクスとして読めるように
+   した。OS を跨いだ再計測 (Epic #57 ルール 5) では、特定ビルドに手を入れ
+   ないと測れない値は使い物にならない。
+
+2. **新しい 4 点は `StartupReport` で `Option<Duration>` にし、`report()` の
+   必須条件にしない。** `report()` は全チェックポイントが揃うまで `None` を
+   返す設計で、`startup` レコードが書かれないと **`velox-bench` が読む起動
+   メトリクスが全部消える**。あとから足した診断が既存の計測を落とせる構造に
+   はしない。JSON では `total_pss_bytes` (D42) や `engine_duration_ms` (D87)
+   と同じ規約で、キーは常に出しつつ値を `null` にする — 「このビルドは報告
+   しない」(キーごと無い = #182 以前の結果ファイル) と「この実行では到達
+   しなかった」(キーがあって `null`) を区別できる。
+
+3. **`ui::BrowserWindow::new` には `&mut StartupTimestamps` を渡さず、
+   `Option<&mut metrics::WindowBuildTimings>` という出力パラメータにする。**
+   `metrics` は UI ツールキット非依存を保つ層であり、`BrowserWindow` は
+   `tao`/`wry` のハンドルを持つ唯一の型なので、依存の向きを片方向に保ちたい。
+   加えて `BrowserWindow::new` は Ctrl/Cmd+N で開く**すべての**ウィンドウが
+   通る経路であり、起動計測の対象はプロセス最初の 1 個だけである。
+   `app::open_new_window` は `None` を渡してコストを一切払わない — 隣の
+   `ipc_log: Option<IpcLog>` (Issue #66) と同じ形にした。
+
+4. **`event_loop_built` だけは計測オフでも `Instant::now()` を 1 回読む。**
+   `app::run` はイベントループを `settings.json` の読込より先に作るが、
+   `perf_metrics` は設定画面 (Advanced タブ、D67) で切り替わりうるため、
+   この時点では計測が有効かどうかがまだ確定していない。D19/D43 の
+   「計測オフ時はクロックを読まない」という規約はイベントごとのホットパス
+   とサンプラースレッドについてのものであり、**プロセスあたり 1 回だけ走る
+   経路での 1 回の読み取り (数十ナノ秒) は対象外**と判断した。
+
+5. **`toolbar_ready` と `first_load` の間を「区間」として扱わない。** content
+   タブの `LoadFinished` とツールバーの `ready` ハンドシェイクは独立した
+   経路で、ページの方が先に終わることが実際にある — Linux で 10 試行を
+   測ったところ差の最小値は **-8.1ms** だった。統合テスト
+   (`startup_completes_and_records_a_startup_event`) のチェックポイント順序
+   アサーションからはこの 2 点間を外してある。**入れていたら race を
+   アサートする flaky テストになっていた**: 最初の実装では入れており、
+   実測して初めて気付いた。
+
+**実測結果 (Linux、計測基盤の検証)**: 詳細は
+`docs/performance-targets.md` §24.3。`window_created` 140.8ms の内訳は
+「VeloX 自身の Rust セットアップ **0.10ms (0.07%)**」「最初の webview の
+生成 **95.95ms (約 68%)**」「tao のイベントループ 12.15ms」「tao のウィンドウ
+生成 29.90ms」「2 個目の webview 1.60ms」。D43 が使い捨ての診断で見ていた
+「最初の webview が高く、2 個目は安い」という非対称性が、常設メトリクスと
+して再現した。
+
+**実測結果 (Windows、本命)**: 詳細は `docs/performance-targets.md` §24.4。
+本 workflow 変更を含む PR に対する `pull_request` トリガーの自動実行
+(run 34178072263、`windows-latest`、`cold_startup` 10 試行) で取得できた。
+`window_created` 922.35ms の内訳 (累積中央値どうしの差) は「VeloX 自身の
+Rust セットアップ **0.55ms (0.06%)**」「最初の webview の生成
+**672.15ms (72.9%)**」「tao のイベントループ 4.50ms」「tao のウィンドウ生成
+58.90ms」「**2 個目の webview 186.25ms**」。
+
+**Linux から外挿していたら間違えていた点が 1 つある** (Epic #57 ルール 5 の
+実例): Linux では 2 個目の webview が 1.60ms しかかからず「エンジンの初回
+コストは 1 個目に集中する」と読めるが、**Windows では 2 個目にも 186ms
+残る**。WebView2 と WebKitGTK のプロセスモデルの違いがここに出ている。
+
+なお §21 (run 34127310212) の `startup_window_created_ms` 中央値 644.05ms に
+対して本 run は 922.35ms で約 1.43 倍ある。**本 Issue の計装が原因である可能性は
+対照実験で否定した** — 計装の入っていない `main` (`c38016c`) を同じ条件で
+測って 885.65ms であり、計装のある 922.35 / 905.80ms と同じ帯にある
+(§24.5、run 34178981601)。**真の原因は特定できていない**が、09-07 13:26 から
+09-08 02:12 の間に `main` へ入った実行時変更 (最有力は #185 = 自動タブ休止の
+デフォルト ON) かランナー環境の変化のいずれかである。§24.4 が答えているのは
+「どの区間に割れるか」という比率の問いであって、Windows の起動時間の代表値では
+ない。
+
+**この Issue では最適化を一切行っていない。** そして Windows の実測が出た
+いま、**それが正しい結論であることが確認できた**: VeloX が唯一直接短縮できる
+`event_loop` → `pre_window_setup` 区間は Linux 0.07% / Windows 0.06% で、
+ここを速くしても起動時間は動かない。**「計測を追加し、最適化はしない」**で
+決着させる — #59 (D43) / #60 / #64 / #66 / #69 と同じである。実行パスは
+変えていないので、`velox-bench` の before/after で既存メトリクスが動かないのも
+当然の結果になる。次に見るべき候補は「2 個目の webview の 186ms」だが、これも
+WebView2 側のコストであり、着手するなら**まず区間の分布 (§24.2 の手順を
+Windows で実行) を取ってから**別 Issue として起票する。
+
+**付随して `perf-windows.yml` に「Startup breakdown summary」ステップを
+追加した**。結果 JSON は累積値しか持たないため、区間を見るには隣接する値の
+引き算が要る。毎回手で計算するのは間違えやすいので Job Summary に表として
+出す。**この差分は「区間の中央値」ではなく「累積中央値どうしの差」**である
+(各中央値は別々の試行から来うる) ことをステップのコメントと出力の両方に
+明記した。区間の分布まで論じる手順は §24.2 に分けてある。ステップは
+`if: always()` + `continue-on-error: true` で、単独では決して計測ジョブを
+落とさない。
+
+**Revisit condition**:
+
+1. ~~Windows の実測 (§24.4) で `event_loop` → `pre_window_setup` 区間が
+   無視できない大きさだった場合~~ — **§24.4 で否定された** (0.55ms /
+   0.06%)。VeloX が唯一直接短縮できる区間はここだが、最適化対象としての
+   価値が無いことが Linux・Windows の両方で確認できた。**将来 VeloX 自身の
+   起動時処理を増やしたとき**(起動時に何かをディスクから読む機能を足した
+   ときなど) に、この区間が伸びていないかを見る回帰の観測点として使う。
+2. `native_window` → `toolbar_webview` (エンジンの初回初期化) — **§24.4 で
+   支配的であることが確認された** (672.15ms / 72.9%)。Epic #57 ルール 3 の
+   ブラックボックスであり、WebView2 の初期化を前倒し・並列化する手段が
+   あるかどうかは wry/tao の API 次第。D43 のフォローアップと同じく、
+   新規依存を避け `unsafe` を使わないという本リポジトリの制約の中で
+   実現できるかを先に検討すること。
+3. **`toolbar_webview` → `window_created` (2 個目の webview) が Windows で
+   186.25ms かかる** — Linux の 1.60ms と質的に違い、§24.4 で初めて見えた。
+   ただし着手前に §24.2 の手順を Windows 上で実行して**区間の分布 (p95 /
+   min / max) を取ること**。現状あるのは累積中央値どうしの差 1 点だけで、
+   ばらつきが分かっていない。
+4. §21 (644.05ms) と §24.4 (922.35ms) の約 1.43 倍の開き — **本 Issue の
+   スコープ外として別 Issue に分離した**。§24.5 に 4 つの計測点と切り分けの
+   手順をまとめてある。本 Issue の計装が原因でないことだけは対照実験で確定
+   しているので、**#182 の内訳 (比率) の結論はこの未解明点に影響されない**。
+   ただし **Windows の起動時間の代表値を論じる前には片付ける必要がある。**
+
 ## D93: Memory Budget Manager (Issue #176) Stage 1 — 計測の結果、本体コードは変更しない。RAM 相対の予算は「裸の比率」では成立しないことが分かった
 
 **対象**: Issue #176 (Memory Budget Manager / Adaptive Memory Management、

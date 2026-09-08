@@ -258,6 +258,73 @@ jobs:
             Write-Host "結果ファイルが生成されていません (velox-bench run が失敗した可能性)"
           }
 
+      # Issue #182 (docs/decisions.md D92)。§21 の初回実測で
+      # startup_first_load_ms 716.7ms のうち startup_window_created_ms が
+      # 644.1ms を占めることが分かり、#182 でその区間を 4 つの中間チェック
+      # ポイントに分解した。結果 JSON は全チェックポイントを「プロセス開始
+      # からの累積 ms」で持つため、区間ごとの長さを見るには隣り合う値を
+      # 引き算する必要がある。毎回それを手でやるのは面倒なだけでなく間違え
+      # やすいので、ここで Job Summary に表として出す。
+      #
+      # ⚠️ **この差分は「区間の中央値」ではなく「累積中央値どうしの差」**。
+      # 各メトリクスの中央値は別々の試行から来うるため、両者は一致しない。
+      # どちらの区間が支配的かを一目で見るには十分だが、区間そのものの
+      # 分布を論じるなら試行ごとに引き算した値を集計すること
+      # (docs/performance-targets.md §24.2 に手順がある)。
+      #
+      # 本実行 (velox-bench run) が失敗しても結果の取りこぼしを増やさない
+      # よう、常に走り、単独では決してジョブを落とさない。
+      - name: Startup breakdown summary (Issue #182)
+        if: always()
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $file = Get-ChildItem -Path results -Filter "*-windows.json" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $file) {
+            Write-Host "結果ファイルが無いため起動内訳をスキップします"
+            exit 0
+          }
+          $result = Get-Content $file.FullName -Raw | ConvertFrom-Json
+          # 到達順。process_start は 0ms の起点なので表の先頭に置く。
+          $checkpoints = @(
+            @{ key = "startup_event_loop_ms";             label = "event_loop (tao のイベントループ生成)" },
+            @{ key = "startup_pre_window_setup_ms";       label = "pre_window_setup (VeloX 自身の Rust セットアップ)" },
+            @{ key = "startup_native_window_ms";          label = "native_window (tao のネイティブウィンドウ生成)" },
+            @{ key = "startup_toolbar_webview_ms";        label = "toolbar_webview (最初の webview = エンジン初期化)" },
+            @{ key = "startup_window_created_ms";         label = "window_created (content webview まで完了)" },
+            @{ key = "startup_toolbar_ready_ms";          label = "toolbar_ready" },
+            @{ key = "startup_first_load_ms";             label = "first_load" }
+          )
+          $lines = @(
+            "### 起動の内訳 (Issue #182)",
+            "",
+            "累積中央値と、隣接する累積中央値の差。**差は区間ごとの中央値ではない** (各中央値は別々の試行から来うる)。",
+            "",
+            "| チェックポイント | 累積 median (ms) | 直前との差 (ms) |",
+            "| --- | ---: | ---: |"
+          )
+          $previous = 0.0
+          $missing = @()
+          foreach ($cp in $checkpoints) {
+            $stats = $result.metrics.($cp.key)
+            if ($null -eq $stats) {
+              $missing += $cp.key
+              continue
+            }
+            $median = [double]$stats.median
+            $lines += "| $($cp.label) | $([math]::Round($median, 2)) | $([math]::Round($median - $previous, 2)) |"
+            $previous = $median
+          }
+          if ($missing.Count -gt 0) {
+            $lines += ""
+            $lines += "> 欠損: $($missing -join ', ') — このシナリオでは記録されないか、#182 より前のビルドの結果ファイルです。"
+          }
+          $summary = $lines -join "`n"
+          Write-Host $summary
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v7

@@ -95,6 +95,12 @@ _PCT = ("%", lambda v: v)
 _COUNT = ("個", lambda v: v)
 
 METRIC_META: dict[str, tuple[str, str, Any]] = {
+    # Issue #182 / D92: `process_start` -> `window_created` の 4 分割。
+    # 表示順は到達順に合わせる。
+    "startup_event_loop_ms": ("event_loop", *_MS),
+    "startup_pre_window_setup_ms": ("pre_window_setup", *_MS),
+    "startup_native_window_ms": ("native_window", *_MS),
+    "startup_toolbar_webview_ms": ("toolbar_webview", *_MS),
     "startup_window_created_ms": ("window_created", *_MS),
     "startup_rust_setup_done_ms": ("rust_setup_done", *_MS),
     "startup_toolbar_script_started_ms": ("toolbar_script_started", *_MS),

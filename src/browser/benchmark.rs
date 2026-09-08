@@ -75,6 +75,30 @@ pub fn parse_jsonl(text: &str) -> Vec<Value> {
 /// new event kind added there needs a matching variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MetricKey {
+    /// tao's event loop has been built — see
+    /// `metrics::StartupTimestamps::mark_event_loop_built` and
+    /// docs/decisions.md D92 (Issue #182). First of four checkpoints
+    /// splitting `process_start` → [`MetricKey::StartupWindowCreatedMs`]
+    /// into toolkit init / VeloX's own setup / native window / first
+    /// webview. Absent (never a fabricated `0`) from a result file produced
+    /// by a pre-#182 build, same rule as [`MetricKey::PssTotalBytes`].
+    StartupEventLoopMs,
+    /// Every Rust-side prerequisite of the first window is loaded and
+    /// `BrowserWindow::new` is about to be called — see
+    /// `metrics::StartupTimestamps::mark_pre_window_setup_done` and D92.
+    /// **The only span of `process_start` → `window_created` that is
+    /// VeloX's own code**; the three around it are tao/engine time that
+    /// Epic #57 rule 3 treats as a black box.
+    StartupPreWindowSetupMs,
+    /// tao's `WindowBuilder::build()` has returned — see
+    /// `metrics::StartupTimestamps::mark_native_window_built` and D92.
+    StartupNativeWindowMs,
+    /// The toolbar (first) webview has been attached — see
+    /// `metrics::StartupTimestamps::mark_toolbar_webview_built` and D92.
+    /// The span before it carries the engine's one-time initialization
+    /// (WebView2 environment creation on Windows), which the content
+    /// webview built right afterwards does not pay again.
+    StartupToolbarWebviewMs,
     StartupWindowCreatedMs,
     /// Right before `app::run` enters the event loop — see
     /// `metrics::StartupTimestamps::mark_rust_setup_done` and
@@ -136,7 +160,11 @@ impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 16] = [
+    pub const ALL: [MetricKey; 20] = [
+        MetricKey::StartupEventLoopMs,
+        MetricKey::StartupPreWindowSetupMs,
+        MetricKey::StartupNativeWindowMs,
+        MetricKey::StartupToolbarWebviewMs,
         MetricKey::StartupWindowCreatedMs,
         MetricKey::StartupRustSetupDoneMs,
         MetricKey::StartupToolbarScriptStartedMs,
@@ -159,6 +187,10 @@ impl MetricKey {
     /// by `velox-bench compare`.
     pub fn as_str(self) -> &'static str {
         match self {
+            MetricKey::StartupEventLoopMs => "startup_event_loop_ms",
+            MetricKey::StartupPreWindowSetupMs => "startup_pre_window_setup_ms",
+            MetricKey::StartupNativeWindowMs => "startup_native_window_ms",
+            MetricKey::StartupToolbarWebviewMs => "startup_toolbar_webview_ms",
             MetricKey::StartupWindowCreatedMs => "startup_window_created_ms",
             MetricKey::StartupRustSetupDoneMs => "startup_rust_setup_done_ms",
             MetricKey::StartupToolbarScriptStartedMs => "startup_toolbar_script_started_ms",
@@ -204,7 +236,11 @@ impl MetricKey {
     /// *opposite* end of the scale (small metrics, small absolute deltas).
     pub fn min_significant_delta(self) -> f64 {
         match self {
-            MetricKey::StartupWindowCreatedMs
+            MetricKey::StartupEventLoopMs
+            | MetricKey::StartupPreWindowSetupMs
+            | MetricKey::StartupNativeWindowMs
+            | MetricKey::StartupToolbarWebviewMs
+            | MetricKey::StartupWindowCreatedMs
             | MetricKey::StartupRustSetupDoneMs
             | MetricKey::StartupToolbarScriptStartedMs
             | MetricKey::StartupToolbarReadyMs
@@ -226,7 +262,11 @@ impl MetricKey {
     /// The `PerfRecord` `"event"` value this metric is read from.
     fn event_name(self) -> &'static str {
         match self {
-            MetricKey::StartupWindowCreatedMs
+            MetricKey::StartupEventLoopMs
+            | MetricKey::StartupPreWindowSetupMs
+            | MetricKey::StartupNativeWindowMs
+            | MetricKey::StartupToolbarWebviewMs
+            | MetricKey::StartupWindowCreatedMs
             | MetricKey::StartupRustSetupDoneMs
             | MetricKey::StartupToolbarScriptStartedMs
             | MetricKey::StartupToolbarReadyMs
@@ -249,6 +289,10 @@ impl MetricKey {
     /// matching event.
     fn field_name(self) -> &'static str {
         match self {
+            MetricKey::StartupEventLoopMs => "event_loop_ms",
+            MetricKey::StartupPreWindowSetupMs => "pre_window_setup_ms",
+            MetricKey::StartupNativeWindowMs => "native_window_ms",
+            MetricKey::StartupToolbarWebviewMs => "toolbar_webview_ms",
             MetricKey::StartupWindowCreatedMs => "window_created_ms",
             MetricKey::StartupRustSetupDoneMs => "rust_setup_done_ms",
             MetricKey::StartupToolbarScriptStartedMs => "toolbar_script_started_ms",

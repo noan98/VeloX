@@ -558,6 +558,16 @@ struct AutomationWait {
 /// is otherwise unused when `config.perf_metrics` is off.
 pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Error>> {
     let event_loop: EventLoop<UserEvent> = EventLoopBuilder::with_user_event().build();
+    // Issue #182 (D92). Captured unconditionally, unlike every other
+    // checkpoint in this function: whether metrics are on at all is not
+    // settled until `apply_settings` below has read `settings.json` (the
+    // Advanced tab can flip `perf_metrics`), and this timestamp has to be
+    // taken before that. That costs one `Instant::now()` per process on the
+    // metrics-off path — the D19/D43 "no clock reads when metrics are off"
+    // convention is about per-event hot paths and sampler threads, not a
+    // single read on a path that runs once. It is folded into
+    // `StartupTimestamps` a few statements below, once one exists.
+    let event_loop_built = Instant::now();
     let proxy = event_loop.create_proxy();
     // Cloned before `proxy` is moved into `BrowserWindow::new` below — see
     // `spawn_automation`'s call site further down, once `AppState` exists.
@@ -602,6 +612,9 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     let mut startup = config
         .perf_metrics
         .then(|| metrics::StartupTimestamps::new(process_start));
+    if let Some(startup) = startup.as_mut() {
+        startup.mark_event_loop_built(event_loop_built);
+    }
 
     // Built once, shared with the RSS sampler thread, every perf-logging
     // call site in this file, and (Issue #66) every `BrowserWindow`'s
@@ -706,6 +719,19 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         site_permissions,
     };
     let window_event_proxy = proxy.clone();
+    // Issue #182 (D92): everything from `event_loop_built` to here is
+    // VeloX's own Rust work — `settings.json`, the blocklist and
+    // site-exception lists, site permissions, session restore, `Windows`/
+    // `Tabs`. It is the only span of `process_start` → `window_created`
+    // that VeloX can shorten without touching tao or the web engine, so it
+    // gets its own checkpoint rather than being lumped in with them.
+    if let Some(startup) = startup.as_mut() {
+        startup.mark_pre_window_setup_done(Instant::now());
+    }
+    // `Some` only while metrics are on; `BrowserWindow::new` fills in the
+    // two checkpoints inside window construction (see its `build_timings`
+    // parameter) and they are folded into `startup` right after it returns.
+    let mut window_build_timings = startup.is_some().then(metrics::WindowBuildTimings::default);
     let primary_window = BrowserWindow::new(
         &event_loop,
         primary_id,
@@ -716,6 +742,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         site_policies.clone(),
         config.private,
         ipc_log.clone(),
+        window_build_timings.as_mut(),
     )?;
     // Every open native window, keyed by the same `browser::WindowId`
     // `windows: Windows` above uses for its logical (tab-owning) half — see
@@ -733,6 +760,18 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // freshly opened one with a `new_window` step (`AutomationCommand::NewWindow`).
     let mut automation_window = primary_id;
     if let Some(startup) = startup.as_mut() {
+        // Issue #182: fold in what `BrowserWindow::new` measured from the
+        // inside. Both timestamps were taken during the call that just
+        // returned, so they belong before `mark_window_created` below —
+        // which is what closes the span they sit in.
+        if let Some(timings) = window_build_timings {
+            if let Some(at) = timings.native_window_built {
+                startup.mark_native_window_built(at);
+            }
+            if let Some(at) = timings.toolbar_webview_built {
+                startup.mark_toolbar_webview_built(at);
+            }
+        }
         startup.mark_window_created(Instant::now());
     }
 
@@ -2354,6 +2393,12 @@ fn open_new_window(
         state.site_policies.clone(),
         private,
         state.perf.as_ref().map(PerfContext::to_ipc_log),
+        // Issue #182: startup's `process_start` → `window_created`
+        // decomposition is about the *first* window only. A window opened
+        // later (Ctrl/Cmd+N) does not pay the engine's one-time
+        // initialization cost and is not part of any startup measurement,
+        // so it records nothing here.
+        None,
     ) {
         Ok(window) => {
             // Issue #30/D67, integrated with multi-window in D68: settings
