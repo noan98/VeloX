@@ -2498,3 +2498,78 @@ for B in 300 500 700; do
   grep tab_suspend "$S/perf-$B.jsonl" | wc -l
 done
 ```
+
+---
+
+## 26. 起動回帰の A/B 切り分け (Issue #208, 2026-09-08)
+
+§24.5 に記録した 4 点の計測で、`windows-latest` の `cold_startup` は
+`startup_window_created_ms` の中央値が **644.05ms (run 1) → 885.65ms
+(run 4)** と +38% 伸びている。#182 の計装が原因でないことは run 4 (計装
+なしの `main`) で否定済みだが、**原因は特定できていない。**
+
+### 26.1 なぜ「コミットの二分探索」ではなく A/B なのか
+
+Issue #208 が最初に挙げた手順は、`beba7b7` (#185 の 1 つ前) と `a6aa703`
+(#185) にブランチを立てて `perf-windows.yml` を複数回まわす二分探索である。
+これは **run をまたぐ比較**であり、次の交絡がそのまま残る:
+
+- ランナー個体差 (同じ `windows-latest` でも実体は毎回違うマシン)
+- ランナーイメージ / WebView2 Runtime の更新 (§24.5 の 4 点は 09-07 13:26
+  〜 09-08 02:12 に分散しており、この間の更新を否定できていない)
+- run 1 が低い側の外れ値である可能性 (run 1 は 1 回しか測っていない)
+
+**§24.5 が結論を出せずにいるのは、まさにこれらを分離できていないためで
+ある。** 二分探索を足しても、同じ交絡を抱えた点が増えるだけになりうる。
+
+そこで `perf-windows.yml` に **同一ジョブ・同一ビルド・同一ランナーの中で
+条件 A/B を交互に測る**モードを入れた (入力 `compare_env` / `repeats`)。
+上の 3 つはすべて A と B で共通なので丸ごと相殺され、差が出れば
+「**その環境変数が起動時間を変えた**」以外の説明が残らない。実験用の
+ブランチを候補コミットに立てる必要も無い。
+
+### 26.2 条件
+
+| 条件 | 設定 | 意味 |
+| --- | --- | --- |
+| A | 既定のまま | #185 (D90) 以降の `main` — メモリ予算 700 MiB による自動タブ休止が既定 ON |
+| B | `VELOX_MEMORY_BUDGET_MB=0` | メモリ予算シグナルだけを切る。#185 が入る前と同じ「メモリ signal 無し」の状態 |
+
+`0` を明示したときだけ既定が `Some` でも `None` になるのは
+`config::resolve_suspension` の `overridable` の規則で、D90 が既定 ON に
+するときに用意した逃げ道そのものである。`settings.json` は起動時に自動
+生成されない (`app::run` の `None => config.to_settings()` は in-memory に
+留まる) ため、クリーンな CI ランナーでは `apply_settings` が環境変数を
+上書きすることもない。
+
+`repeats=2` で **A → B → A → B** の順に計測する。順序効果 (ディスク
+キャッシュの温まり、データディレクトリに溜まる履歴/セッション) を検出
+するためで、**A 同士のばらつきが A/B 差と同程度なら、その差は結論に
+してはならない。**
+
+### 26.3 実行方法
+
+```text
+# Actions → Performance (Windows, manual) → Run workflow
+scenario:    cold_startup
+trials:      10
+compare_env: VELOX_MEMORY_BUDGET_MB=0
+repeats:     2
+```
+
+`perf-windows.yml` 自身を変更する PR でも同じ既定 (cold_startup / 10 試行 /
+上の A/B) で自動実行される。`compare_env` を空欄にすると従来どおりの単独
+計測に戻る。結果は Job Summary の「A/B 比較 (Issue #208)」表と、artifact
+の `results/cold_startup-windows-{baseline,compare}-{1,2}.json` に出る。
+
+### 26.4 結果
+
+**未取得。** この節を追加した PR の Windows ジョブが最初の実行になる。
+結果が出たら、A/B 差・A 同士のばらつき・§24.5 の 4 点との整合を
+ここに転記し、判断を `docs/decisions.md` に記録する。
+
+**差が出なかった場合に次に試すこと** (Issue #208 の手順 2 に対応):
+`compare_env` を `VELOX_PERF_RSS_INTERVAL_MS=0` や #178/#183/#189/#193 が
+導入した挙動を切る変数へ変え、同じ A/B で 1 つずつ潰す。環境変数で切れない
+変更しか残らなくなった時点で初めて、候補コミットへのブランチによる二分
+探索に進む。
