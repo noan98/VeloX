@@ -11642,9 +11642,18 @@ check-run を登録しないため、auto-merge からは「レビューが存�
       (「反応されないまま空打ちする」より「投稿しない」方が安全 — レビュー
       依頼が実際に届いたと誤認させないため)。`@codex review` の投稿は
       これまでどおり `GH_TOKEN` (`AUTO_MERGE_TOKEN||GITHUB_TOKEN` の
-      フォールバック) のままにした — こちらは GITHUB_TOKEN 経由でも
-      Codex が実際に反応することを確認済みであり (この PR 自身で複数回
-      観測)、アプリごとに挙動が異なるため Claude 側だけ個別に対処した。
+      フォールバック) のままにした —
+      ~~こちらは GITHUB_TOKEN 経由でも Codex が実際に反応することを
+      確認済みであり (この PR 自身で複数回観測)、アプリごとに挙動が
+      異なるため Claude 側だけ個別に対処した。~~
+      **[訂正 (2026-09-08、Issue #201)]: この「確認済み」は誤りだった。
+      実際に検証していたのは人間のアカウント (`noan98`) から投稿した
+      ケースのみで、`github-actions[bot]` (GITHUB_TOKEN) からの bot 投稿
+      は一度も試していなかった。PR #200 で実際に bot 投稿を観測したところ
+      Codex は "To use Codex here, create a Codex account and connect to
+      github." と返すのみでレビューを実行せず、`@claude` と同じ制約が
+      `@codex review` にもあることが判明した。詳細と修正は下記
+      「追記 (2026-09-08、Issue #201)」を参照。**
       `auto-merge.yml` の `Merge eligible pull requests` ステップに
       `AUTO_MERGE_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN }}` を追加した
       (未設定なら空文字列になる — GitHub Actions の仕様)。
@@ -11773,6 +11782,55 @@ Claude フォールバックが発動した最初のケースにおいて、投�
 場合、PAT を使っても反応しない別の要因 (トークンの権限スコープ、
 Claude App 側のインストール範囲など) がある可能性があり、追加調査が
 必要になる。
+
+**追記 (2026-09-08、Issue #201)**: 上記「対処」の `@codex review` に
+関する記述 (「GITHUB_TOKEN 経由でも Codex が実際に反応することを確認
+済み」) は**誤りだった**。実際に検証していたのは人間のアカウント
+(`noan98`) から投稿したケース (PR #192) のみで、`github-actions[bot]`
+としての bot 投稿は一度も試していなかった。PR #200 で実際に auto-merge
+が `@codex review` を自動投稿したところ、bot 投稿では Codex が応答せず
+レビューは実行されなかった:
+
+| 時刻 (UTC) | 出来事 |
+| --- | --- |
+| 2026-09-08 01:12:41 | auto-merge が `github-actions[bot]` として `@codex review` を自動投稿 (PR #200) |
+| 2026-09-08 01:12:48 | Codex の返答: "To use Codex here, create a Codex account and connect to github." (レビュー未実行) |
+
+同じ `@codex review` を人間のアカウントから投稿した PR #192 では Codex は
+"You have reached your Codex usage limits for code reviews." という別の
+メッセージを返しており (利用上限到達という別の反応)、**Codex は投稿者を
+見ており bot は Codex ユーザとして扱われない**ことが分かる。`@claude`
+(決定11、PR #193) と同じ制約が `@codex review` にもあった。
+
+- **修正**: `@codex review` の投稿も `@claude` と同じパターンに変更した
+  (`review_gate_decision.sh`)。`GH_TOKEN` (`AUTO_MERGE_TOKEN||GITHUB_TOKEN`
+  フォールバック) は使わず、投稿の瞬間だけ `GH_TOKEN="$AUTO_MERGE_TOKEN"`
+  を明示的に前置する。**`AUTO_MERGE_TOKEN` が未設定なら `@codex review` を
+  投稿せず `::warning::` を出す** (空打ちで「リクエスト済み」と誤認させ
+  ないため)。
+- **マーカーコメントを残さない性質の確認**: `codex_review_request_comment_
+  body()` (`check_review_gate.py`) が返す本文にマーカー
+  (`<!-- auto-merge:codex-review-request:<head SHA> -->`) が埋め込まれて
+  おり、`gh pr comment` を実際に呼ばない限りこの文字列がコメントとして
+  残ることは無い。投稿と本文組み立てが分離されているため、
+  `AUTO_MERGE_TOKEN` 未設定時に「投稿しない」分岐へ入るだけでマーカーも
+  自動的に残らない (実装を変えてもこの分離を維持すること — 一度でも
+  空打ちでマーカーだけ残ると、`_find_request_marker()` がマーカーの
+  有無だけで重複防止を判定するため、その head SHA には二度と
+  `@codex review` がリクエストされず「応答待ち」のまま永久にブロック
+  される)。
+- **テスト**: `test_check_review_gate.py`/`test_review_gate_decision.sh`
+  に、(a) `AUTO_MERGE_TOKEN` 未設定時に `@codex review` を投稿しない・
+  マーカーも残らないこと、(b) 設定時は `GH_TOKEN=$AUTO_MERGE_TOKEN` で
+  投稿されること、(c) `@claude` 側の既存挙動が壊れていないこと、を追加
+  した。
+- Revisit condition (5)/(8) との関係: (5) の懸念 (自動リクエストが実地で
+  正しく投稿されるか) はまさにこの不具合として的中していた。本修正で
+  `@codex review` も `@claude` と同じ `AUTO_MERGE_TOKEN` 前提になった
+  ため、(8) の「PAT を使っても反応しない別の要因があるかもしれない」と
+  いう懸念は `@codex review`/`@claude` の両方に共通する残課題として
+  引き続き有効 (`AUTO_MERGE_TOKEN` が実際に登録された環境での実地確認が
+  必要)。
 
 **追記 (2026-09-08、Issue #203)**: `.github/workflows/claude.yml` の起動条件に
 `github.event.comment.user.type != 'Bot'` を追加した。**`claude-code-action` が
