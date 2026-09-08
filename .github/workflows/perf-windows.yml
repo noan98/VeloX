@@ -6,6 +6,13 @@ name: Performance (Windows, manual)
 # 1 つも無かった。この workflow はそれを埋めるための **手動実行専用**
 # ジョブ。
 #
+# Issue #208 (docs/performance-targets.md §26) で役割が 1 つ増えた:
+# 入力 `compare_env` に `KEY=VALUE` を渡すと、**同一ジョブ・同一ビルド・
+# 同一ランナーの中で「既定 (A)」と「その環境変数を設定した状態 (B)」を
+# 交互に計測する**。run をまたぐ比較では分離できないランナー個体差や
+# ランナーイメージの更新を相殺できるので、性能回帰の原因切り分けに使う。
+# 空欄にすれば従来どおりの単独計測に戻る。
+#
 # **手動実行 (workflow_dispatch) 限定。PR ごとの自動実行や性能回帰ゲート
 # ではない** (Issue #136 のスコープ外。回帰ゲートは Linux の
 # perf-gate.yml が引き続き担う):
@@ -65,6 +72,18 @@ on:
         description: "試行回数 (velox-bench run --trials)"
         type: string
         default: "10"
+      compare_env:
+        description: "A/B 比較の B 条件で追加する環境変数 (KEY=VALUE、複数はセミコロン区切り)。空欄なら比較せず A 条件だけを 1 回計測する"
+        type: string
+        default: "VELOX_MEMORY_BUDGET_MB=0"
+      common_env:
+        description: "A/B の両方に共通で設定する環境変数 (KEY=VALUE、セミコロン区切り)。測定条件を成立させるための設定に使う (例: tabs_N でメモリ予算を評価するときの VELOX_MEMORY_CHECK_INTERVAL_MS=500)"
+        type: string
+        default: ""
+      repeats:
+        description: "A/B のペアを何回繰り返すか (compare_env が空のときは無視される)"
+        type: string
+        default: "2"
       url:
         description: "計測対象ページの URL。空欄なら scripts/bench/pages/minimal.html を loopback 配信して使う"
         type: string
@@ -152,6 +171,14 @@ jobs:
           New-Item -ItemType Directory -Force -Path results | Out-Null
           $summary | Out-File -FilePath "results\environment-info.md" -Encoding utf8
 
+          # Issue #208 (§26.4 事実 2)。`windows-latest` は run ごとに別
+          # スペックのマシン (2 論理コア/8 GiB と 4 論理コア/16 GiB の両方が
+          # 観測されている) が割り当てられるため、**どのランナーで測ったかを
+          # 結果のすぐ隣に出す。** これが違う run どうしの絶対値は比較できない。
+          "cpu=$($cpu.Name)" >> $env:GITHUB_OUTPUT
+          "cores=$($cpu.NumberOfLogicalProcessors)" >> $env:GITHUB_OUTPUT
+          "ram_gib=$mem" >> $env:GITHUB_OUTPUT
+
       - name: Build (release)
         run: cargo build --release
 
@@ -172,14 +199,53 @@ jobs:
             "serve_fixed_pages=false" >> $env:GITHUB_OUTPUT
           }
 
+      # ⚠️ ここは以前 `Start-Sleep -Seconds 2` の固定待ちだった。run
+      # 34225449751 (本 PR の初回実行) で `python -m http.server` が 2 秒
+      # では listen に間に合わず、"No connection could be made because the
+      # target machine actively refused it." でジョブごと落ちた
+      # (python プロセス自体は生きていた)。固定 wait は D84/D85 が統合
+      # テストから追い出したのと同じ失敗の仕方をするので、**待つのではなく
+      # 準備できたことを確かめる**形に変える。サーバの stdout/stderr も
+      # 残しておき、起動そのものが失敗したときに理由が分かるようにする。
       - name: Serve fixed benchmark pages (default URL only)
         if: steps.bench_url.outputs.serve_fixed_pages == 'true'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          # ⚠️ **stdout/stderr をリダイレクトしない。** 一度は診断用に
+          # `-RedirectStandardOutput`/`-RedirectStandardError` を付けたが、
+          # それを入れた 2 つの run (34225826524 / 34226965961) の
+          # `page_load_ms` が 2077ms / 2085ms と、同じ固定ページの §21.2
+          # (54.10ms) から 38 倍離れた。`http.server` はシングルスレッドで
+          # リクエストごとに stderr へログを 1 行書くため、書き込み先が
+          # ファイルになるとその I/O が応答をブロックしうる — これが原因か
+          # どうかを確かめるため、まずリダイレクトを外した状態で測り直す
+          # (§26.4 付随)。起動できなかったときの診断はプロセス一覧で足りる。
           Start-Process -FilePath python -ArgumentList "-m", "http.server", "8731" `
             -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden
-          Start-Sleep -Seconds 2
-          Invoke-WebRequest -Uri "http://127.0.0.1:8731/minimal.html" -UseBasicParsing | Out-Null
+
+          $deadline = (Get-Date).AddSeconds(30)
+          $ready = $false
+          while ((Get-Date) -lt $deadline) {
+            try {
+              Invoke-WebRequest -Uri "http://127.0.0.1:8731/minimal.html" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop | Out-Null
+              $ready = $true
+              break
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if (-not $ready) {
+            Write-Host "--- python プロセス ---"
+            Get-Process python -ErrorAction SilentlyContinue |
+              Format-Table Id, ProcessName, StartTime | Out-String | Write-Host
+            Write-Host "--- 8731 を listen しているか ---"
+            Get-NetTCPConnection -LocalPort 8731 -ErrorAction SilentlyContinue |
+              Format-Table LocalAddress, LocalPort, State | Out-String | Write-Host
+            throw "固定ページの配信サーバ (python -m http.server 8731) が 30 秒以内に応答しませんでした"
+          }
+          Write-Host "固定ページの配信を確認しました: http://127.0.0.1:8731/minimal.html"
 
       # 最大のリスク (GUI/WebView2 ウィンドウが起動できるか) の実地検証。
       # velox.exe を直接起動し、プロセス一覧と perf ログの有無を確認する —
@@ -227,35 +293,163 @@ jobs:
             Write-Host "NO perf records (perf ログファイルが作られていない = ウィンドウ作成の途中でブロックされている可能性)"
           }
 
-      - name: Run velox-bench (windows-latest)
+      # Issue #208。`windows-latest` の `cold_startup` は
+      # `startup_window_created_ms` の中央値が 644.05ms (09-07) →
+      # 885.65ms (09-08) と +38% 伸びており (docs/performance-targets.md
+      # §24.5)、最有力の仮説は #185 (D90: メモリ予算 700 MiB による自動タブ
+      # 休止の既定 ON) である。**その検定を、Issue #208 が最初に挙げた
+      # 「候補コミットへブランチを立てて workflow_dispatch を回す二分探索」
+      # ではなく、同じ head・同じジョブの中の A/B 交互実行で行う。**
+      #
+      # なぜ A/B の方が強いか:
+      #   - 二分探索は run をまたぐ比較なので、ランナー個体差・イメージ更新・
+      #     WebView2 Runtime の更新といった「別 run では揃わない変数」が
+      #     そのまま交絡する。§24.5 が run 1 だけ 27% 低い理由を確定できて
+      #     いないのは、まさにこれが分離できていないため。
+      #   - A/B は同一ジョブ・同一ビルド・同一ランナーなので、それらが丸ごと
+      #     相殺される。差が出れば「その環境変数が起動時間を変えた」以外の
+      #     説明が残らない。
+      #   - 候補コミットへの実験用ブランチを作らずに済む。
+      #
+      # 既定の B 条件 `VELOX_MEMORY_BUDGET_MB=0` は #185 が既定 ON にした
+      # メモリ予算シグナルだけを切る (`config::resolve_suspension` の
+      # `overridable`: 明示的な `0` は既定が `Some` でも必ず `None` になる。
+      # これが D90 の逃げ道として用意された値そのもの)。`settings.json` は
+      # 起動時に自動生成されないため (`app::run` の `None => to_settings()`
+      # は in-memory のみ)、CI のクリーンなランナーでは環境変数が
+      # `apply_settings` に上書きされる心配もない。
+      #
+      # A → B → A → B と交互に回すのは順序効果 (ディスクキャッシュの温まり、
+      # データディレクトリに溜まる履歴/セッション) を検出するため。**A 同士
+      # のばらつきが A/B 差と同程度なら、その差は結論にしてはならない。**
+      #
+      # ⚠️ velox-bench は子プロセス (velox.exe) の環境をクリアしないので、
+      # ここで設定した環境変数はそのまま計測対象に効く。裏を返すと B 条件の
+      # 変数を解除し忘れると以降の A 条件が汚染されるため、必ず finally で
+      # 解除する。
+      - name: Run velox-bench (windows-latest, A/B)
         id: bench_run
         shell: pwsh
+        # 入力はシェルへ直接展開せず環境変数で渡す (script injection 対策)。
+        env:
+          INPUT_SCENARIO: ${{ inputs.scenario }}
+          INPUT_TRIALS: ${{ inputs.trials }}
+          INPUT_COMPARE_ENV: ${{ inputs.compare_env }}
+          INPUT_COMMON_ENV: ${{ inputs.common_env }}
+          INPUT_REPEATS: ${{ inputs.repeats }}
+          EVENT_NAME: ${{ github.event_name }}
+          BENCH_URL: ${{ steps.bench_url.outputs.url }}
         run: |
-          $scenario = "${{ inputs.scenario }}"
+          $ErrorActionPreference = "Stop"
+          $scenario = $env:INPUT_SCENARIO
           if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = "cold_startup" }
-          $trials = "${{ inputs.trials }}"
+          $trials = $env:INPUT_TRIALS
           if ([string]::IsNullOrWhiteSpace($trials)) { $trials = "10" }
 
-          & target\release\velox-bench.exe run `
-            --scenario $scenario `
-            --trials $trials `
-            --url "${{ steps.bench_url.outputs.url }}" `
-            --output "results\$scenario-windows.json"
-          if ($LASTEXITCODE -ne 0) {
-            throw "velox-bench run が失敗しました (exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
+          # pull_request 実行では workflow_dispatch の入力が届かない (すべて
+          # 空文字列) ので既定値をここで補う。`compare_env` は「空欄 = 比較
+          # しない」という意味を持つ入力なので、空欄を既定値で埋めてよいのは
+          # 入力そのものが存在しない pull_request のときだけである。
+          $compareEnv = $env:INPUT_COMPARE_ENV
+          $commonEnv = $env:INPUT_COMMON_ENV
+          $repeatsRaw = $env:INPUT_REPEATS
+          if ($env:EVENT_NAME -eq "pull_request") {
+            $compareEnv = "VELOX_MEMORY_BUDGET_MB=0"
+            $commonEnv = ""
+            $repeatsRaw = "2"
+          }
+          if ([string]::IsNullOrWhiteSpace($repeatsRaw)) { $repeatsRaw = "2" }
+          $repeats = 0
+          if (-not [int]::TryParse($repeatsRaw, [ref]$repeats) -or $repeats -lt 1) {
+            throw "repeats は 1 以上の整数で指定してください (受け取った値: '$repeatsRaw')"
+          }
+
+          # "KEY=VALUE;KEY2=VALUE2" を実際の環境変数として設定し、設定した
+          # 名前の一覧を返す (解除に使う)。
+          function Set-EnvFromSpec([string] $spec) {
+            $names = @()
+            foreach ($pair in $spec -split ';') {
+              $entry = $pair.Trim()
+              if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+              $index = $entry.IndexOf('=')
+              if ($index -lt 1) {
+                throw "compare_env の書式が不正です: '$entry' (KEY=VALUE をセミコロンで区切ってください)"
+              }
+              $name = $entry.Substring(0, $index).Trim()
+              $value = $entry.Substring($index + 1).Trim()
+              Set-Item -Path "Env:$name" -Value $value
+              $names += $name
+            }
+            if ($names.Count -eq 0) {
+              throw "compare_env に有効な KEY=VALUE がありません: '$spec'"
+            }
+            return $names
+          }
+
+          function Invoke-Bench([string] $outfile, [string] $label) {
+            Write-Host "=== $label -> $outfile ==="
+            & target\release\velox-bench.exe run `
+              --scenario $scenario `
+              --trials $trials `
+              --url "$env:BENCH_URL" `
+              --output $outfile
+            if ($LASTEXITCODE -ne 0) {
+              throw "velox-bench run が失敗しました (条件: $label, exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
+            }
+          }
+
+          # A/B の両方に共通で効かせる設定 (Issue #197)。**測定条件そのものを
+          # 成立させるためのもの**で、A と B の差には現れない。例:
+          # `tabs_N` のスクリプトは 9 タブを連続で開いて 3 秒待って quit する
+          # ため、プロセスの生存は約 6 秒しかない。休止判定に使うメモリ
+          # サンプラは `sleep(interval)` を**先に**実行する既定 5 秒周期
+          # なので、そのままではサンプルが 0〜1 回しか取れず、**メモリ予算は
+          # 原理的に発動しない** (run 34227483724 の tabs_10 A/B が差 -0.4%
+          # に終わった理由がこれ)。`VELOX_MEMORY_CHECK_INTERVAL_MS=500` の
+          # ように周期を詰めて初めて、予算の有無が結果に出る。
+          if (-not [string]::IsNullOrWhiteSpace($commonEnv)) {
+            Write-Host "A/B 共通の環境変数: $commonEnv"
+            Set-EnvFromSpec $commonEnv | Out-Null
+          }
+
+          # A/B 比較表を作る後段のステップは別プロセスなので、ここで解決した
+          # 値 (pull_request 実行時の既定を含む) をステップ出力で渡す。
+          "compare_env<<VELOX_EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $compareEnv | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "VELOX_EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+          if ([string]::IsNullOrWhiteSpace($compareEnv)) {
+            # 従来どおりの単独計測。ファイル名も従来のまま
+            # (§21/§24 の結果と同じ名前で artifact に並ぶ)。
+            Invoke-Bench "results\$scenario-windows.json" "A (既定)"
+          } else {
+            Write-Host "A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
+            for ($r = 1; $r -le $repeats; $r++) {
+              Invoke-Bench "results\$scenario-windows-baseline-$r.json" "A (既定) #$r"
+              $names = Set-EnvFromSpec $compareEnv
+              try {
+                Invoke-Bench "results\$scenario-windows-compare-$r.json" "B ($compareEnv) #$r"
+              } finally {
+                foreach ($name in $names) {
+                  Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+                }
+              }
+            }
           }
 
       - name: Show result summary
         if: always()
         shell: pwsh
         run: |
-          $path = Get-ChildItem -Path results -Filter "*-windows.json" -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if ($path) {
-            Write-Host "--- $($path.Name) ---"
-            Get-Content $path.FullName | Write-Host
-          } else {
+          $files = @(Get-ChildItem -Path results -Filter "*-windows*.json" -ErrorAction SilentlyContinue |
+            Sort-Object Name)
+          if ($files.Count -eq 0) {
             Write-Host "結果ファイルが生成されていません (velox-bench run が失敗した可能性)"
+            exit 0
+          }
+          foreach ($file in $files) {
+            Write-Host "--- $($file.Name) ---"
+            Get-Content $file.FullName | Write-Host
           }
 
       # Issue #182 (docs/decisions.md D92)。§21 の初回実測で
@@ -272,21 +466,31 @@ jobs:
       # 分布を論じるなら試行ごとに引き算した値を集計すること
       # (docs/performance-targets.md §24.2 に手順がある)。
       #
+      # 後半の A/B 比較表が Issue #208 の本題。こちらは累積値どうしを
+      # 条件間で比べるだけなので、上の注意は当てはまらない。
+      #
       # 本実行 (velox-bench run) が失敗しても結果の取りこぼしを増やさない
       # よう、常に走り、単独では決してジョブを落とさない。
-      - name: Startup breakdown summary (Issue #182)
+      - name: Startup breakdown / A-B summary (Issue #182, #208)
         if: always()
         continue-on-error: true
         shell: pwsh
+        # bench_run が失敗していれば空になる (表の見出しが空欄になるだけで、
+        # 内訳表そのものは出せる)。
+        env:
+          COMPARE_ENV: ${{ steps.bench_run.outputs.compare_env }}
+          COMMON_ENV: ${{ inputs.common_env }}
+          RUNNER_CPU: ${{ steps.env_info.outputs.cpu }}
+          RUNNER_CORES: ${{ steps.env_info.outputs.cores }}
+          RUNNER_RAM_GIB: ${{ steps.env_info.outputs.ram_gib }}
         run: |
           $ErrorActionPreference = "Continue"
-          $file = Get-ChildItem -Path results -Filter "*-windows.json" -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if (-not $file) {
+          $files = @(Get-ChildItem -Path results -Filter "*-windows*.json" -ErrorAction SilentlyContinue |
+            Sort-Object Name)
+          if ($files.Count -eq 0) {
             Write-Host "結果ファイルが無いため起動内訳をスキップします"
             exit 0
           }
-          $result = Get-Content $file.FullName -Raw | ConvertFrom-Json
           # 到達順。process_start は 0ms の起点なので表の先頭に置く。
           $checkpoints = @(
             @{ key = "startup_event_loop_ms";             label = "event_loop (tao のイベントループ生成)" },
@@ -297,30 +501,86 @@ jobs:
             @{ key = "startup_toolbar_ready_ms";          label = "toolbar_ready" },
             @{ key = "startup_first_load_ms";             label = "first_load" }
           )
-          $lines = @(
-            "### 起動の内訳 (Issue #182)",
-            "",
-            "累積中央値と、隣接する累積中央値の差。**差は区間ごとの中央値ではない** (各中央値は別々の試行から来うる)。",
-            "",
-            "| チェックポイント | 累積 median (ms) | 直前との差 (ms) |",
-            "| --- | ---: | ---: |"
-          )
-          $previous = 0.0
-          $missing = @()
-          foreach ($cp in $checkpoints) {
-            $stats = $result.metrics.($cp.key)
-            if ($null -eq $stats) {
-              $missing += $cp.key
-              continue
-            }
-            $median = [double]$stats.median
-            $lines += "| $($cp.label) | $([math]::Round($median, 2)) | $([math]::Round($median - $previous, 2)) |"
-            $previous = $median
-          }
-          if ($missing.Count -gt 0) {
+          $lines = @()
+          foreach ($file in $files) {
+            $result = Get-Content $file.FullName -Raw | ConvertFrom-Json
+            $lines += "### 起動の内訳 — ``$($file.Name)`` (Issue #182)"
             $lines += ""
-            $lines += "> 欠損: $($missing -join ', ') — このシナリオでは記録されないか、#182 より前のビルドの結果ファイルです。"
+            $lines += "累積中央値と、隣接する累積中央値の差。**差は区間ごとの中央値ではない** (各中央値は別々の試行から来うる)。"
+            $lines += ""
+            $lines += "| チェックポイント | 累積 median (ms) | 直前との差 (ms) |"
+            $lines += "| --- | ---: | ---: |"
+            $previous = 0.0
+            $missing = @()
+            foreach ($cp in $checkpoints) {
+              $stats = $result.metrics.($cp.key)
+              if ($null -eq $stats) {
+                $missing += $cp.key
+                continue
+              }
+              $median = [double]$stats.median
+              $lines += "| $($cp.label) | $([math]::Round($median, 2)) | $([math]::Round($median - $previous, 2)) |"
+              $previous = $median
+            }
+            if ($missing.Count -gt 0) {
+              $lines += ""
+              $lines += "> 欠損: $($missing -join ', ') — このシナリオでは記録されないか、#182 より前のビルドの結果ファイルです。"
+            }
+            $lines += ""
           }
+
+          # --- Issue #208: A/B 比較 -------------------------------------
+          $baselineFiles = @($files | Where-Object { $_.Name -like "*-baseline-*" })
+          $compareFiles = @($files | Where-Object { $_.Name -like "*-compare-*" })
+          if ($baselineFiles.Count -gt 0 -and $compareFiles.Count -gt 0) {
+            function Get-Medians([object[]] $fileList, [string] $key) {
+              $values = @()
+              foreach ($f in $fileList) {
+                $parsed = Get-Content $f.FullName -Raw | ConvertFrom-Json
+                $stats = $parsed.metrics.($key)
+                if ($null -ne $stats) { $values += [double]$stats.median }
+              }
+              return $values
+            }
+            $compareKeys = @(
+              "startup_native_window_ms",
+              "startup_toolbar_webview_ms",
+              "startup_window_created_ms",
+              "startup_toolbar_ready_ms",
+              "startup_first_load_ms",
+              "page_load_ms",
+              "rss_total_bytes"
+            )
+            $lines += "### A/B 比較 (Issue #208)"
+            $lines += ""
+            $lines += "A = 既定のまま / B = ``$env:COMPARE_ENV`` を設定して起動。同一ジョブ・同一ビルド・同一ランナーで交互に計測しているため、ランナー個体差やイメージ更新は相殺される。"
+            $lines += ""
+            if (-not [string]::IsNullOrWhiteSpace($env:COMMON_ENV)) {
+              $lines += "A/B 共通で設定した環境変数: ``$env:COMMON_ENV`` (測定条件を成立させるためのもので、A と B の差には現れない)"
+              $lines += ""
+            }
+            $lines += "計測したランナー: $env:RUNNER_CPU / $env:RUNNER_CORES 論理コア / RAM $env:RUNNER_RAM_GIB GiB。**``windows-latest`` は run ごとに別スペックのマシンが割り当てられる (§26.4 事実 2)。この行が違う run どうしの絶対値を比較してはならない。**"
+            $lines += ""
+            $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
+            $lines += ""
+            $lines += "| メトリクス | A の各 run の median | A 平均 | B の各 run の median | B 平均 | 差 (B-A) | 比 (B/A) |"
+            $lines += "| --- | --- | ---: | --- | ---: | ---: | ---: |"
+            foreach ($key in $compareKeys) {
+              # 単一要素や空を返したときに配列で扱えるよう @() で包む。
+              $a = @(Get-Medians $baselineFiles $key)
+              $b = @(Get-Medians $compareFiles $key)
+              if ($a.Count -eq 0 -or $b.Count -eq 0) { continue }
+              $aAvg = ($a | Measure-Object -Average).Average
+              $bAvg = ($b | Measure-Object -Average).Average
+              $digits = if ($key -eq "rss_total_bytes") { 0 } else { 2 }
+              $aList = ($a | ForEach-Object { [math]::Round($_, $digits) }) -join ", "
+              $bList = ($b | ForEach-Object { [math]::Round($_, $digits) }) -join ", "
+              $ratio = if ($aAvg -ne 0) { [math]::Round($bAvg / $aAvg, 3) } else { "n/a" }
+              $lines += "| $key | $aList | $([math]::Round($aAvg, $digits)) | $bList | $([math]::Round($bAvg, $digits)) | $([math]::Round($bAvg - $aAvg, $digits)) | $ratio |"
+            }
+            $lines += ""
+          }
+
           $summary = $lines -join "`n"
           Write-Host $summary
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
