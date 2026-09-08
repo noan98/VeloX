@@ -2092,30 +2092,106 @@ http://127.0.0.1:8731/minimal.html`** — 累積値。形式は §4/§21 と同�
   大きい (p95 が中央値の 10 倍超)。この環境固有のノイズの可能性が高く、
   この区間だけで回帰を論じるのは避けること。
 
-### 24.4 Windows (WebView2) での実測 — **未取得**
+### 24.4 Windows (WebView2) での実測 — run 34178072263
 
-**まだ測っていない。この節に数値は無い。** §21 の 644.1ms がこの 5 区間に
-どう割れるのかは、Windows 実機ないし `windows-latest` 上で
-`perf-windows.yml` を走らせるまで**分からない**。Linux の内訳
-(§24.3) から外挿してはならない — WebKitGTK と WebView2 はプロセスモデルが
-異なり、特に「最初の webview」のコストの中身 (WebView2 環境の生成と
-`msedgewebview2.exe` の起動) は Linux 側に対応物が無い。
+**取得済み。** `perf-windows.yml` に本 Issue の「Startup breakdown summary」
+ステップを追加した本 PR に対する `pull_request` トリガーの自動実行
+(run [`34178072263`](https://github.com/noan98/VeloX/actions/runs/34178072263)、
+ジョブ `velox-bench run (windows-latest)`、job id `101911349058`、
+2026-09-08 01:51〜01:57 UTC) が success で完走し、Windows 側の内訳が取れた。
+§21 の初回実測 (run 34127310212) と同じ経路である (D88、§21 冒頭を参照)。
 
-取得手順:
+数値はすべて当該ジョブのログおよび Artifact
+`velox-perf-windows-cold_startup` の `cold_startup-windows.json` に実在する
+ものだけを転記しており、**推定値・補間値は含まない**。
 
-1. `main` にマージ済みの `perf-windows.yml` を `workflow_dispatch` で実行する
-   (シナリオ `cold_startup` / 試行 10 回 / URL 空欄 = 固定ページ)。
-   `perf-windows.yml` 自身を変更する PR では `pull_request` でも自動実行される
-   (D88、§21 冒頭を参照)。
-2. Job Summary の「起動の内訳 (Issue #182)」表と、Artifact の
-   `cold_startup-windows.json` を取得する。
-3. §24.3 と同じ形式でこの節に転記する。**ジョブログ / Artifact に実在する値
-   だけを書き、推定・補間はしない** (§21 と同じ規律)。
-4. 区間の分布まで見るなら §24.2 の手順を Windows 上で実行する。
+測定条件: シナリオ `cold_startup` / 試行 10 回 /
+URL `http://127.0.0.1:8731/minimal.html` (固定ページを loopback 配信) /
+結果 JSON の `environment` は `os=windows`, `cpu_count=2`,
+`git_commit=70c543017093cf5131e03a2c293bd7352435c60a` (PR head をベースに
+マージしたコミット) / rustc 1.98.1 x86_64-pc-windows-msvc /
+`cargo build --release`。ランナーは §21.1 と同じ `windows-latest`
+(**GitHub-hosted の共有・仮想化ランナー。Windows 実機の実力値ではない**)。
+本 run の OS ビルド番号・WebView2 Runtime バージョンは
+「Record environment info」ステップのログにあるが、本節には転記していない。
 
-そのうえで初めて、「VeloX 側に手を入れる価値がある区間があるのか」を判断
-できる。Linux の結果 (VeloX 自身は 0.07%) がそのまま Windows でも成り立つ
-なら、**Epic #57 の下では「計測を追加し、最適化はしない」が正しい結論に
-なる** — #59/#60/#64/#66/#69 と同じ決着である。逆に
-`pre_window_setup` 区間が Windows で無視できない大きさなら、そこが最初の
-最適化対象になる。いずれにせよ**実測してから決める**。
+**(a) 累積値** — 形式は §4/§21/§24.3(a) と同じ。
+
+| メトリクス | n | median | p95 | min | max |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `startup_event_loop_ms` | 10 | 4.50 | 8.56 | 3.70 | 10.50 |
+| `startup_pre_window_setup_ms` | 10 | 5.05 | 9.02 | 4.20 | 11.00 |
+| `startup_native_window_ms` | 10 | 63.95 | 85.25 | 55.70 | 85.70 |
+| `startup_toolbar_webview_ms` | 10 | 736.10 | 857.99 | 644.80 | 867.80 |
+| `startup_window_created_ms` | 10 | 922.35 | 1108.91 | 871.50 | 1129.30 |
+| `startup_rust_setup_done_ms` | 10 | 926.60 | 1112.30 | 872.60 | 1130.70 |
+| `startup_toolbar_script_started_ms` | 10 | 927.90 | 1113.21 | 874.70 | 1132.20 |
+| `startup_toolbar_ready_ms` | 10 | 928.00 | 1113.31 | 874.70 | 1132.30 |
+| `startup_first_load_ms` | 10 | 1028.05 | 1210.45 | 968.00 | 1234.80 |
+
+同 run の参考値: `page_load_ms` median 80.95 / p95 117.80、
+`rss_total_bytes` median 385,269,760、`rss_process_count` median 8.00、
+`pss_process_count` 0.00 (Windows では PSS を実装していない。D88)。
+
+**(b) 区間 — 累積中央値どうしの差**
+
+> ⚠️ **これは「区間ごとの中央値」ではない。** 各メトリクスの中央値は別々の
+> 試行から来うるため、差は区間の中央値と一致する保証が無い。§24.3(b) の
+> Linux 側は試行ごとに引き算してから集計しているが、**Windows では試行ごとの
+> 生データを手元に取り込んでいないため、その形式では出せていない。**
+> 区間の分布 (p95 / min / max) まで見るには §24.2 の手順を Windows 上で
+> 実行する必要がある。Job Summary の表も同じ注意書きを出力する。
+
+| 区間 | 累積中央値の差 (ms) | `window_created` 比 |
+| --- | ---: | ---: |
+| `process_start` → `event_loop` | 4.50 | 0.5% |
+| `event_loop` → `pre_window_setup` (**VeloX 自身**) | **0.55** | **0.06%** |
+| `pre_window_setup` → `native_window` | 58.90 | 6.4% |
+| `native_window` → `toolbar_webview` | **672.15** | **72.9%** |
+| `toolbar_webview` → `window_created` | 186.25 | 20.2% |
+| `window_created` → `toolbar_ready` | 5.65 | — |
+| `toolbar_ready` → `first_load` | 100.05 | — |
+
+**Windows で読み取れること**:
+
+- **VeloX 自身の Rust セットアップは 0.55ms** — `window_created` 922.35ms の
+  **0.06%**。設定・ブロックリスト・サイト権限・セッション復元のディスク読込を
+  すべて含めてこの値である。Linux (§24.3、0.10ms / 0.07%) と**同じ結論**で
+  あり、これが本 Issue で最も重要な結果である。**VeloX 側のコードを速くしても
+  起動時間はまず動かない。**
+- **支配的なのは最初の webview の生成 (672.15ms、72.9%)** — WebView2 環境の
+  生成と `msedgewebview2.exe` の起動を含む区間。Epic #57 ルール 3 の
+  「WebView はブラックボックス」に該当し、VeloX 側から短縮する手立ては
+  現時点で無い。
+- **2 個目 (content) の webview が 186.25ms かかる — ここは Linux と質的に
+  違う。** Linux では 1.60ms しかかからず「初回コストは 1 個目に集中する」
+  と読めたが、Windows では 2 個目にも 186ms 残る。**Linux から外挿していたら
+  見落としていた差である** (Epic #57 ルール 5 の実例)。
+- `window_created` → `toolbar_ready` は 5.65ms で、Linux の 171.65ms と
+  逆転している。
+
+**§21 の値との差について (未解明)**:
+
+§21 (run 34127310212) は同じ `windows-latest` / `cold_startup` / 10 試行で
+`startup_window_created_ms` 中央値 **644.05ms**、`startup_first_load_ms`
+**716.70ms** だった。本 run はそれぞれ **922.35ms / 1028.05ms** で、
+**約 1.43 倍**である。**原因は特定できていない。** 候補としては
+GitHub-hosted 共有ランナーのばらつき (§21.1 が明記しているとおり実機より
+大きく出うる)、WebView2 Runtime のバージョン差、ランナーホストの負荷などが
+あるが、**2 点しか無いので切り分けられない**。本 Issue が追加した計装は
+`Instant::now()` 相当が 4 箇所増えるだけであり、280ms の差を説明できる規模
+ではない — ただしこれも**測って否定したわけではない**。
+
+したがって **本節の絶対値を §21 と 1 対 1 で比較しないこと。** 本節が答えを
+出しているのは「644ms (あるいは 922ms) が**どの区間に割れるか**」という比率
+の問いであって、Windows の起動時間の代表値ではない。代表値を論じるには
+§21 と同様に複数 run を積む必要がある。
+
+**結論 (Epic #57 ルール 1 の下での判断)**:
+
+`pre_window_setup` 区間が 0.06% である以上、**この Issue では最適化を行わない
+のが正しい**。#59/#60/#64/#66/#69 と同じ決着である。次に見るべき候補は
+「2 個目の webview の 186ms」だが、これも WebView2 側のコストであり、
+着手するなら**まず区間の分布 (§24.2 の手順を Windows で実行) を取ってから**
+別 Issue として起票する。
+
