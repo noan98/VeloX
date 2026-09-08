@@ -12009,6 +12009,32 @@ PR #192 以降、この gate はすべての PR を「Codex 未レビュー」�
 - `claude` という**ユーザ**アカウントでは緩和が成立しないこと
 - `chatgpt-codex-connector-review` は正規化後も一致しないこと
 
+### 検証 (2026-09-08 09:02、PR #209 head `1183f04`)
+
+修正入りのコードで dry-run 判定を実行し、**Claude フォールバックが実際に
+発火することを確認した。**
+
+| head | 判定 |
+| --- | --- |
+| `955dcfa` (修正前) | `wait: Codex に @codex review を自動リクエスト済みです。応答を待っています [診断: ... 観測した著者=chatgpt-codex-connector,noan98 / Codex ログイン一致0件 ...]` |
+| `1183f04` (修正後) | `info: (dry-run) @claude へのレビュー依頼を投稿する判定になりました` |
+
+同一の PR・同一のコメント列に対して、**コードの違いだけで判定が
+「Codex の応答待ち」から「Claude へレビュー依頼」に変わった。** つまり
+利用上限メッセージが正しく検知されるようになり、Codex に一度も
+レビューされていない PR であることも正しく判定されている。
+dry-run job なので実際の投稿は行っていない (第4引数 `"false"`)。
+
+**ただし本番の判定に効くのは main にマージされてからである。**
+`auto-merge.yml` の merge job は `workflow_dispatch` / `schedule` で
+既定ブランチの内容を checkout して実行するため (D88 と同じ性質)。
+それまでは Codex 判定が全滅した状態が続き、すべての PR が
+「Codex 未レビュー」で止まり続ける。
+
+残る未検証項目は `CLAUDE_CODE_OAUTH_TOKEN` によるレビュー実行そのもの
+(PR #198 で `is_error: true`)。main マージ後、実際に `@claude` が投稿
+されるようになった時点で新しいログが取れるので、そこで切り分ける。
+
 ## D92: 起動の `process_start` → `window_created` を 4 つの中間チェックポイントで分解する (#182) — 計測の追加のみで、最適化はまだ行わない
 
 **対象**: Issue #182 (P1: Windows Startup Performance — Window Creation /
