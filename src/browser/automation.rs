@@ -422,6 +422,24 @@ const SWITCH_SETTLE_MS: u64 = 200;
 /// the RSS sampler (`VELOX_PERF_RSS_INTERVAL_MS`) time to take at least a
 /// couple of samples with all tabs present.
 const MEMORY_STABILIZE_MS: u64 = 3_000;
+/// `tabs_hold_N` (`Scenario::TabCountMemoryHold`) が、全タブを開き終えて
+/// から `mark` を打つまでに待つ時間 (Issue #197、
+/// `docs/performance-targets.md` §27.5)。
+///
+/// **既定のメモリチェック周期 5 秒 (`SuspensionPolicy::
+/// DEFAULT_MEMORY_CHECK_INTERVAL`) の 2 倍より長く取ってある。**
+/// 休止判定を行う `app::spawn_memory_pressure_sampler` は
+/// `sleep(interval)` を**先に**実行するため、プロセスの生存が周期より
+/// 短い `tabs_N` (約 6 秒) では判定が 0〜1 回しか走らない。ここを
+/// 12 秒にすることで、**環境変数で周期を縮めなくても**既定設定のまま
+/// 判定が 2 回以上走り、回収が起きるなら起き切る。
+const MEMORY_HOLD_SETTLE_MS: u64 = 12_000;
+/// `tabs_hold_N` が `mark` の後に保持する時間 — この窓の中で採れた
+/// サンプルだけが集計される (`benchmark::aggregate_trials` は最後の
+/// `measure_start` 以降のイベントしか見ない)。**「タブを開いている
+/// 途中の値」と「落ち着いた後の値」を混ぜないための区切りが `mark`
+/// であり、この窓が後者にあたる。**
+const MEMORY_HOLD_WINDOW_MS: u64 = 8_000;
 /// How many RSS/PSS samples [`recommended_rss_interval_ms`] aims to land
 /// inside the fixed [`MEMORY_STABILIZE_MS`] settle window at the end of a
 /// generated `tabs_N` script — see that function's doc comment and
@@ -542,6 +560,24 @@ pub fn generate_bench_script(
             lines.push(format!("wait {MEMORY_STABILIZE_MS}"));
             lines
         }
+        Scenario::TabCountMemoryHold(tab_count) => {
+            // `TabCountMemory` との違いは 3 つ (Issue #197、§27.5):
+            //   1. タブを開くたびに `STEP_SETTLE_MS` 待つ — 一気に開くと
+            //      休止判定が「まだ開いている途中」の状態を見てしまう。
+            //   2. 開き終えてから `MEMORY_HOLD_SETTLE_MS` 待つ — 既定の
+            //      5 秒周期でも判定が 2 回以上走る長さ。
+            //   3. そのあとに `mark` を打つ — ここから先のサンプルだけが
+            //      集計されるので、得られる値は**落ち着いた後の定常値**に
+            //      なる。開いている最中の値は混ざらない。
+            let extra_tabs = tab_count.saturating_sub(1);
+            let mut lines: Vec<String> = (0..extra_tabs)
+                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+                .collect();
+            lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
+            lines.push("mark".to_owned());
+            lines.push(format!("wait {MEMORY_HOLD_WINDOW_MS}"));
+            lines
+        }
     };
     lines.push("quit".to_owned());
     Some(lines.join("\n") + "\n")
@@ -616,6 +652,11 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             let open_ms = u64::from(tab_count.saturating_sub(1)) * PER_STEP_OVERHEAD_MS;
             open_ms + MEMORY_STABILIZE_MS
         }
+        Scenario::TabCountMemoryHold(tab_count) => {
+            let open_ms =
+                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            open_ms + MEMORY_HOLD_SETTLE_MS + MEMORY_HOLD_WINDOW_MS
+        }
     };
     script_ms / 1000 + STARTUP_DEFAULT_SECS + TEARDOWN_BUFFER_SECS
 }
@@ -662,6 +703,12 @@ pub fn recommended_rss_interval_ms(
     use crate::browser::benchmark::scenario::Scenario;
     match scenario {
         Scenario::TabCountMemory(_) => Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES),
+        // `tabs_hold_N` は `mark` の後ろの窓だけが集計対象なので、
+        // 間隔もその窓を基準に決める (`MEMORY_HOLD_SETTLE_MS` の側は
+        // 捨てられるサンプルしか生まない)。
+        Scenario::TabCountMemoryHold(_) => {
+            Some(MEMORY_HOLD_WINDOW_MS / TARGET_STABILIZED_RSS_SAMPLES)
+        }
         // Same reasoning for the CPU window (Issue #64): the default 5000ms
         // would fit at most one sample inside it, and one sample yields no
         // `cpu_percent` at all (a rate needs two).
@@ -907,11 +954,94 @@ mod tests {
             let has_mark = parse_script(&script)
                 .unwrap()
                 .contains(&AutomationCommand::Mark);
+            // `tabs_hold_N` も `mark` を出す (Issue #197)。こちらは
+            // 「計測したい局面の直前で区切る」ためではなく、**タブを
+            // 開き終えて休止が落ち着くまでの区間を集計から外す**ため。
+            // 集計は最後の `measure_start` 以降しか見ないので、これで
+            // 得られる値が定常値になる。
             let expected = matches!(
                 scenario,
-                Scenario::TabCreateAt(_) | Scenario::TabSwitchAt(_) | Scenario::BackgroundCpu
+                Scenario::TabCreateAt(_)
+                    | Scenario::TabSwitchAt(_)
+                    | Scenario::BackgroundCpu
+                    | Scenario::TabCountMemoryHold(_)
             );
             assert_eq!(has_mark, expected, "{scenario:?}");
+        }
+    }
+
+    #[test]
+    fn tabs_hold_opens_with_pauses_then_settles_before_marking() {
+        // Issue #197 / §27.5。`tabs_hold_N` が `tabs_N` と違うのは
+        // 「開く間隔を空ける」「開き終えてから既定周期 2 回分以上待つ」
+        // 「そのあとに `mark` を打つ」の 3 点。ここが崩れると測っている
+        // ものが「落ち着いた後の値」でなくなるので、順序ごと固定する。
+        let url = "http://127.0.0.1:8731/minimal.html";
+        let script = generate_bench_script(Scenario::TabCountMemoryHold(3), url).unwrap();
+        let commands = parse_script(&script).unwrap();
+
+        let mark_at = commands
+            .iter()
+            .position(|c| *c == AutomationCommand::Mark)
+            .expect("tabs_hold script must emit a mark");
+
+        // mark より前: open が (N-1) 回、それぞれ直後に待ちがある。
+        let opens_before_mark = commands[..mark_at]
+            .iter()
+            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
+            .count();
+        assert_eq!(opens_before_mark, 2, "script was {script:?}");
+        for (i, command) in commands[..mark_at].iter().enumerate() {
+            if matches!(command, AutomationCommand::Open { .. }) {
+                assert!(
+                    matches!(commands[i + 1], AutomationCommand::Wait { .. }),
+                    "open は必ず待ちを伴う: {script:?}"
+                );
+            }
+        }
+
+        // mark の直前は「休止が効くのを待つ」長い待ち。既定のメモリ
+        // チェック周期 (5 秒) の 2 倍より長いこと。
+        let settle = match commands[mark_at - 1] {
+            AutomationCommand::Wait { ms } => ms,
+            ref other => panic!("mark の直前は待ちであるべき: {other:?}"),
+        };
+        assert!(
+            settle >= 2 * 5_000,
+            "settle {settle}ms では既定 5 秒周期の判定が 2 回走らない"
+        );
+
+        // mark の後ろには集計対象になる窓がある (空だとサンプル 0 件)。
+        let window = match commands[mark_at + 1] {
+            AutomationCommand::Wait { ms } => ms,
+            ref other => panic!("mark の直後は待ちであるべき: {other:?}"),
+        };
+        assert!(window > 0, "mark の後ろに窓が無いと何も集計されない");
+        assert_eq!(commands.last(), Some(&AutomationCommand::Quit));
+    }
+
+    #[test]
+    fn tabs_hold_samples_rss_several_times_inside_its_measured_window() {
+        // 間隔が窓より粗いと、集計対象のサンプルが 0〜1 件になって
+        // `memory_sample_confidence` の警告に落ちる。
+        let interval = recommended_rss_interval_ms(Scenario::TabCountMemoryHold(10))
+            .expect("tabs_hold must override the RSS interval");
+        assert!(interval > 0);
+        assert!(
+            MEMORY_HOLD_WINDOW_MS / interval >= 2,
+            "窓 {MEMORY_HOLD_WINDOW_MS}ms に間隔 {interval}ms では 2 サンプル入らない"
+        );
+    }
+
+    #[test]
+    fn tabs_hold_gets_a_longer_timeout_than_the_plain_tabs_scenario() {
+        for n in Scenario::TAB_COUNTS {
+            let plain = recommended_timeout_secs(Scenario::TabCountMemory(n));
+            let hold = recommended_timeout_secs(Scenario::TabCountMemoryHold(n));
+            assert!(
+                hold > plain,
+                "tabs_hold_{n} ({hold}s) は tabs_{n} ({plain}s) より長く待つ必要がある"
+            );
         }
     }
 

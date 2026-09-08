@@ -2031,6 +2031,27 @@ pub mod scenario {
         /// with exactly `tab_count` tabs open. `tab_count` is one of
         /// [`Scenario::TAB_COUNTS`].
         TabCountMemory(u32),
+        /// Like [`Scenario::TabCountMemory`], but measured **after the
+        /// browser has had time to settle** (Issue #197,
+        /// `docs/performance-targets.md` §27.5).
+        ///
+        /// `tabs_N` opens every tab back to back and quits about 6 seconds
+        /// later, which is shorter than the default 5-second period of the
+        /// tab-suspension memory sampler (`app::
+        /// spawn_memory_pressure_sampler` sleeps *before* its first
+        /// sample). Two things follow: the memory budget barely gets a
+        /// chance to fire at all, and whatever reclaim does happen is not
+        /// reflected in the numbers. §27.4 could only measure the budget by
+        /// shortening that period with `VELOX_MEMORY_CHECK_INTERVAL_MS`,
+        /// which is not what a real user runs.
+        ///
+        /// This variant instead opens the tabs with a pause between them,
+        /// waits long enough for suspension to happen **at the default
+        /// period**, and only then emits the `mark` that starts the
+        /// measured window — so the samples describe the *settled* state
+        /// rather than the moments while tabs are still opening.
+        /// `tab_count` is one of [`Scenario::TAB_COUNTS`].
+        TabCountMemoryHold(u32),
     }
 
     impl Scenario {
@@ -2057,6 +2078,11 @@ pub mod scenario {
                     .iter()
                     .map(|&n| Scenario::TabCountMemory(n)),
             );
+            scenarios.extend(
+                Self::TAB_COUNTS
+                    .iter()
+                    .map(|&n| Scenario::TabCountMemoryHold(n)),
+            );
             scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabCreateAt(n)));
             scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabSwitchAt(n)));
             scenarios
@@ -2077,6 +2103,7 @@ pub mod scenario {
                 Scenario::TabCreateAt(n) => format!("tab_create_{n}"),
                 Scenario::TabSwitchAt(n) => format!("tab_switch_{n}"),
                 Scenario::TabCountMemory(n) => format!("tabs_{n}"),
+                Scenario::TabCountMemoryHold(n) => format!("tabs_hold_{n}"),
             }
         }
 
@@ -2103,7 +2130,17 @@ pub mod scenario {
         /// chain of `or_else`s. `None` for an unknown prefix or a tab count
         /// outside [`Self::TAB_COUNTS`].
         fn parse_parameterized(id: &str) -> Option<Scenario> {
+            // ⚠️ **順序が意味を持つ。** `strip_prefix` が最初に一致した
+            // ところで `return` するため、`tabs_hold_` は `tabs_` より
+            // **前**に置かなければならない。逆にすると "tabs_hold_10" が
+            // `tabs_` に食われ、残り "hold_10" の数値パースに失敗して
+            // `None` になる (`tabs_hold_is_not_swallowed_by_tabs` が
+            // これを守っている)。
             for (prefix, build) in [
+                (
+                    "tabs_hold_",
+                    Scenario::TabCountMemoryHold as fn(u32) -> Scenario,
+                ),
                 ("tabs_", Scenario::TabCountMemory as fn(u32) -> Scenario),
                 ("tab_create_", Scenario::TabCreateAt as fn(u32) -> Scenario),
                 ("tab_switch_", Scenario::TabSwitchAt as fn(u32) -> Scenario),
@@ -2146,7 +2183,8 @@ pub mod scenario {
                 | Scenario::BackgroundCpu
                 | Scenario::TabCreateAt(_)
                 | Scenario::TabSwitchAt(_)
-                | Scenario::TabCountMemory(_) => true,
+                | Scenario::TabCountMemory(_)
+                | Scenario::TabCountMemoryHold(_) => true,
             }
         }
     }
@@ -2161,6 +2199,24 @@ pub mod scenario {
                 let id = scenario.id();
                 assert_eq!(Scenario::parse(&id), Some(scenario), "id was {id:?}");
             }
+        }
+
+        #[test]
+        fn tabs_hold_is_not_swallowed_by_tabs() {
+            // `parse_parameterized` は最初に一致したプレフィックスで
+            // return するので、`tabs_hold_` が `tabs_` より後ろにあると
+            // "tabs_hold_10" が None になる。順序を入れ替えたときに
+            // 気付けるようにここで固定する。
+            assert_eq!(
+                Scenario::parse("tabs_hold_10"),
+                Some(Scenario::TabCountMemoryHold(10))
+            );
+            assert_eq!(
+                Scenario::parse("tabs_10"),
+                Some(Scenario::TabCountMemory(10))
+            );
+            assert_eq!(Scenario::parse("tabs_hold_7"), None);
+            assert_eq!(Scenario::parse("tabs_hold_"), None);
         }
 
         #[test]
@@ -2190,8 +2246,11 @@ pub mod scenario {
         }
 
         #[test]
-        fn all_covers_eight_fixed_plus_three_parameterized_families() {
-            assert_eq!(Scenario::all().len(), 8 + 3 * Scenario::TAB_COUNTS.len());
+        fn all_covers_eight_fixed_plus_four_parameterized_families() {
+            // 固定 8 + タブ数でパラメータ化された 4 系統
+            // (`tabs_N` / `tabs_hold_N` / `tab_create_N` / `tab_switch_N`)。
+            // `tabs_hold_N` は Issue #197 で追加。
+            assert_eq!(Scenario::all().len(), 8 + 4 * Scenario::TAB_COUNTS.len());
         }
 
         #[test]
