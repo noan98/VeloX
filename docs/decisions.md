@@ -11956,6 +11956,59 @@ wait: Codex に @codex review を自動リクエスト済みです (head SHA `87
 D88 と同じ性質)。上記の実測が「main の版」で行われたものである点に
 注意すること。
 
+**追記 (2026-09-08、Issue #194 — 原因確定): GraphQL の `Bot` の `login` に
+は `[bot]` が付かない。許可リストが REST 表記だったため、Codex の判定が
+全滅していた。**
+
+前項の診断を仕込んで PR #209 で実行したところ、原因を一意に特定できた。
+
+```
+[診断: コメント7件 / 観測した著者=chatgpt-codex-connector,noan98
+ / Codex ログイン一致0件 (__typename=なし) / 著者判定通過0件
+ / 上限文言一致0件 / 依頼(2026-09-08T08:54:45Z)より後0件]
+```
+
+**GraphQL は `chatgpt-codex-connector` を返す。** REST が返す
+`chatgpt-codex-connector[bot]` とは綴りが違う。`check_review_gate.py` が
+読むのは GraphQL であるのに、許可リスト `_CODEX_LOGINS` は REST 表記で
+書かれており、しかも PR #192 の P2 対応で**前方一致から完全一致に変更**
+されていた。前方一致だった頃は
+`"chatgpt-codex-connector".startswith("chatgpt-codex-connector")` が真に
+なって偶然通っていたが、完全一致にした時点で
+`"chatgpt-codex-connector" != "chatgpt-codex-connector[bot]"` となり、
+**Codex のレビュー・コメント・👍 が 1 件も照合されなくなっていた。**
+
+影響範囲は Claude フォールバックだけではない。`_is_codex_author` を使う
+判定すべて — 「Codex が head SHA をレビュー済みか」「👍 を付けたか」
+「利用上限メッセージを出したか」 — が常に偽になっていた。**つまり
+PR #192 以降、この gate はすべての PR を「Codex 未レビュー」で止め続けて
+いた。** ユニットテストが素通りしたのは、テストデータの login を
+**REST 表記で書いていた**ためである (`CodexLoginExactMatchTest`)。
+
+### 対応
+
+`_normalize_login` を追加し、**小文字化 + 末尾 `[bot]` の除去**をしてから
+**完全一致**で比較する。**前方一致には戻さない** — PR #192 の P2 指摘
+(別名 `chatgpt-codex-connector-review` のすり抜け) はそのまま守られる。
+正規化しても `chatgpt-codex-connector-review` は
+`chatgpt-codex-connector` にならない。
+
+あわせて `_is_login_in` (Claude 用) にも `__typename == "Bot"` の要求を
+追加した。`[bot]` を落として比較するようになったことで、許可リストに
+`claude[bot]` と書いてあっても **`claude` という*ユーザ*アカウント**が
+一致し得るようになったためである。Claude の応答者が GitHub App (= Bot)
+であることは PR #198 で実測済み (id 209825114、
+<https://github.com/apps/claude>) なので、正規の経路は塞がない。
+
+回帰テストは GraphQL 表記 (`[bot]` 無し) で書いた — **テストデータの
+綴りを実データに合わせなかったことが、この不具合を 1 週間近く隠して
+いた原因そのもの**なので、そこを固定する。
+
+- Codex のレビュー / 利用上限メッセージが GraphQL 表記でも照合されること
+- Claude のレビューが GraphQL 表記 (`claude`) でも緩和を成立させること
+- `claude` という**ユーザ**アカウントでは緩和が成立しないこと
+- `chatgpt-codex-connector-review` は正規化後も一致しないこと
+
 ## D92: 起動の `process_start` → `window_created` を 4 つの中間チェックポイントで分解する (#182) — 計測の追加のみで、最適化はまだ行わない
 
 **対象**: Issue #182 (P1: Windows Startup Performance — Window Creation /

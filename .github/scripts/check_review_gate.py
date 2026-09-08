@@ -244,6 +244,30 @@ def _parse_iso8601(value: str) -> datetime:
     return dt
 
 
+def _normalize_login(name: str | None) -> str:
+    """ログイン名を比較用に正規化する — 小文字化し、末尾の `[bot]` を落とす。
+
+    **なぜ必要か (Issue #194、PR #209 で実測)**: GitHub App の
+    ログイン名は API によって綴りが違う。REST は
+    `chatgpt-codex-connector[bot]` を返すが、**GraphQL の `Bot` アクタの
+    `login` は `[bot]` の無い `chatgpt-codex-connector` を返す。**
+    このスクリプトが読むのは GraphQL であり、許可リストは REST 表記で
+    書かれていたため、**Codex のコメント・レビュー・👍 が 1 件も
+    照合されていなかった** (PR #209 の診断:
+    `観測した著者=chatgpt-codex-connector,noan98 / Codex ログイン一致0件`)。
+
+    PR #192 の P2 指摘 (前方一致だと `chatgpt-codex-connector-review` の
+    ような別名がすり抜ける) は**そのまま守る**: ここで行うのは
+    「末尾の `[bot]` を落として**完全一致**」であり、前方一致には戻さない。
+    `chatgpt-codex-connector-review` は正規化しても
+    `chatgpt-codex-connector` にはならないので、依然として一致しない。
+    """
+    login = (name or "").lower()
+    if login.endswith("[bot]"):
+        login = login[: -len("[bot]")]
+    return login
+
+
 def _is_codex_author(
     author: dict[str, Any] | None, codex_logins: frozenset[str]
 ) -> bool:
@@ -257,8 +281,8 @@ def _is_codex_author(
     """
     if not author:
         return False
-    login = (author.get("login") or "").lower()
-    if login not in {l.lower() for l in codex_logins}:
+    login = _normalize_login(author.get("login"))
+    if login not in {_normalize_login(l) for l in codex_logins}:
         return False
     typename = author.get("__typename")
     if typename is not None and typename != "Bot":
@@ -348,15 +372,27 @@ def _find_request_marker(
 
 
 def _is_login_in(author: dict[str, Any] | None, allowed_logins: frozenset[str]) -> bool:
-    """`author`/`user` のログイン名が許可リストに完全一致 (大小無視) するか。
+    """`author`/`user` のログイン名が許可リストに一致するか
+    (大小無視、末尾 `[bot]` を正規化したうえでの**完全一致**)。
 
-    Codex 用の `_is_codex_author` と異なり `__typename` を要求しない —
-    Claude 側の実際の投稿者の種別 (Bot/User) が未確認のため。
+    `_is_codex_author` と同じく `__typename` が取れている場合は `Bot` で
+    あることも要求する。**Issue #194 でこれを追加した**: `[bot]` を
+    落として比較するようになったことで、許可リストに `claude[bot]` と
+    書いてあっても `claude` という**ユーザアカウント**が一致し得るように
+    なったため。Claude の応答者が GitHub App (= `Bot`) であることは
+    PR #198 で実測済み (login `claude[bot]`、id 209825114、
+    <https://github.com/apps/claude>) なので、Bot を要求しても正規の
+    経路は塞がない。
     """
     if not author or not allowed_logins:
         return False
-    login = (author.get("login") or "").lower()
-    return login in {l.lower() for l in allowed_logins}
+    login = _normalize_login(author.get("login"))
+    if login not in {_normalize_login(l) for l in allowed_logins}:
+        return False
+    typename = author.get("__typename")
+    if typename is not None and typename != "Bot":
+        return False
+    return True
 
 
 def _claude_reviewed_head_sha(
