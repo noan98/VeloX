@@ -68,6 +68,15 @@ on:
           - tabs_10
           - tabs_20
           - tabs_50
+          # Issue #197 / §27.5。tabs_N と違い、タブを間隔を空けて開き、
+          # 既定のメモリチェック周期でも休止が起き切るまで待ってから
+          # mark を打つ (集計は mark 以降のみ)。**環境変数で周期を
+          # 縮めなくても、既定設定のままのメモリ予算の効きが測れる。**
+          - tabs_hold_1
+          - tabs_hold_5
+          - tabs_hold_10
+          - tabs_hold_20
+          - tabs_hold_50
       scenarios:
         description: "複数シナリオを 1 回の run で続けて計測する (カンマ区切り、例: tabs_1,tabs_5,tabs_10,tabs_20)。指定するとシナリオ選択より優先される。D96 の「Windows は run ごとに分ける」に従い、タブ数スケーリングのような複数点の比較はこれで同一 run に収める"
         type: string
