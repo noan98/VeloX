@@ -12182,3 +12182,135 @@ session`)。作成時は CLAUDE.md の必須ルールどおり `cost:` と `bene
 (6) `max_live_tabs` / `idle_after` を既定にするかは、D56 Revisit
 condition (2) / D90 Revisit condition (3) のまま据え置く — 本 Issue は
 これを一切変更していない。
+
+---
+
+## D94: 回帰ゲートの入力前提を `gate` 自身が検証する (Issue #196) — シナリオ/OS 不一致・空 candidate を「OK」と言わせない
+
+**対象**: Issue #196 (`velox-bench gate` / `benchmark::evaluate_gate`、
+Epic #57 配下)。D46 (回帰ゲートの設計) は書き換えず、本節で補う。
+
+### 決定
+
+**`evaluate_gate` は「baseline と candidate が比較可能である」ことを
+呼び出し元に任せず、自分で検証する。** 違反は
+`GateInputProblem` として `GateReport::problems` に記録し、
+`GateReport::overall` に反映する。
+
+| 前提違反 | 判定 | 理由 |
+| --- | --- | --- |
+| `scenario` 不一致 | FAIL | `cold_startup` と `tabs_20` の比較は無意味 |
+| `environment.os` 不一致 | FAIL | Epic #57 絶対ルール 5 / `docs/performance-targets.md` §10 |
+| candidate のメトリクスが 0 件 | FAIL | 計測に失敗した結果は「回帰なし」ではない |
+| 比較できたメトリクスが 0 件 | FAIL | 比較していないものを OK とは言えない |
+| baseline にあり全 candidate に無いメトリクス | WARN | 計測漏れかメトリクス削除か区別できないので非ブロッキング |
+
+### なぜ必要だったか
+
+D46 が積み上げた緩和策 (2 段階の閾値・最小絶対差・多数決) は**すべて
+「両者が同じシナリオを同じ OS で測ったものである」ことを前提**にしている。
+その前提自体は誰も検査していなかった。結果として次の 2 つが「OK」に
+なり得た。
+
+1. **`--baseline` のファイル取り違え。** シナリオも OS も見ずに、
+   たまたま名前が一致するメトリクスだけを比較して、自信のありそうな
+   判定を出していた。
+2. **中身が空の candidate。** baseline の全メトリクスが
+   `only_in_baseline` に落ち、比較対象が 1 件も無いまま
+   `overall` は `Ok` (メトリクスが空なら `max()` が `None` → `Ok`)
+   になっていた。**回帰ゲートが最も出してはいけない誤りは、
+   計測できていないときに緑を返すことである。**
+
+CI (`.github/workflows/perf-gate.yml`) は同一ジョブ内で同一 OS・同一
+`cold_startup` を明示的に渡しているため、**この修正で既存 CI の判定は
+変わらない** (`a_well_formed_comparison_reports_no_problems` で固定した)。
+それでも入れたのは、`gate` が汎用 CLI として公開されており、手動
+ベンチマークの利用範囲が #178 / #183 以降広がっているためである。
+
+### なぜ `Result` ではなく `GateReport` の一部にしたか
+
+`evaluate_gate` が `Err` を返す設計も考えたが採らなかった。
+
+- **判定できたメトリクスの数値を捨てることになる。** 「この 2 つは
+  比較してはいけない」と言いつつ数値も見せたほうが、原因追跡が速い。
+- **`velox-bench` の終了コードの意味が壊れる。** `2` は引数/IO エラー用に
+  予約されている (`docs/benchmarking.md` §5)。「前提を満たさない」は
+  引数の形式エラーではなく**ゲートの判定結果**なので、`1` (FAIL) で
+  返すのが正しい。
+
+`GateReport::problems` は `#[serde(default)]` を付けてあるので、
+この変更以前に書き出された `gate-report.json` も読み戻せる。
+
+### 残る限界
+
+(1) 検証しているのは `scenario` と `environment.os` だけである。
+`cpu_count` や WebView のバージョン差は見ていない — 同一ジョブ内計測
+(D46) を守っている限り問題にならないが、**手動で 2 つのファイルを
+渡す場合、同じ OS 名でも同じマシンとは限らない**。§10 の原則
+(セッションをまたぐ比較をしない) は依然として人間が守る必要がある。
+(2) `only_in_candidates` (candidate にだけあるメトリクス) は
+`problems` に入れていない。PR が新しいメトリクスを追加するのは
+正常な変更であり、これを WARN にすると計測追加のたびに黄色くなる。
+(3) 「baseline にあり candidate に無い」を WARN に留めたため、
+**計測漏れは CI をブロックしない**。ブロックさせるには、シナリオごとに
+「必ず取れているべきメトリクス」の一覧が要る — 現状そのような定義は
+どこにも無く、作るなら `MetricKey` 側に持たせるのが筋である。
+
+---
+
+## D95: Issue #195 (metrics OFF で Toolbar IPC の JSON 二重パース) は現行コードには存在しなかった — 型で防がれている
+
+**対象**: Issue #195 (Epic #57 配下)。**`src/` に変更を加えていない。**
+Epic #57 のルール 1 (ベンチマーク無しに最適化しない) に従い、まず
+コードの実態を確認した結果、報告された問題が存在しないことが分かった。
+
+### 検証結果
+
+Issue #195 は「`record_perf_event` の `UserEvent::ToolbarMessage` 分岐が
+metrics OFF (`VELOX_PERF_METRICS` 未設定) でも実行され、
+`Instant::now()` と `toolbar::command_name` による余分な JSON パースが
+通常運用のホットパスに乗っている」と報告している。**現行 `main` では
+そうなっていない。**
+
+1. `perf_log` は `config.perf_metrics.then(|| build_perf_log(&config))`
+   で作られるため、metrics OFF では `None` である (`src/app.rs`)。
+2. `record_perf_event` の唯一の呼び出し元は
+   `if let Some(log) = perf_log.as_deref()` の内側にある。
+3. `record_perf_event` の引数は `perf_log: &PerfLog` であり
+   `Option<&PerfLog>` ではない。**metrics OFF でこの関数に入る経路は
+   型として存在しない** — 将来ゲートを外そうとしてもコンパイルが通らない。
+4. `UserEvent::ToolbarMessage` を処理する箇所はコード全体で 2 つだけ
+   (`record_perf_event` と `handle_user_event`) である。したがって
+   metrics OFF での `parse_command` 呼び出しは**1 回**、
+   `command_name` と `Instant::now()` は**0 回**である。
+
+さらに履歴上も、二重パースが `main` に乗っていた期間は無い。
+`command_name` を `record_perf_event` に入れた #66 のコミット
+(2026-09-07) の時点で、呼び出し元のゲートは既に入っていた
+(2026-09-06)。**PR #183 の「metrics ON の診断専用パス」という説明は
+実装と一致している。**
+
+### 対応
+
+**コード変更なし。回帰テストも追加していない。** 「metrics OFF で
+`record_perf_event` が呼ばれないこと」はテストで確かめるより型で
+保証されているほうが強く、実際そうなっている (上記 3)。
+
+metrics **ON** 側には、`command_name` が `serde_json::Value` を丸ごと
+組み立てるぶんのコストが残っている (`parse_command` と合わせて
+1 メッセージあたり 2 回のパース)。これは計測経路のみの負荷だが、
+`PerfRecord::Ipc` の `duration` を押し上げる=**計測値そのものを
+歪める**という意味では潰す価値がある。ただし Epic #57 ルール 1 に
+従い、**実測なしに手を入れない**。着手するなら
+`velox-bench ipc-summary` で `in` 方向の `median_ms` / `p95_ms` を
+先に採ること。
+
+### 残る限界
+
+(1) 上記は Rust 側の話である。Toolbar 側 (JS) が metrics OFF でも
+計測用のフィールドを載せているかどうかは見ていない。
+(2) metrics ON の 2 回パースを実際に潰す場合、`command_name` の
+「`parse_command` が失敗するメッセージにもラベルを付けられる」という
+性質 (その doc コメント参照) を壊さないこと。単純に
+`parse_command` の結果から名前を引く実装では、不正なメッセージが
+計測から消える。

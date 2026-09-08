@@ -826,6 +826,19 @@ fn print_gate_report(report: &benchmark::GateReport) {
             report.only_in_candidates.join(", ")
         );
     }
+    // Issue #196: a precondition violation is the reason for the verdict
+    // below, so print it right above that verdict — on stderr, since a
+    // caller piping stdout into a report file still needs to see it.
+    if !report.problems.is_empty() {
+        eprintln!("\n入力の前提を満たしていません:");
+        for problem in &report.problems {
+            eprintln!(
+                "  [{}] {}",
+                severity_label(problem.severity()),
+                problem.describe()
+            );
+        }
+    }
     println!("\n総合判定: {}", severity_label(report.overall));
 }
 
