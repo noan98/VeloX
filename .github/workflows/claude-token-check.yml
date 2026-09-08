@@ -1,0 +1,52 @@
+name: Claude Token Check
+
+# Issue #194: `@claude` フォールバックが「モデルを1回も呼ばずに 82ms で
+# is_error:true」を返して終わる原因を切り分けるための最小プローブ。
+#
+# 症状 (run 34231609201 で実測):
+#   - プロンプト構築・CLI インストール (v2.1.263)・初期化
+#     (`model: claude-sonnet-5`) までは成功している
+#   - その 82ms 後に `is_error: true` / `total_cost_usd: 0` /
+#     `modelUsage: {}` — **モデル呼び出しが 0 回**で終了する
+#   - 肝心のエラー本文は `show_full_output: false` により
+#     "Running Claude Code via SDK (full output hidden for security)"
+#     に伏せられており、原因が読めない
+#
+# このプローブは PR にコメントを投稿せず、`CLAUDE_CODE_OAUTH_TOKEN` が
+# 実際にモデルを呼べるかどうかだけを検証する。`claude.yml` (tag モード /
+# issue_comment 起動) と違って agent モードで動くため、
+# 「トークン自体の問題」と「@claude メンション経路の問題」を分離できる。
+#
+# ⚠️ `issue_comment` で起動する workflow は常に**デフォルトブランチの
+# 定義**が使われる (GitHub の仕様)。そのため `claude.yml` の変更は main に
+# 入るまで試せない。このプローブは `workflow_dispatch` なので、main に
+# 入れたあとは任意の ref で即座に再実行できる。
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    name: Probe CLAUDE_CODE_OAUTH_TOKEN
+    runs-on: ubuntu-latest
+    permissions:
+      # リポジトリを書き換えないプローブなので contents は read のみ。
+      # id-token は claude-code-action が OIDC で GitHub App トークンを
+      # 取得するのに使う (claude.yml と同じ)。
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@b7912aeeb535234e3e9385ff49e8237f689b5f14
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # agent モードで動かすための最小プロンプト。モデルが 1 回でも
+          # 応答すれば `modelUsage` が空でなくなり、トークンは生きていると
+          # 判定できる。
+          prompt: |
+            Reply with exactly the following text and nothing else: TOKEN_OK
+          # このプローブの目的そのもの。伏せられていたエラー本文を出す。
+          show_full_output: true
