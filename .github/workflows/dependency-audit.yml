@@ -20,7 +20,7 @@ name: Dependency Audit
 #      check-runs が全部 success/skipped になっているか) にもそもそも
 #      現れない。「VeloX 側に非がなく突然公表される advisory で、依存を
 #      何も動かしていない無関係な PR まで巻き込んで auto-merge が
-#      止まる」という事態を、continue-on-error に頼らず構造的に避ける
+#      止まる」という事態を、continue-on-error に頼らず構造的に避けた
 #      設計にした。
 #   2. schedule (毎日 1 回、既定ブランチを対象): 依存を全く動かしていない
 #      期間でも、後から新しい advisory が公表されるケースを拾うための
@@ -54,7 +54,7 @@ jobs:
     name: cargo deny check (advisories / bans / licenses / sources)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
       # EmbarkStudios/cargo-deny-action は runner 向けにビルド済みの
       # cargo-deny バイナリを取得して deny.toml に従って実行する
@@ -62,4 +62,4 @@ jobs:
       # `command` を省略すると advisories/bans/licenses/sources の
       # 4 領域すべてを検査する。
       - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902
