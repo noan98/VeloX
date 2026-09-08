@@ -587,9 +587,12 @@ jobs:
             if ($_.Name -match $abPattern) { $Matches[1] }
           } | Select-Object -Unique)
 
-          # tabs_N は数値順に並べる (スケーリングを読むため)。それ以外は名前順。
+          # tabs_N / tabs_hold_N は数値順に並べる (スケーリングを読むため)。
+          # それ以外は名前順。**`tabs_hold_` を勘定に入れ忘れると `tabs_hold_20`
+          # が名前順に落ちるうえ、下のスケーリング表からも漏れる** (run
+          # 34247895418 で実際に漏れた)。
           $scenarioNames = @($scenarioNames | Sort-Object {
-            if ($_ -match '^tabs_(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
+            if ($_ -match '^tabs_(?:hold_)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
           }, { $_ })
 
           $compareKeys = @(
@@ -655,13 +658,18 @@ jobs:
           # 複数シナリオを 1 run で回したときだけ出す。**同一 run 内なので
           # ここに並ぶ値どうしは比較してよい** — それが `scenarios` 入力を
           # 足した理由そのものである (D96 決定 3)。
-          $tabScenarios = @($scenarioNames | Where-Object { $_ -match '^tabs_\d+$' })
+          # ⚠️ `tabs_hold_N` を含めること。`^tabs_\d+$` だけだと
+          # `tabs_hold_20` がマッチせず、**スケーリング表が丸ごと出ない**
+          # (run 34247895418 で実際にそうなった)。
+          $tabScenarios = @($scenarioNames | Where-Object { $_ -match '^tabs_(?:hold_)?\d+$' })
           if ($tabScenarios.Count -gt 1) {
             $lines += "### タブ数スケーリング (Issue #197)"
             $lines += ""
             $lines += "``rss_total_bytes`` の平均を MiB で、``rss_process_count`` の平均をプロセス数で示す。**同一 run 内の比較なので、この表の行どうしは並べて読んでよい。**"
             $lines += ""
             $lines += "プロセス数の列は **休止で WebView2 のプロセスが実際に減っているか** を見るためのもの (D97 Revisit (1))。``suspend_tab`` は webview を drop するだけなので、プロセスまで消えるかは RSS だけでは区別がつかない。"
+            $lines += ""
+            $lines += "⚠️ ``tabs_N`` と ``tabs_hold_N`` は**測定条件が違う** (前者は回収が終わる前に測る。D97)。同じ表に並んでも、**系統をまたいで比較してはならない。**"
             $lines += ""
             $lines += "| シナリオ | A (既定) MiB | B (compare_env) MiB | 差 (MiB) | 比 (B/A) | A プロセス数 | B プロセス数 |"
             $lines += "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
