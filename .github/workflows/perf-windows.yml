@@ -208,11 +208,17 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          New-Item -ItemType Directory -Force -Path diag | Out-Null
+          # ⚠️ **stdout/stderr をリダイレクトしない。** 一度は診断用に
+          # `-RedirectStandardOutput`/`-RedirectStandardError` を付けたが、
+          # それを入れた 2 つの run (34225826524 / 34226965961) の
+          # `page_load_ms` が 2077ms / 2085ms と、同じ固定ページの §21.2
+          # (54.10ms) から 38 倍離れた。`http.server` はシングルスレッドで
+          # リクエストごとに stderr へログを 1 行書くため、書き込み先が
+          # ファイルになるとその I/O が応答をブロックしうる — これが原因か
+          # どうかを確かめるため、まずリダイレクトを外した状態で測り直す
+          # (§26.4 付随)。起動できなかったときの診断はプロセス一覧で足りる。
           Start-Process -FilePath python -ArgumentList "-m", "http.server", "8731" `
-            -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden `
-            -RedirectStandardOutput "$PWD\diag\http-server.out.log" `
-            -RedirectStandardError "$PWD\diag\http-server.err.log"
+            -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden
 
           $deadline = (Get-Date).AddSeconds(30)
           $ready = $false
@@ -227,10 +233,12 @@ jobs:
             }
           }
           if (-not $ready) {
-            Write-Host "--- http-server stdout ---"
-            Get-Content "diag\http-server.out.log" -ErrorAction SilentlyContinue | Write-Host
-            Write-Host "--- http-server stderr ---"
-            Get-Content "diag\http-server.err.log" -ErrorAction SilentlyContinue | Write-Host
+            Write-Host "--- python プロセス ---"
+            Get-Process python -ErrorAction SilentlyContinue |
+              Format-Table Id, ProcessName, StartTime | Out-String | Write-Host
+            Write-Host "--- 8731 を listen しているか ---"
+            Get-NetTCPConnection -LocalPort 8731 -ErrorAction SilentlyContinue |
+              Format-Table LocalAddress, LocalPort, State | Out-String | Write-Host
             throw "固定ページの配信サーバ (python -m http.server 8731) が 30 秒以内に応答しませんでした"
           }
           Write-Host "固定ページの配信を確認しました: http://127.0.0.1:8731/minimal.html"
