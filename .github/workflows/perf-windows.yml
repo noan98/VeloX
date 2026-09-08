@@ -76,6 +76,10 @@ on:
         description: "A/B 比較の B 条件で追加する環境変数 (KEY=VALUE、複数はセミコロン区切り)。空欄なら比較せず A 条件だけを 1 回計測する"
         type: string
         default: "VELOX_MEMORY_BUDGET_MB=0"
+      common_env:
+        description: "A/B の両方に共通で設定する環境変数 (KEY=VALUE、セミコロン区切り)。測定条件を成立させるための設定に使う (例: tabs_N でメモリ予算を評価するときの VELOX_MEMORY_CHECK_INTERVAL_MS=500)"
+        type: string
+        default: ""
       repeats:
         description: "A/B のペアを何回繰り返すか (compare_env が空のときは無視される)"
         type: string
@@ -331,6 +335,7 @@ jobs:
           INPUT_SCENARIO: ${{ inputs.scenario }}
           INPUT_TRIALS: ${{ inputs.trials }}
           INPUT_COMPARE_ENV: ${{ inputs.compare_env }}
+          INPUT_COMMON_ENV: ${{ inputs.common_env }}
           INPUT_REPEATS: ${{ inputs.repeats }}
           EVENT_NAME: ${{ github.event_name }}
           BENCH_URL: ${{ steps.bench_url.outputs.url }}
@@ -346,9 +351,11 @@ jobs:
           # しない」という意味を持つ入力なので、空欄を既定値で埋めてよいのは
           # 入力そのものが存在しない pull_request のときだけである。
           $compareEnv = $env:INPUT_COMPARE_ENV
+          $commonEnv = $env:INPUT_COMMON_ENV
           $repeatsRaw = $env:INPUT_REPEATS
           if ($env:EVENT_NAME -eq "pull_request") {
             $compareEnv = "VELOX_MEMORY_BUDGET_MB=0"
+            $commonEnv = ""
             $repeatsRaw = "2"
           }
           if ([string]::IsNullOrWhiteSpace($repeatsRaw)) { $repeatsRaw = "2" }
@@ -359,7 +366,7 @@ jobs:
 
           # "KEY=VALUE;KEY2=VALUE2" を実際の環境変数として設定し、設定した
           # 名前の一覧を返す (解除に使う)。
-          function Set-CompareEnv([string] $spec) {
+          function Set-EnvFromSpec([string] $spec) {
             $names = @()
             foreach ($pair in $spec -split ';') {
               $entry = $pair.Trim()
@@ -391,6 +398,20 @@ jobs:
             }
           }
 
+          # A/B の両方に共通で効かせる設定 (Issue #197)。**測定条件そのものを
+          # 成立させるためのもの**で、A と B の差には現れない。例:
+          # `tabs_N` のスクリプトは 9 タブを連続で開いて 3 秒待って quit する
+          # ため、プロセスの生存は約 6 秒しかない。休止判定に使うメモリ
+          # サンプラは `sleep(interval)` を**先に**実行する既定 5 秒周期
+          # なので、そのままではサンプルが 0〜1 回しか取れず、**メモリ予算は
+          # 原理的に発動しない** (run 34227483724 の tabs_10 A/B が差 -0.4%
+          # に終わった理由がこれ)。`VELOX_MEMORY_CHECK_INTERVAL_MS=500` の
+          # ように周期を詰めて初めて、予算の有無が結果に出る。
+          if (-not [string]::IsNullOrWhiteSpace($commonEnv)) {
+            Write-Host "A/B 共通の環境変数: $commonEnv"
+            Set-EnvFromSpec $commonEnv | Out-Null
+          }
+
           # A/B 比較表を作る後段のステップは別プロセスなので、ここで解決した
           # 値 (pull_request 実行時の既定を含む) をステップ出力で渡す。
           "compare_env<<VELOX_EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
@@ -405,7 +426,7 @@ jobs:
             Write-Host "A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
             for ($r = 1; $r -le $repeats; $r++) {
               Invoke-Bench "results\$scenario-windows-baseline-$r.json" "A (既定) #$r"
-              $names = Set-CompareEnv $compareEnv
+              $names = Set-EnvFromSpec $compareEnv
               try {
                 Invoke-Bench "results\$scenario-windows-compare-$r.json" "B ($compareEnv) #$r"
               } finally {
@@ -458,6 +479,7 @@ jobs:
         # 内訳表そのものは出せる)。
         env:
           COMPARE_ENV: ${{ steps.bench_run.outputs.compare_env }}
+          COMMON_ENV: ${{ inputs.common_env }}
           RUNNER_CPU: ${{ steps.env_info.outputs.cpu }}
           RUNNER_CORES: ${{ steps.env_info.outputs.cores }}
           RUNNER_RAM_GIB: ${{ steps.env_info.outputs.ram_gib }}
@@ -533,6 +555,10 @@ jobs:
             $lines += ""
             $lines += "A = 既定のまま / B = ``$env:COMPARE_ENV`` を設定して起動。同一ジョブ・同一ビルド・同一ランナーで交互に計測しているため、ランナー個体差やイメージ更新は相殺される。"
             $lines += ""
+            if (-not [string]::IsNullOrWhiteSpace($env:COMMON_ENV)) {
+              $lines += "A/B 共通で設定した環境変数: ``$env:COMMON_ENV`` (測定条件を成立させるためのもので、A と B の差には現れない)"
+              $lines += ""
+            }
             $lines += "計測したランナー: $env:RUNNER_CPU / $env:RUNNER_CORES 論理コア / RAM $env:RUNNER_RAM_GIB GiB。**``windows-latest`` は run ごとに別スペックのマシンが割り当てられる (§26.4 事実 2)。この行が違う run どうしの絶対値を比較してはならない。**"
             $lines += ""
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
