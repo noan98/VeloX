@@ -1045,6 +1045,73 @@ class ClaudeFallbackTest(unittest.TestCase):
         self.assertTrue(result["blocked"])
         self.assertFalse(result["claude_relaxed"])
 
+    def test_waiting_reason_carries_a_usage_limit_diagnostic(self) -> None:
+        # Issue #194 / PR #209: 「@codex review は投稿済み、でも上限
+        # メッセージを検知していない」状態のとき、それが「まだ返信が
+        # 無い」のか「返信を取りこぼした」のかをログから区別できる
+        # ようにする。判定そのものは変えない。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                }
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        waiting = [r for r in result["reasons"] if "応答を待っています" in r]
+        self.assertEqual(len(waiting), 1)
+        self.assertIn("診断:", waiting[0])
+        self.assertIn("Codex ログイン一致0件", waiting[0])
+
+    def test_usage_limit_diagnostic_distinguishes_a_rejected_author(self) -> None:
+        # ログイン名は一致するが `__typename` が Bot でないケース。
+        # 「Codex は返信しているが著者判定で落ちている」と読める
+        # 内訳が出ること。
+        pr_comments = {
+            "nodes": [
+                {
+                    "body": (
+                        "@codex review\n"
+                        f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->"
+                    ),
+                    "createdAt": "2026-09-07T16:00:00Z",
+                    "author": {"login": "noan98", "__typename": "User"},
+                },
+                {
+                    "body": "You have reached your Codex usage limits for code reviews.",
+                    "createdAt": "2026-09-07T16:00:30Z",
+                    "author": {
+                        "login": "chatgpt-codex-connector[bot]",
+                        "__typename": "User",
+                    },
+                },
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        waiting = [r for r in result["reasons"] if "応答を待っています" in r]
+        self.assertEqual(len(waiting), 1)
+        self.assertIn("Codex ログイン一致1件", waiting[0])
+        self.assertIn("__typename=User", waiting[0])
+        self.assertIn("著者判定通過0件", waiting[0])
+        # 判定そのものは変わらない (安全側でブロックのまま)。
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_review_request_needed"])
+
     def test_request_comment_body_contains_title_and_marker(self) -> None:
         from check_review_gate import claude_review_request_comment_body
 

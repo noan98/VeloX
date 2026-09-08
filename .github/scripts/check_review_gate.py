@@ -424,6 +424,58 @@ def _find_codex_usage_limit_after(
     return False
 
 
+def _usage_limit_diagnostic(
+    comment_nodes: list[dict[str, Any]],
+    after_iso: str,
+    codex_logins: frozenset[str],
+) -> str:
+    """`_find_codex_usage_limit_after` が False を返した理由を 1 行にまとめる
+    (Issue #194)。
+
+    判定には一切影響しない、ログ用の文字列を返すだけの関数。`@codex review`
+    を投稿したのに利用上限メッセージが検知されない、という状態が
+    PR #209 で観測されたが、当時のログからは「Codex がまだ返信していない」
+    のか「返信を取りこぼした」のかが区別できなかった。次に同じことが
+    起きたときに材料が残るようにする。
+
+    ログイン一致・`__typename`・投稿時刻・定型文言のどの段階で落ちたかが
+    分かるよう、段階ごとの件数と、Codex ログインのコメントで観測した
+    `__typename` の実値を出す。
+    """
+    total = len(comment_nodes)
+    by_login = [
+        c
+        for c in comment_nodes
+        if ((c.get("author") or {}).get("login") or "").lower()
+        in {l.lower() for l in codex_logins}
+    ]
+    typenames = sorted(
+        {
+            str((c.get("author") or {}).get("__typename"))
+            for c in by_login
+        }
+    )
+    accepted_author = [c for c in by_login if _is_codex_author(c.get("author"), codex_logins)]
+    with_phrase = [
+        c for c in accepted_author if _USAGE_LIMIT_PHRASE in (c.get("body") or "").lower()
+    ]
+    after_at = _parse_iso8601(after_iso) if after_iso else None
+    after_request = [
+        c
+        for c in with_phrase
+        if c.get("createdAt")
+        and after_at is not None
+        and _parse_iso8601(c["createdAt"]) > after_at
+    ]
+    return (
+        f" [診断: コメント{total}件 / Codex ログイン一致{len(by_login)}件"
+        f" (__typename={','.join(typenames) or 'なし'})"
+        f" / 著者判定通過{len(accepted_author)}件"
+        f" / 上限文言一致{len(with_phrase)}件"
+        f" / 依頼({after_iso or '不明'})より後{len(after_request)}件]"
+    )
+
+
 def evaluate_review_gate(
     review_threads: dict[str, Any] | None,
     latest_reviews: dict[str, Any] | None,
@@ -629,6 +681,16 @@ def evaluate_review_gate(
                             "wait: Codex に @codex review を自動リクエスト"
                             f"済みです (head SHA `{head_short}`){hint_suffix}。"
                             "応答を待っています"
+                            # Issue #194: この分岐に落ちたとき、それが
+                            # 「Codex がまだ何も返していない」のか
+                            # 「利用上限メッセージを返したのに検知でき
+                            # なかった」のかがログから区別できず、Claude
+                            # フォールバックが発火しない原因を追えなかった
+                            # (PR #209 で実測)。判定に使った材料をその場で
+                            # 出す。**判定は一切変えない** — 文言だけ。
+                            + _usage_limit_diagnostic(
+                                comment_nodes, request_created_at, codex_logins
+                            )
                         )
                     else:
                         # Codex が利用上限に達している。A. この PR の過去の

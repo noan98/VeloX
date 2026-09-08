@@ -11908,6 +11908,54 @@ Codex P2 指摘と同じ穴)。
 コメントと完了レビューを確実に区別できる判別子を見つけてから (2) を
 復活させること — **見つからないまま復活させてはならない。**
 
+**追記 (2026-09-08、Issue #194 — `AUTO_MERGE_TOKEN` 登録後の実測)**:
+PAT を登録して経路を実際に動かしたところ、**Claude フォールバックは
+発火しなかった**。判明したことと未解明な点を分けて記録する。
+
+**判明したこと: PAT の有無が「反応する/しない」を分けていた。**
+2026-09-08 08:24:39 に auto-merge が `@codex review` を PAT で投稿し、
+**9 秒後の 08:24:48 に Codex が利用上限メッセージを返した** (PR #209)。
+投稿者は `github-actions[bot]` ではなく PAT 所有者になっている。
+`AUTO_MERGE_TOKEN` 未設定時の `::warning::` も消えた。**D91 本文の
+「GITHUB_TOKEN で投稿したコメントには反応しない」は、PAT 側からも
+裏付けが取れた。**
+
+**未解明: 利用上限メッセージが検知されない。** 上記の直後 (38 秒後と
+2 分 30 秒後の 2 回) に auto-merge を実行したが、どちらも判定は
+
+```
+wait: Codex に @codex review を自動リクエスト済みです (head SHA `875a36b`)。応答を待っています
+```
+
+で止まり、`@claude` への依頼は投稿されなかった。`_find_codex_usage_limit_after`
+が False を返している。**GraphQL の反映遅れではない** (2 分半後でも同じ)。
+
+同じ入力を模したペイロードを `check_review_gate.py` に流すと
+`claude_review_request_needed: true` が正しく返る。つまり**ロジックの
+誤りではなく、CI が GraphQL から受け取る実データが想定と違う**。
+候補は (a) `author.__typename` が `Bot` でない、(b) `author` が
+`null`、(c) 本文の定型文言の不一致、のいずれか。ログにはどれとも
+書かれていないため、この時点では特定できていない。
+
+**対応: 判定は変えず、診断だけ足した。** 上記の "応答を待っています"
+に、判定の材料を段階別に出す内訳を付けた
+(`_usage_limit_diagnostic`)。
+
+```
+[診断: コメント2件 / Codex ログイン一致1件 (__typename=User) / 著者判定通過0件 / 上限文言一致0件 / 依頼(...)より後0件]
+```
+
+「Codex がまだ返信していない」「ログイン名が一致しない」「`__typename`
+で落ちた」「文言が変わった」「時刻の前後関係で落ちた」を 1 行で区別
+できる。**次に同じ状態になったとき、この行を読めば原因が確定する。**
+
+なお `auto-merge.yml` の merge job は `workflow_dispatch` / `schedule` で
+**既定ブランチ (main) の内容を checkout して実行する**。したがって
+`CLAUDE_REVIEWER_LOGINS` の設定もこの診断も、**main にマージされるまで
+実際の判定には効かない** (dry-run job だけが PR のブランチで動く。
+D88 と同じ性質)。上記の実測が「main の版」で行われたものである点に
+注意すること。
+
 ## D92: 起動の `process_start` → `window_created` を 4 つの中間チェックポイントで分解する (#182) — 計測の追加のみで、最適化はまだ行わない
 
 **対象**: Issue #182 (P1: Windows Startup Performance — Window Creation /
