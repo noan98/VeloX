@@ -443,6 +443,15 @@ def _usage_limit_diagnostic(
     `__typename` の実値を出す。
     """
     total = len(comment_nodes)
+    # Issue #194 / PR #209: 「ログイン一致0件」だけでは `author` が null
+    # なのかログイン名が違うのかを区別できなかったため、実際に観測した
+    # 著者名も出す (GitHub 上で誰でも読める公開 PR のコメント著者のみ)。
+    seen_authors = sorted(
+        {
+            ((c.get("author") or {}).get("login") or "(author=null)")
+            for c in comment_nodes
+        }
+    )[:6]
     by_login = [
         c
         for c in comment_nodes
@@ -468,7 +477,9 @@ def _usage_limit_diagnostic(
         and _parse_iso8601(c["createdAt"]) > after_at
     ]
     return (
-        f" [診断: コメント{total}件 / Codex ログイン一致{len(by_login)}件"
+        f" [診断: コメント{total}件"
+        f" / 観測した著者={','.join(seen_authors) or 'なし'}"
+        f" / Codex ログイン一致{len(by_login)}件"
         f" (__typename={','.join(typenames) or 'なし'})"
         f" / 著者判定通過{len(accepted_author)}件"
         f" / 上限文言一致{len(with_phrase)}件"

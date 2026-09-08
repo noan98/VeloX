@@ -1072,6 +1072,8 @@ class ClaudeFallbackTest(unittest.TestCase):
         self.assertEqual(len(waiting), 1)
         self.assertIn("診断:", waiting[0])
         self.assertIn("Codex ログイン一致0件", waiting[0])
+        # 実際に観測した著者名を出す (null かログイン名違いかの区別用)。
+        self.assertIn("観測した著者=noan98", waiting[0])
 
     def test_usage_limit_diagnostic_distinguishes_a_rejected_author(self) -> None:
         # ログイン名は一致するが `__typename` が Bot でないケース。
@@ -1107,6 +1109,7 @@ class ClaudeFallbackTest(unittest.TestCase):
         self.assertEqual(len(waiting), 1)
         self.assertIn("Codex ログイン一致1件", waiting[0])
         self.assertIn("__typename=User", waiting[0])
+        self.assertIn("chatgpt-codex-connector[bot]", waiting[0])
         self.assertIn("著者判定通過0件", waiting[0])
         # 判定そのものは変わらない (安全側でブロックのまま)。
         self.assertTrue(result["blocked"])
