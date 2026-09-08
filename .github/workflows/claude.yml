@@ -3,23 +3,8 @@ name: Claude Code
 # `@claude` メンションに応答して、レビューやコード変更を行わせるための
 # workflow (Issue #194、docs/decisions.md D91 の Revisit condition (7))。
 #
-# なぜ必要か:
-#   auto-merge.yml (D91) は Codex が利用上限に達したとき、フォールバックとして
-#   PR に `@claude` メンションでレビューを依頼する。しかしこの workflow が
-#   無いと**メンションを投げても誰も応答しない**ため、依頼が空打ちになる。
-#
-# ⚠️ auto-merge.yml との連携で押さえておくべき制約:
-#   - claude-code-action は **bot が投稿したコメントでは既定で起動しない**
-#     (`allowed_bots` に明記しない限り。無限ループ防止のための仕様)。
-#   - 加えて GitHub の仕様上、`GITHUB_TOKEN` で投稿したコメントは
-#     そもそも workflow のトリガにならない。
-#   → したがって auto-merge.yml 側は `@claude` の投稿にだけ
-#     `AUTO_MERGE_TOKEN` (PAT) を明示的に使う実装になっている。
-#     **`AUTO_MERGE_TOKEN` が未設定だと auto-merge は `@claude` を投稿せず、
-#     警告を出して止まる** (空打ちで「依頼が届いた」と誤認させないため)。
-#   - `github-actions[bot]` を `allowed_bots` に足せば GITHUB_TOKEN 経由でも
-#     起動できるように見えるが、上記のとおり GITHUB_TOKEN のコメントは
-#     workflow トリガ自体が発火しないため解決にならない。
+# Public repository では issue_comment / pull_request_review_comment を誰でも発火できるため、
+# リポジトリへの write 権限を持つ Claude workflow を外部ユーザーから直接起動できないようにする。
 on:
   issue_comment:
     types: [created]
@@ -28,42 +13,29 @@ on:
 
 jobs:
   claude:
-    # メンションを含む「人間の」コメントだけを対象にする。
-    #
-    # ⚠️ `contains(...)` だけでは足りない (Issue #203)。claude-code-action は
-    # bot のコメントを内部で拒否するが、**それは action の中の話であって
-    # workflow job の起動自体は防がれない**。実際 PR #198 では、Claude 自身が
-    # 投稿する "Claude Code is working…" コメントと Codex のコメントで
-    # job が 2 回余計に起動した (2026-09-08 実測)。実行時間の浪費であり、
-    # action 側の防御に依存しない形で workflow 側でも断つ。
-    #
-    # auto-merge (D91) の `@claude` 自動投稿とは衝突しない: あちらは
-    # AUTO_MERGE_TOKEN (PAT) で投稿するため投稿者は PAT 所有者 (人間の
-    # アカウント) になり `user.type` は `User` になる。逆に GITHUB_TOKEN で
-    # 投稿すると、この条件以前にそもそも workflow トリガが発火しない。
+    # Public repository の外部ユーザーからの @claude 実行を禁止する。
+    # author_association はコメント投稿者とリポジトリとの関係を表す。
+    # OWNER / MEMBER / COLLABORATOR のみ、contents:write 等を持つ Claude を起動できる。
     if: >-
       github.event.comment.user.type != 'Bot' &&
+      (github.event.comment.author_association == 'OWNER' ||
+       github.event.comment.author_association == 'MEMBER' ||
+       github.event.comment.author_association == 'COLLABORATOR') &&
       contains(github.event.comment.body, '@claude')
     name: Respond to @claude mention
     runs-on: ubuntu-latest
     permissions:
-      # Claude がファイルを変更できるようにする (レビューだけでなく
-      # 「直しておいて」にも応えられるようにするため)。
       contents: write
       pull-requests: write
       issues: write
-      # GitHub App 認証に必要。
       id-token: write
-      # CI の結果を読ませる (失敗原因の調査を頼めるようにするため)。
       actions: read
+
     steps:
       - uses: actions/checkout@v7
         with:
-          # Claude はローカルのコードを読むだけなので浅いクローンで足りる。
           fetch-depth: 1
 
       - uses: anthropics/claude-code-action@v1
         with:
-          # 認証は OAuth トークン。API キー (`anthropic_api_key`) を使う
-          # 場合は入力名が変わるので注意。
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
