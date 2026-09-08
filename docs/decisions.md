@@ -11831,3 +11831,18 @@ Claude App 側のインストール範囲など) がある可能性があり、�
   いう懸念は `@codex review`/`@claude` の両方に共通する残課題として
   引き続き有効 (`AUTO_MERGE_TOKEN` が実際に登録された環境での実地確認が
   必要)。
+
+**追記 (2026-09-08、Issue #203)**: `.github/workflows/claude.yml` の起動条件に
+`github.event.comment.user.type != 'Bot'` を追加した。**`claude-code-action` が
+bot のコメントを拒否するのは action の内部であって、workflow job の起動自体は
+防がれない** — PR #198 で、Claude 自身の "Claude Code is working…" コメントと
+Codex のコメントによって job が 2 回余計に起動したのを実測した (無限ループには
+至らず skipped で止まったが、それは action 側の実装に依存した防御であり、
+workflow 側でも断つべきと判断した)。
+
+この条件は **auto-merge の `@claude` 自動投稿とは衝突しない**。上記のとおり
+`@claude` の投稿には `AUTO_MERGE_TOKEN` (PAT) を使うため、投稿者は PAT 所有者
+(人間のアカウント) になり `user.type` は `User` になる。逆に `GITHUB_TOKEN` で
+投稿する実装に戻すと、この条件以前に**そもそも workflow トリガが発火しない**
+(Issue #201 で `@codex review` について実測したのと同じ制約)。**`@claude` /
+`@codex review` のどちらも PAT 投稿が前提**である、と揃えて理解すること。
