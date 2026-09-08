@@ -12663,3 +12663,102 @@ Linux 専用)。T2 の「Chromium 比 +10% 以内」を Windows で評価する�
 休止した結果か、復帰にどれだけかかるかは測っていない (§25.3 の Windows 版)。
 (5) 本節の計測は 1 つの run (AMD EPYC 7763) のみである。D96 決定 3 のとおり
 **別 run の絶対値と並べてはならない。**
+
+## D98: `@claude` フォールバック (Issue #194) の失敗原因を「見えるようにする」 — エラー本文が `show_full_output: false` で伏せられていた
+
+`auto-merge.yml` の Claude フォールバックは、Codex が利用上限に達したとき
+`@claude` へレビューを依頼して条件3を満たすための最後の逃げ道である
+(D91 決定10)。これが動かないため、**Codex 利用上限 + 自己承認不可 +
+ブランチ保護**の三重苦で PR #210 / #212 / #213 はいずれも手動マージに
+なった。原因を特定するために何が分かっていて何が分かっていないかを
+整理する。
+
+### 実測で確定していること (run 34231609201、PR #210 の head `ed264ac`)
+
+依頼から応答までの経路は**最後の一歩を除いてすべて正常に動いている**。
+
+1. `check_review_gate.py` が Codex の利用上限を検知し、
+   `review_gate_decision.sh` が `AUTO_MERGE_TOKEN` で `@claude` 依頼を投稿
+   (comment 5585827211、投稿者 `noan98` = OWNER)
+2. `claude.yml` の `if` 条件を通過して workflow が起動
+3. `claude-code-action` がプロンプトを構築 — ログに `===== USER REQUEST =====`
+   として依頼本文がそのまま入っている
+4. Claude Code v2.1.263 のインストールに成功
+5. `{"type":"system","subtype":"init","model":"claude-sonnet-5"}` — **初期化まで成功**
+6. その **82ms 後**に
+   `{"type":"result","subtype":"success","is_error":true,"num_turns":1,`
+   `"total_cost_usd":0,"modelUsage":{}}`
+
+`modelUsage` が空で `total_cost_usd` が 0 ということは、**モデルを 1 回も
+呼んでいない**。`num_turns: 1` と 82ms という短さから、ネットワーク往復の
+前後どちらで落ちたのかまでは、この情報だけでは決められない。
+
+### 分かっていないこと — そして、その理由
+
+**エラー本文が読めない。** `claude-code-action` の既定 `show_full_output:
+false` により、実行本体のログが
+
+```
+Running Claude Code via SDK (full output hidden for security)...
+Rerun in debug mode or enable `show_full_output: true` in your workflow file for full output.
+```
+
+に置き換えられる。`result` の中身 (エラーメッセージ) はここに含まれるため、
+**原因を書いた文字列そのものが伏せられている**。残る仮説は少なくとも 2 つ
+あり、どちらも上記の観測と矛盾しない。
+
+- **仮説 A: OAuth トークンが無効/失効している。** ネットワークに出る前に
+  ローカルで弾かれるなら 82ms は説明がつく
+- **仮説 B: アカウント側の利用上限に達している。** サーバが即座に拒否
+  していれば 82ms でも成立しうる (Azure central US から api.anthropic.com
+  への往復は数十 ms 台)
+
+### 誤りの訂正 — 「トークン未登録」は間違いだった
+
+PR #210 のコメント (5585888554) で「`CLAUDE_CODE_OAUTH_TOKEN` が未登録の
+ため」と書いたが、**これは誤りである。** 根拠にしたのはログの
+`ANTHROPIC_API_KEY:` が空だったことだが、**OAuth 認証時に
+`ANTHROPIC_API_KEY` が空なのは正常**であり、`CLAUDE_CODE_OAUTH_TOKEN` は
+同じログで `***` とマスクされている = **値が入っている**。未登録の secret は
+GitHub Actions では空文字列になるので、マスクされること自体が登録済みの
+証拠だった。#194 に訂正済み。
+
+**教訓: 「ある変数が空である」ことは、別の変数が未設定であることの根拠に
+ならない。** D97 で記録した「コードから読める構造的な違いが、そのまま
+観測される差の原因とは限らない」と同じ種類の誤りである。
+
+### 決定
+
+**1. `claude.yml` に `show_full_output: true` を入れる。** 伏せられている
+エラー本文を出す。本リポジトリはプライベートなのでログを読めるのは
+オーナーだけであり、露出のコストは低い。
+
+**2. `claude-token-check.yml` (`workflow_dispatch` 専用) を追加する。**
+`CLAUDE_CODE_OAUTH_TOKEN` が実際にモデルを呼べるかだけを検証する最小
+プローブ。**`issue_comment` で起動する workflow は常にデフォルトブランチの
+定義が使われる**という GitHub の仕様があるため、`claude.yml` の変更は main
+に入るまで試せない。プローブを別に用意することで:
+
+- PR にコメントを投稿せずに何度でも再試行できる (仮説 B の「時間をおいて
+  再試行」がそのまま実行できる)
+- agent モードで動くため、**「トークン自体の問題」と「`@claude` メンション
+  経路の問題」を分離できる** — `claude.yml` は tag モードなので、両者が
+  混ざったままでは切り分けにならない
+
+### Revisit condition
+
+(1) **原因はまだ特定できていない。** 本 PR がやるのは「見えるようにする」
+ところまでである。main にマージしたあとプローブを実行し、エラー本文を読んで
+はじめて仮説 A / B のどちらか (あるいは第三の原因か) が決まる。
+(2) **プローブが成功した場合、`claude.yml` (tag モード) でも成功するとは
+限らない。** その場合は原因がトークンではなくメンション経路にあるので、
+`@claude` を投稿し直して `show_full_output: true` のログを読む必要がある。
+(3) **`show_full_output: true` を恒久的に残すかは未決。** フォールバックが
+安定して動くようになったら false に戻すことを検討する。
+(4) **副次的に見つかった無駄: `@claude` をバッククォートで囲んだ引用でも
+workflow が起動する。** `claude.yml` の `if` は
+`contains(github.event.comment.body, '@claude')` という素朴な部分一致なので、
+コメント本文で `` `@claude` `` に言及しただけで起動する (run 34232084709 が
+実例 — action 側は `Trigger result: false` と正しく判定して何もせず終わる)。
+実害は runner 時間の数十秒だけなので本 PR では直さないが、`if` を厳しく
+するなら「行頭または空白の直後の `@claude`」に限定するのが素直である。
