@@ -187,14 +187,45 @@ jobs:
             "serve_fixed_pages=false" >> $env:GITHUB_OUTPUT
           }
 
+      # ⚠️ ここは以前 `Start-Sleep -Seconds 2` の固定待ちだった。run
+      # 34225449751 (本 PR の初回実行) で `python -m http.server` が 2 秒
+      # では listen に間に合わず、"No connection could be made because the
+      # target machine actively refused it." でジョブごと落ちた
+      # (python プロセス自体は生きていた)。固定 wait は D84/D85 が統合
+      # テストから追い出したのと同じ失敗の仕方をするので、**待つのではなく
+      # 準備できたことを確かめる**形に変える。サーバの stdout/stderr も
+      # 残しておき、起動そのものが失敗したときに理由が分かるようにする。
       - name: Serve fixed benchmark pages (default URL only)
         if: steps.bench_url.outputs.serve_fixed_pages == 'true'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path diag | Out-Null
           Start-Process -FilePath python -ArgumentList "-m", "http.server", "8731" `
-            -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden
-          Start-Sleep -Seconds 2
-          Invoke-WebRequest -Uri "http://127.0.0.1:8731/minimal.html" -UseBasicParsing | Out-Null
+            -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden `
+            -RedirectStandardOutput "$PWD\diag\http-server.out.log" `
+            -RedirectStandardError "$PWD\diag\http-server.err.log"
+
+          $deadline = (Get-Date).AddSeconds(30)
+          $ready = $false
+          while ((Get-Date) -lt $deadline) {
+            try {
+              Invoke-WebRequest -Uri "http://127.0.0.1:8731/minimal.html" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop | Out-Null
+              $ready = $true
+              break
+            } catch {
+              Start-Sleep -Milliseconds 500
+            }
+          }
+          if (-not $ready) {
+            Write-Host "--- http-server stdout ---"
+            Get-Content "diag\http-server.out.log" -ErrorAction SilentlyContinue | Write-Host
+            Write-Host "--- http-server stderr ---"
+            Get-Content "diag\http-server.err.log" -ErrorAction SilentlyContinue | Write-Host
+            throw "固定ページの配信サーバ (python -m http.server 8731) が 30 秒以内に応答しませんでした"
+          }
+          Write-Host "固定ページの配信を確認しました: http://127.0.0.1:8731/minimal.html"
 
       # 最大のリスク (GUI/WebView2 ウィンドウが起動できるか) の実地検証。
       # velox.exe を直接起動し、プロセス一覧と perf ログの有無を確認する —
