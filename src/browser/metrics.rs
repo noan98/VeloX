@@ -43,20 +43,64 @@ use serde_json::json;
 // Startup timestamps
 // ---------------------------------------------------------------------
 
-/// The startup checkpoints: process start, window creation, two
-/// sub-checkpoints splitting the `window_created` → `toolbar_ready` gap
-/// (Issue #59 — see docs/decisions.md D43), the toolbar's `ready`
-/// handshake, and the first `LoadFinished` (≈ time-to-first-page).
+/// The startup checkpoints: process start, four sub-checkpoints splitting
+/// the `process_start` → `window_created` gap (Issue #182 — see
+/// docs/decisions.md D92), window creation, two sub-checkpoints splitting
+/// the `window_created` → `toolbar_ready` gap (Issue #59 — see
+/// docs/decisions.md D43), the toolbar's `ready` handshake, and the first
+/// `LoadFinished` (≈ time-to-first-page).
 ///
-/// The two additions (`rust_setup_done`, `toolbar_script_started`) exist to
-/// answer one question: is the `window_created` → `toolbar_ready` gap spent
-/// in VeloX's own Rust-side setup (persistence I/O, building `AppState`)
-/// before the event loop even starts pumping the webview, or inside the
-/// toolbar webview itself (HTML/CSS parse, JS execution)? See D43 for the
-/// measurement this was built to answer.
+/// The `window_created` → `toolbar_ready` pair (`rust_setup_done`,
+/// `toolbar_script_started`) exists to answer one question: is that gap
+/// spent in VeloX's own Rust-side setup (persistence I/O, building
+/// `AppState`) before the event loop even starts pumping the webview, or
+/// inside the toolbar webview itself (HTML/CSS parse, JS execution)? See
+/// D43 for the measurement this was built to answer.
+///
+/// The `process_start` → `window_created` quartet (`event_loop_built`,
+/// `pre_window_setup_done`, `native_window_built`, `toolbar_webview_built`)
+/// answers the equivalent question for the *other*, much larger half of
+/// startup, which Windows' first real measurement (Issue #136/#180,
+/// `docs/performance-targets.md` §21) showed to be 644ms of a 717ms
+/// `startup_first_load_ms`: how much of it is VeloX's own Rust work
+/// (improvable here) versus toolkit/engine initialization that Epic #57
+/// rule 3 treats as a black box (tao's event loop and native window,
+/// WebView2/WebKitGTK's first webview)? See D92.
+///
+/// **Only the original five checkpoints are required for [`report`] to
+/// produce a record.** The four Issue #182 additions are optional in
+/// [`StartupReport`] precisely so that a future refactor that forgets to
+/// mark one can never suppress the whole `startup` perf record — and with
+/// it every startup metric `velox-bench` reads.
+///
+/// [`report`]: StartupTimestamps::report
 #[derive(Debug, Clone, Copy)]
 pub struct StartupTimestamps {
     process_start: Instant,
+    /// `EventLoopBuilder::with_user_event().build()` has returned — i.e.
+    /// tao has finished whatever the platform needs before any window can
+    /// exist (`gtk_init` on Linux; window-class registration, OLE/COM and
+    /// DPI-awareness setup on Windows). Nothing of VeloX's own runs before
+    /// this, so it is a floor on startup that VeloX cannot move without
+    /// changing or patching tao.
+    event_loop_built: Option<Instant>,
+    /// Every Rust-side prerequisite of the first window is ready and
+    /// `BrowserWindow::new` is about to be called: `settings.json` loaded
+    /// and applied, blocklist and site-exception lists built, site
+    /// permissions and the restored session read from disk, `Windows`/`Tabs`
+    /// constructed. This span (`event_loop_built` → here) is the one part of
+    /// `process_start` → `window_created` that is entirely VeloX's own code.
+    pre_window_setup_done: Option<Instant>,
+    /// tao's `WindowBuilder::build()` has returned — the native window
+    /// (HWND / GtkWindow) exists, icon loaded, but no webview is attached to
+    /// it yet.
+    native_window_built: Option<Instant>,
+    /// The toolbar webview — the *first* webview of the process — has been
+    /// attached. This span (`native_window_built` → here) is where the web
+    /// engine pays its one-time initialization cost (on Windows: creating
+    /// the WebView2 environment and spawning `msedgewebview2.exe`; on Linux:
+    /// WebKitGTK's first `build_gtk`). Black box per Epic #57 rule 3.
+    toolbar_webview_built: Option<Instant>,
     window_created: Option<Instant>,
     /// Right before `app::run` calls `event_loop.run(...)` — after
     /// history/bookmarks/input-history have been loaded from disk and
@@ -81,12 +125,45 @@ impl StartupTimestamps {
     pub fn new(process_start: Instant) -> Self {
         Self {
             process_start,
+            event_loop_built: None,
+            pre_window_setup_done: None,
+            native_window_built: None,
+            toolbar_webview_built: None,
             window_created: None,
             rust_setup_done: None,
             toolbar_script_started: None,
             toolbar_ready: None,
             first_load_finished: None,
         }
+    }
+
+    /// Record the "tao event loop built" checkpoint (Issue #182). Only the
+    /// first call counts.
+    ///
+    /// Unlike every other `mark_*` here, the caller has to capture this
+    /// `Instant` *before* it can know whether metrics are enabled at all —
+    /// `app::run` builds the event loop before `settings.json` (which can
+    /// flip `perf_metrics`) has been read. See its call site.
+    pub fn mark_event_loop_built(&mut self, now: Instant) {
+        self.event_loop_built.get_or_insert(now);
+    }
+
+    /// Record the "Rust-side prerequisites of the first window are ready"
+    /// checkpoint (Issue #182). Only the first call counts.
+    pub fn mark_pre_window_setup_done(&mut self, now: Instant) {
+        self.pre_window_setup_done.get_or_insert(now);
+    }
+
+    /// Record the "tao native window built" checkpoint (Issue #182). Only
+    /// the first call counts.
+    pub fn mark_native_window_built(&mut self, now: Instant) {
+        self.native_window_built.get_or_insert(now);
+    }
+
+    /// Record the "first (toolbar) webview attached" checkpoint (Issue
+    /// #182). Only the first call counts.
+    pub fn mark_toolbar_webview_built(&mut self, now: Instant) {
+        self.toolbar_webview_built.get_or_insert(now);
     }
 
     /// Record the window-creation checkpoint. Only the first call counts.
@@ -118,10 +195,22 @@ impl StartupTimestamps {
     }
 
     /// Build a report of elapsed time from process start to each
-    /// checkpoint. Returns `None` until every post-start checkpoint has
-    /// been recorded (order does not matter).
+    /// checkpoint. Returns `None` until every *required* post-start
+    /// checkpoint has been recorded (order does not matter).
+    ///
+    /// "Required" means the original five (Issue #3/#59). The four Issue
+    /// #182 sub-checkpoints of `process_start` → `window_created` are
+    /// reported as `Option<Duration>` and a missing one is simply absent
+    /// from the record: they are diagnostics layered onto an existing
+    /// measurement, and must never be able to withhold the record that
+    /// `velox-bench` reads every startup metric from.
     pub fn report(&self) -> Option<StartupReport> {
+        let elapsed = |at: Option<Instant>| at.map(|at| at.duration_since(self.process_start));
         Some(StartupReport {
+            to_event_loop_built: elapsed(self.event_loop_built),
+            to_pre_window_setup_done: elapsed(self.pre_window_setup_done),
+            to_native_window_built: elapsed(self.native_window_built),
+            to_toolbar_webview_built: elapsed(self.toolbar_webview_built),
             to_window_created: self.window_created?.duration_since(self.process_start),
             to_rust_setup_done: self.rust_setup_done?.duration_since(self.process_start),
             to_toolbar_script_started: self
@@ -134,8 +223,16 @@ impl StartupTimestamps {
 }
 
 /// Elapsed time from process start to each startup checkpoint.
+///
+/// The four `Option` fields are Issue #182's decomposition of
+/// `process_start` → `to_window_created`; see [`StartupTimestamps`] for what
+/// each one brackets and why they are optional.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StartupReport {
+    pub to_event_loop_built: Option<Duration>,
+    pub to_pre_window_setup_done: Option<Duration>,
+    pub to_native_window_built: Option<Duration>,
+    pub to_toolbar_webview_built: Option<Duration>,
     pub to_window_created: Duration,
     pub to_rust_setup_done: Duration,
     pub to_toolbar_script_started: Duration,
@@ -145,9 +242,25 @@ pub struct StartupReport {
 
 impl fmt::Display for StartupReport {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Issue #182's four sub-checkpoints render as `-` when absent
+        // rather than being dropped, so the field list of this line stays
+        // the same shape every time — a human diffing two `VELOX_PERF_OUTPUT`
+        // files (the `text` format's only consumer) can line them up.
+        let optional = |at: Option<Duration>| match at {
+            Some(at) => format_duration(at),
+            None => "-".to_owned(),
+        };
         write!(
             f,
-            "startup window_created={} rust_setup_done={} toolbar_script_started={} \
+            "startup event_loop={} pre_window_setup={} native_window={} toolbar_webview={} ",
+            optional(self.to_event_loop_built),
+            optional(self.to_pre_window_setup_done),
+            optional(self.to_native_window_built),
+            optional(self.to_toolbar_webview_built),
+        )?;
+        write!(
+            f,
+            "window_created={} rust_setup_done={} toolbar_script_started={} \
              toolbar_ready={} first_page={}",
             format_duration(self.to_window_created),
             format_duration(self.to_rust_setup_done),
@@ -156,6 +269,27 @@ impl fmt::Display for StartupReport {
             format_duration(self.to_first_load_finished),
         )
     }
+}
+
+/// The two checkpoints Issue #182 needs from *inside* window construction,
+/// filled in by `ui::BrowserWindow::new` and folded into
+/// [`StartupTimestamps`] by its caller.
+///
+/// A plain out-parameter rather than passing `&mut StartupTimestamps` down
+/// into `ui::` for two reasons. First, layering: `ui::BrowserWindow` is the
+/// one type that owns `tao`/`wry` handles, and this module is deliberately
+/// UI-toolkit-independent — a `Default`-constructed pair of `Option<Instant>`
+/// keeps the dependency pointing one way. Second, lifetime: `BrowserWindow`
+/// is built for *every* window (`app::open_new_window`, Ctrl/Cmd+N), but
+/// only the process's first one is part of startup; `open_new_window` passes
+/// `None` and pays nothing, exactly like the `ipc_log: Option<IpcLog>`
+/// parameter next to it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WindowBuildTimings {
+    /// tao's `WindowBuilder::build()` returned.
+    pub native_window_built: Option<Instant>,
+    /// The toolbar (first) webview was attached.
+    pub toolbar_webview_built: Option<Instant>,
 }
 
 /// Format a duration as fractional milliseconds, e.g. `"12.3ms"`.
@@ -901,6 +1035,35 @@ impl PerfRecord {
         fields.insert("ts_ms".to_owned(), json!(ms(elapsed)));
         match self {
             PerfRecord::Startup(report) => {
+                // Issue #182: like `engine_duration_ms`/`dispatch_duration_ms`
+                // on `page_load` (Issue #69/D87) and `total_pss_bytes` on
+                // `rss` (Issue #108/D42), these four keys are *always*
+                // present and serialize to JSON `null` when the checkpoint
+                // was never marked — never an absent key. A consumer can
+                // then tell "this build does not report it" (key missing
+                // entirely, i.e. a pre-#182 result file) apart from "this
+                // run did not reach it" (key present, `null`).
+                // `MetricKey::extract`'s `as_f64` drops both alike.
+                let optional_ms = |at: Option<Duration>| match at {
+                    Some(at) => json!(ms(at)),
+                    None => serde_json::Value::Null,
+                };
+                fields.insert(
+                    "event_loop_ms".to_owned(),
+                    optional_ms(report.to_event_loop_built),
+                );
+                fields.insert(
+                    "pre_window_setup_ms".to_owned(),
+                    optional_ms(report.to_pre_window_setup_done),
+                );
+                fields.insert(
+                    "native_window_ms".to_owned(),
+                    optional_ms(report.to_native_window_built),
+                );
+                fields.insert(
+                    "toolbar_webview_ms".to_owned(),
+                    optional_ms(report.to_toolbar_webview_built),
+                );
                 fields.insert(
                     "window_created_ms".to_owned(),
                     json!(ms(report.to_window_created)),
@@ -1533,6 +1696,24 @@ mod imp {
 mod tests {
     use super::*;
 
+    /// A [`StartupReport`] with all nine checkpoints set to distinct,
+    /// chronologically ordered values. Shared by the `PerfRecord` tests so
+    /// each one asserts on the fields it cares about instead of restating
+    /// the whole struct.
+    fn full_startup_report() -> StartupReport {
+        StartupReport {
+            to_event_loop_built: Some(Duration::from_millis(2)),
+            to_pre_window_setup_done: Some(Duration::from_millis(4)),
+            to_native_window_built: Some(Duration::from_millis(5)),
+            to_toolbar_webview_built: Some(Duration::from_millis(8)),
+            to_window_created: Duration::from_millis(10),
+            to_rust_setup_done: Duration::from_millis(12),
+            to_toolbar_script_started: Duration::from_millis(15),
+            to_toolbar_ready: Duration::from_millis(20),
+            to_first_load_finished: Duration::from_millis(30),
+        }
+    }
+
     // -- StartupTimestamps ------------------------------------------------
 
     #[test]
@@ -1582,6 +1763,107 @@ mod tests {
         timestamps.mark_first_load_finished(start);
         let report = timestamps.report().unwrap();
         assert_eq!(report.to_window_created, Duration::ZERO);
+    }
+
+    /// Issue #182: the four sub-checkpoints of `process_start` ->
+    /// `window_created` are diagnostics layered onto an existing
+    /// measurement. They must never be able to withhold the `startup`
+    /// record — every startup metric `velox-bench` reads comes from it.
+    #[test]
+    fn report_does_not_require_the_issue_182_sub_checkpoints() {
+        let start = Instant::now();
+        let mut timestamps = StartupTimestamps::new(start);
+        timestamps.mark_window_created(start);
+        timestamps.mark_rust_setup_done(start);
+        timestamps.mark_toolbar_script_started(start);
+        timestamps.mark_toolbar_ready(start);
+        timestamps.mark_first_load_finished(start);
+
+        let report = timestamps.report().expect("the original five suffice");
+        assert_eq!(report.to_event_loop_built, None);
+        assert_eq!(report.to_pre_window_setup_done, None);
+        assert_eq!(report.to_native_window_built, None);
+        assert_eq!(report.to_toolbar_webview_built, None);
+    }
+
+    #[test]
+    fn report_measures_the_issue_182_sub_checkpoints_from_process_start() {
+        let start = Instant::now();
+        let mut timestamps = StartupTimestamps::new(start);
+        timestamps.mark_event_loop_built(start + Duration::from_millis(100));
+        timestamps.mark_pre_window_setup_done(start + Duration::from_millis(110));
+        timestamps.mark_native_window_built(start + Duration::from_millis(120));
+        timestamps.mark_toolbar_webview_built(start + Duration::from_millis(600));
+        timestamps.mark_window_created(start + Duration::from_millis(644));
+        timestamps.mark_rust_setup_done(start + Duration::from_millis(645));
+        timestamps.mark_toolbar_script_started(start + Duration::from_millis(646));
+        timestamps.mark_toolbar_ready(start + Duration::from_millis(646));
+        timestamps.mark_first_load_finished(start + Duration::from_millis(717));
+
+        let report = timestamps.report().expect("every checkpoint recorded");
+        // Cumulative from process start, like every other checkpoint —
+        // *not* per-segment durations. Consumers subtract adjacent pairs.
+        assert_eq!(report.to_event_loop_built, Some(Duration::from_millis(100)));
+        assert_eq!(
+            report.to_pre_window_setup_done,
+            Some(Duration::from_millis(110))
+        );
+        assert_eq!(
+            report.to_native_window_built,
+            Some(Duration::from_millis(120))
+        );
+        assert_eq!(
+            report.to_toolbar_webview_built,
+            Some(Duration::from_millis(600))
+        );
+        assert_eq!(report.to_window_created, Duration::from_millis(644));
+    }
+
+    #[test]
+    fn only_the_first_mark_counts_for_the_issue_182_sub_checkpoints() {
+        let start = Instant::now();
+        let mut timestamps = StartupTimestamps::new(start);
+        timestamps.mark_event_loop_built(start);
+        timestamps.mark_event_loop_built(start + Duration::from_secs(10)); // ignored
+        timestamps.mark_pre_window_setup_done(start);
+        timestamps.mark_pre_window_setup_done(start + Duration::from_secs(10)); // ignored
+        timestamps.mark_native_window_built(start);
+        timestamps.mark_native_window_built(start + Duration::from_secs(10)); // ignored
+        timestamps.mark_toolbar_webview_built(start);
+        timestamps.mark_toolbar_webview_built(start + Duration::from_secs(10)); // ignored
+        timestamps.mark_window_created(start);
+        timestamps.mark_rust_setup_done(start);
+        timestamps.mark_toolbar_script_started(start);
+        timestamps.mark_toolbar_ready(start);
+        timestamps.mark_first_load_finished(start);
+
+        let report = timestamps.report().unwrap();
+        assert_eq!(report.to_event_loop_built, Some(Duration::ZERO));
+        assert_eq!(report.to_pre_window_setup_done, Some(Duration::ZERO));
+        assert_eq!(report.to_native_window_built, Some(Duration::ZERO));
+        assert_eq!(report.to_toolbar_webview_built, Some(Duration::ZERO));
+    }
+
+    /// The `text` perf format keeps one field per checkpoint even when a
+    /// sub-checkpoint is missing, so two logs stay diffable line-by-line.
+    #[test]
+    fn startup_display_renders_absent_sub_checkpoints_as_a_dash() {
+        let full = full_startup_report().to_string();
+        assert!(full.contains("event_loop=2.0ms"), "{full}");
+        assert!(full.contains("toolbar_webview=8.0ms"), "{full}");
+        assert!(full.contains("window_created=10.0ms"), "{full}");
+
+        let partial = StartupReport {
+            to_event_loop_built: None,
+            to_pre_window_setup_done: None,
+            to_native_window_built: None,
+            to_toolbar_webview_built: None,
+            ..full_startup_report()
+        }
+        .to_string();
+        assert!(partial.contains("event_loop=- "), "{partial}");
+        assert!(partial.contains("toolbar_webview=- "), "{partial}");
+        assert!(partial.contains("window_created=10.0ms"), "{partial}");
     }
 
     #[test]
@@ -1983,13 +2265,7 @@ mod tests {
 
     #[test]
     fn perf_record_startup_text_matches_legacy_display() {
-        let report = StartupReport {
-            to_window_created: Duration::from_millis(10),
-            to_rust_setup_done: Duration::from_millis(12),
-            to_toolbar_script_started: Duration::from_millis(15),
-            to_toolbar_ready: Duration::from_millis(20),
-            to_first_load_finished: Duration::from_millis(30),
-        };
+        let report = full_startup_report();
         let expected = report.to_string();
         assert_eq!(PerfRecord::startup(report).to_text(), expected);
         assert_eq!(PerfRecord::startup(report).event_name(), "startup");
@@ -2199,19 +2475,47 @@ mod tests {
     }
 
     #[test]
-    fn perf_record_startup_json_has_all_five_checkpoints() {
-        let report = StartupReport {
-            to_window_created: Duration::from_millis(10),
-            to_rust_setup_done: Duration::from_millis(12),
-            to_toolbar_script_started: Duration::from_millis(15),
-            to_toolbar_ready: Duration::from_millis(20),
-            to_first_load_finished: Duration::from_millis(30),
-        };
-        let value = PerfRecord::startup(report).to_json(Duration::from_millis(30));
+    fn perf_record_startup_json_has_all_nine_checkpoints() {
+        let value = PerfRecord::startup(full_startup_report()).to_json(Duration::from_millis(30));
+        // Issue #182's four sub-checkpoints of `process_start` ->
+        // `window_created`, in chronological order ...
+        assert_eq!(value["event_loop_ms"], 2.0);
+        assert_eq!(value["pre_window_setup_ms"], 4.0);
+        assert_eq!(value["native_window_ms"], 5.0);
+        assert_eq!(value["toolbar_webview_ms"], 8.0);
+        // ... then the five that predate it.
         assert_eq!(value["window_created_ms"], 10.0);
         assert_eq!(value["rust_setup_done_ms"], 12.0);
         assert_eq!(value["toolbar_script_started_ms"], 15.0);
         assert_eq!(value["toolbar_ready_ms"], 20.0);
+        assert_eq!(value["first_load_ms"], 30.0);
+    }
+
+    /// Issue #182: a build that never marked the four new checkpoints (or a
+    /// run that somehow skipped them) must still emit the keys, as JSON
+    /// `null` — never an absent key and never a fabricated `0`, matching
+    /// `total_pss_bytes` (D42) and `engine_duration_ms` (D87).
+    #[test]
+    fn perf_record_startup_json_nulls_absent_sub_checkpoints() {
+        let report = StartupReport {
+            to_event_loop_built: None,
+            to_pre_window_setup_done: None,
+            to_native_window_built: None,
+            to_toolbar_webview_built: None,
+            ..full_startup_report()
+        };
+        let value = PerfRecord::startup(report).to_json(Duration::from_millis(30));
+        for key in [
+            "event_loop_ms",
+            "pre_window_setup_ms",
+            "native_window_ms",
+            "toolbar_webview_ms",
+        ] {
+            assert!(value.get(key).is_some(), "{key} must still be present");
+            assert!(value[key].is_null(), "{key} must be null, not 0");
+        }
+        // The five original checkpoints are unaffected.
+        assert_eq!(value["window_created_ms"], 10.0);
         assert_eq!(value["first_load_ms"], 30.0);
     }
 

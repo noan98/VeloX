@@ -389,7 +389,34 @@ fn startup_completes_and_records_a_startup_event() {
         launch.perf_records
     );
     let startup = startup_records[0];
-    for field in ["window_created_ms", "toolbar_ready_ms", "first_load_ms"] {
+    // Issue #182 (docs/decisions.md D92) added the first four: they are
+    // filled in from *inside* `ui::window::BrowserWindow::new` (its
+    // `build_timings` out-parameter) and folded back into
+    // `metrics::StartupTimestamps` by `app::run`. That round trip is
+    // exactly the kind of wiring a unit test cannot check, so this list is
+    // deliberately the full chronological chain rather than a sample.
+    //
+    // These are ordered by construction: every one is reached from the same
+    // straight-line call stack in `app::run` (the first five), and
+    // `toolbar_ready` can only be marked from the event loop that starts
+    // after it. A regression that marked a checkpoint at the wrong place —
+    // or reused a neighbour's timestamp — shows up here and nowhere else.
+    //
+    // `first_load_ms` is deliberately *not* in this chain: the content
+    // tab's `LoadFinished` and the toolbar's `ready` handshake are
+    // independent, and the page really can finish first (measured on this
+    // project's Linux sandbox: `toolbar_ready` → `first_load` came out as
+    // low as -8.1ms over 10 trials). Asserting an order between those two
+    // would be asserting a race. It is checked for sanity below instead.
+    let ordered_checkpoints = [
+        "event_loop_ms",
+        "pre_window_setup_ms",
+        "native_window_ms",
+        "toolbar_webview_ms",
+        "window_created_ms",
+        "toolbar_ready_ms",
+    ];
+    let sane = |field: &str| -> f64 {
         let value = startup[field]
             .as_f64()
             .unwrap_or_else(|| panic!("startup record is missing `{field}`: {startup}"));
@@ -397,7 +424,20 @@ fn startup_completes_and_records_a_startup_event() {
             value.is_finite() && value >= 0.0,
             "{field} = {value} is not sane"
         );
+        value
+    };
+    let mut previous: Option<(&str, f64)> = None;
+    for field in ordered_checkpoints {
+        let value = sane(field);
+        if let Some((previous_field, previous_value)) = previous {
+            assert!(
+                value >= previous_value,
+                "{field} = {value} precedes {previous_field} = {previous_value}: {startup}"
+            );
+        }
+        previous = Some((field, value));
     }
+    sane("first_load_ms");
 }
 
 // ---------------------------------------------------------------------

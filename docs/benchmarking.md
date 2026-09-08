@@ -184,7 +184,13 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 
 | メトリクス名 (`BenchmarkResult.metrics` のキー) | 由来イベント | フィールド |
 |---|---|---|
+| `startup_event_loop_ms` | `startup` | `event_loop_ms` (tao のイベントループ生成完了。Issue #182 / D92) |
+| `startup_pre_window_setup_ms` | `startup` | `pre_window_setup_ms` (**VeloX 自身の Rust セットアップ完了**。Issue #182 / D92) |
+| `startup_native_window_ms` | `startup` | `native_window_ms` (tao のネイティブウィンドウ生成完了。Issue #182 / D92) |
+| `startup_toolbar_webview_ms` | `startup` | `toolbar_webview_ms` (最初の webview = エンジン初回初期化の完了。Issue #182 / D92) |
 | `startup_window_created_ms` | `startup` | `window_created_ms` |
+| `startup_rust_setup_done_ms` | `startup` | `rust_setup_done_ms` (イベントループに入る直前。Issue #59 / D43) |
+| `startup_toolbar_script_started_ms` | `startup` | `toolbar_script_started_ms` (ツールバーの inline script 開始。Issue #59 / D43) |
 | `startup_toolbar_ready_ms` | `startup` | `toolbar_ready_ms` |
 | `startup_first_load_ms` | `startup` | `first_load_ms` |
 | `page_load_ms` | `page_load` | `duration_ms` |
@@ -199,6 +205,15 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | `rss_process_count` | `rss` | `process_count` |
 | `pss_total_bytes` | `rss` | `total_pss_bytes` |
 | `pss_process_count` | `rss` | `pss_process_count` |
+
+**`startup_*` はすべて「プロセス開始からの累積 ms」であり、区間の長さでは
+ない** (Issue #182 / D92)。ある区間の長さを見たいときは隣り合うチェック
+ポイントを引き算する。ただし**結果ファイルに入るのは累積値の統計なので、
+中央値どうしの差は「区間の中央値」ではない** — それぞれの中央値は別々の
+試行から来うる。区間そのものの分布を論じる手順は
+`docs/performance-targets.md` §24.2 にある。また `startup_toolbar_ready_ms`
+と `startup_first_load_ms` は独立した経路から来るため**順序が保証されず**、
+この 2 つの差は区間として読んではいけない (D92)。
 
 **`pss_total_bytes` (Issue #108 / D42), not `rss_total_bytes`, is the metric
 to use when comparing memory footprint across builds or against another
