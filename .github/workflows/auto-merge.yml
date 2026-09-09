@@ -117,8 +117,27 @@ on:
   # まで見て行う)。`if` の絞り込みは、外部ユーザに書き込み権限付き
   # workflow を起動させないため + 空振り実行を減らすための多層防御。
   # docs/decisions.md D102 を参照。
+  #
+  # ⚠️ **`edited` を必ず含めること (Issue #219 / D103 決定4)。**
+  # `claude-code-action` は**進捗コメントを 1 つ立てて、それを編集して
+  # 完了させる**。つまり**レビュー完了は `created` ではなく `edited` として
+  # 届く。** `created` だけを購読していると、届くのは「Claude Code is
+  # working…」の時点だけで、その時ゲートは当然「応答待ち」と判定する。
+  # そして 3 分後に本当のレビューが載っても**何も起動しない。**
+  #
+  # PR #220 で実測 (2026-09-09):
+  #   21:55 auto-merge が `@claude` を依頼
+  #   21:56 「working…」が `created` → 起動 → "応答を待っています" で見送り
+  #   21:59 レビュー完了が `edited` → **起動せず**。CI 全緑・猶予期間満了済み
+  #         なのに 38 分以上停止した
+  # `@codex review` 経路は Codex が毎回**新規コメント**を投稿するので
+  # 表面化していなかった。Claude フォールバック (D100 決定1) 特有の穴である。
+  #
+  # 編集のたびに起動するので空振りは増える (1 レビューあたり 3〜4 回、
+  # 1 回 15 秒程度)。auto-merge 自身の依頼コメントは下の `if` のマーカー
+  # 判定で弾かれるため、自己ループにはならない。
   issue_comment:
-    types: [created]
+    types: [created, edited]
   pull_request_review:
     types: [submitted, dismissed]
   workflow_dispatch: {}
