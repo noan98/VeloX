@@ -45,8 +45,21 @@ jobs:
           # `is_error: true` / `modelUsage: {}` (モデル呼び出し 0 回) まで
           # 分かったが、肝心のエラー本文がここで伏せられていた。
           #
-          # 本リポジトリはプライベートなので、ログを読めるのはオーナーだけ。
-          # 診断が終わり `@claude` フォールバックが安定して動くように
-          # なったら false に戻すことを検討する (トークン自体の検証だけなら
-          # `claude-token-check.yml` のプローブで足りる)。
-          show_full_output: true
+          # **2026-09-09 に false (action の既定) へ戻した。理由は 2 つ。**
+          #
+          #   1. **診断が完了した。** 原因は `CLAUDE_CODE_OAUTH_TOKEN` の値に
+          #      改行が混入していたことで、再登録後は tag モードで PR #216 を
+          #      レビューできることまで実測済み (docs/decisions.md D98)。
+          #      この行を足した目的はもう果たされている。
+          #   2. **「本リポジトリはプライベートなので、ログを読めるのは
+          #      オーナーだけ」という当初の但し書きは誤りになった。**
+          #      リポジトリは 2026-09-09 に public へ変更されており、
+          #      **Actions のログは誰でも読める** (docs/decisions.md D102)。
+          #      action がこの出力を既定で伏せているのは
+          #      ("full output hidden for security")、実行ログに環境の情報が
+          #      そのまま出うるためで、public では既定に従うのが安全側。
+          #
+          # 再び診断が必要になったら、まず `claude-token-check.yml` の
+          # プローブ (workflow_dispatch、オーナーのみ起動可) を使うこと。
+          # それでも足りなければこの行を一時的に true へ戻す。
+          show_full_output: false

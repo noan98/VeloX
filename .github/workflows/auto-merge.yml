@@ -1,9 +1,16 @@
 name: Auto Merge
 
-# プライベートリポジトリでは GitHub 標準の auto-merge 機能が使えないため、
-# 「この workflow 以外のすべてのチェックが成功 (success) または
-# スキップ (skipped / neutral) になった PR を自動でマージする」仕組みを
-# 自前で用意する。設計判断は docs/decisions.md D55 を参照。
+# 「この workflow 以外のすべてのチェックが成功 (success) またはスキップ
+# (skipped / neutral) になり、かつレビュー条件を満たした PR を自動で
+# マージする」仕組みを自前で用意する。設計判断は docs/decisions.md D55。
+#
+# ⚠️ D55 当時の導入理由は「**プライベートリポジトリでは GitHub 標準の
+# auto-merge が使えない**」だった。**この前提は 2026-09-09 に消滅した** —
+# リポジトリを public に変更したため、標準 auto-merge は利用できる
+# (docs/decisions.md D102)。それでも自前実装を残しているのは、標準
+# auto-merge が持たない下記 4. のレビューゲート (Codex / Claude の
+# レビュー必須化・自動リクエスト・猶予期間) がこの仕組みの本体だから
+# である。「private だから」ではなく「レビューゲートのため」に残している。
 #
 # 動作の流れ:
 #   1. 他の workflow (CI / perf-gate / release-windows / dependency-audit)
@@ -79,17 +86,31 @@ on:
   # ない**。下の `if` で自分のマーカーを含むコメントを弾き、空振りの実行自体も
   # 減らしてある。
   #
-  # ⚠️ **セキュリティ**: `contents: write` とマージ権限を持つ workflow を
-  # コメントで起動できるようにするのは、一般には権限昇格の経路になりうる。
-  # ここで許容できると判断した根拠は 2 つ:
-  #   1. 本リポジトリはプライベートで、コメントできるのは共同作業者だけ
-  #      (公開リポジトリなら誰でも発火できるため、この判断は成立しない)。
-  #   2. **このジョブはコメント本文を判定に一切使わない。** 起動後は
-  #      `gh pr list` から open PR を取り直し、check-runs とレビュー状態を
-  #      API から読んで一から判定する。したがってコメントでできるのは
-  #      「判定をやり直させる」ことだけで、**判定結果を変えることはできない。**
-  #      上の `if` が本文を見るのは空振りを減らすためだけで、安全性はゲート
-  #      本体 (check_review_gate.py) が担保している。
+  # ⚠️ **セキュリティ**: `contents: write` とマージ権限 (および
+  # `AUTO_MERGE_TOKEN` = repo 権限の PAT) を持つ workflow を、コメントで
+  # 起動できるようにするのは権限昇格の経路になりうる。
+  #
+  # **本リポジトリは 2026-09-09 に public へ変更された** (CI の利用上限を
+  # 緩和するため)。public リポジトリでは **GitHub の任意のユーザが Issue /
+  # PR にコメントできる** ため、「コメントできるのは共同作業者だけ」という
+  # 前提は成立しない。そこで下のジョブ `if` で **投稿者を絞り込む**:
+  #   - `author_association` が OWNER / MEMBER / COLLABORATOR、または
+  #   - ログイン名がレビューボット (`chatgpt-codex-connector[bot]` /
+  #     `claude[bot]`) と完全一致
+  # のいずれかを満たすコメントでしか起動しない。ボットのログイン名は
+  # `[` `]` を含み **GitHub のユーザ名として作成できない** ので、一般
+  # ユーザがこの一致を偽装することはできない。`pull_request_review`
+  # トリガも同じ条件で絞る (public リポジトリではレビューも誰でも出せる)。
+  #
+  # なおゲート判定そのものの安全性は、この `if` ではなくジョブ本体が担保
+  # している: **このジョブはコメント本文を判定に一切使わない。** 起動後は
+  # `gh pr list` から open PR を取り直し、check-runs とレビュー状態を
+  # API から読んで一から判定する。したがってコメントでできるのは
+  # 「判定をやり直させる」ことだけで、**判定結果を変えることはできない**
+  # (レビュー本体の照合は check_review_gate.py が `__typename == "Bot"`
+  # まで見て行う)。`if` の絞り込みは、外部ユーザに書き込み権限付き
+  # workflow を起動させないため + 空振り実行を減らすための多層防御。
+  # docs/decisions.md D102 を参照。
   issue_comment:
     types: [created]
   pull_request_review:
@@ -101,11 +122,16 @@ on:
   # (D88) と同じパターン: workflow_dispatch は main にマージされるまで
   # Actions タブに現れないため、workflow 自身の変更を検証する唯一の手段。
   # 実際にマージはしない (下の dry-run-review-gate ジョブを参照)。
+  #
+  # paths は `.github/scripts/**` 全体にしてある。判定ロジック本体だけでなく
+  # そのテスト (test_*.py) の変更でも dry-run ジョブを走らせたいため
+  # — このジョブが `.github/scripts` の Python テストを回す唯一の場所である
+  # (ci.yml は Rust だけを見ており、これらのテストは長らく CI で
+  # 一度も実行されていなかった。docs/decisions.md D102)。
   pull_request:
     paths:
       - ".github/workflows/auto-merge.yml"
-      - ".github/scripts/check_review_gate.py"
-      - ".github/scripts/review_gate_decision.sh"
+      - ".github/scripts/**"
 
 permissions:
   contents: write
@@ -161,14 +187,34 @@ jobs:
     # pull_request トリガは dry-run-review-gate 専用 (下記)。実際にマージを
     # 行うこのジョブは pull_request では絶対に起動しない。
     #
-    # auto-merge 自身が投稿した依頼コメント (マーカー入り) では起動しない。
-    # 判定材料が何も増えていないので走らせても空振りするだけで、Actions の
-    # ログが読みにくくなる。**レビューボットの返答では起動する** — それが
-    # このトリガを足した目的である。
+    # コメント / レビュー起動の条件 (docs/decisions.md D102)。上から順に:
+    #
+    #   - `issue_comment` は **PR に付いたコメントに限る**。素の Issue への
+    #     コメントで走らせても、このジョブは PR しか見ないので必ず空振りする。
+    #     `github.event.issue.pull_request` は PR のときだけ存在するオブジェクト
+    #     なので、`.url != ''` で判別する (Issue のときは null → '' 扱い)。
+    #   - auto-merge 自身が投稿した依頼コメント (マーカー入り) では起動しない。
+    #     判定材料が何も増えていないので走らせても空振りするだけ。
+    #   - **投稿者が信頼できる場合に限る (public リポジトリ対策)。**
+    #     `author_association` が OWNER / MEMBER / COLLABORATOR か、ログイン名が
+    #     レビューボットと完全一致する場合のみ。ボットのログイン名に含まれる
+    #     `[` `]` は GitHub のユーザ名に使えないため、一般ユーザは偽装できない。
+    #     ボットの `author_association` は NONE / CONTRIBUTOR になりうるので、
+    #     ログイン名の一致を別に見る必要がある。
+    #   - `pull_request_review` も同条件で絞る。public リポジトリでは
+    #     **レビューも誰でも提出できる**ため、コメントと同じ扱いにする。
+    #
+    # **レビューボットの返答では起動する** — それがこのトリガを足した目的である。
     if: >-
-      github.event_name != 'pull_request' &&
-      !(github.event_name == 'issue_comment' &&
-        contains(github.event.comment.body, '<!-- auto-merge:'))
+      github.event_name != 'pull_request'
+      && (github.event_name != 'issue_comment'
+      || (github.event.issue.pull_request.url != ''
+      && !contains(github.event.comment.body, '<!-- auto-merge:')
+      && (contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      || contains(fromJSON('["chatgpt-codex-connector[bot]", "claude[bot]"]'), github.event.comment.user.login))))
+      && (github.event_name != 'pull_request_review'
+      || contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.review.author_association)
+      || contains(fromJSON('["chatgpt-codex-connector[bot]", "claude[bot]"]'), github.event.review.user.login))
     steps:
       # Issue #168: この job は元々リポジトリを checkout していなかった
       # (gh CLI と API しか使わないため必要が無かった)。マージ後の Issue
@@ -390,6 +436,18 @@ jobs:
       checks: read
     steps:
       - uses: actions/checkout@v7
+
+      # Issue #188 / D102: 判定ロジックの単体テスト。これまで
+      # `.github/scripts/test_*.py` は CI のどこからも実行されていなかった
+      # (ci.yml は Rust のみ)。ロジックを触る PR ではここで必ず回す。
+      - name: 判定ロジックの単体テスト
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
+
+      - name: レビュー判定ロジックの shell 側テスト
+        run: bash .github/scripts/test_review_gate_decision.sh
 
       - name: レビュー判定ロジックを検証実行する (マージは一切行わない)
         env:
