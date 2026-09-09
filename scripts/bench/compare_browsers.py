@@ -303,6 +303,34 @@ def summarize(values: list[float]) -> dict:
     }
 
 
+def format_trial_line(trial: int, name: str, result: dict) -> str:
+    """試行 1 回ぶんの進捗表示を組み立てる。
+
+    **`pss_bytes` は Windows では常に `None`、`private_bytes` は Linux では
+    常に `None`** なので、どちらかを直接割り算してはいけない。ここを純粋関数に
+    切り出してあるのは、**両 OS 分の形をユニットテストで踏めるようにするため**
+    である (run 34364659960 で、サマリ表だけ Windows 対応にして**この 1 行を
+    直し忘れ**、計測が完了したあとの表示で `TypeError` になった)。
+    """
+    lower = result.get("lower_bytes")
+    upper = result.get("upper_bytes")
+    span = (
+        f"mem={lower / 1024 / 1024:.1f}"
+        if lower is not None and lower == upper
+        else f"mem=[{'—' if lower is None else format(lower / 1024 / 1024, '.1f')}, "
+        f"{upper / 1024 / 1024:.1f}]"
+    )
+    line = (
+        f"  試行 {trial}: {name}: "
+        f"{result['startup_to_load_ms']:.1f}ms "
+        f"{span}MiB procs={result['process_count']}"
+    )
+    if result.get("unreadable_count"):
+        # 読めなかったプロセスがあると合計は過小評価になる。黙って出さない。
+        line += f" (うち {result['unreadable_count']} プロセスは読めず)"
+    return line
+
+
 #: T2 の判定しきい値 (`docs/performance-targets.md` の「Chromium 比 +10% 以内」)。
 T2_THRESHOLD = 0.10
 
@@ -445,13 +473,7 @@ def main() -> int:
                     print(f"  試行 {trial}: {name}: load を検知できませんでした")
                     continue
                 samples[name].append(result)
-                print(
-                    f"  試行 {trial}: {name}: "
-                    f"{result['startup_to_load_ms']:.1f}ms "
-                    f"pss={result['pss_bytes'] / 1024 / 1024:.1f}MiB "
-                    f"rss={result['rss_bytes'] / 1024 / 1024:.1f}MiB "
-                    f"procs={result['process_count']}"
-                )
+                print(format_trial_line(trial, name, result))
     finally:
         server.shutdown()
         shutil.rmtree(workdir, ignore_errors=True)

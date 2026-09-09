@@ -3307,3 +3307,41 @@ Chrome との比較にはエンジン差が含まれる。
 `proctree.py` の ctypes FFI (Toolhelp32 / `QueryWorkingSet`) は**まだ一度も実行
 されていない** — 失敗が print で起きたため、そこまで到達していない。D99 Revisit
 condition (2) は未解決のままである。
+
+### 29.7 2 回目の実行 (run 34364659960) — 計測は成功したが、また表示で落ちた
+
+文字コードを直して再実行すると、**今度は計測そのものが最後まで動いた** — ブラウザ
+が起動し、`load` を検知し、メモリも採れた。それでもジョブは失敗した。落ちたのは
+**試行ごとの進捗を表示する 1 行**である。
+
+```
+File "compare_browsers.py", line 451, in main
+    f"pss={result['pss_bytes'] / 1024 / 1024:.1f}MiB "
+TypeError: unsupported operand type(s) for /: 'NoneType' and 'int'
+```
+
+**サマリ表は Windows 対応にしたのに、この 1 行を直し忘れていた。** `pss_bytes` は
+Windows では常に `None` である。
+
+### 同じ失敗が 2 回続いた — 教訓
+
+| 回 | 落ちた場所 | 計測そのもの |
+| --- | --- | --- |
+| 1 (§29.6) | 自動検出の結果を `print` する行 (cp1252) | 成功していた |
+| 2 (本節) | 試行ごとの進捗を `print` する行 (`None` の割り算) | **成功していた** |
+
+**どちらも計測は正しく動いていて、結果を表示する段で落ちている。** 私は
+「計測ロジックを Windows 対応にする」ことに注意を集中し、**出力側を同じ厳しさで
+見ていなかった。** OS 依存の値を `None` にする設計にした以上、**その値に触る
+すべての箇所**が対象なのに、集計側 (`summarize` / サマリ表 / `compare_bounds`)
+だけを直して、逐次表示を見落とした。
+
+対策として進捗表示を純粋関数 `format_trial_line` に切り出し、**Linux 形
+(`private_bytes` が `None`) と Windows 形 (`pss_bytes` が `None`) の両方を
+ユニットテストで踏む**ようにした。文字コードの方も
+`PYTHONIOENCODING=cp1252` で Linux から再現できるテストにしてある。
+**どちらも「Windows 実機が無いと踏めない」失敗ではなかった** — テストの
+形を先に用意していれば防げた。
+
+ランナーは Intel Xeon Platinum 8370C (4 論理コア) で、§29.6 の AMD EPYC 7763 とは
+別機種だった。D96 のとおり `windows-latest` は run ごとに機種が変わる。
