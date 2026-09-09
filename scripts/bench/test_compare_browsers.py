@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -84,6 +86,37 @@ class CompareBoundsTest(unittest.TestCase):
         """相手のメモリが 0 は計測失敗。**0 除算より前に弾く。**"""
         verdict, _ = compare_bounds(100 * MIB, 100 * MIB, 0, 0)
         self.assertEqual(verdict, "unknown")
+
+
+class OutputEncodingTest(unittest.TestCase):
+    """日本語の出力で計測が落ちないこと (Issue #197、run 34364067651 の回帰)。
+
+    Windows の Python は標準出力が cp1252 になることがあり、**日本語を
+    `print` しただけで `UnicodeEncodeError` で落ちる。** Windows 対応の初回
+    実行がまさにこれで失敗した — 比較相手の自動検出も計測ロジックも正しく
+    動いていたのに、**「自動検出しました」と表示する行だけで計測全体が
+    落ちた。**
+
+    Linux でも `PYTHONIOENCODING=cp1252` を与えれば同じ条件を作れるので、
+    Windows 実機なしで回帰を止められる。
+    """
+
+    def test_runs_under_a_non_utf8_stdout_encoding(self):
+        script = Path(__file__).resolve().parent / "compare_browsers.py"
+        result = subprocess.run(
+            [sys.executable, str(script), "--help"],
+            capture_output=True,
+            text=True,
+            # 日本語を表現できないコードページを強制する。修正前はここで
+            # UnicodeEncodeError になっていた。
+            env={**os.environ, "PYTHONIOENCODING": "cp1252"},
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"cp1252 の標準出力で失敗しました:\n{result.stderr}",
+        )
+        self.assertNotIn("UnicodeEncodeError", result.stderr)
 
 
 if __name__ == "__main__":

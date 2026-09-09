@@ -3264,3 +3264,46 @@ Chrome との比較も選べるが、そちらはエンジン差を含む (Linux
 「実機で検証する手段が無い」ことだったので、**検証手段を先に用意する**という順序に
 してある。単体テストで固定できたのは木の走査・集計 (`collect_tree`) と判定
 (`compare_bounds`) だけで、FFI 部分は実機で走るまで未検証と扱うこと。
+
+### 29.6 初回実行 (run 34364067651) — 計測には到達しなかったが、確認できたこと
+
+`compare-windows.yml` の初回実行は**失敗した**。ただし失敗したのは計測ロジック
+ではなく、**日本語を `print` した行**である。
+
+```
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 0-12
+  File "compare_browsers.py", line 411, in main
+    print(f"比較相手を自動検出しました: {detected_name} ({baseline_path})")
+```
+
+Windows の Python は標準出力が cp1252 になることがあり、日本語を出力しただけで
+落ちる。**比較相手の自動検出も、その手前の単体テストもビルドも成功していた**のに、
+表示の 1 行で計測全体が終わった。`sys.stdout.reconfigure(encoding="utf-8")` で
+修正し、`PYTHONIOENCODING=cp1252` を与えれば Linux でも同じ条件を再現できるので
+回帰テストにした。
+
+計測には届かなかったが、**この run で確認できたことが 3 つある。**
+
+**1. 単体テストは Windows でも通る。** Python 3.12.10 で 17 件成功。木の走査・集計
+と判定ロジックが OS 非依存であることが実機で確かめられた。
+
+**2. Edge との比較はエンジンが同一であると確認できた。** 環境記録ステップの値:
+
+| 項目 | 値 |
+| --- | --- |
+| Edge | 151.0.4129.101 |
+| **WebView2 Runtime** | **151.0.4129.101** |
+| Chrome | 151.0.7922.174 |
+
+**WebView2 Runtime と Edge のバージョンが完全に一致している。** §29.3 では
+「VeloX は WebView2 = Edge と同じエンジンを使う」と設計上の理由から述べたが、
+これは**実測による裏づけ**である。Chrome は別バージョン (151.0.7922.174) なので、
+Chrome との比較にはエンジン差が含まれる。
+
+**3. ランナーの構成。** Windows Server 2025 build 26100 / AMD EPYC 7763
+(4 論理コア) / RAM 16 GiB。D96 のとおり `windows-latest` は run ごとに機種が
+変わるため、**この値は次回も同じとは限らない。**
+
+`proctree.py` の ctypes FFI (Toolhelp32 / `QueryWorkingSet`) は**まだ一度も実行
+されていない** — 失敗が print で起きたため、そこまで到達していない。D99 Revisit
+condition (2) は未解決のままである。

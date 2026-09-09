@@ -12885,6 +12885,10 @@ Windows では事情が変わる。**VeloX は WebView2、つまり Edge と同�
 はっきりした。自動検出は Edge を先に探し、Chrome を選んだ場合はエンジン差を含む
 ことを結果に明記する。
 
+**これは設計上の推論ではなく実測で裏づけられた。** run 34364067651 の環境記録で
+Edge と WebView2 Runtime がともに `151.0.4129.101` (完全一致)、Chrome は
+`151.0.7922.174` (別バージョン) だった。
+
 ### 決定4: 重複していた `/proc` 走査を `proctree.py` に集約する
 
 `process_tree_memory` は `compare_browsers.py` / `tab_scaling.py` / `tab_churn.py`
@@ -12907,7 +12911,7 @@ Windows PSS 相当を Rust 側に実装するかは、依然として未決の�
 まだ言えていない。`compare-windows.yml` を走らせて §29 に転記するまで、Stage 1
 (#176) は閉じられない。
 (2) ⚠️ **`proctree.py` の Windows 実装 (ctypes による FFI) は一度も実行されて
-いない。** 開発環境は Linux コンテナで Windows 実機が無い (D61/D88 と同じ制約)。
+いない** (初回実行 run 34364067651 は計測に届く前に落ちた。§29.6)。 開発環境は Linux コンテナで Windows 実機が無い (D61/D88 と同じ制約)。
 単体テストで固定できたのは木の走査・集計 (`collect_tree`) と判定
 (`compare_bounds`) だけである。`QueryWorkingSet` のバッファ再取得や
 `PROCESS_QUERY_INFORMATION` の権限まわりは実機で落ちうる。**最初の実行が失敗する

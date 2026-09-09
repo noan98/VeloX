@@ -99,6 +99,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from proctree import TreeMemory, process_tree_memory, supported  # noqa: E402
 
+# ⚠️ **Windows の Python は標準出力が cp1252 になることがあり、日本語を
+# `print` しただけで `UnicodeEncodeError` で落ちる。** 実際 run 34364067651
+# (Windows 対応の初回実行) は、比較相手を自動検出したことを表示する行で
+# 落ちた — 検出も計測も正しく動いていたのに、**出力の文字コードだけで
+# 計測全体が失敗した。** 明示的に UTF-8 に張り替えてから走らせる。
+# `errors="replace"` にしておくのは、コンソールが UTF-8 を表示できない
+# 環境でも**計測を止めないため** (表示が化けるのは、計測が落ちるより遥かに
+# ましである)。
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+
 PAGES_DIR = Path(__file__).resolve().parent / "pages"
 
 # `load` の後に 1 回だけ beacon を送る。`load` にしているのは、DOMContentLoaded
