@@ -495,7 +495,8 @@ def main() -> int:
         "baseline": baseline_name,
         "memory_metric": (
             "pss (smaps_rollup)" if sys.platform.startswith("linux")
-            else "working set の上下界 (PSS は Windows に存在しない — D88)"
+            else "private working set と ShareCount 由来の上界で挟む区間 "
+            "(PSS は Windows に存在しない — D88/D99)"
         ),
         "browsers": {
             name: {
@@ -564,9 +565,10 @@ def main() -> int:
     else:
         print(
             "\n注: Windows に PSS は無い (docs/decisions.md D88)。lower は"
-            " Private Working Set 合計、\nupper は Working Set 合計で、"
-            "真の値はこの区間のどこかにある。**区間の端を代表値として"
-            "\n引用しないこと。** OS をまたいだ数値比較も成立しない (Epic #57)。"
+            " Private Working Set 合計、\nupper は共有ページを ShareCount で"
+            "割った和で、どちらも真の PSS を挟む厳密な値である\n(近似値ではない"
+            " — 詳細は proctree.py)。**区間の端を代表値として引用しないこと。**"
+            "\nOS をまたいだ数値比較も成立しない (Epic #57)。"
         )
 
     # --- T2 の判定 --------------------------------------------------------

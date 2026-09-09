@@ -232,8 +232,10 @@ jobs:
               }
             }
             $lines += "> ⚠️ Windows に PSS は無い (docs/decisions.md D88)。下界は Private Working Set 合計、"
-            $lines += "> 上界は Working Set 合計で、真の値はこの区間のどこかにある。**区間の端を代表値として"
-            $lines += "> 引用しないこと。** Linux の PSS と数値を並べることも成立しない (Epic #57 の絶対ルール5)。"
+            $lines += "> 上界は共有ページを ShareCount で割った和で、**どちらも近似値ではなく真の PSS を挟む"
+            $lines += "> 厳密な値である** (D99 決定1)。真の値はこの区間のどこかにあるので、**区間の端を"
+            $lines += "> 代表値として引用しないこと。** Linux の PSS と数値を並べることも成立しない"
+            $lines += "> (Epic #57 の絶対ルール5)。"
           } else {
             $lines += "### 結果"
             $lines += ""
