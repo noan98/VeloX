@@ -154,7 +154,7 @@ from __future__ import annotations
 import json
 import re
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # GraphQL で最新レビューが CHANGES_REQUESTED として残っていることを示す状態。
@@ -231,6 +231,25 @@ def claude_review_request_comment_body(head_sha: str, pr_title: str | None) -> s
 # Codex の利用上限メッセージに含まれる定型文言 (実測: "You have reached
 # your Codex usage limits for code reviews.")。大小無視の部分一致。
 _USAGE_LIMIT_PHRASE = "reached your codex usage limits"
+
+#: `anthropics/claude-code-action` がレビューを**完了した**ときにコメント
+#: 本文の先頭へ付ける見出し。実測 (PR #216):
+#:
+#:     **Claude finished @noan98's task in 2m 15s** —— [View job](...)
+#:
+#: 起動直後の進捗コメント (「Claude Code is working…」) や、失敗時の
+#: 「**Claude encountered an error after 0s**」には現れない。
+#: **この違いが Issue #203 の懸念を解く鍵である** (下記
+#: `_claude_completed_review_after` の docstring を参照)。
+_CLAUDE_COMPLETION_RE = re.compile(
+    r"\*\*Claude finished\b.{0,200}?\btask in\b", re.IGNORECASE | re.DOTALL
+)
+
+#: Codex の利用上限を「今も続いている」とみなす時間 (時間単位)。この時間内に
+#: 上限メッセージを観測していれば、`@codex review` を投げずに最初から Claude に
+#: 依頼する (往復を 1 つ省く)。**短すぎると往復が復活し、長すぎると Codex の
+#: 上限が回復しても使わなくなる。** 上限は数時間で回復する運用実感から 6 時間。
+CODEX_USAGE_LIMIT_LOOKBACK_HOURS = 6
 
 
 def _parse_iso8601(value: str) -> datetime:
@@ -439,6 +458,86 @@ def _claude_reviewed_head_sha(
     return False
 
 
+def _claude_completed_review_after(
+    comment_nodes: list[dict[str, Any]],
+    after_iso: str,
+    claude_logins: frozenset[str],
+) -> bool:
+    """Claude が `after_iso` より後に**完了した**レビューを残したか判定する。
+
+    **なぜコメントを見るのか (Issue #216 で実測)**: `anthropics/claude-code-action`
+    は **正式な PR レビューを作れない。** 実行時のプロンプトに
+    「What You CANNOT Do: - Submit formal GitHub PR reviews」と明記されており、
+    実際 PR #216 のレビューオブジェクトは 0 件だった。したがって
+    `_claude_reviewed_head_sha` (レビューオブジェクトのみを見る) だけでは
+    **Claude フォールバックは永久に成立しない** — 実際にレビューは行われ、
+    的確な指摘まで出ていたのに、ゲートがそれを受理できずに止まっていた。
+
+    **Issue #203 の懸念をどう解くか**: 当時「起動直後の進捗コメント
+    (『working…』) を数えると、レビューが 1 文字も書かれていない時点で要件が
+    緩和されてしまう」として、コメントを数えることを止めた。その懸念は正しい。
+    しかし**進捗と完了は本文で区別できる** — 完了時にのみ
+    `**Claude finished ... task in ...**` の見出しが付く
+    (`_CLAUDE_COMPLETION_RE`)。失敗時は「encountered an error」であり、
+    この見出しは付かない。したがって「完了見出しを含むコメントだけを数える」
+    なら、#203 が防ぎたかった状態は起きない。
+
+    進捗コメントは**同一コメントが編集され続ける**ため `createdAt` は
+    進捗投稿時のままだが、判定に使うのは**現在の本文**なので問題ない。
+
+    見出しの文言は action の実装依存であり、変われば一致しなくなる。その場合の
+    挙動は「マージを見送る」= 安全側であり、`automerge-without-codex` ラベルに
+    よる手動対応に落ちるだけである (逆向きの誤りは取り返しがつかない)。
+    """
+    if not claude_logins or not after_iso:
+        return False
+    after_at = _parse_iso8601(after_iso)
+    for c in comment_nodes:
+        if not _is_login_in(c.get("author"), claude_logins):
+            continue
+        created_at = c.get("createdAt")
+        if not created_at:
+            continue
+        if _parse_iso8601(created_at) <= after_at:
+            continue
+        if _CLAUDE_COMPLETION_RE.search(c.get("body") or ""):
+            return True
+    return False
+
+
+def _codex_usage_limit_within(
+    comment_nodes: list[dict[str, Any]],
+    now_iso: str,
+    lookback_hours: int,
+    codex_logins: frozenset[str],
+) -> bool:
+    """直近 `lookback_hours` 時間以内に、この PR で Codex の利用上限を観測したか。
+
+    **なぜ必要か**: 従来は「`@codex review` を投げる → 上限メッセージが返る →
+    次の実行で Claude に依頼する」という往復を毎回踏んでいた。Codex が上限に
+    達している間はこの往復が確実に無駄になる (実測で 1 サイクルあたり十数分)。
+    既に上限を観測しているなら、最初から Claude に依頼してよい。
+
+    **時間窓を設ける理由**: Codex の上限は時間で回復する。窓を設けずに
+    「過去に一度でも上限を観測したか」で判定すると、回復後も永久に Codex を
+    使わなくなる。逆に窓が短すぎると往復が復活する。
+    """
+    if lookback_hours <= 0 or not now_iso:
+        return False
+    cutoff = _parse_iso8601(now_iso) - timedelta(hours=lookback_hours)
+    for c in comment_nodes:
+        if not _is_codex_author(c.get("author"), codex_logins):
+            continue
+        created_at = c.get("createdAt")
+        if not created_at:
+            continue
+        if _USAGE_LIMIT_PHRASE not in (c.get("body") or "").lower():
+            continue
+        if _parse_iso8601(created_at) > cutoff:
+            return True
+    return False
+
+
 def _find_codex_usage_limit_after(
     comment_nodes: list[dict[str, Any]],
     after_iso: str,
@@ -535,6 +634,7 @@ def evaluate_review_gate(
     codex_logins: frozenset[str] = _CODEX_LOGINS,
     pr_comments: dict[str, Any] | None = None,
     claude_logins: frozenset[str] = frozenset(),
+    codex_usage_limit_lookback_hours: int = CODEX_USAGE_LIMIT_LOOKBACK_HOURS,
 ) -> dict[str, Any]:
     """マージしてよいかを判定する。
 
@@ -704,7 +804,27 @@ def evaluate_review_gate(
                 request_comment = _find_request_marker(
                     comment_nodes, head_sha, _CODEX_REQUEST_MARKER_RE
                 )
-                if request_comment is None:
+                request_created_at = (request_comment or {}).get("createdAt") or ""
+                # 従来からの厳密な検知: 「この head SHA への依頼より後に
+                # 上限メッセージが来た」。**過去の Codex レビューでの代替は
+                # これでしか許さない** (下記)。
+                limit_strict = bool(request_created_at) and (
+                    _find_codex_usage_limit_after(
+                        comment_nodes, request_created_at, codex_logins
+                    )
+                )
+                # B (待ち時間短縮): この PR で直近に上限を観測しているなら、
+                # `@codex review` を投げても上限メッセージが返るだけなので往復を
+                # 省く。**Claude フォールバックが設定されているときだけ**有効に
+                # する — 未設定なら依頼を省いても行き先が無く、Codex への再依頼を
+                # 止める副作用だけが残るため。
+                limit_recent = bool(claude_logins) and _codex_usage_limit_within(
+                    comment_nodes,
+                    now,
+                    codex_usage_limit_lookback_hours,
+                    codex_logins,
+                )
+                if request_comment is None and not limit_recent:
                     # まだこの head SHA への @codex review リクエストを
                     # 投稿していない。呼び出し側に投稿させる。
                     codex_review_request_needed = True
@@ -715,13 +835,9 @@ def evaluate_review_gate(
                         "@codex review を自動リクエストします"
                     )
                 else:
-                    request_created_at = request_comment.get("createdAt") or ""
-                    limit_reached = (
-                        bool(request_created_at)
-                        and _find_codex_usage_limit_after(
-                            comment_nodes, request_created_at, codex_logins
-                        )
-                    )
+                    # `limit_recent` が立っていれば依頼を投げる前でもここに来る
+                    # (B)。その場合 `request_created_at` は空。
+                    limit_reached = limit_strict or limit_recent
                     if not limit_reached:
                         head_short = head_sha[:7]
                         reasons.append(
@@ -749,7 +865,14 @@ def evaluate_review_gate(
                             for r in latest_reviews_nodes
                         )
                         head_short = head_sha[:7]
-                        if any_codex_review:
+                        # ⚠️ **過去の Codex レビューでの代替は `limit_strict`
+                        # のときだけ許す。** これは「別の commit へのレビューで
+                        # 現在の head を通す」という最も強い緩和なので、B が
+                        # 導入した緩い検知 (直近の上限メッセージ = 別の head への
+                        # 依頼に対する返信かもしれない) では発動させない。
+                        # `limit_recent` だけの場合は Claude に新しく
+                        # レビューさせる (下の分岐)。
+                        if any_codex_review and limit_strict:
                             matched = True
                             codex_relaxed = True
                             codex_relaxed_detail = (
@@ -763,9 +886,20 @@ def evaluate_review_gate(
                             claude_request_comment = _find_request_marker(
                                 comment_nodes, head_sha, _CLAUDE_REQUEST_MARKER_RE
                             )
+                            # F (Issue #216): レビューオブジェクトだけでなく、
+                            # **完了見出しを持つ Claude のコメント**も受理する。
+                            # claude-code-action は正式なレビューを作れないため
+                            # (実行時プロンプトに明記)、これが無いとフォール
+                            # バックは永久に成立しない。進捗コメントは完了見出しが
+                            # 無いので数えない (Issue #203 の懸念を維持)。
                             claude_matched = _claude_reviewed_head_sha(
                                 latest_reviews_nodes,
                                 head_sha,
+                                claude_logins,
+                            ) or _claude_completed_review_after(
+                                comment_nodes,
+                                (claude_request_comment or {}).get("createdAt")
+                                or "",
                                 claude_logins,
                             )
                             if claude_matched:
@@ -854,7 +988,8 @@ def main(argv: list[str]) -> int:
     渡すこと (git committer date ではない — モジュール docstring の
     警告を参照)。`claudeLogins` は文字列の配列 (省略/空なら Claude
     フォールバックは常に不成立)。`prTitle` は `@claude` への依頼コメント
-    に含める PR タイトル (省略可)。
+    に含める PR タイトル (省略可)。`codexUsageLimitLookbackHours` は Codex の
+    利用上限を「今も続いている」とみなす時間 (省略時 6 時間、`0` で無効化)。
     """
     if len(argv) > 1:
         with open(argv[1], "r", encoding="utf-8") as f:
@@ -876,6 +1011,14 @@ def main(argv: list[str]) -> int:
         codex_bypass=bool(payload.get("codexBypass", False)),
         pr_comments=payload.get("prComments"),
         claude_logins=claude_logins,
+        # 省略時は既定 (6 時間)。`0` を渡すと B (Codex 往復の省略) を
+        # 無効化して従来の挙動に戻せる。
+        codex_usage_limit_lookback_hours=int(
+            payload.get(
+                "codexUsageLimitLookbackHours",
+                CODEX_USAGE_LIMIT_LOOKBACK_HOURS,
+            )
+        ),
     )
     # 呼び出し側 (review_gate_decision.sh) が実際にコメントを投稿する際に
     # 使う本文。マーカー文字列の組み立て方をここに一元化しておき、bash 側

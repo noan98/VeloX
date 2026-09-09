@@ -56,6 +56,7 @@ def _evaluate(
     codex_bypass=True,
     pr_comments=_EMPTY_PR_COMMENTS,
     claude_logins=frozenset(),
+    codex_usage_limit_lookback_hours=None,
 ):
     """条件1/2/4 (Codex 非依存の条件) を検証するための既定ヘルパー。
 
@@ -74,6 +75,15 @@ def _evaluate(
         codex_bypass=codex_bypass,
         pr_comments=pr_comments,
         claude_logins=claude_logins,
+        **(
+            {}
+            if codex_usage_limit_lookback_hours is None
+            else {
+                "codex_usage_limit_lookback_hours": (
+                    codex_usage_limit_lookback_hours
+                )
+            }
+        ),
     )
 
 
@@ -798,6 +808,312 @@ class ClaudeFallbackTest(unittest.TestCase):
             ),
             self._codex_usage_limit_comment("2026-09-07T16:01:00Z"),
         ]
+
+    def _claude_progress_comment(self, created_at: str) -> dict:
+        """起動直後の進捗コメント。**これを数えてはいけない** (Issue #203)。"""
+        return {
+            "author": {"login": self._CLAUDE_LOGIN, "__typename": "Bot"},
+            "body": (
+                "Claude Code is working… \n\nI'll analyze this and get back "
+                "to you.\n\n[View job run](https://github.com/x/y/actions/runs/1)"
+            ),
+            "createdAt": created_at,
+        }
+
+    def _claude_finished_comment(self, created_at: str) -> dict:
+        """レビュー完了後のコメント。**完了見出しが付く** (PR #216 で実測)。"""
+        return {
+            "author": {"login": self._CLAUDE_LOGIN, "__typename": "Bot"},
+            "body": (
+                "**Claude finished @noan98's task in 2m 15s** —— "
+                "[View job](https://github.com/x/y/actions/runs/1)\n\n"
+                "---\n### レビュー結果\n\n気になった点なし。"
+            ),
+            "createdAt": created_at,
+        }
+
+    def _claude_error_comment(self, created_at: str) -> dict:
+        """失敗時のコメント。完了見出しは付かない (#194 で実測した形)。"""
+        return {
+            "author": {"login": self._CLAUDE_LOGIN, "__typename": "Bot"},
+            "body": (
+                "**Claude encountered an error after 0s** —— "
+                "[View job](https://github.com/x/y/actions/runs/1)"
+            ),
+            "createdAt": created_at,
+        }
+
+    # -- F: Claude のコメントレビューを受理する (Issue #216) ----------------
+
+    def test_claude_completion_comment_satisfies_the_gate(self) -> None:
+        """**完了見出しを持つコメント**でレビュー要件を満たす。
+
+        `claude-code-action` は正式な PR レビューを作れない (実行時プロンプトに
+        明記) ため、レビューオブジェクトだけを見ていると**フォールバックは永久に
+        成立しない。** PR #216 で実際にそうなった — レビューは行われ的確な指摘まで
+        出ていたのに、ゲートが受理できず止まっていた。
+        """
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                self._claude_finished_comment("2026-09-07T16:03:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertFalse(result["blocked"], result["reasons"])
+        self.assertTrue(result["claude_relaxed"])
+
+    def test_claude_progress_comment_does_not_satisfy_the_gate(self) -> None:
+        """**進捗コメントでは満たさない** — Issue #203 の懸念をそのまま維持する。
+
+        「working…」の時点で緩和されると、**レビューが 1 文字も書かれていない
+        まま**マージされうる。完了見出しの有無で区別する設計の核心なので、
+        ここが壊れたら F の前提が崩れる。
+        """
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                self._claude_progress_comment("2026-09-07T16:03:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_claude_error_comment_does_not_satisfy_the_gate(self) -> None:
+        """失敗コメント (#194 で実測した形) では満たさない。"""
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                self._claude_error_comment("2026-09-07T16:03:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_claude_completion_before_the_request_does_not_count(self) -> None:
+        """依頼より**前**の完了コメントは数えない (古いレビューの使い回し防止)。"""
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_finished_comment("2026-09-07T16:01:30Z"),
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_completion_comment_from_another_login_does_not_count(self) -> None:
+        """許可リストに無いログインの完了見出しは数えない (なりすまし防止)。"""
+        impostor = self._claude_finished_comment("2026-09-07T16:03:00Z")
+        impostor["author"] = {"login": "someone-else", "__typename": "User"}
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                impostor,
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_relaxed"])
+
+    def test_claude_completion_still_blocked_by_unresolved_thread(self) -> None:
+        """完了レビューがあっても、未解決スレッドは免除されない。"""
+        pr_comments = {
+            "nodes": self._usage_limit_state_comments()
+            + [
+                self._claude_request_marker_comment(
+                    _HEAD_SHA, "2026-09-07T16:02:00Z"
+                ),
+                self._claude_finished_comment("2026-09-07T16:03:00Z"),
+            ]
+        }
+        threads = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "nodes": [
+                            {"path": "src/a.rs", "author": {"login": "human"}}
+                        ]
+                    },
+                }
+            ],
+        }
+        result = _evaluate(
+            threads=threads,
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+
+    # -- B: Codex への往復を省く (待ち時間短縮) -----------------------------
+
+    def test_recent_usage_limit_skips_the_codex_round_trip(self) -> None:
+        """直近に上限を観測していれば、`@codex review` を投げずに Claude へ。
+
+        従来は「依頼 → 上限が返る → 次の実行で Claude に依頼」と 1 往復して
+        いた。Codex が上限に達している間、この往復は確実に無駄になる。
+        """
+        pr_comments = {
+            "nodes": [
+                # **この head SHA への依頼は無い**。別の head への依頼に対する
+                # 上限メッセージだけがある状態。
+                self._codex_usage_limit_comment("2026-09-07T16:00:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        # Codex には投げず、Claude に依頼する
+        self.assertFalse(result["codex_review_request_needed"])
+        self.assertTrue(result["claude_review_request_needed"])
+
+    def test_stale_usage_limit_outside_the_window_still_asks_codex(self) -> None:
+        """窓の外の古い上限メッセージでは往復を省かない。
+
+        Codex の上限は時間で回復する。**窓が無いと回復後も永久に Codex を
+        使わなくなる。**
+        """
+        pr_comments = {
+            "nodes": [
+                # _NOW (16:31) の 2 日前 — 既定の窓 (6 時間) の外
+                self._codex_usage_limit_comment("2026-09-05T16:00:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertTrue(result["codex_review_request_needed"])
+        self.assertFalse(result["claude_review_request_needed"])
+
+    def test_recent_limit_does_not_enable_reuse_of_a_past_codex_review(
+        self,
+    ) -> None:
+        """**B は「過去の Codex レビューでの代替」を発動させない。**
+
+        別 commit へのレビューで現在の head を通すのは最も強い緩和なので、
+        B が導入した緩い検知 (別の head への依頼に対する返信かもしれない
+        上限メッセージ) では許さない。Claude に新しくレビューさせる。
+        """
+        pr_comments = {
+            "nodes": [
+                self._codex_usage_limit_comment("2026-09-07T16:00:00Z"),
+            ]
+        }
+        reviews = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": "9" * 40},  # 別 commit
+                }
+            ],
+        }
+        result = _evaluate(
+            reviews=reviews,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_relaxed"])
+        self.assertTrue(result["claude_review_request_needed"])
+
+    def test_recent_limit_shortcut_requires_claude_to_be_configured(self) -> None:
+        """Claude 未設定なら B は効かない。
+
+        行き先が無いのに Codex への依頼だけ止めると、**再依頼が止まる副作用**
+        だけが残る。
+        """
+        pr_comments = {
+            "nodes": [
+                self._codex_usage_limit_comment("2026-09-07T16:00:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset(),  # 未設定
+        )
+        self.assertTrue(result["blocked"])
+        self.assertTrue(result["codex_review_request_needed"])
+
+    def test_lookback_zero_disables_the_shortcut(self) -> None:
+        """`codex_usage_limit_lookback_hours=0` で B を無効化できる。
+
+        新しい挙動には必ず「元に戻す手段」を用意しておく。窓の考え方が
+        運用に合わなかったときに、コードを消さずに戻せる。
+        """
+        pr_comments = {
+            "nodes": [
+                self._codex_usage_limit_comment("2026-09-07T16:00:00Z"),
+            ]
+        }
+        result = _evaluate(
+            reviews=_EMPTY_REVIEWS,
+            pr_comments=pr_comments,
+            codex_bypass=False,
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+            codex_usage_limit_lookback_hours=0,
+        )
+        self.assertTrue(result["blocked"])
+        # B が無効なので従来どおり Codex に依頼する
+        self.assertTrue(result["codex_review_request_needed"])
 
     def test_claude_configured_and_reviewed_head_sha_merges(self) -> None:
         # 上限検知 + Claude 許可リスト設定済み + head SHA への Claude
