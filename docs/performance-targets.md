@@ -52,12 +52,40 @@ Linux に存在せず、Edge は実質 Chromium と同一エンジンなので�
 ブラウザの内部 API に依存しない外形指標のみを使う。内部イベントは VeloX にしか
 無く、比較に使えない。
 
-| メトリクス | 定義 |
-| --- | --- |
-| `startup_to_load_ms` | プロセス spawn の瞬間から、**ページ自身の `load` イベント**が発火するまでの実時間。ページに注入した beacon が loopback の HTTP サーバを叩き、その到着時刻で測る |
-| `pss_bytes` | load から `--settle-secs` 秒後の、プロセスツリー全体の **PSS** 合計 |
-| `rss_bytes` | 同時点の RSS 合計 (**比較には使わない**。下記参照) |
-| `process_count` | 同時点のプロセス数 |
+| メトリクス | 定義 | OS |
+| --- | --- | --- |
+| `startup_to_load_ms` | プロセス spawn の瞬間から、**ページ自身の `load` イベント**が発火するまでの実時間。ページに注入した beacon が loopback の HTTP サーバを叩き、その到着時刻で測る | 共通 |
+| `pss_bytes` | load から `--settle-secs` 秒後の、プロセスツリー全体の **PSS** 合計 (`smaps_rollup` のカーネル計算値) | Linux のみ |
+| `private_bytes` | 同時点の **Private Working Set** 合計 | Windows のみ |
+| `rss_bytes` | 同時点の RSS / Working Set 合計 (**Linux では比較に使わない**。下記参照) | 共通 |
+| `lower_bytes` / `upper_bytes` | **真の PSS を挟む区間**。Linux では PSS 自身なので下界 = 上界 (幅ゼロ)、Windows では `private_bytes` と `rss_bytes` | 共通 |
+| `process_count` | 同時点のプロセス数 | 共通 |
+
+> ### Windows には PSS が無いので「挟み込む」 (Issue #197)
+>
+> Linux の `Pss:` は共有ページを共有プロセス数で割った値を**カーネルが計算して**
+> 返す。Windows にこれに相当するものは無い (D88)。
+>
+> D88 は `QueryWorkingSetEx` の `ShareCount` で `1/ShareCount` を足し上げる近似を
+> 検討し、「正確さが自明でない」として見送った。**その判断は正しかった** —
+> `PSAPI_WORKING_SET_BLOCK` の `ShareCount` は **3 bit しかなく 7 で飽和する**。
+> ブラウザのように 8 個以上のプロセスが同じ DLL ページを共有する状況では共有
+> ページの重みが実際より重く出るうえ、**飽和の度合いがプロセス数に依存する**ので、
+> プロセス構成の違うブラウザ同士の比較という、まさに使いたい用途で歪む。
+>
+> そこで近似値は作らず、**真の PSS を上下から挟む 2 つの厳密な値**を採る。
+> `QueryWorkingSet` は working set の各ページが共有かどうかを返すので、1 回の
+> 呼び出しで両方が得られる。
+>
+>     private_bytes  <=  真の PSS  <=  rss_bytes (Working Set 合計)
+>
+> 判定は区間で行い、**区間が重なる間は「判定不能」と言う** — 片方の端を代表値に
+> 選んで断定するのは、測れていないものを測れたことにする行為である
+> (`compare_bounds`)。Linux では下界 = 上界なので、従来どおりの PSS 比較に退化し、
+> **既存の評価方法は変わらない。**
+>
+> ⚠️ **Windows の下界/上界を Linux の PSS と並べてはならない。** 算出方法が違う
+> ので OS をまたいだ数値比較は成立しない (D88 の警告、Epic #57 の絶対ルール5)。
 
 > ### ⚠️ メモリ比較には PSS を使うこと
 >
@@ -3153,3 +3181,86 @@ D97 Revisit condition (1) の答え。`rss_process_count` を A/B 比較表に
 `^tabs_(?:hold_)?\d+$` に修正し、並び順も `tabs_hold_N` を数値順に扱う
 ようにした。**`tabs_N` と `tabs_hold_N` は測定条件が違う**ので、同じ表に
 並んでも系統をまたいで比較してはならない旨を表の説明にも入れた。
+
+## 29. Windows で T2 を評価できるようにする (Issue #197, 2026-09-09)
+
+### 29.1 何が問題だったか
+
+**T2 (メモリで Chromium 比 +10% 以内) の評価は Linux でしか行えていなかった。**
+比較ハーネス `scripts/bench/compare_browsers.py` が `/proc` 前提だったためである
+(D97 Revisit condition (3))。
+
+これは記録の欠落ではなく、**Stage 1 (Issue #176) を閉じられない理由**だった。
+§28 で「Windows の自動タブ休止は正しく機能している (20 タブ -61.5%)」ことは確定
+したが、それは VeloX の設定間 (予算 ON / OFF) の比較でしかない。T2 は競合との
+比較なので、**Windows で競合を測る手段が無い限り達成も未達も言えない。**
+CLAUDE.md が Windows を最優先と定めている以上、Windows で評価できない目標を完了
+条件に据えることはできない。
+
+### 29.2 Windows に PSS が無いことをどう扱うか
+
+§3.1 に定義を書いたとおり、**近似値を作らず、真の PSS を上下から挟む。**
+
+D88 が検討した `ShareCount` による `1/ShareCount` 近似は、`ShareCount` が
+**3 bit で 7 に飽和する**ため、8 個以上のプロセスが同じページを共有する状況
+(まさにブラウザ) で歪む。しかも歪み方がプロセス数に依存するので、プロセス構成の
+違うブラウザを比べるという目的に対して最悪の性質を持つ。
+
+代わりに `QueryWorkingSet` を 1 回呼んで、working set の各ページが共有かどうかを
+数える。共有でないページの合計が Private Working Set = **下界**、全ページの合計が
+Working Set = **上界**である。どちらも近似ではなく、OS が返す値をそのまま数えた
+厳密な量である。
+
+判定 (`compare_bounds`) は 3 値を返す。
+
+| 判定 | 条件 | 意味 |
+| --- | --- | --- |
+| `met` | VeloX の**上界** <= 相手の**下界** × 1.10 | 真値がどこでも達成 |
+| `missed` | VeloX の**下界** > 相手の**上界** × 1.10 | 真値がどこでも未達 |
+| `inconclusive` | 区間が重なる | 真値の位置次第で結論が変わる |
+
+**`inconclusive` を潰さないことがこの設計の要点である。** 幅がある以上、判定
+できない場合は必ず存在する。そこで片方の端を代表値に選んで断定するのは、測れて
+いないものを測れたことにする行為になる。Linux では下界 = 上界 (幅ゼロ) なので、
+この判定はふつうの PSS 比較に退化し、**既存の評価方法を一切変えない。**
+
+### 29.3 Windows でだけ可能になる切り分け — Edge との比較
+
+Linux の比較は「VeloX 対 Chromium」であると同時に「WebKitGTK 対 Blink」でもあり、
+**VeloX 自身のオーバーヘッドとエンジン差を分離できない** (Epic #57 の原則、§2)。
+
+Windows では事情が変わる。**VeloX は WebView2、つまり Edge と同じ Chromium
+エンジンを使う。** したがって Edge と比較すればエンジン差が相殺され、**残る差は
+VeloX 自身のオーバーヘッドだけになる。** Linux では原理的に不可能だった切り分けが
+Windows では可能になる。
+
+`compare-windows.yml` の `baseline` 入力は既定 `auto` で **Edge を優先して探す**。
+Chrome との比較も選べるが、そちらはエンジン差を含む (Linux と同じ性質) ことを
+結果に明記する。
+
+### 29.4 実装
+
+| 追加 | 役割 |
+| --- | --- |
+| `scripts/bench/proctree.py` | プロセスツリーのメモリ計測を OS 非依存の形で 1 か所に集約。Linux は `/proc`、Windows は Toolhelp32 + `QueryWorkingSet` (ctypes) |
+| `scripts/bench/compare_browsers.py` | 上記を使うよう変更。`DISPLAY` の確認を Linux 限定に、比較相手の自動検出、`compare_bounds` による T2 判定を追加 |
+| `.github/workflows/compare-windows.yml` | `windows-latest` 上で実際に比較を走らせる (`workflow_dispatch` 限定) |
+
+`process_tree_memory` は `compare_browsers.py` / `tab_scaling.py` / `tab_churn.py`
+に**同じ実装が 3 つ重複していた**。Windows 対応で 4 つ目を増やすのは明らかに悪手
+なので、`proctree.py` に集約して 3 スクリプトとも委譲に変えた。
+
+プロセス一覧の取り方は `browser::metrics` の Windows 実装 (D88) と同じ
+`CreateToolhelp32Snapshot`、RSS も同じ `GetProcessMemoryInfo` の `WorkingSetSize`
+にそろえてある。**§28 の `rss_total_bytes` と同じ定義なので、並べて読める。**
+
+### 29.5 まだ測っていない — この節は「測れるようにした」までである
+
+**数値はまだ 1 つも無い。** この節が記録しているのは手段の整備だけである。
+
+⚠️ **`proctree.py` の Windows 実装 (ctypes による FFI) は、`compare-windows.yml`
+が走るまで一度も実行されていない。** 開発環境は Linux コンテナで Windows 実機が
+無い (D61/D88 と同じ制約)。D88 が `QueryWorkingSetEx` の実装を見送った理由の 1 つが
+「実機で検証する手段が無い」ことだったので、**検証手段を先に用意する**という順序に
+してある。単体テストで固定できたのは木の走査・集計 (`collect_tree`) と判定
+(`compare_bounds`) だけで、FFI 部分は実機で走るまで未検証と扱うこと。

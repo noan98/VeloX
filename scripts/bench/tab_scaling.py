@@ -66,6 +66,10 @@ import threading
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from proctree import process_tree_memory as proctree_memory  # noqa: E402
+
 PAGES_DIR = Path(__file__).resolve().parent / "pages"
 
 # `browser::suspension::SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`
@@ -93,56 +97,15 @@ def default_stabilize_secs(memory_check_interval_ms: int) -> float:
     return max(3.0, 3.0 * memory_check_interval_ms / 1000.0)
 
 
-def _pss_bytes(entry: Path) -> int | None:
-    """`smaps_rollup` の `Pss:` 行 (kB) をバイトで返す。読めなければ `None`。
-
-    `compare_browsers.py`/`pss_sampler.py`/`process_breakdown.py` と同一ロジック。
-    """
-    try:
-        for line in (entry / "smaps_rollup").read_text().splitlines():
-            if line.startswith("Pss:"):
-                return int(line.split()[1]) * 1024
-    except (OSError, IndexError, ValueError):
-        return None
-    return None
-
-
 def process_tree_memory(root_pid: int) -> tuple[int, int | None, int]:
-    """`root_pid` を根とするツリーの (RSS 合計, PSS 合計 or None, プロセス数)。"""
-    children: dict[int, list[int]] = {}
-    rss: dict[int, int] = {}
-    pss: dict[int, int] = {}
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        try:
-            fields = (entry / "stat").read_text().rsplit(") ", 1)[1].split()
-            ppid = int(fields[1])
-            resident_pages = int((entry / "statm").read_text().split()[1])
-        except (OSError, IndexError, ValueError):
-            continue
-        children.setdefault(ppid, []).append(pid)
-        rss[pid] = resident_pages * os.sysconf("SC_PAGE_SIZE")
-        proportional = _pss_bytes(entry)
-        if proportional is not None:
-            pss[pid] = proportional
+    """`root_pid` を根とするツリーの (RSS 合計, PSS 合計 or None, プロセス数)。
 
-    rss_total = pss_total = count = pss_count = 0
-    stack = [root_pid]
-    seen: set[int] = set()
-    while stack:
-        pid = stack.pop()
-        if pid in seen or pid not in rss:
-            continue
-        seen.add(pid)
-        rss_total += rss[pid]
-        count += 1
-        if pid in pss:
-            pss_total += pss[pid]
-            pss_count += 1
-        stack.extend(children.get(pid, []))
-    return rss_total, (pss_total if pss_count > 0 else None), count
+    実装は `proctree.py` に集約した (Issue #197)。**同じ `/proc` 走査が 3 つの
+    スクリプトに重複していた**ため、Windows 対応を足すにあたって 1 つにまとめた。
+    このスクリプト自身は Linux 専用のままなので、戻り値の形は変えていない。
+    """
+    mem = proctree_memory(root_pid)
+    return mem.rss_bytes, mem.pss_bytes, mem.process_count
 
 
 class _QuietHandler(http.server.SimpleHTTPRequestHandler):

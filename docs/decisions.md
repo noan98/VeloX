@@ -12656,9 +12656,9 @@ aggregate_trials` は最後の `measure_start` 以降しか集計しないので
 説明できていない)。
 (2) **`tabs_hold_50` は未測定。** 20 → 50 タブで 65 MiB/タブの線形が続くか、
 予算がどこで頭打ちになるかは分かっていない。
-(3) **Windows では Chromium と比較できていない** (`compare_browsers.py` は
-Linux 専用)。T2 の「Chromium 比 +10% 以内」を Windows で評価する手段が
-無い。
+(3) **手段は用意した (D99)。数値はまだ無い。** `compare_browsers.py` を
+Windows 対応にし、`compare-windows.yml` で `windows-latest` 上を走らせられる
+ようにした。実測はこれから。
 (4) **休止による状態喪失のコストは未計測。** 616.8 MiB が背景タブを何個
 休止した結果か、復帰にどれだけかかるかは測っていない (§25.3 の Windows 版)。
 (5) 本節の計測は 1 つの run (AMD EPYC 7763) のみである。D96 決定 3 のとおり
@@ -12815,3 +12815,107 @@ D98 の前半で「マスクされていること自体が登録済みの証拠�
 `show_full_output: false` という既定値ひとつのために、1 文字ずつ位置まで
 教えてくれる診断メッセージが読めず、複数の PR が手動マージに追い込まれて
 いた。**原因を推測する前に、まずログを全部見えるようにするべきだった。**
+
+## D99: Windows で T2 (Chromium 比) を評価できるようにする (Issue #197) — PSS が無い OS では「近似値を作らず、真の値を区間で挟む」
+
+**Scope**: `docs/performance-targets.md` の T2「メモリで Chromium 比 +10% 以内」は
+Linux でしか評価できていなかった。比較ハーネス `scripts/bench/compare_browsers.py`
+が `/proc` 前提だったためである (D97 Revisit condition (3))。
+
+これは記録の欠落ではなく、**Stage 1 (Issue #176) を閉じられない理由**だった。
+§28 で確定したのは VeloX の設定間 (予算 ON / OFF) の比較であり、T2 は競合との
+比較なので、**Windows で競合を測れない限り達成も未達も言えない。** CLAUDE.md が
+Windows を最優先と定めている以上、Windows で評価できない目標を完了条件に据える
+ことはできない。
+
+### 決定1: 近似 PSS は作らない。真の PSS を上下から挟む
+
+Linux の `smaps_rollup` の `Pss:` は、共有ページを共有プロセス数で割った値を
+**カーネルが計算して**返す。Windows にこれに相当するものは無い (D88 が調査済み)。
+
+D88 は代替として `QueryWorkingSetEx` の `ShareCount` から `1/ShareCount` を
+足し上げる近似を検討し、「Windows のページ共有モデルに対してどこまで正確かが
+自明でない」として見送った。**この判断は正しかった。** 実装しようとして分かった
+具体的な理由は、D88 が挙げたものより単純で決定的である:
+
+**`PSAPI_WORKING_SET_BLOCK` の `ShareCount` は 3 bit しかなく、7 で飽和する。**
+
+ブラウザのように 8 個以上のプロセスが同じ DLL ページを共有する状況では、共有
+ページの重みが実際より重く出る。しかも**飽和の度合いはプロセス数に依存する**ので、
+プロセス構成の違うブラウザ同士を比べるという、まさに使いたい用途で歪む。
+§28.8 で実測したとおり Windows の VeloX は 20 タブで 27 プロセス (予算 OFF)、
+11 プロセス (ON) なので、飽和は例外的な状況ではなく常態である。
+
+そこで近似値は作らず、**真の PSS を上下から挟む 2 つの厳密な値**を採る。
+`QueryWorkingSet` は working set の各ページが共有かどうか (`Shared` ビット) を
+返すので、1 回の呼び出しで両方が得られる:
+
+    private_bytes (共有でないページの合計)  <=  真の PSS  <=  rss_bytes (全ページの合計)
+
+どちらも近似ではなく、OS が返す値をそのまま数えた量である。
+
+### 決定2: 判定は 3 値。「判定不能」を潰さない
+
+`compare_bounds` は `met` / `missed` / `inconclusive` を返す。
+
+| 判定 | 条件 | 意味 |
+| --- | --- | --- |
+| `met` | VeloX の**上界** <= 相手の**下界** × 1.10 | 真値がどこでも達成 |
+| `missed` | VeloX の**下界** > 相手の**上界** × 1.10 | 真値がどこでも未達 |
+| `inconclusive` | 区間が重なる | 真値の位置次第で結論が変わる |
+
+**`inconclusive` を残すことがこの設計の要点である。** 区間に幅がある以上、判定
+できない場合は必ず存在する。そこで片方の端を代表値に選んで断定するのは、
+**測れていないものを測れたことにする**行為であり、この Issue で繰り返し踏んだ
+失敗 (§27.4 の誤結論、D97 の「構造的な違いを原因と決めつけた」件) と同じ種類の
+誤りになる。
+
+Linux では下界 = 上界 (幅ゼロ) なので、この判定はふつうの PSS 比較に退化する。
+**既存の Linux の評価方法は一切変わらない** — 単体テストでそれを固定した。
+
+### 決定3: Windows では Edge を優先して比較する
+
+Linux の比較は「VeloX 対 Chromium」であると同時に「WebKitGTK 対 Blink」でもあり、
+**VeloX 自身のオーバーヘッドとエンジン差を分離できない** (Epic #57 の原則)。
+
+Windows では事情が変わる。**VeloX は WebView2、つまり Edge と同じ Chromium
+エンジンを使う。** Edge と比較すればエンジン差が相殺され、**残る差は VeloX 自身の
+オーバーヘッドだけになる。** Linux では原理的に不可能だった切り分けが Windows では
+可能になる — これは「Windows を最優先する」方針の副次的な利点として、今回はじめて
+はっきりした。自動検出は Edge を先に探し、Chrome を選んだ場合はエンジン差を含む
+ことを結果に明記する。
+
+### 決定4: 重複していた `/proc` 走査を `proctree.py` に集約する
+
+`process_tree_memory` は `compare_browsers.py` / `tab_scaling.py` / `tab_churn.py`
+に**同じ実装が 3 つ重複していた** (`scripts/profile/pss_sampler.py` も同型)。
+Windows 対応で 4 つ目を増やすのは明らかに悪手なので、`proctree.py` に集約して
+3 スクリプトとも委譲に変えた。Linux 専用の 2 つは戻り値の形を変えていない。
+
+プロセス一覧の取り方は `browser::metrics` の Windows 実装 (D88) と同じ
+`CreateToolhelp32Snapshot`、RSS も同じ `GetProcessMemoryInfo` の `WorkingSetSize`
+にそろえた。**§28 の `rss_total_bytes` と同じ定義なので並べて読める。**
+
+なお `unsafe` を伴う FFI は Rust 側 (`src/browser/metrics.rs`) には足していない。
+比較ハーネスは計測用スクリプトであり、**製品コードに未検証の `unsafe` を持ち込む
+必要は無い** (CLAUDE.md「`unsafe` は原則使用しない」)。D88 が保留した
+Windows PSS 相当を Rust 側に実装するかは、依然として未決のままにしてある。
+
+### Revisit condition
+
+(1) **数値はまだ 1 つも無い。** この決定が用意したのは手段だけで、T2 の達成/未達は
+まだ言えていない。`compare-windows.yml` を走らせて §29 に転記するまで、Stage 1
+(#176) は閉じられない。
+(2) ⚠️ **`proctree.py` の Windows 実装 (ctypes による FFI) は一度も実行されて
+いない。** 開発環境は Linux コンテナで Windows 実機が無い (D61/D88 と同じ制約)。
+単体テストで固定できたのは木の走査・集計 (`collect_tree`) と判定
+(`compare_bounds`) だけである。`QueryWorkingSet` のバッファ再取得や
+`PROCESS_QUERY_INFORMATION` の権限まわりは実機で落ちうる。**最初の実行が失敗する
+前提で読むこと。**
+(3) **`private_bytes` が下界として十分に締まっているかは未知。** 共有ページの
+割合が大きければ区間が広くなり、`inconclusive` ばかりになって T2 を判定できない
+可能性がある。その場合は「判定できなかった」ことをまず記録し、区間を狭める手段
+(例えば共有ページを共有元プロセス数で正確に割る方法の再調査) を別途検討する —
+**判定できないことを判定できたことにしない。**
+(4) `scripts/profile/pss_sampler.py` はまだ独自実装のまま。Linux 専用ツールで
+今回の変更に巻き込む必要が無かったため触っていない。
