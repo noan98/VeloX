@@ -19,6 +19,7 @@ Windows の FFI 部分 (`_windows_nodes`) はここでは検証できない。�
 
 from __future__ import annotations
 
+import ast
 import os
 import sys
 import unittest
@@ -218,6 +219,71 @@ class WorkingSetPagesTest(unittest.TestCase):
 
     def test_empty_working_set(self):
         self.assertEqual(working_set_pages([], PAGE), (0, 0))
+
+
+class ModuleStructureTest(unittest.TestCase):
+    """モジュールの構造そのものを検査する (Issue #197、run 34366896517 の回帰)。
+
+    **同じ関数を 2 回定義してしまった。** スクリプトでファイルを書き換えた際に
+    置換範囲を誤り、`_windows_nodes` が 2 つになった。Python は後の定義で
+    上書きするだけで何も言わない — 構文チェックも既存のユニットテストも通り、
+    **Windows 上で実行してはじめて `NameError` で落ちた** (古い方の定義が
+    新しいヘルパを呼んでいたため)。
+
+    Windows 専用のコードは実機がないと実行できないので、**構造の壊れ方を
+    実行なしで捕まえる手立てが要る。** この環境には静的解析ツールが無いため、
+    AST を直接見て重複定義を弾く。
+
+    `_linux_nodes` / `_windows_nodes` のように「片方の OS でしか実行されない
+    関数」がこのリポジトリには増えていく見込みなので、この検査は今後も効く。
+    """
+
+    def _module_tree(self, name: str) -> ast.Module:
+        path = Path(__file__).resolve().parent / f"{name}.py"
+        return ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+
+    def _duplicate_definitions(self, tree: ast.AST) -> list[str]:
+        """同じスコープ内で 2 回以上定義されている関数/クラス名を返す。"""
+        duplicates: list[str] = []
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if not isinstance(body, list):
+                continue
+            seen: set[str] = set()
+            for child in body:
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    if child.name in seen:
+                        duplicates.append(child.name)
+                    seen.add(child.name)
+        return duplicates
+
+    def test_no_duplicate_definitions(self):
+        for name in ("proctree", "compare_browsers"):
+            with self.subTest(module=name):
+                dupes = self._duplicate_definitions(self._module_tree(name))
+                self.assertEqual(dupes, [], f"{name}.py に重複定義: {dupes}")
+
+    def test_windows_walker_uses_the_extracted_page_helper(self):
+        """`_windows_nodes` が切り出した純粋関数を実際に呼んでいること。
+
+        古い実装が残っていると、**テストで固定した計算が本番では使われない**
+        という最悪の形になる (テストは通るのに数字が違う)。
+        """
+        tree = self._module_tree("proctree")
+        walker = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_windows_nodes"
+        )
+        called = {
+            node.func.id
+            for node in ast.walk(walker)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        self.assertIn("working_set_pages", called)
+        self.assertIn("working_set_breakdown", called)
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux でのみ実測できる")
