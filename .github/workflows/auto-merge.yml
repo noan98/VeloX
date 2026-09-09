@@ -496,7 +496,6 @@ jobs:
             sleep "$wait_seconds"
           done
 
-
   # Issue #188 / docs/decisions.md D91: この workflow 自身、またはレビュー
   # 判定ロジックを変更する PR に限り、上の on.pull_request.paths フィルタで
   # 起動する dry-run 検証ジョブ。実際の auto-merge ジョブとは別ジョブに分け、
