@@ -318,6 +318,88 @@ class GracePeriodBlocksTest(unittest.TestCase):
         self.assertTrue(result["blocked"])
 
 
+class GraceRemainingSecondsTest(unittest.TestCase):
+    """Issue #219 / D103: 「あと何秒待てば猶予期間が明けるか」を機械可読に出す。
+
+    **猶予期間の満了は誰も何もしないのでイベントを生まない。** auto-merge.yml
+    はこの 2 フィールドを見て、ブロック要因が猶予期間だけの PR があれば
+    その分だけ待って再評価する。ここが壊れると、レビュー条件が揃っているのに
+    次に誰かが何かするまで (実測で `schedule` は 2〜5 時間間隔) 放置される。
+    """
+
+    def test_remaining_seconds_matches_the_clock(self) -> None:
+        # push 16:20:00 / now 16:31:14 -> 経過 11分14秒、残り 3分46秒 = 226秒。
+        result = _evaluate(push_observed_at="2026-09-07T16:20:00Z", now=_NOW, grace=15)
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["grace_remaining_seconds"], 226)
+        self.assertTrue(result["blocked_only_by_grace"])
+
+    def test_remaining_seconds_rounds_up(self) -> None:
+        """**切り上げる。** 切り捨てると待ち明けにまだ猶予期間内で二度手間になる。"""
+        # push 16:20:00.5 / now 16:31:14 -> 残り 226.5 秒。
+        # 切り上げ 227 / 切り捨て 226 で結果が割れる値を選んである。
+        result = _evaluate(
+            push_observed_at="2026-09-07T16:20:00.5Z", now=_NOW, grace=15
+        )
+        self.assertTrue(result["blocked"])
+        self.assertEqual(result["grace_remaining_seconds"], 227)
+
+    def test_remaining_seconds_never_rounds_down_to_zero(self) -> None:
+        # 15分に 0.5 秒足りない状態。0 秒を返すと呼び出し側が待たずに
+        # 再評価して同じ結論に戻ってしまう。
+        result = _evaluate(
+            push_observed_at="2026-09-07T16:16:14.5Z", now=_NOW, grace=15
+        )
+        self.assertTrue(result["blocked"])
+        self.assertGreaterEqual(result["grace_remaining_seconds"], 1)
+
+    def test_not_blocked_has_no_remaining_seconds(self) -> None:
+        result = _evaluate(push_observed_at=_HEAD_PUSH_OBSERVED_1H_AGO, now=_NOW)
+        self.assertFalse(result["blocked"])
+        self.assertIsNone(result["grace_remaining_seconds"])
+        self.assertFalse(result["blocked_only_by_grace"])
+
+    def test_other_blockers_clear_blocked_only_by_grace(self) -> None:
+        """**猶予期間以外の理由が 1 つでもあれば False。**
+
+        待っても解決しない理由が混ざっているのに待つと、runner を無駄に
+        占有したうえで同じ結論に戻ってくるだけになる。
+        """
+        unresolved = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "isResolved": False,
+                    "comments": {
+                        "nodes": [{"path": "src/app.rs", "author": {"login": "someone"}}]
+                    },
+                }
+            ],
+        }
+        result = _evaluate(
+            threads=unresolved,
+            push_observed_at="2026-09-07T16:20:00Z",
+            now=_NOW,
+            grace=15,
+        )
+        self.assertTrue(result["blocked"])
+        # 残り秒数自体は取れるが、待って良い状態ではない。
+        self.assertEqual(result["grace_remaining_seconds"], 226)
+        self.assertFalse(result["blocked_only_by_grace"])
+        self.assertGreater(len(result["reasons"]), 1)
+
+    def test_missing_push_observed_at_is_not_a_grace_wait(self) -> None:
+        """push 観測時刻が取れない場合は「待てば解決する」ではない。
+
+        待っても check-suite が現れる保証は無いので、`blocked_only_by_grace`
+        を True にしてはいけない (待ち直しが空振りする)。
+        """
+        result = _evaluate(push_observed_at=None)
+        self.assertTrue(result["blocked"])
+        self.assertIsNone(result["grace_remaining_seconds"])
+        self.assertFalse(result["blocked_only_by_grace"])
+
+
 class CodexReviewRequiredTest(unittest.TestCase):
     """条件3: Codex が現在の head SHA をレビュー済みであること (必須要件)。
 

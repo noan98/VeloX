@@ -63,6 +63,12 @@ on:
   # ⚠️ **実測ではこの schedule はほとんど発火していない。** GitHub は負荷に
   # 応じて schedule を間引く。頼りにできるのは下記の issue_comment /
   # pull_request_review と workflow_dispatch である。
+  #
+  # Issue #219 でこれを数えた: **cron は 1 日 144 回のはずだが、全期間の
+  # 発火は 36 回 (約6%)。実際の間隔は 2〜5 時間。** つまりこの schedule を
+  # 「最悪でも10分で拾える安全網」として設計に織り込んではいけない
+  # (docs/decisions.md D103)。猶予期間の満了はこの schedule ではなく、
+  # ジョブ自身の待ち直しで拾っている。
   schedule:
     - cron: "*/10 * * * *"
   # レビューの返答でゲートを即座に再評価する (待ち時間短縮)。
@@ -104,8 +110,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/auto-merge.yml"
-      - ".github/scripts/check_review_gate.py"
-      - ".github/scripts/review_gate_decision.sh"
+      - ".github/scripts/**"
 
 permissions:
   contents: write
@@ -158,6 +163,11 @@ jobs:
   auto-merge:
     name: Auto merge PRs whose checks all passed
     runs-on: ubuntu-latest
+    # Issue #219 / D103: 猶予期間の満了を待ち直すため、この job は最大で
+    # GRACE_PERIOD_MINUTES + 1 分ほど sleep することがある。既定の 360 分
+    # では暴走時に runner を長時間占有してしまうので、明示的に上限を置く
+    # (通常の実行は 15 秒程度、待ち直しが入っても 16 分程度)。
+    timeout-minutes: 30
     # pull_request トリガは dry-run-review-gate 専用 (下記)。実際にマージを
     # 行うこのジョブは pull_request では絶対に起動しない。
     #
@@ -199,172 +209,246 @@ jobs:
         run: |
           set -euo pipefail
 
-          # PR 一覧 (open かつ BASE_BRANCH 向け)
-          prs=$(gh pr list --state open --base "$BASE_BRANCH" --limit 100 \
-                  --json number,title,isDraft,labels,headRefOid,headRefName)
-          count=$(echo "$prs" | jq 'length')
-          echo "対象候補: ${count} 件の open PR (base: ${BASE_BRANCH})"
-          if [ "$count" -eq 0 ]; then
-            exit 0
-          fi
+          # --- Issue #219 / docs/decisions.md D103 ------------------------
+          # **猶予期間 (GRACE_PERIOD_MINUTES) の満了は、誰も何もしないので
+          # イベントを生まない。** レビュー条件がすべて揃っていても、残り
+          # 数分の時計待ちの間に起動要因が尽きると、その PR は次に誰かが
+          # 何かするまで放置される。
+          #
+          # 受け皿は `schedule: */10` のはずだった。しかし**実測では 1 日
+          # 144 回のうち 36 回しか発火しておらず (全期間、約6%)、実際の
+          # 間隔は 2〜5 時間**である (Issue #219 で計測)。つまり最後の
+          # 数分の待ちが数時間の放置になっていた。
+          #
+          # そこで「ブロック要因が猶予期間だけ」の PR があれば、**この run
+          # の中でその分だけ待って、全 PR をもう一度評価する。** 待つのは
+          # 高々 1 回で、待ち時間も猶予期間 + 1 分で頭打ちにしてある。
+          #
+          # 待つのが安全な理由: 待ち終えたあとは `gh pr list` から取り直して
+          # check-runs もレビュー状態も**一から再評価する**。待っている間に
+          # 新しい commit が push されていれば head SHA が変わるので
+          # `--match-head-commit` が弾き、チェックが増減していれば再評価で
+          # 拾う。「待つ前の判定結果を保持して待ち明けに使う」ことはしない。
+          grace_file=$(mktemp)
+          gate_result_file=$(mktemp)
+          trap 'rm -f "$grace_file" "$gate_result_file"' EXIT
 
-          echo "$prs" | jq -c '.[]' | while read -r pr; do
-            number=$(echo "$pr" | jq -r '.number')
-            title=$(echo "$pr" | jq -r '.title')
-            sha=$(echo "$pr" | jq -r '.headRefOid')
-            draft=$(echo "$pr" | jq -r '.isDraft')
-            has_skip=$(echo "$pr" | jq -r --arg l "$SKIP_LABEL" \
-                         '[.labels[].name] | index($l) != null')
-            has_codex_bypass=$(echo "$pr" | jq -r --arg l "$CODEX_BYPASS_LABEL" \
-                         '[.labels[].name] | index($l) != null')
-
-            echo "::group::PR #${number} ${title} (${sha:0:7})"
-
-            if [ "$draft" = "true" ]; then
-              echo "skip: Draft PR"
-              echo "::endgroup::"; continue
-            fi
-            if [ "$has_skip" = "true" ]; then
-              echo "skip: ラベル '${SKIP_LABEL}' が付いている"
-              echo "::endgroup::"; continue
-            fi
-
-            # --- check-runs (GitHub Actions / GitHub App のチェック) ---
-            # filter=latest (既定) なので、再実行した場合は最新の結果だけ見る。
-            # この workflow 自身 (workflow 名 / job 名) は判定から除外する。
-            runs=$(gh api --paginate \
-                     "repos/${GH_REPO}/commits/${sha}/check-runs?per_page=100" \
-                     --jq '.check_runs[]' | jq -s \
-                     --arg self "$SELF_WORKFLOW" --arg self_job "$SELF_JOB" \
-                     '[.[] | select(.name != $self and .name != $self_job)]')
-
-            # --- commit status (レガシー API を使う外部サービス向け) ---
-            statuses=$(gh api "repos/${GH_REPO}/commits/${sha}/status" \
-                         --jq '.statuses')
-
-            total=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
-                      '($r | length) + ($s | length)')
-            if [ "$total" -eq 0 ]; then
-              echo "wait: まだチェックが 1 つも登録されていない"
-              echo "::endgroup::"; continue
+          evaluate_open_prs() {
+            # PR 一覧 (open かつ BASE_BRANCH 向け)
+            prs=$(gh pr list --state open --base "$BASE_BRANCH" --limit 100 \
+                    --json number,title,isDraft,labels,headRefOid,headRefName)
+            count=$(echo "$prs" | jq 'length')
+            echo "対象候補: ${count} 件の open PR (base: ${BASE_BRANCH})"
+            if [ "$count" -eq 0 ]; then
+              return 0
             fi
 
-            echo "check-runs:"
-            echo "$runs" | jq -r '.[] | "  - \(.name): \(.status) / \(.conclusion // "-")"'
-            if [ "$(echo "$statuses" | jq 'length')" -gt 0 ]; then
-              echo "statuses:"
-              echo "$statuses" | jq -r '.[] | "  - \(.context): \(.state)"'
-            fi
+            echo "$prs" | jq -c '.[]' | while read -r pr; do
+              number=$(echo "$pr" | jq -r '.number')
+              title=$(echo "$pr" | jq -r '.title')
+              sha=$(echo "$pr" | jq -r '.headRefOid')
+              draft=$(echo "$pr" | jq -r '.isDraft')
+              has_skip=$(echo "$pr" | jq -r --arg l "$SKIP_LABEL" \
+                           '[.labels[].name] | index($l) != null')
+              has_codex_bypass=$(echo "$pr" | jq -r --arg l "$CODEX_BYPASS_LABEL" \
+                           '[.labels[].name] | index($l) != null')
 
-            pending=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
-              '([$r[] | select(.status != "completed")] | length)
-               + ([$s[] | select(.state == "pending")] | length)')
-            if [ "$pending" -gt 0 ]; then
-              echo "wait: 未完了のチェックが ${pending} 件ある"
-              echo "::endgroup::"; continue
-            fi
+              echo "::group::PR #${number} ${title} (${sha:0:7})"
 
-            failed=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
-              '([$r[] | select(.conclusion != "success"
-                                and .conclusion != "skipped"
-                                and .conclusion != "neutral")] | length)
-               + ([$s[] | select(.state != "success")] | length)')
-            if [ "$failed" -gt 0 ]; then
-              echo "skip: 成功/スキップ以外のチェックが ${failed} 件ある"
-              echo "::endgroup::"; continue
-            fi
-
-            echo "check-runs / commit status: all green"
-
-            # --- Issue #188: レビュー状態の判定 -------------------------
-            # check-runs / commit status には現れない Pull Request の
-            # レビュー (Codex の指摘、人間のレビュー) を見る。Codex が
-            # 現在の head SHA をレビュー済みであることも必須要件
-            # (CODEX_BYPASS_LABEL で免除可能)。判定ロジック本体は
-            # review_gate_decision.sh / check_review_gate.py に切り出して
-            # あり単体テストがある (docs/decisions.md D91)。GraphQL 呼び出し
-            # 自体の失敗も含めて常に「安全側 = マージしない」に倒す
-            # (取得できなかったので指摘ゼロとみなす、は絶対にしない)。
-            echo "レビュー状態を確認します (Issue #188):"
-            if [ "$has_codex_bypass" = "true" ]; then
-              echo "  '${CODEX_BYPASS_LABEL}' ラベルあり: Codex レビュー要件のみ免除 (未解決スレッド/CHANGES_REQUESTED は免除されません)"
-            fi
-            # 第4引数 "true": Codex がこの head SHA をまだレビューして
-            # いなければ実際に `@codex review` を自動投稿する (pull-requests:
-            # write が要る。この job のみが実際に投稿する — dry-run job は
-            # 読み取り専用のまま「投稿する判定になった」ことをログに出す
-            # だけ)。
-            review_gate_output=""
-            review_gate_rc=0
-            review_gate_output=$(bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$has_codex_bypass" "true") \
-              || review_gate_rc=$?
-            if [ -n "$review_gate_output" ]; then
-              echo "$review_gate_output" | sed 's/^/  /'
-            fi
-            if [ "$review_gate_rc" -ne 0 ]; then
-              echo "wait: レビュー状態が条件を満たさないためマージを見送ります"
-              echo "::endgroup::"; continue
-            fi
-            echo "  問題なし (未解決スレッド 0 件 / CHANGES_REQUESTED 0 件 / Codex レビュー条件を満たす / 猶予期間経過済み)"
-
-            echo "all green: マージします (${MERGE_METHOD})"
-            # --match-head-commit: 判定した commit から PR が進んでいたら
-            # マージしない (新しい commit のチェックが未評価のため)。
-            if gh pr merge "$number" "--${MERGE_METHOD}" \
-                 --match-head-commit "$sha" --delete-branch; then
-              echo "merged: PR #${number}"
-
-              # --- Issue #168 -------------------------------------------
-              # GITHUB_TOKEN でのマージは GitHub 側のそれ以上の自動処理
-              # (Closes キーワードによる Issue 自動クローズ) を誘発しない
-              # ため、ここで明示的に閉じる。AUTO_MERGE_TOKEN (PAT) が
-              # 登録されて本物の自動クローズが効くようになった場合でも、
-              # 対象 Issue は既に closed のはずなので下の冪等チェックで
-              # 何もせず skip になる (二重クローズしない)。
-              # 抽出ロジック本体は .github/scripts/extract_closing_issues.py
-              # に切り出してあり、単体テストがある
-              # (.github/scripts/test_extract_closing_issues.py)。
-              # 抽出の失敗 (スクリプトが無い・python が落ちる等) を握り
-              # つぶさないこと: 黙って空を返すと「1 件も閉じないまま成功」
-              # に見え、この Issue が直そうとしている症状と区別が付かない。
-              # 1 件の PR の失敗で他の PR のマージまで止める必要は無いので、
-              # 警告を出して次へ進む。
-              body=$(gh pr view "$number" --json body --jq '.body // ""')
-              if ! issues=$(printf '%s' "$body" | \
-                   python3 .github/scripts/extract_closing_issues.py); then
-                echo "::warning::PR #${number} 本文からの Closes 抽出に失敗しました (Issue は閉じられていません)"
-                issues=""
+              if [ "$draft" = "true" ]; then
+                echo "skip: Draft PR"
+                echo "::endgroup::"; continue
               fi
-              if [ -n "$issues" ]; then
-                echo "$issues" | while read -r issue; do
-                  [ -z "$issue" ] && continue
-                  # gh の stderr は捨てないこと: 「存在しない」と「権限が
-                  # 無い」はどちらもここで失敗するが、原因はまったく違う。
-                  # 実際に #168 の初回リリースでは `issues` 権限が無くて
-                  # 404 になっていたのに、メッセージが「見つかりません」
-                  # だったため原因がログから読み取れなかった。
-                  if ! state=$(gh issue view "$issue" --json state --jq '.state' 2>&1); then
-                    echo "::warning::Issue #${issue} の状態を取得できませんでした (PR #${number} 本文の Closes 参照): ${state}"
-                    continue
-                  fi
-                  if [ "$state" = "CLOSED" ]; then
-                    echo "skip: Issue #${issue} は既に closed (PR #${number})"
-                    continue
-                  fi
-                  if gh issue close "$issue" --reason completed; then
-                    echo "closed: Issue #${issue} (PR #${number} の Closes キーワードにより)"
-                  else
-                    echo "::warning::Issue #${issue} のクローズに失敗しました (PR #${number})"
-                  fi
-                done
+              if [ "$has_skip" = "true" ]; then
+                echo "skip: ラベル '${SKIP_LABEL}' が付いている"
+                echo "::endgroup::"; continue
               fi
-            else
-              # ブランチ保護 (レビュー必須など) や競合でマージできない場合。
-              # 他の PR の処理は続ける。
-              echo "::warning::PR #${number} のマージに失敗しました (競合・ブランチ保護など)"
+
+              # --- check-runs (GitHub Actions / GitHub App のチェック) ---
+              # filter=latest (既定) なので、再実行した場合は最新の結果だけ見る。
+              # この workflow 自身 (workflow 名 / job 名) は判定から除外する。
+              runs=$(gh api --paginate \
+                       "repos/${GH_REPO}/commits/${sha}/check-runs?per_page=100" \
+                       --jq '.check_runs[]' | jq -s \
+                       --arg self "$SELF_WORKFLOW" --arg self_job "$SELF_JOB" \
+                       '[.[] | select(.name != $self and .name != $self_job)]')
+
+              # --- commit status (レガシー API を使う外部サービス向け) ---
+              statuses=$(gh api "repos/${GH_REPO}/commits/${sha}/status" \
+                           --jq '.statuses')
+
+              total=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
+                        '($r | length) + ($s | length)')
+              if [ "$total" -eq 0 ]; then
+                echo "wait: まだチェックが 1 つも登録されていない"
+                echo "::endgroup::"; continue
+              fi
+
+              echo "check-runs:"
+              echo "$runs" | jq -r '.[] | "  - \(.name): \(.status) / \(.conclusion // "-")"'
+              if [ "$(echo "$statuses" | jq 'length')" -gt 0 ]; then
+                echo "statuses:"
+                echo "$statuses" | jq -r '.[] | "  - \(.context): \(.state)"'
+              fi
+
+              pending=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
+                '([$r[] | select(.status != "completed")] | length)
+                 + ([$s[] | select(.state == "pending")] | length)')
+              if [ "$pending" -gt 0 ]; then
+                echo "wait: 未完了のチェックが ${pending} 件ある"
+                echo "::endgroup::"; continue
+              fi
+
+              failed=$(jq -n --argjson r "$runs" --argjson s "$statuses" \
+                '([$r[] | select(.conclusion != "success"
+                                  and .conclusion != "skipped"
+                                  and .conclusion != "neutral")] | length)
+                 + ([$s[] | select(.state != "success")] | length)')
+              if [ "$failed" -gt 0 ]; then
+                echo "skip: 成功/スキップ以外のチェックが ${failed} 件ある"
+                echo "::endgroup::"; continue
+              fi
+
+              echo "check-runs / commit status: all green"
+
+              # --- Issue #188: レビュー状態の判定 -------------------------
+              # check-runs / commit status には現れない Pull Request の
+              # レビュー (Codex の指摘、人間のレビュー) を見る。Codex が
+              # 現在の head SHA をレビュー済みであることも必須要件
+              # (CODEX_BYPASS_LABEL で免除可能)。判定ロジック本体は
+              # review_gate_decision.sh / check_review_gate.py に切り出して
+              # あり単体テストがある (docs/decisions.md D91)。GraphQL 呼び出し
+              # 自体の失敗も含めて常に「安全側 = マージしない」に倒す
+              # (取得できなかったので指摘ゼロとみなす、は絶対にしない)。
+              echo "レビュー状態を確認します (Issue #188):"
+              if [ "$has_codex_bypass" = "true" ]; then
+                echo "  '${CODEX_BYPASS_LABEL}' ラベルあり: Codex レビュー要件のみ免除 (未解決スレッド/CHANGES_REQUESTED は免除されません)"
+              fi
+              # 第4引数 "true": Codex がこの head SHA をまだレビューして
+              # いなければ実際に `@codex review` を自動投稿する (pull-requests:
+              # write が要る。この job のみが実際に投稿する — dry-run job は
+              # 読み取り専用のまま「投稿する判定になった」ことをログに出す
+              # だけ)。
+              review_gate_output=""
+              review_gate_rc=0
+              : > "$gate_result_file"
+              review_gate_output=$(GATE_RESULT_FILE="$gate_result_file" \
+                bash .github/scripts/review_gate_decision.sh "$number" "$sha" "$has_codex_bypass" "true") \
+                || review_gate_rc=$?
+              if [ -n "$review_gate_output" ]; then
+                echo "$review_gate_output" | sed 's/^/  /'
+              fi
+              if [ "$review_gate_rc" -ne 0 ]; then
+                echo "wait: レビュー状態が条件を満たさないためマージを見送ります"
+                # Issue #219 / D103: ブロック要因が**猶予期間だけ**なら、
+                # 残り秒数を記録する。あとでその分だけ待って再評価する。
+                # ほかの理由 (未解決スレッド・レビュー待ちなど) が 1 つでも
+                # 残っているうちは記録しない — それらは待っても解決せず、
+                # 誰かが行動したときにイベントで起動するのが正しい。
+                if [ -s "$gate_result_file" ]; then
+                  grace_only=$(jq -r '.blocked_only_by_grace // false' "$gate_result_file")
+                  grace_seconds=$(jq -r '.grace_remaining_seconds // empty' "$gate_result_file")
+                  if [ "$grace_only" = "true" ] && [ -n "$grace_seconds" ]; then
+                    echo "  → 待っているのは猶予期間だけです (あと ${grace_seconds}秒)"
+                    echo "$grace_seconds" >> "$grace_file"
+                  fi
+                fi
+                echo "::endgroup::"; continue
+              fi
+              echo "  問題なし (未解決スレッド 0 件 / CHANGES_REQUESTED 0 件 / Codex レビュー条件を満たす / 猶予期間経過済み)"
+
+              echo "all green: マージします (${MERGE_METHOD})"
+              # --match-head-commit: 判定した commit から PR が進んでいたら
+              # マージしない (新しい commit のチェックが未評価のため)。
+              if gh pr merge "$number" "--${MERGE_METHOD}" \
+                   --match-head-commit "$sha" --delete-branch; then
+                echo "merged: PR #${number}"
+
+                # --- Issue #168 -------------------------------------------
+                # GITHUB_TOKEN でのマージは GitHub 側のそれ以上の自動処理
+                # (Closes キーワードによる Issue 自動クローズ) を誘発しない
+                # ため、ここで明示的に閉じる。AUTO_MERGE_TOKEN (PAT) が
+                # 登録されて本物の自動クローズが効くようになった場合でも、
+                # 対象 Issue は既に closed のはずなので下の冪等チェックで
+                # 何もせず skip になる (二重クローズしない)。
+                # 抽出ロジック本体は .github/scripts/extract_closing_issues.py
+                # に切り出してあり、単体テストがある
+                # (.github/scripts/test_extract_closing_issues.py)。
+                # 抽出の失敗 (スクリプトが無い・python が落ちる等) を握り
+                # つぶさないこと: 黙って空を返すと「1 件も閉じないまま成功」
+                # に見え、この Issue が直そうとしている症状と区別が付かない。
+                # 1 件の PR の失敗で他の PR のマージまで止める必要は無いので、
+                # 警告を出して次へ進む。
+                body=$(gh pr view "$number" --json body --jq '.body // ""')
+                if ! issues=$(printf '%s' "$body" | \
+                     python3 .github/scripts/extract_closing_issues.py); then
+                  echo "::warning::PR #${number} 本文からの Closes 抽出に失敗しました (Issue は閉じられていません)"
+                  issues=""
+                fi
+                if [ -n "$issues" ]; then
+                  echo "$issues" | while read -r issue; do
+                    [ -z "$issue" ] && continue
+                    # gh の stderr は捨てないこと: 「存在しない」と「権限が
+                    # 無い」はどちらもここで失敗するが、原因はまったく違う。
+                    # 実際に #168 の初回リリースでは `issues` 権限が無くて
+                    # 404 になっていたのに、メッセージが「見つかりません」
+                    # だったため原因がログから読み取れなかった。
+                    if ! state=$(gh issue view "$issue" --json state --jq '.state' 2>&1); then
+                      echo "::warning::Issue #${issue} の状態を取得できませんでした (PR #${number} 本文の Closes 参照): ${state}"
+                      continue
+                    fi
+                    if [ "$state" = "CLOSED" ]; then
+                      echo "skip: Issue #${issue} は既に closed (PR #${number})"
+                      continue
+                    fi
+                    if gh issue close "$issue" --reason completed; then
+                      echo "closed: Issue #${issue} (PR #${number} の Closes キーワードにより)"
+                    else
+                      echo "::warning::Issue #${issue} のクローズに失敗しました (PR #${number})"
+                    fi
+                  done
+                fi
+              else
+                # ブランチ保護 (レビュー必須など) や競合でマージできない場合。
+                # 他の PR の処理は続ける。
+                echo "::warning::PR #${number} のマージに失敗しました (競合・ブランチ保護など)"
+              fi
+              echo "::endgroup::"
+            done
+            return 0
+          }
+
+          for pass in 1 2; do
+            : > "$grace_file"
+            evaluate_open_prs
+
+            # 猶予期間だけを待っている PR が 1 つも無ければ、待つ意味は無い
+            if [ ! -s "$grace_file" ]; then
+              break
             fi
-            echo "::endgroup::"
+
+            # 最短の残り時間で起きる (最初に条件を満たす PR に合わせる)
+            wait_seconds=$(sort -n "$grace_file" | head -1)
+
+            if [ "$pass" -ge 2 ]; then
+              echo "info: 猶予期間だけを待っている PR がまだあります (最短 ${wait_seconds}秒)。待ち直しはこの run では 1 回までなので、ここで終了します"
+              break
+            fi
+
+            # 境界ちょうどで起きると「まだ経過していない」と判定されうるので
+            # 少しだけ余裕を足す。上限は猶予期間 + 1 分 — 何かの拍子に巨大な
+            # 値が来ても runner を長時間占有しないため (job 側にも
+            # timeout-minutes を設定してある)。
+            wait_seconds=$((wait_seconds + 15))
+            max_wait=$(( ${GRACE_PERIOD_MINUTES:-15} * 60 + 60 ))
+            if [ "$wait_seconds" -gt "$max_wait" ]; then
+              wait_seconds="$max_wait"
+            fi
+
+            echo "::notice::待っているのが猶予期間だけの PR があります。${wait_seconds}秒 待ってから全 PR を再評価します (Issue #219)"
+            sleep "$wait_seconds"
           done
+
 
   # Issue #188 / docs/decisions.md D91: この workflow 自身、またはレビュー
   # 判定ロジックを変更する PR に限り、上の on.pull_request.paths フィルタで
@@ -390,6 +474,22 @@ jobs:
       checks: read
     steps:
       - uses: actions/checkout@v7
+
+      # Issue #219 / D103: 判定ロジックとマージ判定ステップの自動テスト。
+      # `.github/scripts/test_*.py` はこれまで CI のどこからも実行されて
+      # いなかった (ci.yml は Rust のみ)。ロジックを触る PR ではここで回す。
+      - name: 判定ロジックの単体テスト (Python)
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          python3 -m unittest discover -s .github/scripts -p "test_*.py" -v
+
+      - name: シェル側の統合テスト (review_gate_decision.sh / auto-merge の run ブロック)
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          bash .github/scripts/test_review_gate_decision.sh
+          bash .github/scripts/test_auto_merge_step.sh
 
       - name: レビュー判定ロジックを検証実行する (マージは一切行わない)
         env:

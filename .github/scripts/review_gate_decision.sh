@@ -45,6 +45,13 @@
 #                               仕組みが導入されているか未確認のため、
 #                               ログイン名をハードコードしていない
 #                               (docs/decisions.md D91 参照)。
+#   GATE_RESULT_FILE         - **任意**。指定するとこのパスに判定結果の
+#                               JSON をそのまま書き出す (`blocked` /
+#                               `grace_remaining_seconds` /
+#                               `blocked_only_by_grace` など)。auto-merge.yml
+#                               が「猶予期間だけを待っている PR」を検出して
+#                               待ち直すために使う (Issue #219 / D103)。
+#                               未設定なら何も書き出さない。
 #   AUTO_MERGE_TOKEN         - `@claude` メンション / `@codex review`
 #                               投稿専用の PAT。**未設定ならどちらも
 #                               投稿しない** (GH_TOKEN の
@@ -221,6 +228,16 @@ payload=$(jq -n \
   }')
 
 result=$(echo "$payload" | python3 "${scripts_dir}/check_review_gate.py")
+
+# Issue #219 / D103: 呼び出し側が「あと何秒待てば猶予期間が明けるか」を
+# 機械可読に取れるようにする。stdout は人間向けのログ (呼び出し側が
+# そのまま Actions のログへ流す) なので混ぜず、環境変数で指定された
+# ファイルへ判定結果の JSON をそのまま書き出す。**未設定なら何もしない**
+# ので、既存の呼び出し側 (dry-run ジョブ・テスト) の挙動は変わらない。
+if [ -n "${GATE_RESULT_FILE:-}" ]; then
+  printf '%s' "$result" > "$GATE_RESULT_FILE"
+fi
+
 blocked=$(echo "$result" | jq -r '.blocked')
 codex_request_needed=$(echo "$result" | jq -r '.codex_review_request_needed')
 codex_relaxed=$(echo "$result" | jq -r '.codex_relaxed')
