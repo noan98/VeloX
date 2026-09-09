@@ -56,9 +56,10 @@ Linux に存在せず、Edge は実質 Chromium と同一エンジンなので�
 | --- | --- | --- |
 | `startup_to_load_ms` | プロセス spawn の瞬間から、**ページ自身の `load` イベント**が発火するまでの実時間。ページに注入した beacon が loopback の HTTP サーバを叩き、その到着時刻で測る | 共通 |
 | `pss_bytes` | load から `--settle-secs` 秒後の、プロセスツリー全体の **PSS** 合計 (`smaps_rollup` のカーネル計算値) | Linux のみ |
-| `private_bytes` | 同時点の **Private Working Set** 合計 | Windows のみ |
-| `rss_bytes` | 同時点の RSS / Working Set 合計 (**Linux では比較に使わない**。下記参照) | 共通 |
-| `lower_bytes` / `upper_bytes` | **真の PSS を挟む区間**。Linux では PSS 自身なので下界 = 上界 (幅ゼロ)、Windows では `private_bytes` と `rss_bytes` | 共通 |
+| `private_bytes` | 同時点の **Private Working Set** 合計 = **真の PSS の下界** | Windows のみ |
+| `pss_upper_bytes` | 私有ページ + 共有ページを `ShareCount` で割った和 = **真の PSS の上界**。近似値ではない (下記参照) | Windows のみ |
+| `rss_bytes` | 同時点の RSS / Working Set 合計 (**比較には使わない**。Linux は PSS が、Windows は `pss_upper_bytes` がある) | 共通 |
+| `lower_bytes` / `upper_bytes` | **真の PSS を挟む区間**。Linux では PSS 自身なので下界 = 上界 (幅ゼロ)、Windows では `private_bytes` と `pss_upper_bytes` | 共通 |
 | `process_count` | 同時点のプロセス数 | 共通 |
 
 > ### Windows には PSS が無いので「挟み込む」 (Issue #197)
@@ -67,17 +68,25 @@ Linux に存在せず、Edge は実質 Chromium と同一エンジンなので�
 > 返す。Windows にこれに相当するものは無い (D88)。
 >
 > D88 は `QueryWorkingSetEx` の `ShareCount` で `1/ShareCount` を足し上げる近似を
-> 検討し、「正確さが自明でない」として見送った。**その判断は正しかった** —
-> `PSAPI_WORKING_SET_BLOCK` の `ShareCount` は **3 bit しかなく 7 で飽和する**。
-> ブラウザのように 8 個以上のプロセスが同じ DLL ページを共有する状況では共有
-> ページの重みが実際より重く出るうえ、**飽和の度合いがプロセス数に依存する**ので、
-> プロセス構成の違うブラウザ同士の比較という、まさに使いたい用途で歪む。
+> 検討し、「正確さが自明でない」として見送った。**近似値として使う限り、その判断は
+> 正しい** — `PSAPI_WORKING_SET_BLOCK` の `ShareCount` は **3 bit しかなく 7 で
+> 飽和する**ので、8 個以上のプロセスが同じ DLL ページを共有する状況では共有ページの
+> 重みが実際より重く出るうえ、**飽和の度合いがプロセス数に依存する**。
 >
-> そこで近似値は作らず、**真の PSS を上下から挟む 2 つの厳密な値**を採る。
-> `QueryWorkingSet` は working set の各ページが共有かどうかを返すので、1 回の
-> 呼び出しで両方が得られる。
+> **しかし上界として使えば飽和は破綻しない。** 報告値を c、実際の共有プロセス数を
+> n とすると、飽和していなければ n = c、飽和していれば n >= 7 = c なので、
+> **どちらでも n >= c**。よって各ページの寄与は `page_size / n <= page_size / c`
+> であり、和は必ず真の PSS 以上になる。飽和は上界を緩めるだけで、上界であること
+> 自体を壊さない (D99 決定1)。
 >
->     private_bytes  <=  真の PSS  <=  rss_bytes (Working Set 合計)
+> そこで近似値は作らず、**真の PSS を上下から挟む厳密な値**を採る。
+> `QueryWorkingSet` は各ページの `Shared` と `ShareCount` を返すので、1 回の
+> 呼び出しですべて得られる。
+>
+>     private_bytes  <=  真の PSS  <=  pss_upper_bytes  <=  rss_bytes (Working Set 合計)
+>
+> `rss_bytes` も正しい上界だが「c = 1 と置いた」のと同じで最も緩い。実測では
+> 4 倍ほど緩く、**そのままでは T2 を判定できなかった** (§29.8 → §29.10)。
 >
 > 判定は区間で行い、**区間が重なる間は「判定不能」と言う** — 片方の端を代表値に
 > 選んで断定するのは、測れていないものを測れたことにする行為である
