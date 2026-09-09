@@ -33,6 +33,7 @@ from proctree import (  # noqa: E402
     collect_tree,
     process_tree_memory,
     supported,
+    working_set_pages,
 )
 
 
@@ -111,11 +112,13 @@ class BoundsTest(unittest.TestCase):
             rss_bytes=1000,
             pss_bytes=None,
             private_bytes=400,
+            pss_upper_bytes=650,
             process_count=3,
             unreadable_count=0,
         )
         self.assertEqual(result.lower_bytes, 400)
-        self.assertEqual(result.upper_bytes, 1000)
+        # Working Set 合計 (1000) ではなく、締まった上界 (650) を使う。
+        self.assertEqual(result.upper_bytes, 650)
         self.assertLessEqual(result.lower_bytes, result.upper_bytes)
 
     def test_linux_pss_is_both_bounds(self):
@@ -124,6 +127,7 @@ class BoundsTest(unittest.TestCase):
             rss_bytes=1000,
             pss_bytes=600,
             private_bytes=None,
+            pss_upper_bytes=None,
             process_count=3,
             unreadable_count=0,
         )
@@ -137,6 +141,83 @@ class BoundsTest(unittest.TestCase):
         判断も見直す必要がある (docs/decisions.md D88/D99)。
         """
         self.assertEqual(WINDOWS_SHARE_COUNT_MAX, 7)
+
+
+PAGE = 4096
+
+
+def block(shared: bool, share_count: int = 0) -> int:
+    """`PSAPI_WORKING_SET_BLOCK` を組み立てる。
+
+    ビット配置は Protection:5, ShareCount:3, Shared:1 — つまり `ShareCount` は
+    bit 5-7、`Shared` は bit 8。**この配置を間違えると数字が静かに狂う**ので、
+    テスト側でも同じ規則で組み立てて往復させる。
+    """
+    value = (share_count & 0x7) << 5
+    if shared:
+        value |= 1 << 8
+    return value
+
+
+class WorkingSetPagesTest(unittest.TestCase):
+    """`ShareCount` 由来の上界 (Issue #197、D99 決定1)。
+
+    **D88 はこれを「近似値」として使うことを検討して見送った。** その懸念
+    (`ShareCount` が 3 bit で 7 に飽和する) は事実だが、**上界として使うなら
+    飽和は破綻しない** — 報告値 c に対して実際の共有数 n は必ず n >= c なので、
+    `page_size / n <= page_size / c` が常に成り立つ。ここではその性質を固定する。
+    """
+
+    def test_private_pages_are_counted_in_full(self):
+        pages = [block(shared=False)] * 10
+        private, upper = working_set_pages(pages, PAGE)
+        self.assertEqual(private, 10 * PAGE)
+        # 共有ページが無ければ上界 = 私有 = 真の PSS。
+        self.assertEqual(upper, 10 * PAGE)
+
+    def test_shared_pages_are_excluded_from_the_lower_bound(self):
+        """下界は私有ページのみ。共有ページは 1 枚も数えない。"""
+        pages = [block(shared=True, share_count=2)] * 8
+        private, upper = working_set_pages(pages, PAGE)
+        self.assertEqual(private, 0)
+        self.assertEqual(upper, 4 * PAGE)  # 8 ページ × 1/2
+
+    def test_upper_bound_divides_by_share_count(self):
+        """私有 2 + 共有 4 (c=4) → 上界 = 2 + 1 = 3 ページ分。"""
+        pages = [block(shared=False)] * 2 + [block(shared=True, share_count=4)] * 4
+        private, upper = working_set_pages(pages, PAGE)
+        self.assertEqual(private, 2 * PAGE)
+        self.assertEqual(upper, 3 * PAGE)
+
+    def test_saturated_share_count_still_yields_a_valid_upper_bound(self):
+        """**飽和しても上界であり続ける** — D88 の懸念への直接の回答。
+
+        c=7 と報告されたページが実際には 20 プロセスで共有されていたとする。
+        真の寄与は 1/20 だが、こちらは 1/7 で数えるので**多めに見積もる**。
+        上界としては正しい (緩いだけ)。
+        """
+        pages = [block(shared=True, share_count=WINDOWS_SHARE_COUNT_MAX)] * 70
+        _, upper = working_set_pages(pages, PAGE)
+        true_pss_if_20_sharers = 70 / 20 * PAGE
+        self.assertEqual(upper, 10 * PAGE)  # 70 × 1/7
+        self.assertGreater(upper, true_pss_if_20_sharers)
+
+    def test_upper_bound_never_exceeds_the_working_set_total(self):
+        """上界は Working Set 合計 (c=1 と置いたのと同じ) を超えない。"""
+        pages = [block(shared=False)] * 3 + [
+            block(shared=True, share_count=c) for c in (1, 2, 3, 7)
+        ]
+        _, upper = working_set_pages(pages, PAGE)
+        self.assertLessEqual(upper, len(pages) * PAGE)
+
+    def test_zero_share_count_does_not_divide_by_zero(self):
+        """共有ページで c=0 は本来ありえないが、落ちずに上界を保つ。"""
+        pages = [block(shared=True, share_count=0)] * 5
+        _, upper = working_set_pages(pages, PAGE)
+        self.assertEqual(upper, 5 * PAGE)  # 1 とみなす = 最も緩い上界
+
+    def test_empty_working_set(self):
+        self.assertEqual(working_set_pages([], PAGE), (0, 0))
 
 
 @unittest.skipUnless(sys.platform.startswith("linux"), "Linux でのみ実測できる")

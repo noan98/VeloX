@@ -17,7 +17,8 @@
 2. `rss_bytes` — ロード完了から `--settle-secs` 秒後の、プロセスツリー全体の
    RSS 合計。`/proc` を辿るだけで、`browser::metrics::sample_process_tree_rss`
    と同じ考え方 (D16)。
-3. `pss_bytes` — 同じ時点の PSS (Proportional Set Size) 合計。**RSS 合計だけで
+3. `pss_bytes` — 同じ時点の PSS (Proportional Set Size) 合計 (Linux のみ。
+   Windows は `private_bytes` と `pss_upper_bytes` の区間で挟む)。**RSS 合計だけで
    比較してはいけない**: RSS は共有メモリをプロセスごとに丸ごと数えるため、
    プロセス数の多いブラウザほど二重計上で不利に出る (この環境では VeloX が 5
    プロセス、Chromium が 9 プロセス)。PSS は共有ページを共有者数で割るので、
@@ -52,8 +53,10 @@ T2 の評価は Linux でしか行えていなかった — このスクリプ�
 
 1. **メモリの採り方**。`/proc` の代わりに Toolhelp32 + `QueryWorkingSet` を使う
    (`proctree.py`)。**Windows に PSS は無い** (D88)。代わりに真の PSS を挟む
-   上下界 — Private Working Set 合計 (下界) と Working Set 合計 (上界) — を
-   採り、区間が重なる間は「判定不能」と言う (`compare_bounds`)。
+   上下界 — Private Working Set 合計 (下界) と、共有ページを `ShareCount` で
+   割った和 (上界) — を採り、区間が重なる間は「判定不能」と言う
+   (`compare_bounds`)。**上界の割り算は近似ではなく、飽和しても壊れない厳密な
+   上界である** (理由は `proctree.py` を参照)。
 2. **仮想ディスプレイが要らない**。`DISPLAY` の確認は Linux でのみ行う。
 3. **比較相手**。Windows の VeloX は WebView2 (= Edge と同じ Chromium エンジン)
    を使うので、**Edge と比べると「エンジン差」が消えて VeloX 自身のオーバー
@@ -272,6 +275,10 @@ def run_trial(name: str, argv: list[str], env_extra: dict, server: Harness,
             "pss_bytes": mem.pss_bytes,
             # Windows のみ。Private Working Set 合計 = 真の PSS の下界。
             "private_bytes": mem.private_bytes,
+            # Windows のみ。ShareCount 由来の締まった上界 (Working Set 合計
+            # より遥かに小さい)。両方残すのは、どちらを使ったかを後から
+            # 確かめられるようにするため。
+            "pss_upper_bytes": mem.pss_upper_bytes,
             # 比較に使う区間。Linux では下界 = 上界 = PSS になる。
             "lower_bytes": mem.lower_bytes,
             "upper_bytes": mem.upper_bytes,
@@ -505,6 +512,11 @@ def main() -> int:
                 "private_bytes": summarize(
                     [float(s["private_bytes"]) for s in samples[name]
                      if s["private_bytes"] is not None]
+                ),
+                # Windows のみ。ShareCount 由来の締まった上界。
+                "pss_upper_bytes": summarize(
+                    [float(s["pss_upper_bytes"]) for s in samples[name]
+                     if s.get("pss_upper_bytes") is not None]
                 ),
                 "lower_bytes": summarize(
                     [float(s["lower_bytes"]) for s in samples[name]
