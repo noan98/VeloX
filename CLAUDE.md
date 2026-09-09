@@ -133,9 +133,24 @@ fmt → clippy → test → build を Linux 上で実行します。加えて Wi
 
 `.github/workflows/auto-merge.yml` は、`main` 向けの open な PR のうち
 「Auto Merge 自身を除くすべてのチェックが success / skipped になった」ものを
-自動でマージします (プライベートリポジトリでは GitHub 標準の auto-merge が
-使えないための代替。docs/decisions.md D55 を参照)。自動マージさせたくない
+自動でマージします (docs/decisions.md D55 を参照)。自動マージさせたくない
 PR には `no-automerge` ラベルを付けるか、Draft のままにしてください。
+
+D55 当時の導入理由は「プライベートリポジトリでは GitHub 標準の auto-merge が
+使えない」でしたが、**リポジトリは 2026-09-09 に public へ変更されたため
+この前提は失効しています** (docs/decisions.md D102)。それでも自前実装を
+残しているのは、標準 auto-merge が持たないレビューゲート (Codex / Claude の
+レビュー必須化・自動リクエスト・猶予期間、Issue #188 / D91) がこの仕組みの
+本体だからです。
+
+**public リポジトリであることは workflow を書くときの前提条件です。**
+`issue_comment` / `pull_request_review` は **GitHub の任意のユーザが発火
+できます**。書き込み権限 (`contents: write` など) やシークレットを持つ
+job をこれらのトリガで起動する場合は、必ず job の `if` で投稿者を絞って
+ください (`author_association` が OWNER / MEMBER / COLLABORATOR、または
+ログイン名がボットと完全一致)。実例と単体テストは
+`.github/workflows/auto-merge.yml` と
+`.github/scripts/test_auto_merge_trigger_guard.py` にあります。
 
 ## 対応 OS の優先度
 

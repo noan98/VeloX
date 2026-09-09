@@ -49,4 +49,11 @@ jobs:
           prompt: |
             Reply with exactly the following text and nothing else: TOKEN_OK
           # このプローブの目的そのもの。伏せられていたエラー本文を出す。
+          #
+          # ⚠️ **リポジトリは public なので、この実行ログは誰でも読める**
+          # (docs/decisions.md D102)。ここで true のままにしているのは、
+          # (a) 起動が `workflow_dispatch` に限られ、オーナーが必要なときに
+          # だけ手動で走らせるものであること、(b) プロンプトが固定文言で
+          # リポジトリの内容を一切読ませないこと、による。常時起動する
+          # `claude.yml` 側は既定の false に戻してある。
           show_full_output: true
