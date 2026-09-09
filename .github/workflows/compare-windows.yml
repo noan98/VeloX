@@ -1,0 +1,260 @@
+name: Browser comparison (Windows, manual)
+
+# Issue #197 / docs/decisions.md D97 Revisit condition (3)。
+#
+# `docs/performance-targets.md` の T2 は「メモリで Chromium 比 +10% 以内」だが、
+# **この評価は Linux でしか行えていなかった** — 比較ハーネス
+# (`scripts/bench/compare_browsers.py`) が `/proc` 前提だったためである。
+# CLAUDE.md は Windows を最優先と定めており、Windows で評価できない目標を
+# Stage 1 (Issue #176) の完了条件に据えることはできない。この workflow が
+# その穴を埋める。
+#
+# **なぜ perf-windows.yml に相乗りしないのか**: あちらは velox-bench の
+# A/B 計測という別の役割を既に担っており、§28 の測定系として動いている。
+# 比較ハーネスは固定ページの配信も beacon の受信も自前で行う (別サーバを
+# 立てる必要が無い) ため構造が違い、混ぜると両方が読みにくくなる。壊した
+# ときの被害を分けるためにも独立させた。
+#
+# ⚠️ **`compare_browsers.py` の Windows 実装 (Toolhelp32 + QueryWorkingSet の
+# ctypes 呼び出し) は、この workflow が走るまで一度も実行されていない。**
+# 開発環境は Linux コンテナで Windows 実機が無い (D61/D88 と同じ制約)。
+# D88 が `QueryWorkingSetEx` の実装を見送った理由の 1 つが「実機で検証する
+# 手段が無い」ことだったので、**検証手段を先に用意する**という順序にしている。
+#
+# `on:` は workflow_dispatch が基本だが、perf-windows.yml / release-windows.yml
+# と同じパターンで、**この workflow と実行対象スクリプトを変更する PR に限り**
+# pull_request でも走らせる — workflow_dispatch は main にマージされるまで
+# Actions タブに現れないため、マージ前に Windows 実機で検証する唯一の手段になる。
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: "試行回数 (ブラウザごと)"
+        type: string
+        default: "5"
+      page:
+        description: "scripts/bench/pages/ の固定ページ"
+        type: choice
+        default: minimal.html
+        options:
+          - minimal.html
+          - dom_heavy.html
+          - text.html
+      baseline:
+        description: >-
+          比較相手。auto は Edge → Chrome の順に探す。
+          VeloX は WebView2 (Edge と同じエンジン) を使うので、
+          edge を選ぶとエンジン差が消えて VeloX 自身のオーバーヘッドだけが残る
+        type: choice
+        default: auto
+        options:
+          - auto
+          - edge
+          - chrome
+      settle_secs:
+        description: "load 後、メモリを採るまでの待ち時間 (秒)"
+        type: string
+        default: "3"
+  pull_request:
+    paths:
+      - ".github/workflows/compare-windows.yml"
+      - "scripts/bench/compare_browsers.py"
+      - "scripts/bench/proctree.py"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  compare:
+    name: VeloX vs Chromium (windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # 純粋ロジックの単体テスト。Windows 上でも走らせるのは、`collect_tree`
+      # の集計が OS 非依存であることを Windows でも確かめるため。FFI 部分は
+      # ここでは検証できない (実際の比較実行がその役割を担う)。
+      - name: Unit tests (bench scripts)
+        shell: pwsh
+        run: python -m unittest discover -s scripts/bench -p "test_*.py" -v
+
+      # docs/performance-targets.md §1「測定環境を固定して記録する」。
+      # ブラウザのバージョンは比較結果の意味を左右するので必ず残す。
+      - name: Record environment info
+        id: env_info
+        shell: pwsh
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+          $ramGiB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+          Write-Host "OS      : $($os.Caption) build $($os.BuildNumber)"
+          Write-Host "CPU     : $($cpu.Name) ($($cpu.NumberOfLogicalProcessors) 論理コア)"
+          Write-Host "RAM     : $ramGiB GiB"
+
+          function Get-BrowserVersion([string]$path) {
+            if (Test-Path $path) {
+              return (Get-Item $path).VersionInfo.ProductVersion
+            }
+            return $null
+          }
+          $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+          $chrome = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+          $edgeVer = Get-BrowserVersion $edge
+          $chromeVer = Get-BrowserVersion $chrome
+          Write-Host "Edge    : $(if ($edgeVer) { $edgeVer } else { '未インストール' })"
+          Write-Host "Chrome  : $(if ($chromeVer) { $chromeVer } else { '未インストール' })"
+
+          # VeloX が使う WebView2 Runtime のバージョン。Edge 本体とは別物なので
+          # 別に記録する (同じ Chromium 系でもビルドがずれうる)。
+          $wv2Key = "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+          $wv2 = (Get-ItemProperty -Path $wv2Key -ErrorAction SilentlyContinue).pv
+          Write-Host "WebView2: $(if ($wv2) { $wv2 } else { '不明' })"
+
+          "os=$($os.Caption) build $($os.BuildNumber)" >> $env:GITHUB_OUTPUT
+          "cpu=$($cpu.Name)" >> $env:GITHUB_OUTPUT
+          "cores=$($cpu.NumberOfLogicalProcessors)" >> $env:GITHUB_OUTPUT
+          "ram=$ramGiB GiB" >> $env:GITHUB_OUTPUT
+          "edge=$edgeVer" >> $env:GITHUB_OUTPUT
+          "chrome=$chromeVer" >> $env:GITHUB_OUTPUT
+          "webview2=$wv2" >> $env:GITHUB_OUTPUT
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Run comparison
+        id: compare
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $trials = "${{ inputs.trials }}"
+          if ([string]::IsNullOrWhiteSpace($trials)) { $trials = "5" }
+          $page = "${{ inputs.page }}"
+          if ([string]::IsNullOrWhiteSpace($page)) { $page = "minimal.html" }
+          $settle = "${{ inputs.settle_secs }}"
+          if ([string]::IsNullOrWhiteSpace($settle)) { $settle = "3" }
+          $baseline = "${{ inputs.baseline }}"
+          if ([string]::IsNullOrWhiteSpace($baseline)) { $baseline = "auto" }
+
+          # ⚠️ `$args` は PowerShell の自動変数なので使わない。
+          $pyArgs = @(
+            "scripts/bench/compare_browsers.py",
+            "--velox", ".\target\release\velox.exe",
+            "--page", $page,
+            "--trials", $trials,
+            "--settle-secs", $settle,
+            "--output", "results/compare-windows.json"
+          )
+          # auto ならスクリプト側の自動検出に任せる。明示指定なら実在確認を
+          # ここで行い、**無いのに黙って別のブラウザで測る**ことを防ぐ。
+          if ($baseline -eq "edge") {
+            $path = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            if (-not (Test-Path $path)) {
+              $path = "C:\Program Files\Microsoft\Edge\Application\msedge.exe"
+            }
+            if (-not (Test-Path $path)) { throw "Edge が見つかりません" }
+            $pyArgs += @("--chromium", $path, "--baseline-name", "edge")
+          } elseif ($baseline -eq "chrome") {
+            $path = "C:\Program Files\Google\Chrome\Application\chrome.exe"
+            if (-not (Test-Path $path)) {
+              $path = "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"
+            }
+            if (-not (Test-Path $path)) { throw "Chrome が見つかりません" }
+            $pyArgs += @("--chromium", $path, "--baseline-name", "chrome")
+          }
+
+          Write-Host "python $($pyArgs -join ' ')"
+          # ⚠️ ここで `ErrorActionPreference` を Continue に落とす。GitHub は
+          # pwsh ステップに既定で Stop を設定するが、その状態で native コマンドの
+          # stderr を `2>&1` でパイプに流すと NativeCommandError として例外に
+          # なりうる。**Python が警告を 1 行出しただけで計測が落ちる**のは割に
+          # 合わない。失敗判定は下の `$LASTEXITCODE` で明示的に行う
+          # (perf-windows.yml の診断ステップと同じ扱い)。
+          $ErrorActionPreference = "Continue"
+          python @pyArgs 2>&1 | Tee-Object -FilePath compare-output.txt
+          $exit = $LASTEXITCODE
+          if ($exit -ne 0) { throw "compare_browsers.py が exit code $exit で失敗しました" }
+
+      - name: Job summary
+        if: always()
+        shell: pwsh
+        run: |
+          $lines = @()
+          $lines += "## VeloX vs Chromium (Windows)"
+          $lines += ""
+          $lines += "| 項目 | 値 |"
+          $lines += "| --- | --- |"
+          $lines += "| OS | ${{ steps.env_info.outputs.os }} |"
+          $lines += "| CPU | ${{ steps.env_info.outputs.cpu }} (${{ steps.env_info.outputs.cores }} 論理コア) |"
+          $lines += "| RAM | ${{ steps.env_info.outputs.ram }} |"
+          $lines += "| Edge | ${{ steps.env_info.outputs.edge }} |"
+          $lines += "| Chrome | ${{ steps.env_info.outputs.chrome }} |"
+          $lines += "| WebView2 Runtime | ${{ steps.env_info.outputs.webview2 }} |"
+          $lines += ""
+
+          if (Test-Path "results/compare-windows.json") {
+            $r = Get-Content "results/compare-windows.json" -Raw | ConvertFrom-Json
+            $lines += "### 結果 (page=$($r.page), trials=$($r.trials_requested))"
+            $lines += ""
+            $lines += "メモリ指標: $($r.memory_metric)"
+            $lines += ""
+            $lines += "| ブラウザ | n | load 中央値 (ms) | メモリ下界 (MiB) | メモリ上界 (MiB) | プロセス数 |"
+            $lines += "| --- | ---: | ---: | ---: | ---: | ---: |"
+            foreach ($name in $r.browsers.PSObject.Properties.Name) {
+              $b = $r.browsers.$name
+              if ($b.startup_to_load_ms.n -eq 0) {
+                $lines += "| $name | 0 | — | — | — | — |"
+                continue
+              }
+              $lower = if ($b.lower_bytes.n -gt 0) {
+                "{0:N1}" -f ($b.lower_bytes.median / 1MB)
+              } else { "—" }
+              $lines += ("| {0} | {1} | {2:N1} | {3} | {4:N1} | {5:N0} |" -f `
+                $name, $b.startup_to_load_ms.n, $b.startup_to_load_ms.median,
+                $lower, ($b.upper_bytes.median / 1MB), $b.process_count.median)
+            }
+            $lines += ""
+            if ($r.t2) {
+              $lines += "### T2 (Chromium 比 +10% 以内)"
+              $lines += ""
+              $lines += "**判定: $($r.t2.verdict)** — $($r.t2.detail)"
+              $lines += ""
+              if ($r.t2.baseline -eq "edge") {
+                $lines += "> VeloX は WebView2 (Edge と同じ Chromium エンジン) を使うため、"
+                $lines += "> **この比較にエンジン差は含まれない。** 残る差は VeloX 自身の"
+                $lines += "> オーバーヘッドである。Linux (WebKitGTK 対 Blink) では不可能だった切り分け。"
+                $lines += ""
+              }
+            }
+            $lines += "> ⚠️ Windows に PSS は無い (docs/decisions.md D88)。下界は Private Working Set 合計、"
+            $lines += "> 上界は共有ページを ShareCount で割った和で、**どちらも近似値ではなく真の PSS を挟む"
+            $lines += "> 厳密な値である** (D99 決定1)。真の値はこの区間のどこかにあるので、**区間の端を"
+            $lines += "> 代表値として引用しないこと。** Linux の PSS と数値を並べることも成立しない"
+            $lines += "> (Epic #57 の絶対ルール5)。"
+          } else {
+            $lines += "### 結果"
+            $lines += ""
+            $lines += "結果 JSON が生成されませんでした。ログを確認してください。"
+            if (Test-Path "compare-output.txt") {
+              $lines += ""
+              $lines += '```'
+              $lines += (Get-Content "compare-output.txt" -Tail 40)
+              $lines += '```'
+            }
+          }
+          $lines -join "`n" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: velox-compare-windows
+          path: |
+            results/compare-windows.json
+            compare-output.txt
+          if-no-files-found: warn

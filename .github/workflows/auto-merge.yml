@@ -59,8 +59,41 @@ on:
   # Issue #188 / docs/decisions.md D91: 猶予期間 (既定15分) を追加した分、
   # 定期実行だけに頼るケース (workflow_run で拾えなかった PR) の最悪遅延が
   # 増えないよう、30分間隔から10分間隔に詰めた。
+  #
+  # ⚠️ **実測ではこの schedule はほとんど発火していない。** GitHub は負荷に
+  # 応じて schedule を間引く。頼りにできるのは下記の issue_comment /
+  # pull_request_review と workflow_dispatch である。
   schedule:
     - cron: "*/10 * * * *"
+  # レビューの返答でゲートを即座に再評価する (待ち時間短縮)。
+  #
+  # **なぜ必要か**: レビュー要件を満たすまでに auto-merge の実行が 3 回要る
+  # (依頼を出す → 上限/レビューを検知して次へ進む → マージ)。ところが
+  # `workflow_run` は CI 完了でしか発火しないため、**レビューボットが返答
+  # しても何も起こらない。** 実測では 1 段ごとに十数分〜手動 dispatch 待ちに
+  # なっていた。Codex の上限メッセージも Claude のレビュー完了もコメントとして
+  # 届くので、それを拾えば数秒で次段へ進む。
+  #
+  # ループしないか: auto-merge 自身も依頼コメントを投稿するため再発火するが、
+  # 同じ head SHA への依頼はマーカーで重複防止されるので**投稿は繰り返され
+  # ない**。下の `if` で自分のマーカーを含むコメントを弾き、空振りの実行自体も
+  # 減らしてある。
+  #
+  # ⚠️ **セキュリティ**: `contents: write` とマージ権限を持つ workflow を
+  # コメントで起動できるようにするのは、一般には権限昇格の経路になりうる。
+  # ここで許容できると判断した根拠は 2 つ:
+  #   1. 本リポジトリはプライベートで、コメントできるのは共同作業者だけ
+  #      (公開リポジトリなら誰でも発火できるため、この判断は成立しない)。
+  #   2. **このジョブはコメント本文を判定に一切使わない。** 起動後は
+  #      `gh pr list` から open PR を取り直し、check-runs とレビュー状態を
+  #      API から読んで一から判定する。したがってコメントでできるのは
+  #      「判定をやり直させる」ことだけで、**判定結果を変えることはできない。**
+  #      上の `if` が本文を見るのは空振りを減らすためだけで、安全性はゲート
+  #      本体 (check_review_gate.py) が担保している。
+  issue_comment:
+    types: [created]
+  pull_request_review:
+    types: [submitted, dismissed]
   workflow_dispatch: {}
   # Issue #188 / D91: この workflow 自身、またはレビュー判定ロジック
   # (check_review_gate.py / review_gate_decision.sh) を変更する PR に限り
@@ -127,7 +160,15 @@ jobs:
     runs-on: ubuntu-latest
     # pull_request トリガは dry-run-review-gate 専用 (下記)。実際にマージを
     # 行うこのジョブは pull_request では絶対に起動しない。
-    if: github.event_name != 'pull_request'
+    #
+    # auto-merge 自身が投稿した依頼コメント (マーカー入り) では起動しない。
+    # 判定材料が何も増えていないので走らせても空振りするだけで、Actions の
+    # ログが読みにくくなる。**レビューボットの返答では起動する** — それが
+    # このトリガを足した目的である。
+    if: >-
+      github.event_name != 'pull_request' &&
+      !(github.event_name == 'issue_comment' &&
+        contains(github.event.comment.body, '<!-- auto-merge:'))
     steps:
       # Issue #168: この job は元々リポジトリを checkout していなかった
       # (gh CLI と API しか使わないため必要が無かった)。マージ後の Issue
