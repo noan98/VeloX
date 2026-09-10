@@ -152,6 +152,7 @@ GraphQL のページング (`pageInfo.hasNextPage == true`) で全件を確認�
 from __future__ import annotations
 
 import json
+import math
 import re
 import sys
 from datetime import datetime, timedelta, timezone
@@ -689,11 +690,16 @@ def evaluate_review_gate(
 
     Returns:
         `{"blocked": bool, "reasons": [str, ...],
+        "grace_remaining_seconds": int | None, "blocked_only_by_grace": bool,
         "codex_review_request_needed": bool, "codex_relaxed": bool,
         "codex_relaxed_detail": str | None, "claude_review_request_needed":
         bool, "claude_relaxed": bool, "claude_relaxed_detail": str | None}`。
         `reasons` はログ出力用の日本語メッセージ (先頭が "wait: ")。
-        `blocked` は `len(reasons) > 0` と等価。`codex_review_request_needed`
+        `blocked` は `len(reasons) > 0` と等価。`grace_remaining_seconds`
+        は猶予期間が理由に挙がったときの残り秒数 (切り上げ)、
+        `blocked_only_by_grace` は**ブロック要因が猶予期間だけ**のとき
+        `True` — 呼び出し側はこの秒数だけ待って再評価すればよい
+        (Issue #219 / D103)。`codex_review_request_needed`
         が `True` の場合、呼び出し側は `codex_review_request_comment_body()`
         の内容で `@codex review` を投稿すべき (本関数自体は投稿しない)。
         `claude_review_request_needed` が `True` の場合、呼び出し側は
@@ -703,6 +709,7 @@ def evaluate_review_gate(
         `::warning::` として目立たせて出力すべき。
     """
     reasons: list[str] = []
+    grace_remaining_seconds: int | None = None
     codex_review_request_needed = False
     codex_relaxed = False
     codex_relaxed_detail: str | None = None
@@ -954,9 +961,21 @@ def evaluate_review_gate(
     else:
         observed_at = _parse_iso8601(head_push_observed_at)
         now_at = _parse_iso8601(now)
-        elapsed_minutes = (now_at - observed_at).total_seconds() / 60
+        elapsed_seconds = (now_at - observed_at).total_seconds()
+        elapsed_minutes = elapsed_seconds / 60
         if elapsed_minutes < grace_period_minutes:
             remaining = grace_period_minutes - elapsed_minutes
+            # 呼び出し側が「あと何秒待てば良いか」を機械可読に取れるように
+            # する (Issue #219 / D103)。**切り上げる** — 切り捨てると
+            # 待ち終えた直後にまだ猶予期間内で、もう一度待つことになる。
+            #
+            # ⚠️ `remaining * 60` で計算しないこと。秒→分→秒と往復すると
+            # 二進浮動小数の誤差が乗り、ちょうど 226 秒のケースが
+            # 226.00000000000006 になって切り上げで 227 になる。秒のまま
+            # 引き算する (テストで固定済み)。
+            grace_remaining_seconds = max(
+                1, math.ceil(grace_period_minutes * 60 - elapsed_seconds)
+            )
             reasons.append(
                 f"wait: head SHA の push 観測からまだ {elapsed_minutes:.1f}分 "
                 f"しか経過していません (猶予期間 {grace_period_minutes}分、"
@@ -966,6 +985,18 @@ def evaluate_review_gate(
     return {
         "blocked": len(reasons) > 0,
         "reasons": reasons,
+        # 猶予期間の残り (秒)。猶予期間が理由に挙がったときだけ非 None。
+        "grace_remaining_seconds": grace_remaining_seconds,
+        # **ブロック要因が猶予期間「だけ」か。** これが True の PR は、
+        # ほかに待つものが何も無く、時計が進むのを待っているだけである。
+        # 時計の経過はイベントを生まないため、呼び出し側はこの値を見て
+        # 自分で待ち直す必要がある (Issue #219 / D103)。
+        # grace_remaining_seconds が設定されるのは猶予期間の理由を
+        # append した箇所だけなので、この 2 条件で「唯一の理由」を
+        # 過不足なく表せる。
+        "blocked_only_by_grace": (
+            len(reasons) == 1 and grace_remaining_seconds is not None
+        ),
         "codex_review_request_needed": codex_review_request_needed,
         "codex_relaxed": codex_relaxed,
         "codex_relaxed_detail": codex_relaxed_detail,

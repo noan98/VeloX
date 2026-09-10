@@ -283,6 +283,46 @@ class AutoMergeTriggerGuardTest(unittest.TestCase):
         )
 
 
+class TriggerDeclarationTest(unittest.TestCase):
+    """`on:` が購読するイベントの宣言を固定する (Issue #219 / D103 決定4)。
+
+    ジョブの `if` をいくら正しく書いても、**そもそもイベントを購読して
+    いなければ workflow は起動しない。** ここはその 1 段外側を守る。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        workflow = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        # PyYAML は YAML 1.1 として `on:` を真偽値 True に解釈する。
+        cls.triggers = workflow[True] if True in workflow else workflow["on"]
+
+    def test_issue_comment_includes_edited(self) -> None:
+        """**`edited` が要る。** `claude-code-action` はコメントを編集して完了する。
+
+        進捗コメントを 1 つ立てて編集し続ける実装なので、**レビュー完了は
+        `created` ではなく `edited` として届く。** `created` だけだと
+        「Claude Code is working…」の時点でしか起動せず、その時点では
+        ゲートが「応答待ち」と判定するのは当然で、本当のレビューが載っても
+        二度と起動しない (PR #220 で 38 分以上の停止を実測)。
+        """
+        types = self.triggers["issue_comment"]["types"]
+        self.assertIn("created", types)
+        self.assertIn(
+            "edited",
+            types,
+            "issue_comment に edited が無いと Claude のレビュー完了を拾えない",
+        )
+
+    def test_pull_request_review_is_subscribed(self) -> None:
+        self.assertIn("submitted", self.triggers["pull_request_review"]["types"])
+
+    def test_comment_driven_triggers_still_present(self) -> None:
+        """D100 決定2 (A) が足したトリガが消えていないこと。"""
+        for name in ("issue_comment", "pull_request_review", "workflow_dispatch"):
+            with self.subTest(trigger=name):
+                self.assertIn(name, self.triggers)
+
+
 class MiniEvaluatorTest(unittest.TestCase):
     """ミニ評価器そのものの健全性 (これが壊れていると上のテストが無意味になる)。"""
 
