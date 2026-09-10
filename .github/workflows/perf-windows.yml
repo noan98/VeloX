@@ -611,7 +611,15 @@ jobs:
             #   - プロセス数が減っている   -> プロセス単位で回収できている
             #   - 減っていない             -> webview は落ちてもプロセスは残る
             # 後者なら #176 Memory Budget Manager の設計課題になる。
-            "rss_process_count"
+            "rss_process_count",
+            # D97 Revisit condition (4) / D105。**RSS の隣に「何タブ休止した
+            # 結果か」を出すための鍵。** 616.8 MiB のような着地値だけでは
+            # 休止による状態喪失 (再読み込みの発生) のコストが読み取れない
+            # ため、`tab_suspend` イベントの件数 (`suspended_tab_count`、
+            # `MetricKey::extract` が 1 trial につき 1 サンプルに畳んだ値)
+            # を並べる。復帰の速さそのものは別メトリクス `tab_resume_ms` が
+            # 対象であり、ここでは扱わない。
+            "suspended_tab_count"
           )
 
           if ($scenarioNames.Count -gt 0) {
@@ -644,7 +652,7 @@ jobs:
               if ($a.Count -eq 0 -or $b.Count -eq 0) { continue }
               $aAvg = ($a | Measure-Object -Average).Average
               $bAvg = ($b | Measure-Object -Average).Average
-              $digits = if ($key -eq "rss_total_bytes" -or $key -eq "rss_process_count") { 0 } else { 2 }
+              $digits = if ($key -eq "rss_total_bytes" -or $key -eq "rss_process_count" -or $key -eq "suspended_tab_count") { 0 } else { 2 }
               $aList = ($a | ForEach-Object { [math]::Round($_, $digits) }) -join ", "
               $bList = ($b | ForEach-Object { [math]::Round($_, $digits) }) -join ", "
               $ratio = if ($aAvg -ne 0) { [math]::Round($bAvg / $aAvg, 3) } else { "n/a" }
@@ -669,10 +677,12 @@ jobs:
             $lines += ""
             $lines += "プロセス数の列は **休止で WebView2 のプロセスが実際に減っているか** を見るためのもの (D97 Revisit (1))。``suspend_tab`` は webview を drop するだけなので、プロセスまで消えるかは RSS だけでは区別がつかない。"
             $lines += ""
+            $lines += "休止タブ数の列は **616.8 MiB のような着地値が背景タブを何個休止した結果か** を見るためのもの (D97 Revisit (4) / D105)。復帰の速さそのものは別メトリクス ``tab_resume_ms`` が対象であり、この表では扱わない。"
+            $lines += ""
             $lines += "⚠️ ``tabs_N`` と ``tabs_hold_N`` は**測定条件が違う** (前者は回収が終わる前に測る。D97)。同じ表に並んでも、**系統をまたいで比較してはならない。**"
             $lines += ""
-            $lines += "| シナリオ | A (既定) MiB | B (compare_env) MiB | 差 (MiB) | 比 (B/A) | A プロセス数 | B プロセス数 |"
-            $lines += "| --- | ---: | ---: | ---: | ---: | ---: | ---: |"
+            $lines += "| シナリオ | A (既定) MiB | B (compare_env) MiB | 差 (MiB) | 比 (B/A) | A プロセス数 | B プロセス数 | A 休止タブ数 | B 休止タブ数 |"
+            $lines += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
             foreach ($sc in $tabScenarios) {
               $baselineFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-baseline-*" })
               $compareFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-compare-*" })
@@ -682,8 +692,8 @@ jobs:
               $aMiB = ($a | Measure-Object -Average).Average / 1MB
               $bMiB = ($b | Measure-Object -Average).Average / 1MB
               $ratio = if ($aMiB -ne 0) { [math]::Round($bMiB / $aMiB, 3) } else { "n/a" }
-              # プロセス数は欠損しうる (古い結果ファイル) ので、その場合は
-              # 表に "-" を置いて RSS の行そのものは落とさない。
+              # プロセス数・休止タブ数はどちらも欠損しうる (古い結果ファイル)
+              # ので、その場合は表に "-" を置いて RSS の行そのものは落とさない。
               $aProc = @(Get-Medians $baselineFiles "rss_process_count")
               $bProc = @(Get-Medians $compareFiles "rss_process_count")
               $aProcText = if ($aProc.Count -gt 0) {
@@ -692,7 +702,15 @@ jobs:
               $bProcText = if ($bProc.Count -gt 0) {
                 [math]::Round(($bProc | Measure-Object -Average).Average, 1)
               } else { "-" }
-              $lines += "| $sc | $([math]::Round($aMiB, 1)) | $([math]::Round($bMiB, 1)) | $([math]::Round($bMiB - $aMiB, 1)) | $ratio | $aProcText | $bProcText |"
+              $aSuspended = @(Get-Medians $baselineFiles "suspended_tab_count")
+              $bSuspended = @(Get-Medians $compareFiles "suspended_tab_count")
+              $aSuspendedText = if ($aSuspended.Count -gt 0) {
+                [math]::Round(($aSuspended | Measure-Object -Average).Average, 0)
+              } else { "-" }
+              $bSuspendedText = if ($bSuspended.Count -gt 0) {
+                [math]::Round(($bSuspended | Measure-Object -Average).Average, 0)
+              } else { "-" }
+              $lines += "| $sc | $([math]::Round($aMiB, 1)) | $([math]::Round($bMiB, 1)) | $([math]::Round($bMiB - $aMiB, 1)) | $ratio | $aProcText | $bProcText | $aSuspendedText | $bSuspendedText |"
             }
             $lines += ""
           }

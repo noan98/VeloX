@@ -13608,3 +13608,111 @@ PowerShell で採った値を環境変数として `velox-bench run` に渡す) 
 別 PR、または本 PR 後の追加 PR で配線する。
 (3) macOS のネイティブ収集は用意していない。CLAUDE.md の方針どおり、
 macOS/Linux 本格対応に着手する段階で必要なら追加する。
+
+## D105: 休止タブ数を RSS の隣に出せるようにする (Issue #197 Revisit condition (4)) — 「0 件」は欠損ではない
+
+**対象**: D97 Revisit condition (4)「休止による状態喪失のコストが未計測 —
+616.8 MiB が背景タブを何個休止した結果か、復帰にどれだけかかるかは測っていない」
+への対応。`src/` への変更は `MetricKey::SuspendedTabCount`
+(`suspended_tab_count`) の追加のみで、休止の判定ロジック自体は変えていない。
+
+### 決定1: 「件数」を新しい `MetricKey` にする — 既存の 2 つの型に当てはまらない
+
+`MetricKey::extract` はこれまで一貫して「イベント名で絞り込み、そのイベントが
+持つ数値フィールドを読む」形をしていた (`startup_first_load_ms` の `duration_ms`
+など)。だが `tab_suspend` イベント (`metrics::PerfRecord::TabSuspend`) が持つのは
+`tab_id` と `reason` だけで、読むべき数値フィールドが無い — このメトリクスが
+知りたいのは「イベントが何回起きたか」そのものである。
+
+**「1 trial につき 1 サンプル (その trial の合計件数)」を選んだ。** 既存の
+フィールド抽出キーの流儀 (1 イベント = 1 サンプル) をそのまま踏襲して「1 件の
+`tab_suspend` = 値 `1.0` のサンプル 1 個」にすることもできたが、それでは
+`Stats::count` の意味がこのキーだけ壊れる。20 タブ中 16 個を休止する 1 trial が
+`compute_stats` に 16 サンプルを渡すことになり、同じ集計結果の中で他のキーが
+「N サンプル = N trial」であるのに対しこのキーだけ「N サンプル = 何 trial 分か
+分からない」になってしまう。1 trial 1 サンプルなら、この不変条件を保ったまま
+「この trial は何個休止したか」という素直な問いにそのまま答えられる。
+
+### 決定2: 「0 件」と「欠損」を区別する — 向きが逆の同じ規約
+
+本リポジトリには `PssTotalBytes` 以来の強い規約がある: **測れなかったメトリクスは
+0 をでっち上げず、キーごと欠損させる。** 一見するとこのメトリクスもそれに従い、
+`tab_suspend` が 1 件も無い trial は欠損として扱うべきに見える。**しかし逆である。**
+
+`PssTotalBytes` の欠損が守っているのは「測ろうとして測れなかった」ケース (未対応
+OS、権限不足、古いカーネル) であり、「本当に値が 0 だった」ケースとの混同を防ぐ
+ためのものである。`tab_suspend` は逆に、**イベントが無いこと自体が答え**になる
+メトリクスである。`app::record_tab_suspend` は metrics が有効な間、実際に休止が
+起きたときにしか書かれない (perf 無効時は no-op であり、`0` 件の記録を書くわけ
+ではない) ので、「metrics は動いていたが `tab_suspend` が 1 件も無かった」は
+「予算内に収まって誰も休止されなかった」という**測定結果そのもの**であり、
+測定の失敗ではない。ここでこれを欠損にしてしまうと、「このタブ数では休止が
+起きない設定」と「この計測 (`tab_suspend` の集計) 自体に対応していない古い
+ビルド」が区別できなくなる — これは `PssTotalBytes` の規約が防ごうとしている
+のとまったく同じ種類の取り違えを、向きだけ逆にして再現することになる。
+
+そこで `MetricKey::extract` は次の 2 段構えにした:
+
+- **trial の `events` が空 (perf レコードが 1 件も無い)** → 欠損。metrics が
+  実質何も書けなかった trial (metrics OFF、起動前クラッシュ等) であり、他の
+  キーと同じ「サンプル無し」を返す。
+- **`events` は非空だが `tab_suspend` に 1 件もマッチしない** → 実測値 `0.0`。
+  計測は行われ、答えが 0 件だっただけ。
+
+この境界がまさに本 PR で一番レビューされるべき箇所であり、単体テストで両方の
+枝を固定した (`suspended_tab_count_is_absent_for_a_wholly_empty_trial` /
+`suspended_tab_count_is_a_real_zero_when_the_event_never_fires_but_others_did`)。
+既存の `aggregate_trials_omits_metrics_with_no_samples` テストも、この設計変更で
+「非空 trial は `suspended_tab_count: 0.0` を持つようになる」ことを反映して
+更新した (メトリクス数 3 → 4)。
+
+### 決定3: 「measured phase」ではなく trial 全体を数える
+
+`aggregate_trials` は最後の `measure_start` 以降だけを集計する (`measured_phase`、
+Issue #60)。だがこのキーだけそれに従うと、常にほぼ 0 になって使い物にならない。
+
+`tabs_hold_N` (D97) はタブを開き終えてから `MEMORY_HOLD_SETTLE_MS` (12 秒、既定
+メモリチェック周期 5 秒の 2 倍) 待ってから `mark` を打ち、そこから 8 秒だけを
+測定窓とする — これは**休止判定が `mark` より前に起き切るように**わざと
+設計されている (§27.5)。しかも同じタブが 2 度休止されることは無い (§25.3) ので、
+`mark` の時点で数えるべき `tab_suspend` はほぼ全部発生済みであり、その後の 8 秒
+窓には何も残っていない。他のメトリクス (`tab_create_ms` 等) が「ウォームアップ中
+の値を捨てて定常値だけを見る」ために `measured_phase` を必要とするのとは逆に、
+このキーは「trial 全体で何が起きたか」の累計を知りたい。
+
+`MetricKey::counts_whole_trial()` を追加し、`aggregate_trials` はこのキーにだけ
+`measured_phase` でカットする前の trial 全体を渡す。単体テスト
+`aggregate_trials_counts_suspensions_from_before_the_measure_start_marker` で、
+`measure_start` より前の休止が数えられる一方、同じ trial の `tab_create_ms` は
+従来どおりカットされることを確認した。
+
+### 決定4: A/B 比較表・タブ数スケーリング表に列を足す
+
+`perf-windows.yml` の `$compareKeys` に `suspended_tab_count` を追加し
+(`rss_process_count` を D97 Revisit (1) のために足したときと同じ書き方)、桁数
+分岐 (`$digits`) にも整数として反映した。**タブ数スケーリング表**にも
+「A/B 休止タブ数」の列を追加した — 616.8 MiB のような着地値の隣に休止タブ数を
+並べて読めることが、この PR の目標そのものだからである。プロセス数の列と同じく
+値が欠損しうる (旧い結果ファイル) ので `"-"` を置いて行自体は落とさない、
+`rss_process_count` の既存の扱いに倣った。
+
+### まだ分からないこと
+
+**このメトリクスは「何個休止したか」だけを答える。** D97 Revisit (4) が問うていた
+うち、次の 2 つはこの PR の範囲外のまま残っている:
+
+1. **復帰にどれだけかかるか。** これは既存の別メトリクス `tab_resume_ms`
+   (`TabResumeMs`、Issue #63) が対象であり、`suspended_tab_count` とは独立に
+   Windows で計測できる状態にある (D97 Revisit (4) は「未計測」と書いていたが、
+   計測手段自体は #197 以前から存在していた。実行して数値を取るのはまだ)。
+2. **状態喪失そのもののユーザ影響は数値化していない。** 休止されたタブが
+   再表示時に再読み込みされることで失われるスクロール位置・フォーム入力・
+   未保存の JS 状態は、`suspended_tab_count` からも `tab_resume_ms` からも
+   読み取れない。この 2 つのメトリクスは「何個・どれだけの時間」という量は
+   示せるが、「それがユーザにとってどれだけ迷惑か」という質は測っていない。
+   D97 §25.3 が「コストは CPU ではなく状態の喪失である」と述べた指摘に、
+   この PR は量的な裏付けを 1 つ足しただけであり、答え切ってはいない。
+
+なお本 PR は `perf-windows.yml` の Job Summary に列を追加するだけで、実際に
+`perf-windows.yml` を実行して数値を取ることはスコープに含めていない (D97
+Revisit (2)/(3) と同様、計測基盤と実測は別の作業)。
