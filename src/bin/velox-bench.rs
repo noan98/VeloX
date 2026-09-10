@@ -943,8 +943,7 @@ fn collect_linux_environment_info() -> MachineInfo {
         .and_then(|contents| parse_total_memory_bytes_from_proc_meminfo(&contents));
     let os_version = fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
-        .map(|s| s.trim().to_owned())
-        .filter(|s| !s.is_empty());
+        .and_then(|s| non_empty_machine_field(&s));
     MachineInfo {
         cpu_model,
         total_memory_bytes,
