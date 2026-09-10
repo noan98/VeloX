@@ -574,7 +574,11 @@ Xvfb で仮想ディスプレイを用意しているが、Windows ランナー�
     "cpu_count": 4,
     "git_commit": "a60b710873b9d8074723276f73781d7d5c03fc",
     "generated_at": "2026-09-01T13:15:42Z",
-    "trials": 10
+    "trials": 10,
+    "cpu_model": "AMD EPYC 9V74 80-Core Processor",
+    "total_memory_bytes": 8589934592,
+    "os_version": "6.8.0-1015-azure",
+    "webview_runtime": null
   },
   "metrics": {
     "startup_first_load_ms": {
@@ -594,6 +598,17 @@ Xvfb で仮想ディスプレイを用意しているが、Windows ランナー�
 commit、実行日時、試行回数)」に対応する。`metrics` はレコードが 1 件も無い
 メトリクスは省略される (存在しない項目をゼロ扱いにしない — 詳細は
 `compute_stats` のドキュメントコメント)。
+
+`cpu_model` / `total_memory_bytes` / `os_version` / `webview_runtime` は
+Issue #211 (`docs/decisions.md` D104) で追加された機種情報で、いずれも
+`Option` であり取得できなかった場合は `null` になる (これらのフィールドが
+無い過去の結果ファイルもそのままデシリアライズできる)。`velox-bench` は
+まず OS ごとにネイティブ収集を試み (Linux は `/proc/cpuinfo` /
+`/proc/meminfo` / `/proc/sys/kernel/osrelease`、Windows は PowerShell 経由の
+`Get-CimInstance` と WebView2 Runtime の `pv` レジストリ値、macOS は常に
+`null`)、`VELOX_BENCH_CPU_MODEL` / `VELOX_BENCH_TOTAL_MEMORY_BYTES` /
+`VELOX_BENCH_OS_VERSION` / `VELOX_BENCH_WEBVIEW_RUNTIME` が設定されていれば
+そちらを優先する。
 
 `velox-bench compare --output` が書き出す JSON (`ComparisonReport`) の例:
 

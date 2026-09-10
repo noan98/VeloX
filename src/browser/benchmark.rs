@@ -159,7 +159,7 @@ pub enum MetricKey {
     /// D97 Revisit condition (4) / Issue #197's latest comment: a figure
     /// like 616.8 MiB (D97 §28.5/§28.8) says nothing on its own about how
     /// many background tabs automatic suspension had to drop to get there.
-    /// See `docs/decisions.md` D104 for the full design rationale.
+    /// See `docs/decisions.md` D105 for the full design rationale.
     ///
     /// **Unlike every other key, this counts matching events instead of
     /// reading a numeric field out of them** — `tab_suspend` carries only
@@ -168,7 +168,7 @@ pub enum MetricKey {
     /// [`MetricKey::extract`] for how "1 trial -> 1 sample" is upheld for
     /// this key, and why a trial with zero suspensions is a real,
     /// meaningful `0` rather than an absent metric like
-    /// [`MetricKey::PssTotalBytes`] (D104).
+    /// [`MetricKey::PssTotalBytes`] (D105).
     ///
     /// **Counted over the whole trial, not the "measured phase" the rest of
     /// this project's memory metrics use** — see
@@ -180,7 +180,7 @@ pub enum MetricKey {
     /// [`MetricKey::TabResumeMs`] (a separate, already-existing metric,
     /// Issue #63), and the user-facing impact of losing a tab's in-memory
     /// state (scroll position, form input, unsaved JS state) is not
-    /// quantified by either metric — see D104's "まだ分からないこと".
+    /// quantified by either metric — see D105's "まだ分からないこと".
     SuspendedTabCount,
 }
 
@@ -385,7 +385,7 @@ impl MetricKey {
     /// reporting a misleading `0.0`.
     ///
     /// [`MetricKey::SuspendedTabCount`] does not fit that "read a field"
-    /// shape at all (D104, Issue #197 revisit condition (4)) and gets its
+    /// shape at all (D105, Issue #197 revisit condition (4)) and gets its
     /// own branch:
     ///
     /// - **Why one sample per trial, not one per event.** Every other key's
@@ -446,7 +446,7 @@ impl MetricKey {
     /// rather than only its "measured phase" (the slice after the last
     /// `measure_start` marker that [`measured_phase`] cuts to, and that
     /// [`aggregate_trials`] passes to every other key). `true` only for
-    /// [`MetricKey::SuspendedTabCount`] (D104).
+    /// [`MetricKey::SuspendedTabCount`] (D105).
     ///
     /// This is not an arbitrary exception: it is forced by how
     /// `tabs_hold_N` (`Scenario::TabCountMemoryHold`, D97) — the scenario
@@ -563,7 +563,7 @@ pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
     let mut out = BTreeMap::new();
     for key in MetricKey::ALL {
         let mut values = Vec::new();
-        // [`MetricKey::counts_whole_trial`] (D104): almost every key wants
+        // [`MetricKey::counts_whole_trial`] (D105): almost every key wants
         // the post-warm-up `measured` slice, but a cumulative
         // whole-trial-count key like `SuspendedTabCount` wants the
         // unmodified trial instead — see that method's doc comment.
@@ -814,6 +814,29 @@ pub struct RunEnvironment {
     pub generated_at: String,
     /// Number of trials this result was aggregated from.
     pub trials: u32,
+    /// CPU のモデル名（例: "AMD EPYC 9V74 80-Core Processor"）。Issue #211。
+    /// `windows-latest` ランナーが run ごとに異なる機種を割り当てること
+    /// (`docs/decisions.md` D96) が判明したため、`results/
+    /// environment-info.md` に別立てで記録するだけでは結果 JSON と機械的に
+    /// 突き合わせられない。`None`（未取得）かつ `#[serde(default)]` なのは、
+    /// このフィールドが存在しない過去の結果ファイル（`results/baseline/`
+    /// や `results/history/` の JSONL）のデシリアライズを壊さないため
+    /// (`docs/decisions.md` D104)。
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    /// 物理メモリの総量（バイト）。`None`/`#[serde(default)]` の理由は
+    /// `cpu_model` と同じ (D104)。
+    #[serde(default)]
+    pub total_memory_bytes: Option<u64>,
+    /// OS のバージョン/ビルド（例: Windows なら "10.0.26100"）。
+    /// `None`/`#[serde(default)]` の理由は `cpu_model` と同じ (D104)。
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// WebView ランタイムのバージョン（Windows なら WebView2 Runtime の
+    /// `pv` 値）。`None`/`#[serde(default)]` の理由は `cpu_model` と同じ
+    /// (D104)。
+    #[serde(default)]
+    pub webview_runtime: Option<String>,
 }
 
 /// One scenario's aggregated benchmark result — the unit this project saves
@@ -1568,6 +1591,10 @@ mod gate_tests {
                 git_commit: Some("abc123".to_owned()),
                 generated_at: "2026-09-02T00:00:00Z".to_owned(),
                 trials: 10,
+                cpu_model: None,
+                total_memory_bytes: None,
+                os_version: None,
+                webview_runtime: None,
             },
             metrics: metrics
                 .iter()
@@ -2667,7 +2694,7 @@ mod tests {
         assert!(MetricKey::TabCreateMs.extract(&events).is_empty());
     }
 
-    // -- MetricKey::SuspendedTabCount (Issue #197 revisit condition (4), D104) --
+    // -- MetricKey::SuspendedTabCount (Issue #197 revisit condition (4), D105) --
 
     #[test]
     fn suspended_tab_count_counts_every_tab_suspend_event_as_one_sample() {
@@ -2853,7 +2880,7 @@ mod tests {
         // metrics just asserted absent above (whose *event kind* never
         // fired at all), this trial's events are non-empty, so
         // `SuspendedTabCount` reports a real, measured `0` rather than
-        // being omitted — see `MetricKey::extract`'s doc comment (D104).
+        // being omitted — see `MetricKey::extract`'s doc comment (D105).
         assert_eq!(aggregated.len(), 4);
         assert_eq!(aggregated["suspended_tab_count"].median, 0.0);
     }
@@ -3077,6 +3104,51 @@ mod tests {
         assert_eq!(format_unix_time_utc(1), "1970-01-01T00:00:01Z");
     }
 
+    // -- RunEnvironment: 機種情報フィールドの後方互換 (Issue #211/D105) ----
+
+    /// `cpu_model`/`total_memory_bytes`/`os_version`/`webview_runtime` を
+    /// 追加する前に保存された結果ファイル (`results/baseline/` や
+    /// `results/history/` の JSONL) はこれらのキーを一切持たない。
+    /// `#[serde(default)]` により `None` へフォールバックし、デシリアライズ
+    /// が失敗しないことを確認する。
+    #[test]
+    fn run_environment_deserializes_without_machine_fields() {
+        let json = r#"{
+            "os": "linux",
+            "cpu_count": 4,
+            "git_commit": "abc123",
+            "generated_at": "2026-09-01T00:00:00Z",
+            "trials": 10
+        }"#;
+        let env: RunEnvironment = serde_json::from_str(json).unwrap();
+        assert_eq!(env.os, "linux");
+        assert_eq!(env.cpu_count, 4);
+        assert_eq!(env.cpu_model, None);
+        assert_eq!(env.total_memory_bytes, None);
+        assert_eq!(env.os_version, None);
+        assert_eq!(env.webview_runtime, None);
+    }
+
+    /// 新フィールドを含む結果のシリアライズ→デシリアライズが値を保つこと
+    /// (ラウンドトリップ)。
+    #[test]
+    fn run_environment_roundtrips_with_machine_fields() {
+        let env = RunEnvironment {
+            os: "windows".to_owned(),
+            cpu_count: 4,
+            git_commit: Some("abc123".to_owned()),
+            generated_at: "2026-09-01T00:00:00Z".to_owned(),
+            trials: 10,
+            cpu_model: Some("AMD EPYC 9V74 80-Core Processor".to_owned()),
+            total_memory_bytes: Some(8_589_934_592),
+            os_version: Some("10.0.26100".to_owned()),
+            webview_runtime: Some("128.0.2739.79".to_owned()),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        let restored: RunEnvironment = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, env);
+    }
+
     // -- compare -------------------------------------------------------
 
     fn result_with(scenario: &str, metrics: &[(&str, f64)]) -> BenchmarkResult {
@@ -3088,6 +3160,10 @@ mod tests {
                 git_commit: Some("abc123".to_owned()),
                 generated_at: "2026-09-01T00:00:00Z".to_owned(),
                 trials: 10,
+                cpu_model: None,
+                total_memory_bytes: None,
+                os_version: None,
+                webview_runtime: None,
             },
             metrics: metrics
                 .iter()

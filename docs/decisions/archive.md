@@ -13507,7 +13507,109 @@ auto-merge 以外にも影響しうる。`schedule` を持つ workflow を見直
 **文言依存を `if` に持ち込むことになる**ので、安易にはやらないこと
 (ゲート本体の `_CLAUDE_COMPLETION_RE` と二重管理になる)。
 
-## D104: 休止タブ数を RSS の隣に出せるようにする (Issue #197 Revisit condition (4)) — 「0 件」は欠損ではない
+---
+
+## D104: `velox-bench` の結果 JSON に機種情報を持たせる (Issue #211 項目1) — `environment-info.md` では機械的に突き合わせられない
+
+**Scope**: Issue #211「やること」の項目1のみ。項目2 (ダッシュボードの比較単位)・
+項目3 (分散の実測)・項目4 (定期計測) は別 PR で扱う。
+
+### なぜ結果 JSON に持たせるのか
+
+D96 (Issue #208) で `windows-latest` ランナーが run ごとにハード構成の異なる
+マシンを割り当てることが判明した。これまでに観測された CPU だけでも AMD EPYC
+9V74 / Intel Xeon 8573C / Intel Xeon 6973P-C / AMD EPYC 7763 の 4 種類があり、
+`startup_window_created_ms` の絶対値は 573 / 644 / 885〜922ms とばらつく。D96
+決定3は「結果を残すときは CPU モデル・論理コア数・搭載 RAM を必ず併記する」と
+運用ルールを定めたが、実際にそれを担っていたのは `perf-windows.yml` の
+`Record environment info` ステップが書く **`results/environment-info.md`
+(Markdown の表) だけ**で、`velox-bench` の結果 JSON 自身は機種情報を一切
+持っていなかった。
+
+Markdown の表は人間が読む分には十分だが、**同じ run の中でしか隣に並ばない**
+うえ、結果 JSON とキーで突き合わせる手段が無い。項目2 (ダッシュボード側で
+「同じ機種同士でしか比較しない」を強制する) を実現するには、比較の起点である
+結果 JSON 自身が機種を持っている必要がある。そこで `RunEnvironment` に
+`cpu_model` / `total_memory_bytes` / `os_version` / `webview_runtime` の 4
+フィールドを追加した。
+
+### なぜ `Option` + `#[serde(default)]` なのか
+
+`results/baseline/cold_startup-linux-xvfb.json` や `results/history/` の
+JSONL には、これらのフィールドが存在しない過去の結果が大量に埋まっている。
+`Option<T>` フィールドは値が欠けていても serde が既定で `None` にデシリアラ
+イズするが、後方互換であることを実装からも読み取れるようにするため、
+明示的に `#[serde(default)]` を付けた。新フィールドを追加しても既存の結果
+ファイルのデシリアライズが壊れないことは、`benchmark.rs` の
+`run_environment_deserializes_without_machine_fields` テストで確認している。
+
+### なぜ環境変数の上書きを用意したのか (`VELOX_BENCH_CPU_MODEL` 等)
+
+収集方法は OS ごとに異なり、精度も一様ではない (下記)。加えて:
+
+- `perf-windows.yml` の `Record environment info` ステップは既に PowerShell
+  で `$cpu.Name` / `$os.TotalVisibleMemorySize` / `$os.Version` / WebView2
+  Runtime の `pv` 値を採っている。CI 側で二重に (Rust からもう一度
+  PowerShell を叩く形で) 収集させるのではなく、CI が既に持っている値を
+  `VELOX_BENCH_*` にそのまま渡せるようにしておけば、収集経路を 1 本化
+  できる (このフラグの実際の配線は `perf-windows.yml` を変更する別 PR の
+  scope)。
+- Windows の実機を持たない開発環境 (本 PR の実装・検証はすべて Linux の
+  コンテナ上で行っている) では、ネイティブ収集そのものを検証できない。
+  環境変数で値を注入できれば、`RunEnvironment` の JSON への反映や
+  `apply_environment_overrides` のロジックはネイティブ収集を経由せずに
+  検証できる。
+
+環境変数はネイティブ収集より常に優先する。`VELOX_BENCH_TOTAL_MEMORY_BYTES`
+が数値としてパースできない場合は無視してネイティブ収集側の値にフォール
+バックする — 壊れた環境変数でベンチマーク実行そのものを失敗させないため。
+
+### 収集方法: Linux は `/proc`、Windows は PowerShell 経由、macOS は `None`
+
+- **Linux**: `/proc/cpuinfo` の `model name`、`/proc/meminfo` の
+  `MemTotal`、`/proc/sys/kernel/osrelease`。`webview_runtime` は WebKitGTK
+  のバージョンを機械的に取得する手段が無いため常に `None`。
+- **Windows (最優先 OS)**: `perf-windows.yml` の `Record environment info`
+  ステップと同じ情報源 (`Get-CimInstance Win32_OperatingSystem` /
+  `Win32_Processor`、WebView2 Runtime の `pv` レジストリ値) を
+  `std::process::Command` で PowerShell を起動して読む。**この
+  プロジェクトは D59/D76/D88 で `windows` クレートに既に依存しており、
+  レジストリや `GlobalMemoryStatusEx` 等の Win32 API バインディングを
+  直接呼ぶ実装も可能だったが、採らなかった。** それらはすべて `unsafe
+  fn` であり、CLAUDE.md の「`unsafe` は原則使用しない」方針に対し、
+  `Command` 経由なら `unsafe` を一切書かずに済む。`collect_environment`
+  はベンチマーク 1 回の実行につき 1 度しか呼ばれず計測対象そのものでは
+  ないため、プロセス起動のコストは無視できる。**この Windows 側の収集は
+  実機で検証していない** (開発環境が Linux のみのため) — PowerShell の
+  出力を JSON としてパースする部分 (`parse_windows_hardware_info_json`)
+  は単体テストでカバーしたが、実際に `windows-latest` 上で
+  `Get-CimInstance` や EdgeUpdate のレジストリ値がこの実装の想定どおりに
+  取れるかは、`perf-windows.yml` を実行して確認する必要がある。
+- **macOS / その他**: CLAUDE.md「対応 OS の優先度」が Windows を最優先し
+  macOS/Linux を「最低限の整備」に留める方針を明示しているため、ネイティブ
+  収集は用意せず常に `None` とした。必要になれば `VELOX_BENCH_*` の上書き
+  で個別に埋められる。
+
+いずれの OS でも収集失敗はベンチマーク実行を止めない — 各収集関数は
+`Result`/`Option` を握りつぶし、取得できなかったフィールドは `None` の
+ままにする。
+
+### Revisit condition
+
+(1) Windows 側のネイティブ収集 (`collect_windows_environment_info`) は
+実機未検証。`perf-windows.yml` を実際に走らせて `cpu_model` /
+`total_memory_bytes` / `os_version` / `webview_runtime` が想定どおりの
+値で埋まることを確認し、`environment-info.md` の値と一致するかを見る
+必要がある。
+(2) `perf-windows.yml` に `VELOX_BENCH_*` を実際に渡す配線 (CI が
+PowerShell で採った値を環境変数として `velox-bench run` に渡す) は本 PR
+の scope 外。項目1はスキーマと収集ロジックの追加のみで、Issue #211 の
+残りの項目 (ダッシュボードの比較単位・分散の実測・定期計測) を担当する
+別 PR、または本 PR 後の追加 PR で配線する。
+(3) macOS のネイティブ収集は用意していない。CLAUDE.md の方針どおり、
+macOS/Linux 本格対応に着手する段階で必要なら追加する。
+
+## D105: 休止タブ数を RSS の隣に出せるようにする (Issue #197 Revisit condition (4)) — 「0 件」は欠損ではない
 
 **対象**: D97 Revisit condition (4)「休止による状態喪失のコストが未計測 —
 616.8 MiB が背景タブを何個休止した結果か、復帰にどれだけかかるかは測っていない」
