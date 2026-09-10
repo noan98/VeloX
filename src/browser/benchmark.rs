@@ -154,13 +154,41 @@ pub enum MetricKey {
     /// core fully busy. The metric background-tab work is judged by — see
     /// `docs/decisions.md` D58.
     CpuPercent,
+    /// How many `tab_suspend` events (Issue #63,
+    /// `metrics::PerfRecord::TabSuspend`) fired during a trial — answers
+    /// D97 Revisit condition (4) / Issue #197's latest comment: a figure
+    /// like 616.8 MiB (D97 §28.5/§28.8) says nothing on its own about how
+    /// many background tabs automatic suspension had to drop to get there.
+    /// See `docs/decisions.md` D104 for the full design rationale.
+    ///
+    /// **Unlike every other key, this counts matching events instead of
+    /// reading a numeric field out of them** — `tab_suspend` carries only
+    /// `tab_id`/`reason` (dropping a webview is synchronous, so there is no
+    /// duration to read; see `PerfRecord::TabSuspend`'s doc comment). See
+    /// [`MetricKey::extract`] for how "1 trial -> 1 sample" is upheld for
+    /// this key, and why a trial with zero suspensions is a real,
+    /// meaningful `0` rather than an absent metric like
+    /// [`MetricKey::PssTotalBytes`] (D104).
+    ///
+    /// **Counted over the whole trial, not the "measured phase" the rest of
+    /// this project's memory metrics use** — see
+    /// [`MetricKey::counts_whole_trial`] for why `tabs_hold_N`'s own design
+    /// (D97) makes that necessary here specifically.
+    ///
+    /// This says nothing about the *cost* of a suspension: how long a
+    /// resumed tab took to become usable again is
+    /// [`MetricKey::TabResumeMs`] (a separate, already-existing metric,
+    /// Issue #63), and the user-facing impact of losing a tab's in-memory
+    /// state (scroll position, form input, unsaved JS state) is not
+    /// quantified by either metric — see D104's "まだ分からないこと".
+    SuspendedTabCount,
 }
 
 impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 20] = [
+    pub const ALL: [MetricKey; 21] = [
         MetricKey::StartupEventLoopMs,
         MetricKey::StartupPreWindowSetupMs,
         MetricKey::StartupNativeWindowMs,
@@ -181,6 +209,7 @@ impl MetricKey {
         MetricKey::PssTotalBytes,
         MetricKey::PssProcessCount,
         MetricKey::CpuPercent,
+        MetricKey::SuspendedTabCount,
     ];
 
     /// The key's name as stored in [`BenchmarkResult::metrics`] and printed
@@ -207,6 +236,7 @@ impl MetricKey {
             MetricKey::PssTotalBytes => "pss_total_bytes",
             MetricKey::PssProcessCount => "pss_process_count",
             MetricKey::CpuPercent => "cpu_percent",
+            MetricKey::SuspendedTabCount => "suspended_tab_count",
         }
     }
 
@@ -256,6 +286,19 @@ impl MetricKey {
             // 5 percentage points of one core. Below that, the difference
             // between two runs on a shared machine is scheduling noise.
             MetricKey::CpuPercent => 5.0,
+            // 1 whole tab — but **not for the same reason as the timing
+            // metrics above.** Those floors exist to absorb *measurement
+            // noise* (a real quantity that jitters run to run even with no
+            // code change). A suspended-tab count has no such noise: it is
+            // an exact integer count of discrete events
+            // ([`MetricKey::extract`]), not a sampled continuous quantity,
+            // so there is no sub-1 "noise" to filter. The floor here exists
+            // only so a change of *less than one whole tab* — which cannot
+            // physically happen but could in principle appear from a
+            // hand-edited/foreign result file — is never treated as
+            // significant, same reasoning as the process-count keys just
+            // above.
+            MetricKey::SuspendedTabCount => 1.0,
         }
     }
 
@@ -282,6 +325,7 @@ impl MetricKey {
             | MetricKey::PssTotalBytes
             | MetricKey::PssProcessCount => "rss",
             MetricKey::CpuPercent => "cpu",
+            MetricKey::SuspendedTabCount => "tab_suspend",
         }
     }
 
@@ -312,6 +356,17 @@ impl MetricKey {
             // metric is called `cpu_percent` to stay unambiguous in a
             // result file that also carries byte and millisecond metrics.
             MetricKey::CpuPercent => "percent",
+            // Never reached: `extract` special-cases `SuspendedTabCount`
+            // before it gets here, because `tab_suspend` events carry no
+            // numeric field worth reading — the value this key reports is
+            // the *count* of matching events, not a field inside one. Kept
+            // as a real (panicking) arm rather than folded into a
+            // catch-all so this match stays exhaustive and self-documenting
+            // if a future variant is added.
+            MetricKey::SuspendedTabCount => unreachable!(
+                "SuspendedTabCount is counted by MetricKey::extract's own \
+                 branch, not read from a field — see MetricKey::extract"
+            ),
         }
     }
 
@@ -328,12 +383,95 @@ impl MetricKey {
     /// was never available ends up with zero samples for this key, and
     /// [`aggregate_trials`] omits it from the result entirely rather than
     /// reporting a misleading `0.0`.
+    ///
+    /// [`MetricKey::SuspendedTabCount`] does not fit that "read a field"
+    /// shape at all (D104, Issue #197 revisit condition (4)) and gets its
+    /// own branch:
+    ///
+    /// - **Why one sample per trial, not one per event.** Every other key's
+    ///   natural multiplicity is "however many matching events the trial
+    ///   produced" (e.g. several `rss` samples). Following that same
+    ///   pattern here — one sample per `tab_suspend` event, all fixed at
+    ///   the value `1.0` — would silently change what [`Stats::count`]
+    ///   means for this key alone: a single 20-tab trial that suspends 16
+    ///   tabs would contribute *16* samples to [`compute_stats`], making it
+    ///   look like 16 trials' worth of data sat next to every other
+    ///   metric's "N samples = N trials" count in the same aggregated
+    ///   result. Counting once per trial keeps that invariant, and gives
+    ///   the natural answer to the question this key exists to answer:
+    ///   "how many tabs did *this trial* suspend".
+    /// - **Why a trial with zero matches is a real `0`, not an absent
+    ///   metric — the opposite of the [`MetricKey::PssTotalBytes`] rule
+    ///   just above.** That rule protects a measurement that *could not be
+    ///   taken* (unsupported platform, a field that failed to parse) from
+    ///   being reported as a confirmed zero. Here the failure mode does not
+    ///   exist the same way: `tab_suspend` is written by
+    ///   `app::record_tab_suspend` only when perf metrics are on, and it is
+    ///   a no-op — never a zero-valued record — otherwise. So a trial whose
+    ///   events are non-empty (i.e. metrics genuinely ran) but contains no
+    ///   `tab_suspend` at all did not "fail to measure" anything: it
+    ///   measured, and the answer was zero (e.g. every tab stayed under the
+    ///   memory budget). Reporting that as an *absent* key would make "this
+    ///   config never suspends anything" indistinguishable from "this
+    ///   build predates the feature" — exactly the ambiguity the "no
+    ///   fabricated 0" rule exists to prevent for the other keys, just
+    ///   pointed the other way.
+    /// - **Why an entirely empty `events` slice is still treated as
+    ///   absent**, matching every other key: a trial that produced zero
+    ///   perf records of *any* kind (metrics were off, or the process
+    ///   crashed before writing anything) did fail to measure, and must
+    ///   not report a fabricated "0 tabs suspended" alongside a result set
+    ///   where every other key is correctly missing.
     pub fn extract(self, events: &[Value]) -> Vec<f64> {
+        if self == MetricKey::SuspendedTabCount {
+            if events.is_empty() {
+                return Vec::new();
+            }
+            let suspended = events
+                .iter()
+                .filter(|event| {
+                    event.get("event").and_then(Value::as_str) == Some(self.event_name())
+                })
+                .count();
+            return vec![suspended as f64];
+        }
         events
             .iter()
             .filter(|event| event.get("event").and_then(Value::as_str) == Some(self.event_name()))
             .filter_map(|event| event.get(self.field_name()).and_then(Value::as_f64))
             .collect()
+    }
+
+    /// Whether [`MetricKey::extract`] should be given **the whole trial**
+    /// rather than only its "measured phase" (the slice after the last
+    /// `measure_start` marker that [`measured_phase`] cuts to, and that
+    /// [`aggregate_trials`] passes to every other key). `true` only for
+    /// [`MetricKey::SuspendedTabCount`] (D104).
+    ///
+    /// This is not an arbitrary exception: it is forced by how
+    /// `tabs_hold_N` (`Scenario::TabCountMemoryHold`, D97) — the scenario
+    /// this key exists to annotate — is deliberately shaped.
+    /// `tabs_hold_N` waits `automation::MEMORY_HOLD_SETTLE_MS` (12s, twice
+    /// the 5s default memory-check period) **before** marking, precisely so
+    /// the memory-pressure sampler's suspension sweep(s) land before the
+    /// marker rather than inside the measured window
+    /// (`docs/performance-targets.md` §27.5). And a tab that is already
+    /// suspended is never reconsidered (§25.3), so by the time
+    /// `measure_start` fires, the very suspensions this key exists to
+    /// count have almost always already happened. Cutting to the measured
+    /// phase the same way every other key does would read back at or near
+    /// zero for this key on nearly every trial — hiding the exact number
+    /// Issue #197's latest comment asks for, on the one scenario built to
+    /// answer it.
+    ///
+    /// Every duration/byte metric, by contrast, genuinely wants the
+    /// "settled" window: `tab_create_ms` averaged over 20 warm-up creations
+    /// plus the measured ones would blur two different tab counts together
+    /// (the reason [`measured_phase`] exists at all, Issue #60). This key
+    /// is cumulative rather than a settled-state snapshot, so it wants the
+    /// opposite: everything the trial did, not just its final window.
+    fn counts_whole_trial(self) -> bool {
+        matches!(self, MetricKey::SuspendedTabCount)
     }
 }
 
@@ -425,8 +563,17 @@ pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
     let mut out = BTreeMap::new();
     for key in MetricKey::ALL {
         let mut values = Vec::new();
-        for trial in &measured {
-            values.extend(key.extract(trial));
+        // [`MetricKey::counts_whole_trial`] (D104): almost every key wants
+        // the post-warm-up `measured` slice, but a cumulative
+        // whole-trial-count key like `SuspendedTabCount` wants the
+        // unmodified trial instead — see that method's doc comment.
+        for (trial, trial_measured) in trials.iter().zip(&measured) {
+            let source: &[Value] = if key.counts_whole_trial() {
+                trial
+            } else {
+                trial_measured
+            };
+            values.extend(key.extract(source));
         }
         if let Some(stats) = compute_stats(&values) {
             out.insert(key.as_str().to_owned(), stats);
@@ -2520,6 +2667,87 @@ mod tests {
         assert!(MetricKey::TabCreateMs.extract(&events).is_empty());
     }
 
+    // -- MetricKey::SuspendedTabCount (Issue #197 revisit condition (4), D104) --
+
+    #[test]
+    fn suspended_tab_count_counts_every_tab_suspend_event_as_one_sample() {
+        let events = vec![
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":1.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":2,"reason":"memory","ts_ms":2.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":3,"reason":"idle","ts_ms":3.0}"#),
+        ];
+        // 3 matching events fold into exactly 1 sample — the trial's total
+        // — not 3 samples, unlike every field-based key.
+        assert_eq!(MetricKey::SuspendedTabCount.extract(&events), vec![3.0]);
+    }
+
+    #[test]
+    fn suspended_tab_count_is_a_real_zero_when_the_event_never_fires_but_others_did() {
+        // Metrics genuinely ran (the trial is non-empty) but nothing was
+        // ever suspended (e.g. every tab stayed under the memory budget) —
+        // this must be a measured `0.0`, not an absent key.
+        let events = vec![
+            event(r#"{"event":"tab_create","tab_id":1,"duration_ms":10.0}"#),
+            event(r#"{"event":"rss","process_count":1,"total_rss_bytes":100,"ts_ms":1.0}"#),
+        ];
+        assert_eq!(MetricKey::SuspendedTabCount.extract(&events), vec![0.0]);
+    }
+
+    #[test]
+    fn suspended_tab_count_is_absent_for_a_wholly_empty_trial() {
+        // No perf records at all (metrics off, or a crash before anything
+        // was written) is a measurement *failure*, not "zero suspended" —
+        // same absence rule every other key follows for its own failure
+        // mode.
+        assert!(MetricKey::SuspendedTabCount.extract(&[]).is_empty());
+    }
+
+    #[test]
+    fn suspended_tab_count_ignores_other_event_kinds() {
+        let events = vec![
+            event(r#"{"event":"tab_resume","tab_id":1,"duration_ms":5.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"tab_count","ts_ms":1.0}"#),
+            event(r#"{"event":"tab_create","tab_id":2,"duration_ms":10.0}"#),
+        ];
+        assert_eq!(MetricKey::SuspendedTabCount.extract(&events), vec![1.0]);
+    }
+
+    #[test]
+    fn suspended_tab_count_round_trips_through_from_metric_name() {
+        assert_eq!(
+            MetricKey::from_metric_name("suspended_tab_count"),
+            Some(MetricKey::SuspendedTabCount)
+        );
+    }
+
+    #[test]
+    fn aggregate_trials_counts_suspensions_from_before_the_measure_start_marker() {
+        // Unlike every other key, SuspendedTabCount must see suspensions
+        // that happened during the tabs_hold_N warm-up wait (before
+        // `measure_start`) — see MetricKey::counts_whole_trial. A
+        // tab_create in the same warm-up window must still be excluded
+        // from tab_create_ms, proving the whole-trial exception is scoped
+        // to this one key.
+        let trial = vec![
+            event(r#"{"event":"tab_create","tab_id":1,"duration_ms":50.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":60.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":2,"reason":"memory","ts_ms":61.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+            event(r#"{"event":"tab_create","tab_id":3,"duration_ms":10.0}"#),
+        ];
+        let aggregated = aggregate_trials(&[trial]);
+        assert_eq!(
+            aggregated.get("suspended_tab_count").unwrap().median,
+            2.0,
+            "suspensions before measure_start must still be counted"
+        );
+        assert_eq!(
+            aggregated.get("tab_create_ms").unwrap().count,
+            1,
+            "the warm-up tab_create must still be cut, unlike suspended_tab_count"
+        );
+    }
+
     // -- compute_stats / percentile ------------------------------------
 
     #[test]
@@ -2621,7 +2849,13 @@ mod tests {
         let aggregated = aggregate_trials(&[trial]);
         assert!(!aggregated.contains_key("tab_create_ms"));
         assert!(!aggregated.contains_key("rss_total_bytes"));
-        assert_eq!(aggregated.len(), 3);
+        // 3 startup_* fields, plus `suspended_tab_count`: unlike the two
+        // metrics just asserted absent above (whose *event kind* never
+        // fired at all), this trial's events are non-empty, so
+        // `SuspendedTabCount` reports a real, measured `0` rather than
+        // being omitted — see `MetricKey::extract`'s doc comment (D104).
+        assert_eq!(aggregated.len(), 4);
+        assert_eq!(aggregated["suspended_tab_count"].median, 0.0);
     }
 
     #[test]
