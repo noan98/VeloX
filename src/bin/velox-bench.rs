@@ -953,6 +953,25 @@ fn collect_linux_environment_info() -> MachineInfo {
     }
 }
 
+/// 機種情報の文字列項目を「値として使えるもの」だけに絞る。前後の空白を
+/// 落とし、空になったものは `None` にする。
+///
+/// **取得経路をまたいで同じ規則を使うためのもの。** Linux の
+/// `/proc` パースはもともと空値を `None` に落としていたが、Windows の
+/// PowerShell 出力 (`$cpu.Name` が空文字列で返る場合) と `VELOX_BENCH_*`
+/// による上書き (壊れた設定や、値を取れなかった CI が空文字列を渡す場合)
+/// にはその扱いが無く、**空文字列がネイティブ収集済みの値を押しのけて
+/// 採用されてしまう**非対称があった。空文字列は「値がある」ではなく
+/// 「取れなかった」なので、どの経路でも `None` に揃える。
+fn non_empty_machine_field(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
 /// `/proc/cpuinfo` の `model name` 行から CPU モデル名を取り出す。
 /// 複数コア分同じ行が繰り返されるので最初の 1 件だけを使う。
 fn parse_cpu_model_from_proc_cpuinfo(contents: &str) -> Option<String> {
@@ -961,12 +980,7 @@ fn parse_cpu_model_from_proc_cpuinfo(contents: &str) -> Option<String> {
         if key.trim() != "model name" {
             return None;
         }
-        let value = value.trim();
-        if value.is_empty() {
-            None
-        } else {
-            Some(value.to_owned())
-        }
+        non_empty_machine_field(value)
     })
 }
 
@@ -995,6 +1009,16 @@ fn parse_total_memory_bytes_from_proc_meminfo(contents: &str) -> Option<u64> {
 /// 等の Win32 API バインディングは `unsafe fn` であり、これを避けられる。
 /// `collect_environment` はベンチマーク 1 回の実行につき 1 度しか呼ばれず、
 /// 計測対象そのものではないため、プロセス起動のコストは無視できる。
+/// **呼ぶのは `pwsh` (PowerShell 7) ではなく `powershell` (Windows
+/// PowerShell 5.1) である点に注意。** `perf-windows.yml` の各ステップは
+/// `shell: pwsh` を使っており、そちらとは別のバイナリになる。ここで 5.1 を
+/// 選ぶのは、**5.1 は Windows に標準で入っているが `pwsh` は入っていない**
+/// ため — `velox-bench` は CI 専用のツールではなく、開発者が自分の Windows
+/// 機で走らせるものでもあり、`pwsh` を前提にすると素の Windows で機種情報が
+/// 丸ごと欠ける。上のスクリプトが使っているのは `Get-CimInstance` /
+/// `Get-ItemProperty` / `ConvertTo-Json` だけで、いずれも 5.1 と 7 の
+/// 双方にあるため、情報源が `perf-windows.yml` と一致することは変わらない。
+///
 /// なお本実装は Windows 実機で検証していない (Linux 開発環境からは
 /// `powershell` コマンド自体が見つからず `None` にフォールバックするため)。
 /// PR レビューではここを重点的に見てほしい。
@@ -1049,16 +1073,16 @@ fn parse_windows_hardware_info_json(json: &str) -> MachineInfo {
         cpu_model: value
             .get("cpu_model")
             .and_then(Value::as_str)
-            .map(str::to_owned),
+            .and_then(non_empty_machine_field),
         total_memory_bytes: value.get("total_memory_bytes").and_then(Value::as_u64),
         os_version: value
             .get("os_version")
             .and_then(Value::as_str)
-            .map(str::to_owned),
+            .and_then(non_empty_machine_field),
         webview_runtime: value
             .get("webview_runtime")
             .and_then(Value::as_str)
-            .map(str::to_owned),
+            .and_then(non_empty_machine_field),
     }
 }
 
@@ -1073,7 +1097,9 @@ fn parse_windows_hardware_info_json(json: &str) -> MachineInfo {
 ///
 /// `total_memory_bytes` のオーバーライドが数値としてパースできない場合は
 /// 無視してネイティブ収集側の値にフォールバックする (壊れた環境変数で
-/// ベンチマークを失敗させない)。
+/// ベンチマークを失敗させない)。文字列項目も同じ考え方で、空文字列や
+/// 空白だけの値は [`non_empty_machine_field`] が `None` に落とすため、
+/// **ネイティブ収集済みの値を空文字列で押しのけることはない。**
 fn apply_environment_overrides(
     native: MachineInfo,
     cpu_model_override: Option<&str>,
@@ -1082,13 +1108,17 @@ fn apply_environment_overrides(
     webview_runtime_override: Option<&str>,
 ) -> MachineInfo {
     MachineInfo {
-        cpu_model: cpu_model_override.map(str::to_owned).or(native.cpu_model),
+        cpu_model: cpu_model_override
+            .and_then(non_empty_machine_field)
+            .or(native.cpu_model),
         total_memory_bytes: total_memory_bytes_override
-            .and_then(|s| s.parse::<u64>().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
             .or(native.total_memory_bytes),
-        os_version: os_version_override.map(str::to_owned).or(native.os_version),
+        os_version: os_version_override
+            .and_then(non_empty_machine_field)
+            .or(native.os_version),
         webview_runtime: webview_runtime_override
-            .map(str::to_owned)
+            .and_then(non_empty_machine_field)
             .or(native.webview_runtime),
     }
 }
@@ -1288,5 +1318,50 @@ MemFree:         1234567 kB
     fn empty_native_with_no_overrides_yields_default() {
         let result = apply_environment_overrides(MachineInfo::default(), None, None, None, None);
         assert_eq!(result, MachineInfo::default());
+    }
+
+    #[test]
+    fn blank_string_overrides_fall_back_to_native() {
+        // 空文字列や空白だけの `VELOX_BENCH_*` は「値がある」ではなく
+        // 「取れなかった」なので、ネイティブ収集済みの値を押しのけては
+        // ならない。値を取れなかった CI がそのまま空文字列を渡す経路が
+        // 現実にありうる。
+        let result = apply_environment_overrides(
+            sample_native(),
+            Some(""),
+            Some("   "),
+            Some("   "),
+            Some(""),
+        );
+        assert_eq!(result, sample_native());
+    }
+
+    #[test]
+    fn whitespace_padded_overrides_are_trimmed() {
+        let result = apply_environment_overrides(
+            sample_native(),
+            Some("  Override CPU  "),
+            Some(" 2048 "),
+            Some(" 10.0.26100 "),
+            Some("  151.0.4129.101 "),
+        );
+        assert_eq!(result.cpu_model.as_deref(), Some("Override CPU"));
+        assert_eq!(result.total_memory_bytes, Some(2_048));
+        assert_eq!(result.os_version.as_deref(), Some("10.0.26100"));
+        assert_eq!(result.webview_runtime.as_deref(), Some("151.0.4129.101"));
+    }
+
+    #[test]
+    fn windows_json_blank_strings_become_none() {
+        // PowerShell 側で値が取れなかったとき、`$cpu.Name` が `null` では
+        // なく空文字列で返ることがある。`None` と同じ扱いにしないと、
+        // 「機種不明」を「機種名が空文字列の機種」として記録してしまう。
+        let result = parse_windows_hardware_info_json(
+            r#"{"cpu_model":"","total_memory_bytes":2048,"os_version":"   ","webview_runtime":""}"#,
+        );
+        assert_eq!(result.cpu_model, None);
+        assert_eq!(result.total_memory_bytes, Some(2_048));
+        assert_eq!(result.os_version, None);
+        assert_eq!(result.webview_runtime, None);
     }
 }
