@@ -667,6 +667,29 @@ pub struct RunEnvironment {
     pub generated_at: String,
     /// Number of trials this result was aggregated from.
     pub trials: u32,
+    /// CPU のモデル名（例: "AMD EPYC 9V74 80-Core Processor"）。Issue #211。
+    /// `windows-latest` ランナーが run ごとに異なる機種を割り当てること
+    /// (`docs/decisions.md` D96) が判明したため、`results/
+    /// environment-info.md` に別立てで記録するだけでは結果 JSON と機械的に
+    /// 突き合わせられない。`None`（未取得）かつ `#[serde(default)]` なのは、
+    /// このフィールドが存在しない過去の結果ファイル（`results/baseline/`
+    /// や `results/history/` の JSONL）のデシリアライズを壊さないため
+    /// (`docs/decisions.md` D104)。
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    /// 物理メモリの総量（バイト）。`None`/`#[serde(default)]` の理由は
+    /// `cpu_model` と同じ (D104)。
+    #[serde(default)]
+    pub total_memory_bytes: Option<u64>,
+    /// OS のバージョン/ビルド（例: Windows なら "10.0.26100"）。
+    /// `None`/`#[serde(default)]` の理由は `cpu_model` と同じ (D104)。
+    #[serde(default)]
+    pub os_version: Option<String>,
+    /// WebView ランタイムのバージョン（Windows なら WebView2 Runtime の
+    /// `pv` 値）。`None`/`#[serde(default)]` の理由は `cpu_model` と同じ
+    /// (D104)。
+    #[serde(default)]
+    pub webview_runtime: Option<String>,
 }
 
 /// One scenario's aggregated benchmark result — the unit this project saves
@@ -1421,6 +1444,10 @@ mod gate_tests {
                 git_commit: Some("abc123".to_owned()),
                 generated_at: "2026-09-02T00:00:00Z".to_owned(),
                 trials: 10,
+                cpu_model: None,
+                total_memory_bytes: None,
+                os_version: None,
+                webview_runtime: None,
             },
             metrics: metrics
                 .iter()
@@ -2843,6 +2870,51 @@ mod tests {
         assert_eq!(format_unix_time_utc(1), "1970-01-01T00:00:01Z");
     }
 
+    // -- RunEnvironment: 機種情報フィールドの後方互換 (Issue #211/D104) ----
+
+    /// `cpu_model`/`total_memory_bytes`/`os_version`/`webview_runtime` を
+    /// 追加する前に保存された結果ファイル (`results/baseline/` や
+    /// `results/history/` の JSONL) はこれらのキーを一切持たない。
+    /// `#[serde(default)]` により `None` へフォールバックし、デシリアライズ
+    /// が失敗しないことを確認する。
+    #[test]
+    fn run_environment_deserializes_without_machine_fields() {
+        let json = r#"{
+            "os": "linux",
+            "cpu_count": 4,
+            "git_commit": "abc123",
+            "generated_at": "2026-09-01T00:00:00Z",
+            "trials": 10
+        }"#;
+        let env: RunEnvironment = serde_json::from_str(json).unwrap();
+        assert_eq!(env.os, "linux");
+        assert_eq!(env.cpu_count, 4);
+        assert_eq!(env.cpu_model, None);
+        assert_eq!(env.total_memory_bytes, None);
+        assert_eq!(env.os_version, None);
+        assert_eq!(env.webview_runtime, None);
+    }
+
+    /// 新フィールドを含む結果のシリアライズ→デシリアライズが値を保つこと
+    /// (ラウンドトリップ)。
+    #[test]
+    fn run_environment_roundtrips_with_machine_fields() {
+        let env = RunEnvironment {
+            os: "windows".to_owned(),
+            cpu_count: 4,
+            git_commit: Some("abc123".to_owned()),
+            generated_at: "2026-09-01T00:00:00Z".to_owned(),
+            trials: 10,
+            cpu_model: Some("AMD EPYC 9V74 80-Core Processor".to_owned()),
+            total_memory_bytes: Some(8_589_934_592),
+            os_version: Some("10.0.26100".to_owned()),
+            webview_runtime: Some("128.0.2739.79".to_owned()),
+        };
+        let json = serde_json::to_string(&env).unwrap();
+        let restored: RunEnvironment = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, env);
+    }
+
     // -- compare -------------------------------------------------------
 
     fn result_with(scenario: &str, metrics: &[(&str, f64)]) -> BenchmarkResult {
@@ -2854,6 +2926,10 @@ mod tests {
                 git_commit: Some("abc123".to_owned()),
                 generated_at: "2026-09-01T00:00:00Z".to_owned(),
                 trials: 10,
+                cpu_model: None,
+                total_memory_bytes: None,
+                os_version: None,
+                webview_runtime: None,
             },
             metrics: metrics
                 .iter()

@@ -10,7 +10,7 @@ SVG を文字列として組み立てている (新規依存なし)。
 ## 「異なるセッション/マシンの数値を比較してはならない」原則の担保
 
 `common.py` のモジュール docstring に設計の全体像がある。このスクリプトが
-UI 側で守っている規則は 1 つ (Issue #211 項目2 / docs/decisions.md D104 で
+UI 側で守っている規則は 1 つ (Issue #211 項目2 / docs/decisions.md D106 で
 「機種」の軸を追加した):
 
 **同一 `session_id` かつ同一機種 (`machine_key`) の隣接エントリ同士だけを
@@ -69,7 +69,7 @@ from common import (  # noqa: E402
     short_sha,
 )
 
-# Issue #211 項目2 / D104。「同一 session_id かつ同一機種」だけが比較可能
+# Issue #211 項目2 / D106。「同一 session_id かつ同一機種」だけが比較可能
 # な系列 — `session_id` (無ければ "unknown-session") と `machine_key` の
 # 組。session_id だけの D82 の単位に、機種という軸を 1 つ足したもの。
 SeriesKey = tuple[str, str]
@@ -200,7 +200,7 @@ def compute_diff_fallback(prev: HistoryEntry, curr: HistoryEntry, metric_name: s
 
 def assign_series_colors(entries_time_sorted: list[HistoryEntry]) -> dict[SeriesKey, str]:
     """系列 (session_id + machine_key) ごとに色を割り当てる。機種が違えば
-    `session_id` が同じでも別系列 = 別色になる (D104) — 「同じ色の点だけが
+    `session_id` が同じでも別系列 = 別色になる (D106) — 「同じ色の点だけが
     比較可能」という UI 上の約束を、機種軸でも保つため。"""
     colors: dict[SeriesKey, str] = {}
     for e in entries_time_sorted:
@@ -216,7 +216,7 @@ def render_svg_chart(
     series_colors: dict[SeriesKey, str],
 ) -> str:
     """`points` は時系列順 (古い→新しい) の (エントリ, 生の値)。同一系列
-    (session_id かつ machine_key が同じ、D104) の点だけを線でつなぐ —
+    (session_id かつ machine_key が同じ、D106) の点だけを線でつなぐ —
     異なる系列の点は marker のみ描画し、線を引かない (モジュール docstring
     の規則)。"""
     if not points:
@@ -248,7 +248,7 @@ def render_svg_chart(
         return pad_top + plot_h * (1 - (v - v_min) / span)
 
     # 系列 (session_id + machine_key) ごとに折れ線を分ける — 同一系列の
-    # 点だけをつなぐ (D104)。
+    # 点だけをつなぐ (D106)。
     by_series: dict[SeriesKey, list[int]] = defaultdict(list)
     for i, (entry, _) in enumerate(points):
         by_series[series_key(entry)].append(i)
@@ -330,7 +330,7 @@ def build_report_model(
                 scenario_entries.sort(key=lambda e: parse_time(e.generated_at))
                 series_colors = assign_series_colors(scenario_entries)
 
-                # 系列 (session_id + machine_key, D104) ごとに「直前の
+                # 系列 (session_id + machine_key, D106) ごとに「直前の
                 # 同一系列のエントリ」を求め、差分を計算する。機種が違えば
                 # session_id が同じでも別系列として扱う。
                 last_by_series: dict[SeriesKey, HistoryEntry] = {}
@@ -488,7 +488,7 @@ code { background: rgba(127,127,127,.15); padding: .1em .3em; border-radius: 3px
         "(<code>docs/performance-targets.md</code> §10、"
         "<code>docs/decisions.md</code> D46 — "
         "同一バイナリでもセッションを跨ぐと最大 +78.9% 動くことが実測済み。"
-        "<code>docs/decisions.md</code> D96/D104 — "
+        "<code>docs/decisions.md</code> D96/D106 — "
         "<code>windows-latest</code> は run ごとに機種の異なるマシンを"
         "割り当てるため、機種が違えば同一セッション扱いでも比較しません。"
         "「機種不明」(CPU 情報の無い古い結果) は安全側に倒し、他のどの"
@@ -583,7 +583,7 @@ def render_markdown(model: dict, thresholds_note: str, repo_url: str) -> str:
     lines.append(
         "> 同じセッション ID **かつ同じ機種**の隣接エントリ同士だけが比較可能"
         "です。セッションまたは機種が変わる箇所は差分を計算していません "
-        "(docs/performance-targets.md §10 / docs/decisions.md D46/D96/D104)。"
+        "(docs/performance-targets.md §10 / docs/decisions.md D46/D96/D106)。"
         "「機種不明」(CPU 情報の無い古い結果) は安全側に倒し、他のどの"
         "エントリとも比較しません。"
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""report.py のユニットテスト (Issue #211 項目2 / docs/decisions.md D104)。
+"""report.py のユニットテスト (Issue #211 項目2 / docs/decisions.md D106)。
 
 実行方法:
     python3 -m unittest discover -s scripts/dashboard -p 'test_*.py' -v
@@ -71,7 +71,7 @@ class SeriesKeyTest(unittest.TestCase):
         self.assertEqual(series_key(e1), series_key(e2))
 
     def test_same_session_different_machine_are_different_series(self):
-        """D104 の核心: `session_id` だけでは同一系列と認めない。"""
+        """D106 の核心: `session_id` だけでは同一系列と認めない。"""
         e1 = make_entry("S1", "2026-09-01T00:00:00Z", cpu_model="AMD EPYC 9V74", line_no=1)
         e2 = make_entry("S1", "2026-09-02T00:00:00Z", cpu_model="Intel Xeon 8573C", line_no=2)
         self.assertNotEqual(series_key(e1), series_key(e2))
@@ -104,7 +104,7 @@ class BuildReportModelTest(unittest.TestCase):
         self.assertEqual(rows[1]["diffs"], {})
 
     def test_unknown_machine_entries_never_connect_to_each_other(self):
-        """機種不明どうしも安全側に倒して連結しない (D104)。"""
+        """機種不明どうしも安全側に倒して連結しない (D106)。"""
         entries = [
             make_entry("S1", "2026-09-01T00:00:00Z", cpu_model=None, line_no=1),
             make_entry("S1", "2026-09-02T00:00:00Z", cpu_model=None, line_no=2),

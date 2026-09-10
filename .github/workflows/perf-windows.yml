@@ -44,7 +44,7 @@ name: Performance (Windows)
 # だけでは、いつ・どの機種のデータが何本貯まるかを制御できず、機種ごとの
 # 傾向を見るには本数が全く足りない。** そこで `schedule` を足し、既定条件
 # (cold_startup、A/B 比較) で機械的に run を積み重ねる。機種ごとに系列を
-# 分けて蓄積できるのは、Issue #211 項目2 (`docs/decisions.md` D104、
+# 分けて蓄積できるのは、Issue #211 項目2 (`docs/decisions.md` D106、
 # `scripts/dashboard/common.py` の `machine_key`) が「同一 session_id でも
 # 機種が違えば比較しない」を保証しているおかげであり、schedule 自体は
 # `record.py`/`results/history/` への取り込みまでは行わない (§の末尾、
@@ -159,7 +159,7 @@ on:
   pull_request:
     paths:
       - ".github/workflows/perf-windows.yml"
-  # Issue #211 項目4 / docs/decisions.md D104。機種ごとの系列を貯めるための
+  # Issue #211 項目4 / docs/decisions.md D106。機種ごとの系列を貯めるための
   # 定期計測 — 頻度・ゲート化を見送る理由は冒頭のコメント参照。cron は
   # UTC で評価される (UTC 月曜 03:00)。`schedule` は既定ブランチ (main) の
   # workflow 定義だけで評価され、他ブランチ/fork のこのファイルからは

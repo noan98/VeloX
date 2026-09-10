@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""common.py のユニットテスト (Issue #211 項目2 / docs/decisions.md D104)。
+"""common.py のユニットテスト (Issue #211 項目2 / docs/decisions.md D106)。
 
 実行方法:
     python3 -m unittest discover -s scripts/dashboard -p 'test_*.py' -v
@@ -12,7 +12,7 @@
      salt に依存しないこと (同じ機種なら常に同じ key)。
   2. **機種不明 (cpu_model 無し) のエントリは、salt が異なれば必ず
      異なる key になり、決して他のエントリと同一視されないこと**
-     (D104 の「安全側に倒す」を固定する — ここが壊れると、比較しては
+     (D106 の「安全側に倒す」を固定する — ここが壊れると、比較しては
      いけない古いエントリ同士が誤って連結される)。
   3. `results/history/` の v1 エントリ (`environment` に `cpu_model` 等が
      無い) が引き続き問題なく読み込めること (後方互換)。
@@ -90,7 +90,7 @@ class DeriveMachineKeyTest(unittest.TestCase):
         self.assertEqual(key_a, key_b)
 
     def test_unknown_machine_never_equals_another_unknown_machine_with_different_salt(self):
-        """D104 の核心: cpu_model が無い「機種不明」は、salt が違えば必ず
+        """D106 の核心: cpu_model が無い「機種不明」は、salt が違えば必ず
         別の key になる。**これが崩れると、比較してはいけない機種不明の
         エントリ同士が誤って同一機種として連結される。**"""
         env = {"os": "windows", "cpu_count": 4}  # cpu_model が無い

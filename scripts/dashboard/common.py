@@ -51,7 +51,7 @@
 UI (session_id が変わる箇所は線を切り、差分バッジを出さない) の両方で
 強制される。
 
-## 「機種」という、もう一段の比較単位 (Issue #211 / D104)
+## 「機種」という、もう一段の比較単位 (Issue #211 / D106)
 
 D96 (Issue #208) は `windows-latest` が **run ごとに別スペックのマシンを
 割り当てる** ことを実測した (AMD EPYC 9V74 / Intel Xeon 8573C / Intel Xeon
@@ -185,7 +185,7 @@ def _memory_gib_bucket(total_memory_bytes: Any) -> str:
 
 def derive_machine_key(environment: dict, *, salt: str) -> str:
     """`result.environment` から「同一機種とみなしてよい」識別子を作る
-    (Issue #211 項目2 / docs/decisions.md D104)。モジュール docstring の
+    (Issue #211 項目2 / docs/decisions.md D106)。モジュール docstring の
     「機種という、もう一段の比較単位」を参照。
 
     `os` / `cpu_model` / `cpu_count` / `total_memory_bytes` は Issue #211
@@ -305,7 +305,7 @@ class HistoryEntry:
 
     @property
     def machine_key(self) -> str:
-        """Issue #211 項目2 / D104。同一機種の run 同士でのみ比較するための
+        """Issue #211 項目2 / D106。同一機種の run 同士でのみ比較するための
         識別子。`salt` に `path:line_no` (ファイル内でのこのエントリの位置)
         を渡すので、「機種不明」のエントリはファイル内の行ごとに必ず異なる
         値になり、互いに連結されない (`derive_machine_key` の docstring
