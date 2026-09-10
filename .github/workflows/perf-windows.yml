@@ -1,10 +1,11 @@
-name: Performance (Windows, manual)
+name: Performance (Windows)
 
 # Issue #136。VeloX の性能実測はこれまで全て Linux (WebKitGTK/Xvfb、
 # perf-gate.yml/docs/performance-targets.md) のものしかなく、CLAUDE.md
 # 「対応 OS の優先度」が最優先と定める Windows (WebView2) の数値が
-# 1 つも無かった。この workflow はそれを埋めるための **手動実行専用**
-# ジョブ。
+# 1 つも無かった。この workflow はそれを埋めるための **手動実行 + 週次
+# スケジュール実行** ジョブ (後者は Issue #211 項目4 で追加。導入時点では
+# 手動実行専用だった — 経緯は下記参照)。
 #
 # Issue #208 (docs/performance-targets.md §26) で役割が 1 つ増えた:
 # 入力 `compare_env` に `KEY=VALUE` を渡すと、**同一ジョブ・同一ビルド・
@@ -13,9 +14,10 @@ name: Performance (Windows, manual)
 # ランナーイメージの更新を相殺できるので、性能回帰の原因切り分けに使う。
 # 空欄にすれば従来どおりの単独計測に戻る。
 #
-# **手動実行 (workflow_dispatch) 限定。PR ごとの自動実行や性能回帰ゲート
-# ではない** (Issue #136 のスコープ外。回帰ゲートは Linux の
-# perf-gate.yml が引き続き担う):
+# **手動実行 (workflow_dispatch) と週次スケジュール実行 (schedule) のみ。
+# PR ごとの自動実行や性能回帰ゲートではない** (Issue #136 のスコープ外。
+# 回帰ゲートは Linux の perf-gate.yml が引き続き担う。ゲート化しない理由は
+# 下記「Issue #211 項目4」の節を参照):
 #   - 性能回帰ゲートは Linux 側 (perf-gate.yml) で担保済みであり、
 #     二重化する必要が無い。
 #   - GUI アプリを CI 上で起動する構成は不安定になりやすく、PR を無用に
@@ -33,10 +35,59 @@ name: Performance (Windows, manual)
 # 残し、セルフホストランナー等の方式再検討を次の課題とする
 # (docs/decisions.md D88、Issue #59 が起動時間の調査で採った進め方と同じ)。
 #
-# `on:` は workflow_dispatch のみが基本だが、release-windows.yml と同じ
+# ## Issue #211 項目4: なぜ `schedule` を足すか / なぜまだゲート化しないか
+#
+# D96 (Issue #208) が明らかにしたのは「`windows-latest` は run ごとに機種
+# の異なるマシンを割り当てる」ことだった (AMD EPYC 9V74 / Intel Xeon
+# 8573C / Intel Xeon 6973P-C / AMD EPYC 7763 の 4 機種が観測済み、
+# `startup_window_created_ms` は 573〜922ms まで散らばる)。**手動実行
+# だけでは、いつ・どの機種のデータが何本貯まるかを制御できず、機種ごとの
+# 傾向を見るには本数が全く足りない。** そこで `schedule` を足し、既定条件
+# (cold_startup、A/B 比較) で機械的に run を積み重ねる。機種ごとに系列を
+# 分けて蓄積できるのは、Issue #211 項目2 (`docs/decisions.md` D104、
+# `scripts/dashboard/common.py` の `machine_key`) が「同一 session_id でも
+# 機種が違えば比較しない」を保証しているおかげであり、schedule 自体は
+# `record.py`/`results/history/` への取り込みまでは行わない (§の末尾、
+# 「Upload results」ステップの直前を参照 — artifact として残すのみで、
+# history への commit 導線は今回のスコープでは未着手のまま)。
+#
+# **ここではまだ fail させない (ゲート化しない)。** 理由:
+#   - Issue #211 項目3 (同一機種内での分散の実測) が未着手で、「どこからが
+#     有意な差か」の閾値をまだ決められない。実測もせず勘で閾値を決めると、
+#     D46/D96 が繰り返し指摘してきた「ノイズを回帰の証拠であるかのように
+#     見せる」誤りを、今度は Windows の機種間・機種内ノイズに対してやる
+#     ことになる。
+#   - 機種ごとの系列 (machine_key) がある程度の本数貯まって初めて、
+#     「同一機種内で許容できるばらつき」を実測できる。それより前に閾値を
+#     決めるのは、D46 が実測データより先に何かを決め打ちすることを繰り返し
+#     戒めてきたのと同じ誤りになる。
+#   - したがってこの PR (Issue #211) では「貯める」ことだけを目的にし、
+#     ゲート化は項目3 の実測が揃ってから改めて判断する。
+#
+# **頻度は週次にした。** 理由:
+#   - Windows ランナーは (上記の通り) Linux ランナーより実行コストが高い。
+#     日次では月に約 30 回の高コスト run を積み増すことになり、まだ
+#     ゲート化もしない蓄積目的のデータにその頻度は見合わない。
+#   - 一方で月次では、機種のサンプルが十分な本数に育つまで数ヶ月〜半年を
+#     要し、項目3 (分散の実測) の着手が不必要に遅れる。
+#   - `windows-latest` の機種はランナー割り当てのたびに変わりうる (D96)
+#     ため、頻度を上げて「同一機種の run 数」を意図的に稼ぐことはできない
+#     — 週次でも機種は毎回変わりうる。**この不確実性はコストを上げても
+#     解消しないので、コストの低い側 (週次) を選ぶ。**
+#   - cron は UTC で評価される。UTC 月曜 03:00 (JST 月曜正午ごろ) とし、
+#     平日日中の CI 混雑時間帯を避けた。
+#
+# `on:` は workflow_dispatch が基本だが、release-windows.yml と同じ
 # パターンで、この workflow 自身を変更する PR に限り pull_request でも
 # 走らせる — workflow_dispatch は main にマージされるまで Actions タブに
-# 現れないため、workflow 自身の変更を検証する唯一の手段になる。
+# 現れないため、workflow 自身の変更を検証する唯一の手段になる。`schedule`
+# は既定ブランチ (main) の workflow 定義でのみ評価され、fork や他ブランチ
+# の同名ファイルからは起動しない (GitHub の仕様) — CLAUDE.md「public
+# リポジトリであることは workflow を書くときの前提条件」の対象は
+# `issue_comment`/`pull_request_review` のような「任意の GitHub ユーザが
+# 発火できる」トリガであり、`schedule` はそれに該当しない (発火元はリポジ
+# トリ設定であり、外部ユーザは発火できない)。書き込み権限やシークレットを
+# 使うステップも無いため、投稿者を絞る `if` の追加は不要と判断した。
 on:
   workflow_dispatch:
     inputs:
@@ -108,6 +159,13 @@ on:
   pull_request:
     paths:
       - ".github/workflows/perf-windows.yml"
+  # Issue #211 項目4 / docs/decisions.md D104。機種ごとの系列を貯めるための
+  # 定期計測 — 頻度・ゲート化を見送る理由は冒頭のコメント参照。cron は
+  # UTC で評価される (UTC 月曜 03:00)。`schedule` は既定ブランチ (main) の
+  # workflow 定義だけで評価され、他ブランチ/fork のこのファイルからは
+  # 発火しない (GitHub の仕様)。
+  schedule:
+    - cron: "0 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -116,7 +174,10 @@ env:
 # 場面がある) ので、Linux の perf-gate.yml のような直列化は行わない。
 # ブランチ + workflow_dispatch の入力が同じ場合のみ、素朴に前の実行を
 # 置き換える (cancel-in-progress = true) — Windows ランナーは高コストな
-# ため、同一条件の実行を並べて無駄に消費しないようにする。
+# ため、同一条件の実行を並べて無駄に消費しないようにする。schedule は常に
+# `github.ref` = `refs/heads/main` で走るので、同じグループに乗る手動実行
+# (main を対象にしたもの) と重なった場合は後勝ちで前者/後者が cancel
+# されうる — 週次 1 回・手動実行は稀という運用なので実害は無いと判断した。
 concurrency:
   group: perf-windows-${{ github.ref }}
   cancel-in-progress: true
@@ -125,8 +186,9 @@ jobs:
   perf-windows:
     name: velox-bench run (windows-latest)
     runs-on: windows-latest
-    # workflow_dispatch では常に走る。pull_request では上の paths フィルタ
-    # により、この workflow 自身を変更する PR だけがここに来る。
+    # workflow_dispatch では常に走る。schedule では毎週月曜 UTC 03:00 に
+    # main に対して走る (Issue #211 項目4)。pull_request では上の paths
+    # フィルタにより、この workflow 自身を変更する PR だけがここに来る。
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -378,14 +440,20 @@ jobs:
           $trials = $env:INPUT_TRIALS
           if ([string]::IsNullOrWhiteSpace($trials)) { $trials = "10" }
 
-          # pull_request 実行では workflow_dispatch の入力が届かない (すべて
-          # 空文字列) ので既定値をここで補う。`compare_env` は「空欄 = 比較
-          # しない」という意味を持つ入力なので、空欄を既定値で埋めてよいのは
-          # 入力そのものが存在しない pull_request のときだけである。
+          # pull_request / schedule 実行では workflow_dispatch の入力が
+          # 届かない (すべて空文字列 — GitHub の仕様) ので既定値をここで
+          # 補う。`compare_env` は「空欄 = 比較しない」という意味を持つ
+          # 入力なので、空欄を既定値で埋めてよいのは、入力そのものが存在
+          # しない pull_request / schedule のときだけである。**schedule を
+          # ここに足し忘れると、ジョブ自体は失敗しないが `compare_env` が
+          # 空欄のまま単独計測 (A のみ) に落ち、Issue #211 項目4 が意図する
+          # 「機種ごとの A/B 系列を貯める」定期計測になっていないことに
+          # 誰も気付けない** — CI が緑のまま目的を達成しない、という壊れ方
+          # なので、pull_request と同じ既定値をここで明示的に補う。
           $compareEnv = $env:INPUT_COMPARE_ENV
           $commonEnv = $env:INPUT_COMMON_ENV
           $repeatsRaw = $env:INPUT_REPEATS
-          if ($env:EVENT_NAME -eq "pull_request") {
+          if ($env:EVENT_NAME -eq "pull_request" -or $env:EVENT_NAME -eq "schedule") {
             $compareEnv = "VELOX_MEMORY_BUDGET_MB=0"
             $commonEnv = ""
             $repeatsRaw = "2"
