@@ -3104,7 +3104,7 @@ mod tests {
         assert_eq!(format_unix_time_utc(1), "1970-01-01T00:00:01Z");
     }
 
-    // -- RunEnvironment: 機種情報フィールドの後方互換 (Issue #211/D105) ----
+    // -- RunEnvironment: 機種情報フィールドの後方互換 (Issue #211/D104) ----
 
     /// `cpu_model`/`total_memory_bytes`/`os_version`/`webview_runtime` を
     /// 追加する前に保存された結果ファイル (`results/baseline/` や
