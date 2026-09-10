@@ -48,6 +48,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::Value;
+
 use velox::browser::automation;
 use velox::browser::benchmark::scenario::Scenario;
 use velox::browser::benchmark::{
@@ -857,12 +859,266 @@ fn collect_environment(trials: u32, git_commit_override: Option<String>) -> RunE
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
     let generated_at = benchmark::format_unix_time_utc(epoch_seconds);
+
+    // Issue #211 (docs/decisions.md D104)。CPU モデル・搭載メモリ・OS
+    // バージョン・WebView ランタイムは、まずネイティブに収集を試み
+    // (`collect_native_environment_info`)、`VELOX_BENCH_*` 環境変数が
+    // 設定されていればそちらを優先する (`apply_environment_overrides`)。
+    // CI (`perf-windows.yml`) が PowerShell で既に採った値をそのまま渡せる
+    // ようにするため、また実機を持たない開発環境で検証できるようにする
+    // ためのオーバーライドである。
+    let native = collect_native_environment_info();
+    let cpu_model_env = env::var("VELOX_BENCH_CPU_MODEL").ok();
+    let total_memory_bytes_env = env::var("VELOX_BENCH_TOTAL_MEMORY_BYTES").ok();
+    let os_version_env = env::var("VELOX_BENCH_OS_VERSION").ok();
+    let webview_runtime_env = env::var("VELOX_BENCH_WEBVIEW_RUNTIME").ok();
+    let machine_info = apply_environment_overrides(
+        native,
+        cpu_model_env.as_deref(),
+        total_memory_bytes_env.as_deref(),
+        os_version_env.as_deref(),
+        webview_runtime_env.as_deref(),
+    );
+
     RunEnvironment {
         os,
         cpu_count,
         git_commit,
         generated_at,
         trials,
+        cpu_model: machine_info.cpu_model,
+        total_memory_bytes: machine_info.total_memory_bytes,
+        os_version: machine_info.os_version,
+        webview_runtime: machine_info.webview_runtime,
+    }
+}
+
+// ---------------------------------------------------------------------
+// 機種情報の収集 (Issue #211, docs/decisions.md D104)
+// ---------------------------------------------------------------------
+
+/// `RunEnvironment` の機種情報 4 フィールド分。ネイティブ収集
+/// (`collect_native_environment_info`) と `VELOX_BENCH_*` 上書き
+/// (`apply_environment_overrides`) の両方が共通で組み立てる中間表現。
+#[derive(Debug, Default, Clone, PartialEq)]
+struct MachineInfo {
+    cpu_model: Option<String>,
+    total_memory_bytes: Option<u64>,
+    os_version: Option<String>,
+    webview_runtime: Option<String>,
+}
+
+/// 現在実行中の OS のネイティブ収集を、実行時に `env::consts::OS` で
+/// 振り分けて行う。`#[cfg(target_os = ...)]` ではなくランタイム分岐に
+/// しているのは、CLAUDE.md が求める
+/// `cargo check --target x86_64-pc-windows-msvc` 型チェックを含め、
+/// どのターゲットでも全分岐がコンパイル・単体テストされるようにするため
+/// (Windows 固有のロジックを Linux の `cargo test` でも検証できる)。
+///
+/// 取得に失敗しても本関数は絶対にエラーを返さない — 各収集関数は内部で
+/// `Result`/`Option` を握りつぶし、取得できなかったフィールドは `None`
+/// のまま返す (ベンチマーク実行そのものを失敗させない、という CLAUDE.md
+/// の方針に従う)。
+fn collect_native_environment_info() -> MachineInfo {
+    match env::consts::OS {
+        "linux" => collect_linux_environment_info(),
+        "windows" => collect_windows_environment_info(),
+        // macOS / その他: CLAUDE.md「対応 OS の優先度」により Windows を
+        // 最優先し、macOS/Linux は「最低限の整備」に留める方針
+        // (docs/decisions.md D104)。ネイティブ収集は用意せず、必要なら
+        // `VELOX_BENCH_*` の上書きで対応する。
+        _ => MachineInfo::default(),
+    }
+}
+
+/// Linux: `/proc` から CPU モデル・物理メモリ・カーネルバージョンを読む。
+/// `webview_runtime` は WebKitGTK のバージョンを機械的に取得する手段が
+/// 無いため常に `None`。
+fn collect_linux_environment_info() -> MachineInfo {
+    let cpu_model = fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|contents| parse_cpu_model_from_proc_cpuinfo(&contents));
+    let total_memory_bytes = fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|contents| parse_total_memory_bytes_from_proc_meminfo(&contents));
+    let os_version = fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .and_then(|s| non_empty_machine_field(&s));
+    MachineInfo {
+        cpu_model,
+        total_memory_bytes,
+        os_version,
+        webview_runtime: None,
+    }
+}
+
+/// 機種情報の文字列項目を「値として使えるもの」だけに絞る。前後の空白を
+/// 落とし、空になったものは `None` にする。
+///
+/// **取得経路をまたいで同じ規則を使うためのもの。** Linux の
+/// `/proc` パースはもともと空値を `None` に落としていたが、Windows の
+/// PowerShell 出力 (`$cpu.Name` が空文字列で返る場合) と `VELOX_BENCH_*`
+/// による上書き (壊れた設定や、値を取れなかった CI が空文字列を渡す場合)
+/// にはその扱いが無く、**空文字列がネイティブ収集済みの値を押しのけて
+/// 採用されてしまう**非対称があった。空文字列は「値がある」ではなく
+/// 「取れなかった」なので、どの経路でも `None` に揃える。
+fn non_empty_machine_field(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_owned())
+    }
+}
+
+/// `/proc/cpuinfo` の `model name` 行から CPU モデル名を取り出す。
+/// 複数コア分同じ行が繰り返されるので最初の 1 件だけを使う。
+fn parse_cpu_model_from_proc_cpuinfo(contents: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() != "model name" {
+            return None;
+        }
+        non_empty_machine_field(value)
+    })
+}
+
+/// `/proc/meminfo` の `MemTotal:` 行 (kB 単位) からバイト単位の総メモリ量
+/// を取り出す。
+fn parse_total_memory_bytes_from_proc_meminfo(contents: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() != "MemTotal" {
+            return None;
+        }
+        let kb: u64 = value.split_whitespace().next()?.parse().ok()?;
+        Some(kb.saturating_mul(1024))
+    })
+}
+
+/// Windows: `.github/workflows/perf-windows.yml` の "Record environment
+/// info" ステップと同じ情報源 (`Get-CimInstance Win32_OperatingSystem` /
+/// `Win32_Processor`、WebView2 Runtime の `pv` レジストリ値) を PowerShell
+/// 経由で読む。
+///
+/// `windows` クレート (このプロジェクトは D59/D76/D88 で既に依存済み) の
+/// 生の Win32 レジストリ/API バインディングを直接叩く実装ではなく、
+/// `std::process::Command` で PowerShell を呼ぶ実装を選んだ — CLAUDE.md
+/// が `unsafe` を原則禁止しているところ、レジストリ/`GlobalMemoryStatusEx`
+/// 等の Win32 API バインディングは `unsafe fn` であり、これを避けられる。
+/// `collect_environment` はベンチマーク 1 回の実行につき 1 度しか呼ばれず、
+/// 計測対象そのものではないため、プロセス起動のコストは無視できる。
+/// **呼ぶのは `pwsh` (PowerShell 7) ではなく `powershell` (Windows
+/// PowerShell 5.1) である点に注意。** `perf-windows.yml` の各ステップは
+/// `shell: pwsh` を使っており、そちらとは別のバイナリになる。ここで 5.1 を
+/// 選ぶのは、**5.1 は Windows に標準で入っているが `pwsh` は入っていない**
+/// ため — `velox-bench` は CI 専用のツールではなく、開発者が自分の Windows
+/// 機で走らせるものでもあり、`pwsh` を前提にすると素の Windows で機種情報が
+/// 丸ごと欠ける。上のスクリプトが使っているのは `Get-CimInstance` /
+/// `Get-ItemProperty` / `ConvertTo-Json` だけで、いずれも 5.1 と 7 の
+/// 双方にあるため、情報源が `perf-windows.yml` と一致することは変わらない。
+///
+/// なお本実装は Windows 実機で検証していない (Linux 開発環境からは
+/// `powershell` コマンド自体が見つからず `None` にフォールバックするため)。
+/// PR レビューではここを重点的に見てほしい。
+fn collect_windows_environment_info() -> MachineInfo {
+    // here-string の中身は perf-windows.yml のステップと同じ発想 (Get-
+    // CimInstance + EdgeUpdate クライアントのレジストリ pv 値) で、結果を
+    // 1 行の JSON として出力する。`ConvertTo-Json -Compress` を使うのは、
+    // Rust 側の `serde_json` でそのままパースできる形にするため。
+    const SCRIPT: &str = r#"
+$ErrorActionPreference = "SilentlyContinue"
+$os = Get-CimInstance Win32_OperatingSystem
+$cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+$webview2 = $null
+$regPaths = @(
+  "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}",
+  "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+)
+foreach ($p in $regPaths) {
+  if (Test-Path $p) {
+    $pv = (Get-ItemProperty -Path $p -Name "pv" -ErrorAction SilentlyContinue).pv
+    if ($pv) { $webview2 = $pv; break }
+  }
+}
+[PSCustomObject]@{
+  cpu_model = $cpu.Name
+  total_memory_bytes = [uint64]$os.TotalVisibleMemorySize * 1024
+  os_version = $os.Version
+  webview_runtime = $webview2
+} | ConvertTo-Json -Compress
+"#;
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", SCRIPT])
+        .output();
+    match output {
+        Ok(out) if out.status.success() => {
+            parse_windows_hardware_info_json(&String::from_utf8_lossy(&out.stdout))
+        }
+        _ => MachineInfo::default(),
+    }
+}
+
+/// [`collect_windows_environment_info`] の PowerShell 出力 (JSON 1 行) を
+/// パースする純粋関数。プロセス起動を伴わないため Linux 上の `cargo test`
+/// でも検証できる。
+fn parse_windows_hardware_info_json(json: &str) -> MachineInfo {
+    let value: Value = match serde_json::from_str(json.trim()) {
+        Ok(v) => v,
+        Err(_) => return MachineInfo::default(),
+    };
+    MachineInfo {
+        cpu_model: value
+            .get("cpu_model")
+            .and_then(Value::as_str)
+            .and_then(non_empty_machine_field),
+        total_memory_bytes: value.get("total_memory_bytes").and_then(Value::as_u64),
+        os_version: value
+            .get("os_version")
+            .and_then(Value::as_str)
+            .and_then(non_empty_machine_field),
+        webview_runtime: value
+            .get("webview_runtime")
+            .and_then(Value::as_str)
+            .and_then(non_empty_machine_field),
+    }
+}
+
+/// `VELOX_BENCH_CPU_MODEL` / `VELOX_BENCH_TOTAL_MEMORY_BYTES` /
+/// `VELOX_BENCH_OS_VERSION` / `VELOX_BENCH_WEBVIEW_RUNTIME` の値
+/// (未設定なら `None`) を、ネイティブ収集結果の上に重ねる。
+///
+/// 環境変数の読み取り自体を行わない純粋関数にしてあるのは、`std::env` を
+/// 直接読むテストは並列実行されるテスト間でプロセス環境を取り合って干渉
+/// するため (docs/decisions.md D104) — 値の受け渡し部分だけを切り出せば
+/// 環境変数を一切触らずにテストできる。
+///
+/// `total_memory_bytes` のオーバーライドが数値としてパースできない場合は
+/// 無視してネイティブ収集側の値にフォールバックする (壊れた環境変数で
+/// ベンチマークを失敗させない)。文字列項目も同じ考え方で、空文字列や
+/// 空白だけの値は [`non_empty_machine_field`] が `None` に落とすため、
+/// **ネイティブ収集済みの値を空文字列で押しのけることはない。**
+fn apply_environment_overrides(
+    native: MachineInfo,
+    cpu_model_override: Option<&str>,
+    total_memory_bytes_override: Option<&str>,
+    os_version_override: Option<&str>,
+    webview_runtime_override: Option<&str>,
+) -> MachineInfo {
+    MachineInfo {
+        cpu_model: cpu_model_override
+            .and_then(non_empty_machine_field)
+            .or(native.cpu_model),
+        total_memory_bytes: total_memory_bytes_override
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .or(native.total_memory_bytes),
+        os_version: os_version_override
+            .and_then(non_empty_machine_field)
+            .or(native.os_version),
+        webview_runtime: webview_runtime_override
+            .and_then(non_empty_machine_field)
+            .or(native.webview_runtime),
     }
 }
 
@@ -920,5 +1176,191 @@ fn print_result_summary(result: &BenchmarkResult) {
             "{:<28} {:>8} {:>12.2} {:>12.2}",
             name, stats.count, stats.median, stats.p95
         );
+    }
+}
+
+#[cfg(test)]
+mod environment_info_tests {
+    use super::*;
+
+    // -- /proc/cpuinfo / /proc/meminfo のパース (Linux) ---------------------
+
+    #[test]
+    fn parses_cpu_model_from_typical_proc_cpuinfo() {
+        let contents = "\
+processor\t: 0
+vendor_id\t: AuthenticAMD
+model name\t: AMD EPYC 9V74 80-Core Processor
+cache size\t: 512 KB
+
+processor\t: 1
+model name\t: AMD EPYC 9V74 80-Core Processor
+";
+        assert_eq!(
+            parse_cpu_model_from_proc_cpuinfo(contents),
+            Some("AMD EPYC 9V74 80-Core Processor".to_owned())
+        );
+    }
+
+    #[test]
+    fn cpu_model_is_none_when_field_absent() {
+        assert_eq!(parse_cpu_model_from_proc_cpuinfo("processor\t: 0\n"), None);
+    }
+
+    #[test]
+    fn parses_total_memory_bytes_from_typical_proc_meminfo() {
+        let contents = "\
+MemTotal:       16336864 kB
+MemFree:         1234567 kB
+";
+        // 16336864 kB * 1024 = 16728948736 bytes
+        assert_eq!(
+            parse_total_memory_bytes_from_proc_meminfo(contents),
+            Some(16_728_948_736)
+        );
+    }
+
+    #[test]
+    fn total_memory_bytes_is_none_when_field_absent() {
+        assert_eq!(
+            parse_total_memory_bytes_from_proc_meminfo("MemFree: 1234 kB\n"),
+            None
+        );
+    }
+
+    // -- Windows PowerShell JSON のパース ------------------------------------
+
+    #[test]
+    fn parses_windows_hardware_info_json_with_all_fields() {
+        let json = r#"{"cpu_model":"AMD EPYC 9V74 80-Core Processor","total_memory_bytes":8589934592,"os_version":"10.0.26100","webview_runtime":"128.0.2739.79"}"#;
+        let info = parse_windows_hardware_info_json(json);
+        assert_eq!(
+            info.cpu_model,
+            Some("AMD EPYC 9V74 80-Core Processor".to_owned())
+        );
+        assert_eq!(info.total_memory_bytes, Some(8_589_934_592));
+        assert_eq!(info.os_version, Some("10.0.26100".to_owned()));
+        assert_eq!(info.webview_runtime, Some("128.0.2739.79".to_owned()));
+    }
+
+    #[test]
+    fn parses_windows_hardware_info_json_with_null_webview_runtime() {
+        // WebView2 Runtime が見つからなかった場合、PowerShell 側は
+        // `$webview2 = $null` のまま JSON 化する。
+        let json = r#"{"cpu_model":"Intel(R) Xeon(R) Platinum 8573C","total_memory_bytes":17179869184,"os_version":"10.0.26100","webview_runtime":null}"#;
+        let info = parse_windows_hardware_info_json(json);
+        assert_eq!(info.webview_runtime, None);
+    }
+
+    #[test]
+    fn windows_hardware_info_json_falls_back_to_default_on_garbage_input() {
+        // PowerShell 自体が使えない・出力が壊れている場合でもパニックせず
+        // 全フィールド `None` を返す (ベンチマークを失敗させない)。
+        assert_eq!(
+            parse_windows_hardware_info_json("not json at all"),
+            MachineInfo::default()
+        );
+        assert_eq!(parse_windows_hardware_info_json(""), MachineInfo::default());
+    }
+
+    // -- VELOX_BENCH_* による上書き (Issue #211) -----------------------------
+    //
+    // `std::env` を直接読まない純粋関数として `apply_environment_overrides`
+    // を切り出してあるので、プロセス環境変数を触らずにテストできる
+    // (環境変数を触るテストは並列実行で干渉するため)。
+
+    fn sample_native() -> MachineInfo {
+        MachineInfo {
+            cpu_model: Some("native-cpu".to_owned()),
+            total_memory_bytes: Some(1_024),
+            os_version: Some("native-os".to_owned()),
+            webview_runtime: Some("native-webview".to_owned()),
+        }
+    }
+
+    #[test]
+    fn overrides_are_none_by_default_keep_native_values() {
+        let result = apply_environment_overrides(sample_native(), None, None, None, None);
+        assert_eq!(result, sample_native());
+    }
+
+    #[test]
+    fn overrides_replace_native_values_when_set() {
+        let result = apply_environment_overrides(
+            sample_native(),
+            Some("overridden-cpu"),
+            Some("2048"),
+            Some("overridden-os"),
+            Some("overridden-webview"),
+        );
+        assert_eq!(
+            result,
+            MachineInfo {
+                cpu_model: Some("overridden-cpu".to_owned()),
+                total_memory_bytes: Some(2_048),
+                os_version: Some("overridden-os".to_owned()),
+                webview_runtime: Some("overridden-webview".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn unparseable_total_memory_bytes_override_falls_back_to_native() {
+        // 壊れた環境変数 (数値でない) でベンチマークを失敗させず、
+        // ネイティブ収集側の値にフォールバックする。
+        let result =
+            apply_environment_overrides(sample_native(), None, Some("not-a-number"), None, None);
+        assert_eq!(result.total_memory_bytes, Some(1_024));
+    }
+
+    #[test]
+    fn empty_native_with_no_overrides_yields_default() {
+        let result = apply_environment_overrides(MachineInfo::default(), None, None, None, None);
+        assert_eq!(result, MachineInfo::default());
+    }
+
+    #[test]
+    fn blank_string_overrides_fall_back_to_native() {
+        // 空文字列や空白だけの `VELOX_BENCH_*` は「値がある」ではなく
+        // 「取れなかった」なので、ネイティブ収集済みの値を押しのけては
+        // ならない。値を取れなかった CI がそのまま空文字列を渡す経路が
+        // 現実にありうる。
+        let result = apply_environment_overrides(
+            sample_native(),
+            Some(""),
+            Some("   "),
+            Some("   "),
+            Some(""),
+        );
+        assert_eq!(result, sample_native());
+    }
+
+    #[test]
+    fn whitespace_padded_overrides_are_trimmed() {
+        let result = apply_environment_overrides(
+            sample_native(),
+            Some("  Override CPU  "),
+            Some(" 2048 "),
+            Some(" 10.0.26100 "),
+            Some("  151.0.4129.101 "),
+        );
+        assert_eq!(result.cpu_model.as_deref(), Some("Override CPU"));
+        assert_eq!(result.total_memory_bytes, Some(2_048));
+        assert_eq!(result.os_version.as_deref(), Some("10.0.26100"));
+        assert_eq!(result.webview_runtime.as_deref(), Some("151.0.4129.101"));
+    }
+
+    #[test]
+    fn windows_json_blank_strings_become_none() {
+        // PowerShell 側で値が取れなかったとき、`$cpu.Name` が `null` では
+        // なく空文字列で返ることがある。`None` と同じ扱いにしないと、
+        // 「機種不明」を「機種名が空文字列の機種」として記録してしまう。
+        let result = parse_windows_hardware_info_json(
+            r#"{"cpu_model":"","total_memory_bytes":2048,"os_version":"   ","webview_runtime":""}"#,
+        );
+        assert_eq!(result.cpu_model, None);
+        assert_eq!(result.total_memory_bytes, Some(2_048));
+        assert_eq!(result.os_version, None);
+        assert_eq!(result.webview_runtime, None);
     }
 }
