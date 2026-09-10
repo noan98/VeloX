@@ -8,7 +8,7 @@
 | 文書 | 内容 |
 | --- | --- |
 | [architecture.md](architecture.md) | UI (`src/ui/`) / Application (`src/app.rs`) / Browser logic (`src/browser/`) / Web engine (wry) という 4 層の責務分担と依存方向。UI 側は状態を直接触らず `UserEvent` を投げる、という設計もここ (`src/config/` は `src/browser/` と同じく純粋 Rust の補助モジュールで、層には数えない) |
-| [decisions.md](decisions.md) | 設計判断の記録。「なぜそうしたか」「なぜそうしなかったか」を D 番号ごとに残す。実装方針を変えたときはここに追記する |
+| [decisions/README.md](decisions/README.md) | 設計判断の入口。D 番号をテーマ別に整理し、詳細な一次記録は `decisions/archive.md` に保持 |
 
 ## 性能
 
