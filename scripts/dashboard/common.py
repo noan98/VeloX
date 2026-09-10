@@ -50,6 +50,33 @@
 このルールはデータ構造 (`session_id` フィールドが無ければ比較できない) と
 UI (session_id が変わる箇所は線を切り、差分バッジを出さない) の両方で
 強制される。
+
+## 「機種」という、もう一段の比較単位 (Issue #211 / D106)
+
+D96 (Issue #208) は `windows-latest` が **run ごとに別スペックのマシンを
+割り当てる** ことを実測した (AMD EPYC 9V74 / Intel Xeon 8573C / Intel Xeon
+6973P-C / AMD EPYC 7763 の 4 種が観測済み)。`session_id` は「呼び出し側が
+明示的に同一と指定した run」を表すだけで、**その run がどの機種で計測された
+かは別問題**である — 将来、定期計測 (Issue #211 項目4) が「時系列として
+蓄積する」ために複数回の run へ同じ `session_id` を使い回すようになった
+場合、機種が違う run を同一系列としてつないでしまう恐れがある。
+
+そこで `session_id` に加えて **`machine_key`** (`derive_machine_key`) を
+比較のもう一段の単位として導入する。`report.py` は
+**`session_id` と `machine_key` の両方が一致する隣接エントリ同士だけ**を
+線でつなぎ、差分を計算する — どちらか一方でも変われば D82 と同じ扱い
+(点は表示するが線を引かず、差分も出さない) になる。
+
+`machine_key` は `result.environment` の `cpu_model`/`os`/`cpu_count`/
+`total_memory_bytes` (Issue #211 項目1 で追加されるフィールド。すべて
+省略可能) から導出する純粋関数 (`derive_machine_key`)。**`cpu_model` が
+無い「機種不明」のエントリは、安全側に倒して他のどのエントリとも同一機種
+として扱わない** (`HistoryEntry.machine_key` の docstring 参照) — 「不明」
+同士を同一機種とみなすと、比較してはならない組み合わせを比較することに
+なるため。既存の `results/history/` の v1 エントリ (item1 以前に記録された
+もの) はすべてこの「機種不明」に該当し、`report.py` 上では常に孤立した点
+として表示される。データそのものは変更しておらず、読み込み (パース) は
+引き続き問題なく行える — 変わるのは表示上の連結判定だけである。
 """
 
 from __future__ import annotations
@@ -147,6 +174,56 @@ def generate_session_id(source: str) -> str:
     return f"{source}-{host}-{ts}-{secrets.token_hex(3)}"
 
 
+def _memory_gib_bucket(total_memory_bytes: Any) -> str:
+    """総メモリを GiB 単位に丸めた文字列にする。OS が報告する値は予約領域
+    などでバイト単位に細かいブレが出うるため、機種判定にそのブレを持ち込ま
+    ないよう丸める。値が無い/数値でない場合は "?" とする。"""
+    if not isinstance(total_memory_bytes, (int, float)) or total_memory_bytes <= 0:
+        return "?GiB"
+    return f"{round(total_memory_bytes / (1024 ** 3))}GiB"
+
+
+def derive_machine_key(environment: dict, *, salt: str) -> str:
+    """`result.environment` から「同一機種とみなしてよい」識別子を作る
+    (Issue #211 項目2 / docs/decisions.md D106)。モジュール docstring の
+    「機種という、もう一段の比較単位」を参照。
+
+    `os` / `cpu_model` / `cpu_count` / `total_memory_bytes` は Issue #211
+    項目1 で `BenchmarkResult.environment` に追加されるフィールド (すべて
+    省略可能)。
+
+    **`cpu_model` が無い「機種不明」のエントリは、安全側に倒して他のどの
+    エントリとも同一機種として扱わない。** そのため `cpu_model` が無い
+    場合は `salt` を混ぜた値を返す — 呼び出し側は、そのエントリを一意に
+    指す値 (例: `f"{path}:{line_no}"`) を渡すこと。**同じ `salt` を機種不明の
+    2 エントリに使い回すと、その 2 つは誤って同一機種として連結される。**
+
+    既知の機種同士は `salt` を使わない (`os`/`cpu_model`/`cpu_count`/
+    メモリ量だけで決まる) — 同じ機種であれば、いつ・どのセッションで
+    計測しても同じ `machine_key` になってほしいため。
+
+    純粋関数 (`environment` と `salt` だけで結果が決まり、副作用も無い) —
+    テストしやすさのためにこの形にしてある。
+    """
+    os_name = environment.get("os") or "?"
+    cpu_model = environment.get("cpu_model")
+    if not cpu_model:
+        return f"unknown:{salt}"
+    cpu_count = environment.get("cpu_count")
+    mem_bucket = _memory_gib_bucket(environment.get("total_memory_bytes"))
+    return f"{os_name}|{cpu_model}|{cpu_count if cpu_count is not None else '?'}コア|{mem_bucket}"
+
+
+def machine_label(environment: dict) -> str:
+    """人間向けの機種表示ラベル。`derive_machine_key` と違い比較には使わない
+    (表示専用) ので `salt` を取らない。"""
+    cpu_model = environment.get("cpu_model")
+    if not cpu_model:
+        return "機種不明"
+    cpu_count = environment.get("cpu_count")
+    return f"{cpu_model} ({cpu_count}コア)" if cpu_count else cpu_model
+
+
 def short_sha(sha: str | None, length: int = 12) -> str:
     if not sha:
         return "unknown"
@@ -221,6 +298,24 @@ class HistoryEntry:
     @property
     def cpu_count(self) -> int | None:
         return self.environment.get("cpu_count")
+
+    @property
+    def cpu_model(self) -> str | None:
+        return self.environment.get("cpu_model")
+
+    @property
+    def machine_key(self) -> str:
+        """Issue #211 項目2 / D106。同一機種の run 同士でのみ比較するための
+        識別子。`salt` に `path:line_no` (ファイル内でのこのエントリの位置)
+        を渡すので、「機種不明」のエントリはファイル内の行ごとに必ず異なる
+        値になり、互いに連結されない (`derive_machine_key` の docstring
+        参照)。"""
+        return derive_machine_key(self.environment, salt=f"{self.path}:{self.line_no}")
+
+    @property
+    def machine_display(self) -> str:
+        """人間向けの機種表示ラベル (表示専用、比較には使わない)。"""
+        return machine_label(self.environment)
 
     def metric_median(self, name: str) -> float | None:
         stats = self.result.get("metrics", {}).get(name)

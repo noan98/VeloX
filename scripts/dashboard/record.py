@@ -21,6 +21,14 @@ docstring を参照。
 `session_id=...` が表示されるので、それを後続の呼び出しにそのまま渡せば
 よい。
 
+## 「機種」について (Issue #211 項目2 / docs/decisions.md D106)
+
+`--session-id` が同じでも、`report.py` は **機種 (`environment.cpu_model`
+等から導出する `machine_key`) が一致する場合にしか隣接エントリを比較しない**
+(`common.py` の該当節参照)。`environment.cpu_model` が無い結果は「機種不明」
+として記録され、安全側に倒して他のどのエントリとも自動比較されない —
+このコマンドはその旨を記録のたびに表示する。
+
 使い方
 ------
     # 1 回だけ記録する (session_id は自動生成される)
@@ -50,6 +58,7 @@ from common import (  # noqa: E402
     append_jsonl,
     generate_session_id,
     history_file_for,
+    machine_label,
     now_iso,
 )
 
@@ -133,6 +142,18 @@ def main() -> int:
             f"(scenario={scenario} os={os_name} "
             f"commit={result['environment'].get('git_commit', 'unknown')[:12] if result['environment'].get('git_commit') else 'unknown'})"
         )
+        # Issue #211 項目2 / docs/decisions.md D106: report.py は session_id
+        # に加えて機種 (machine_key) が一致する隣接エントリ同士だけを比較
+        # する。cpu_model が無い結果は「機種不明」として記録され、
+        # report.py 上では他のどのエントリとも自動比較されない (安全側)。
+        environment = result["environment"]
+        print(f"  機種: {machine_label(environment)}")
+        if not environment.get("cpu_model"):
+            print(
+                "  警告: environment.cpu_model が無いため「機種不明」として"
+                "記録されます。report.py はこのエントリを他のどのエントリとも"
+                "つなぎません (docs/decisions.md D106)。"
+            )
 
     print(f"session_id={session_id}")
     print(

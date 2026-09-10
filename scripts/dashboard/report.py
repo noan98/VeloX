@@ -10,14 +10,19 @@ SVG を文字列として組み立てている (新規依存なし)。
 ## 「異なるセッション/マシンの数値を比較してはならない」原則の担保
 
 `common.py` のモジュール docstring に設計の全体像がある。このスクリプトが
-UI 側で守っている規則は 1 つ:
+UI 側で守っている規則は 1 つ (Issue #211 項目2 / docs/decisions.md D106 で
+「機種」の軸を追加した):
 
-**同一 `session_id` の隣接エントリ同士だけを線でつなぎ、`velox-bench gate`
-で差分の重大度 (OK/WARN/FAIL) を計算する。`session_id` が異なる点は、時系列
-グラフ上には (どちらも) 表示するが、線ではつながず、差分バッジも出さない。**
+**同一 `session_id` かつ同一機種 (`machine_key`) の隣接エントリ同士だけを
+線でつなぎ、`velox-bench gate` で差分の重大度 (OK/WARN/FAIL) を計算する。
+`session_id` または機種のどちらかが異なる点は、時系列グラフ上には
+(どちらも) 表示するが、線ではつながず、差分バッジも出さない。**
 
-これにより「グラフ上に複数セッションの点が乗っていても、線が切れている
-箇所は比較不可能」であることが一目でわかるようにしてある。
+これにより「グラフ上に複数セッション/機種の点が乗っていても、線が切れている
+箇所は比較不可能」であることが一目でわかるようにしてある。「機種不明」
+(`environment.cpu_model` が無い、item1 以前の古いエントリなど) は安全側に
+倒し、他のどのエントリとも同一機種として連結しない
+(`common.derive_machine_key` 参照)。
 
 ## threshold (閾値) 表示について
 
@@ -63,6 +68,15 @@ from common import (  # noqa: E402
     read_history,
     short_sha,
 )
+
+# Issue #211 項目2 / D106。「同一 session_id かつ同一機種」だけが比較可能
+# な系列 — `session_id` (無ければ "unknown-session") と `machine_key` の
+# 組。session_id だけの D82 の単位に、機種という軸を 1 つ足したもの。
+SeriesKey = tuple[str, str]
+
+
+def series_key(entry: HistoryEntry) -> SeriesKey:
+    return (entry.session_id or "unknown-session", entry.machine_key)
 
 DEFAULT_REPO_URL = "https://github.com/noan98/VeloX"
 
@@ -184,23 +198,27 @@ def compute_diff_fallback(prev: HistoryEntry, curr: HistoryEntry, metric_name: s
     return Diff(pct_change=pct, severity=severity, approximate=True)
 
 
-def assign_session_colors(entries_time_sorted: list[HistoryEntry]) -> dict[str, str]:
-    colors: dict[str, str] = {}
+def assign_series_colors(entries_time_sorted: list[HistoryEntry]) -> dict[SeriesKey, str]:
+    """系列 (session_id + machine_key) ごとに色を割り当てる。機種が違えば
+    `session_id` が同じでも別系列 = 別色になる (D106) — 「同じ色の点だけが
+    比較可能」という UI 上の約束を、機種軸でも保つため。"""
+    colors: dict[SeriesKey, str] = {}
     for e in entries_time_sorted:
-        sid = e.session_id or "unknown"
-        if sid not in colors:
-            colors[sid] = PALETTE[len(colors) % len(PALETTE)]
+        skey = series_key(e)
+        if skey not in colors:
+            colors[skey] = PALETTE[len(colors) % len(PALETTE)]
     return colors
 
 
 def render_svg_chart(
     points: list[tuple[HistoryEntry, float]],
     metric_name: str,
-    session_colors: dict[str, str],
+    series_colors: dict[SeriesKey, str],
 ) -> str:
-    """`points` は時系列順 (古い→新しい) の (エントリ, 生の値)。同一
-    session_id の点だけを線でつなぐ — 異なるセッションの点は marker のみ
-    描画し、線を引かない (モジュール docstring の規則)。"""
+    """`points` は時系列順 (古い→新しい) の (エントリ, 生の値)。同一系列
+    (session_id かつ machine_key が同じ、D106) の点だけを線でつなぐ —
+    異なる系列の点は marker のみ描画し、線を引かない (モジュール docstring
+    の規則)。"""
     if not points:
         return "<p class='muted'>データがありません。</p>"
 
@@ -229,10 +247,11 @@ def render_svg_chart(
     def y_at(v: float) -> float:
         return pad_top + plot_h * (1 - (v - v_min) / span)
 
-    # セッションごとに折れ線を分ける (同一セッションの点だけをつなぐ)。
-    by_session: dict[str, list[int]] = defaultdict(list)
+    # 系列 (session_id + machine_key) ごとに折れ線を分ける — 同一系列の
+    # 点だけをつなぐ (D106)。
+    by_series: dict[SeriesKey, list[int]] = defaultdict(list)
     for i, (entry, _) in enumerate(points):
-        by_session[entry.session_id or "unknown"].append(i)
+        by_series[series_key(entry)].append(i)
 
     parts: list[str] = [
         f"<svg viewBox='0 0 {width} {height}' role='img' "
@@ -251,8 +270,8 @@ def render_svg_chart(
             f"{label_v:.1f}</text>"
         )
 
-    for sid, idxs in by_session.items():
-        color = session_colors.get(sid, "#888")
+    for skey, idxs in by_series.items():
+        color = series_colors.get(skey, "#888")
         if len(idxs) >= 2:
             path = " ".join(
                 f"{x_at(i):.1f},{y_at(metric_display_value(metric_name, points[i][1])):.1f}"
@@ -263,9 +282,11 @@ def render_svg_chart(
             entry, raw_v = points[i]
             dv = metric_display_value(metric_name, raw_v)
             x, y = x_at(i), y_at(dv)
+            sid, _machine_key = skey
             tooltip = (
                 f"{entry.generated_at} | commit={short_sha(entry.commit)} | "
-                f"session={sid} | source={entry.source} | "
+                f"session={sid} | machine={entry.machine_display} | "
+                f"source={entry.source} | "
                 f"{dv:.2f}{metric_unit(metric_name)}"
             )
             parts.append(
@@ -307,16 +328,17 @@ def build_report_model(
             model[os_name] = {}
             for scenario, scenario_entries in sorted(scenarios.items()):
                 scenario_entries.sort(key=lambda e: parse_time(e.generated_at))
-                session_colors = assign_session_colors(scenario_entries)
+                series_colors = assign_series_colors(scenario_entries)
 
-                # セッションごとに「直前の同一セッションのエントリ」を求め、
-                # 差分を計算する。
-                last_by_session: dict[str, HistoryEntry] = {}
+                # 系列 (session_id + machine_key, D106) ごとに「直前の
+                # 同一系列のエントリ」を求め、差分を計算する。機種が違えば
+                # session_id が同じでも別系列として扱う。
+                last_by_series: dict[SeriesKey, HistoryEntry] = {}
                 rows = []
-                prev_session_id: str | None = None
+                prev_series: SeriesKey | None = None
                 for e in scenario_entries:
-                    sid = e.session_id or "unknown"
-                    prev_entry = last_by_session.get(sid)
+                    skey = series_key(e)
+                    prev_entry = last_by_series.get(skey)
                     diffs: dict[str, Diff] = {}
                     if prev_entry is not None:
                         gate_report = None
@@ -339,14 +361,14 @@ def build_report_model(
                     rows.append(
                         {
                             "entry": e,
-                            "session_boundary": sid != prev_session_id,
-                            "color": session_colors.get(sid, "#888"),
+                            "series_boundary": skey != prev_series,
+                            "color": series_colors.get(skey, "#888"),
                             "diffs": diffs,
                             "has_prev": prev_entry is not None,
                         }
                     )
-                    last_by_session[sid] = e
-                    prev_session_id = sid
+                    last_by_series[skey] = e
+                    prev_series = skey
 
                 charts = {}
                 for group_key, group_label, candidates in METRIC_GROUPS:
@@ -368,13 +390,13 @@ def build_report_model(
                     charts[group_key] = {
                         "label": group_label,
                         "metric_name": metric_name,
-                        "svg": render_svg_chart(points, metric_name, session_colors),
+                        "svg": render_svg_chart(points, metric_name, series_colors),
                     }
 
                 model[os_name][scenario] = {
                     "rows": rows,
                     "charts": charts,
-                    "session_colors": session_colors,
+                    "series_colors": series_colors,
                 }
     return {
         "by_os": model,
@@ -439,7 +461,7 @@ h3 { margin-top: 2rem; }
 table { border-collapse: collapse; width: 100%; font-size: .85rem; margin: .5rem 0 1.5rem; }
 th, td { border: 1px solid #ddd; padding: .35rem .5rem; text-align: left; white-space: nowrap; }
 th { background: #f0f0f0; position: sticky; top: 0; }
-tr.session-boundary td { border-top: 3px solid #999; }
+tr.series-boundary td { border-top: 3px solid #999; }
 .session-tag { display: inline-block; width: .7em; height: .7em; border-radius: 50%; margin-right: .35em; }
 .sev-ok { color: #2e7d32; }
 .sev-warn { color: #b26a00; font-weight: 600; }
@@ -458,14 +480,19 @@ code { background: rgba(127,127,127,.15); padding: .1em .3em; border-radius: 3px
     parts.append(f"<p class='note'>生成日時 (UTC): {generated_at}</p>")
     parts.append(
         "<div class='card'><strong>読み方</strong>: "
-        "この表・グラフの各行/点は「1回の計測セッション」に属します。"
-        "<strong>同じ色・線でつながっている点だけが比較可能</strong>です。"
-        "線が途切れている、あるいは色が変わっている箇所は"
-        "<strong>別のマシン/別のセッションで採った数値</strong>であり、"
+        "この表・グラフの各行/点は「1回の計測セッション・1つの機種」の"
+        "組に属します。<strong>同じ色・線でつながっている点だけが比較可能"
+        "</strong>です。線が途切れている、あるいは色が変わっている箇所は"
+        "<strong>別のセッション、または別の機種で採った数値</strong>であり、"
         "並べて表示はしますが自動では差分を計算しません "
         "(<code>docs/performance-targets.md</code> §10、"
         "<code>docs/decisions.md</code> D46 — "
-        "同一バイナリでもセッションを跨ぐと最大 +78.9% 動くことが実測済み)。"
+        "同一バイナリでもセッションを跨ぐと最大 +78.9% 動くことが実測済み。"
+        "<code>docs/decisions.md</code> D96/D106 — "
+        "<code>windows-latest</code> は run ごとに機種の異なるマシンを"
+        "割り当てるため、機種が違えば同一セッション扱いでも比較しません。"
+        "「機種不明」(CPU 情報の無い古い結果) は安全側に倒し、他のどの"
+        "エントリとも比較しません)。"
         f"<br>{html_escape(thresholds_note)}"
         "<br>メモリはプロセス数の異なるブラウザ間で比較できる "
         "<strong>PSS</strong> を優先表示します "
@@ -506,14 +533,14 @@ code { background: rgba(127,127,127,.15); padding: .1em .3em; border-radius: 3px
                 if any(r["entry"].metric_median(m) is not None for r in data["rows"])
             ]
             parts.append("<div style='overflow-x:auto'><table><thead><tr>")
-            for col in ("日時", "セッション/ソース", "コミット", "ブランチ", "PR", "試行数"):
+            for col in ("日時", "セッション/ソース", "機種", "コミット", "ブランチ", "PR", "試行数"):
                 parts.append(f"<th>{col}</th>")
             for m in present_metrics:
                 parts.append(f"<th>{html_escape(metric_label(m))}</th>")
             parts.append("</tr></thead><tbody>")
             for row in data["rows"]:
                 e: HistoryEntry = row["entry"]
-                cls = " class='session-boundary'" if row["session_boundary"] else ""
+                cls = " class='series-boundary'" if row["series_boundary"] else ""
                 parts.append(f"<tr{cls}>")
                 parts.append(f"<td>{html_escape(e.generated_at)}</td>")
                 sid_short = (e.session_id or "unknown")[:28]
@@ -521,6 +548,10 @@ code { background: rgba(127,127,127,.15); padding: .1em .3em; border-radius: 3px
                     f"<td><span class='session-tag' style='background:{row['color']}'></span>"
                     f"{html_escape(sid_short)}<br><span class='muted'>{html_escape(e.source)}"
                     f"{' / ' + html_escape(e.note) if e.note else ''}</span></td>"
+                )
+                machine_cls = " class='muted'" if not e.cpu_model else ""
+                parts.append(
+                    f"<td{machine_cls}>{html_escape(e.machine_display)}</td>"
                 )
                 if e.commit:
                     commit_url = f"{repo_url}/commit/{e.commit}"
@@ -550,9 +581,11 @@ def render_markdown(model: dict, thresholds_note: str, repo_url: str) -> str:
     generated_at = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
     lines = ["# VeloX Performance Dashboard", "", f"生成日時 (UTC): {generated_at}", ""]
     lines.append(
-        "> 同じセッション ID の隣接エントリ同士だけが比較可能です。"
-        "セッションが変わる箇所は差分を計算していません "
-        "(docs/performance-targets.md §10 / docs/decisions.md D46)。"
+        "> 同じセッション ID **かつ同じ機種**の隣接エントリ同士だけが比較可能"
+        "です。セッションまたは機種が変わる箇所は差分を計算していません "
+        "(docs/performance-targets.md §10 / docs/decisions.md D46/D96/D106)。"
+        "「機種不明」(CPU 情報の無い古い結果) は安全側に倒し、他のどの"
+        "エントリとも比較しません。"
     )
     lines.append(f"> {thresholds_note}")
     lines.append("")
@@ -569,20 +602,21 @@ def render_markdown(model: dict, thresholds_note: str, repo_url: str) -> str:
                 for m in PRIMARY_TABLE_METRICS
                 if any(r["entry"].metric_median(m) is not None for r in data["rows"])
             ]
-            header = ["日時", "セッション", "ソース", "commit", "PR", "試行数"] + [
+            header = ["日時", "セッション", "機種", "ソース", "commit", "PR", "試行数"] + [
                 metric_label(m) for m in present_metrics
             ]
             lines.append("| " + " | ".join(header) + " |")
             lines.append("|" + "|".join(["---"] * len(header)) + "|")
             for row in data["rows"]:
                 e: HistoryEntry = row["entry"]
-                boundary_mark = "**↓新セッション** " if row["session_boundary"] else ""
+                boundary_mark = "**↓新系列 (セッション/機種)** " if row["series_boundary"] else ""
                 sid_short = (e.session_id or "unknown")[:20]
                 pr_cell = f"#{e.pr_number}" if e.pr_number else "—"
                 commit_cell = short_sha(e.commit) if e.commit else "—"
                 cells = [
                     e.generated_at,
                     f"{boundary_mark}{sid_short}",
+                    e.machine_display,
                     e.source,
                     commit_cell,
                     pr_cell,
