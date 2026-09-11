@@ -13864,3 +13864,163 @@ schedule が生成する結果 JSON を artifact から拾って `record.py` に
 識別子 (マイクロコード版数等) が要る。
 (4) 週次の頻度は実測に基づかない見積もりで決めた。データが貯まる速度が
 明らかに遅すぎる/コストが見合わないと分かった時点で調整する。
+
+## D107: auto-merge の `workflow_run` 監視対象を「PR の check-run に現れうる workflow 全部」に揃え、列挙漏れをテストで固定する (Issue #225)
+
+**対象**: Issue #225。PR #223 (Issue #211 項目2/項目4) が、CI 全部緑・
+`mergeable_state: clean`・`no-automerge` なしの状態で **auto-merge が一度も
+起動しないまま止まった**事象への対処。
+
+### 事象と原因
+
+`auto-merge.yml` の `workflow_run` トリガが監視していたのは
+`CI` / `Performance Regression Gate` / `Release (Windows)` /
+`Dependency Audit` の 4 つだけだった。一方 `perf-windows.yml`
+(`Performance (Windows)`) は D88 の設計により「**自分自身を変更する PR に
+限り `pull_request` でも走る**」ため、そうした PR では check-run として
+現れる。この組み合わせで次の順に詰む。
+
+1. `CI` が先に完了 → auto-merge 起動 → `perf-windows` がまだ実行中なので
+   「全チェックが success/skipped」を満たさず、マージせず終了
+2. その後 `perf-windows` が完了 → **監視対象外なので auto-merge が起動
+   しない**
+3. 誰も auto-merge を起こさないまま放置される
+
+`schedule` (10分ごと) は安全網にならない。Issue #219 / D103 が実測した
+通り、cron は 1 日 144 回のはずが全期間で 36 回 (約6%)、実際の間隔は
+2〜5 時間である。#223 では `workflow_dispatch` の手動起動で解消した。
+
+### 決定1: 漏れていたのは Issue が挙げた 2 つではなく 4 つだった
+
+Issue #225 の対応案は `Performance (Windows, manual)` と
+`Browser comparison (Windows, manual)` の 2 つを足す内容だったが、実装前に
+`.github/workflows/*.yml` を全件走査したところ、**`pull_request` トリガを
+持つのに未列挙だった workflow は 4 つ**あった。
+
+| workflow | `name:` | `pull_request` で走る条件 |
+|---|---|---|
+| `perf-windows.yml` | `Performance (Windows)` | 自身を変更する PR (D88) |
+| `compare-windows.yml` | `Browser comparison (Windows, manual)` | 自身と `scripts/bench/compare_browsers.py` / `proctree.py` を変更する PR |
+| `release-linux.yml` | `Release (Linux)` | 自身を変更する PR |
+| `codeql.yml` | `CodeQL` | 全 PR |
+
+`CodeQL` は**全 PR で走る**ため、「最後に完了するのが CodeQL だった PR」
+では常に同じ止まり方をしうる。Issue の起票時点では #223 の症状
+(`perf-windows`) だけが見えていたが、原因は個別の workflow ではなく
+**列挙という管理方法そのもの**だった。
+
+### 決定2: Issue の対応案をそのまま貼ってはいけなかった — 名前は既に変わっていた
+
+Issue #225 は `Performance (Windows, manual)` と書いていたが、
+`perf-windows.yml` の `name:` は D106 (週次スケジュール実行の追加) で既に
+`Performance (Windows)` へ変わっている。**Issue の案文をそのまま貼ると、
+YAML としては正しく、CI も緑で、しかし一致する workflow が存在しないため
+何も直っていない**という状態になっていた。GitHub はこのずれを一切警告
+しない (そういう名前の workflow が完了しないだけでエラーにはならない)。
+
+### 決定3: 列挙の漏れ・ずれをテストで固定する
+
+Issue #225 が「より根本的には『PR の check-runs に現れうる workflow を
+すべて列挙する』という管理が必要で、workflow を足すたびにここを更新し
+忘れるリスクが残る」と指摘していた点への回答。`workflow_run` の列挙を
+やめる別方式 (Issue の言う「スコープを超える」案) は採らず、**列挙を
+維持したうえで、漏れを機械的に検知する**方を選んだ。
+
+`.github/scripts/test_workflow_run_coverage.py` が
+`.github/workflows/*.yml` を走査し、次を検査する。
+
+1. `pull_request` トリガを持つ workflow (auto-merge 自身を除く) の
+   `name:` が、すべて `workflow_run.workflows` に列挙されている
+2. `workflow_run.workflows` の各名前が、実在する workflow の `name:` と
+   完全一致する (旧名・誤記の検知 — 決定2 の形)
+3. auto-merge が自分自身を監視していない / 列挙に重複が無い /
+   全 workflow が `name:` を持つ
+
+検知したい 3 つの壊れ方 (workflow 追加時の列挙忘れ・`name:` 変更への
+追随忘れ・実在しない名前の残存) は、どれも **CI が緑のまま**進行する。
+テスト自体が壊れを見つけられることは、列挙を 1 行消した状態と旧名を
+書いた状態の両方で実際に失敗することを確認して裏付けた。
+
+なお PyYAML は YAML 1.1 の規則で**裸の `on` を真偽値 `True` として解釈
+する**ため、`doc["on"]` では `on:` セクションを取り出せない。テストは
+`"on"` と `True` の両方を見る。
+
+### Revisit condition
+
+(1) 監視対象が増えたことで auto-merge の空振り実行が増える。とくに
+`CodeQL` は全 PR で走るため、PR あたりの auto-merge 起動回数が増える
+(判定は冪等で、マージ条件を満たさなければ何もしない)。実行コストが問題に
+なるようなら、`workflow_run` の列挙をやめて別の起動方法へ切り替える案
+(Issue #225 が「スコープを超える」とした案) を再検討する。
+(2) テストが見ているのは `.github/workflows/*.yml` のみ。`.yaml` 拡張子の
+workflow を追加した場合は glob を広げる必要がある。
+(3) PR の check-runs には workflow 以外 (外部 App の commit status など)
+も現れるが、それらは `workflow_run` では拾えない。本決定はあくまで
+「自リポジトリの workflow の列挙漏れ」を対象とする。
+
+## D108: `scripts/` と `.github/scripts/` の Python テストを `ci.yml` で回す (Issue #224) — 「テスト 0 件で緑」を明示的に失敗させる
+
+**対象**: Issue #224。PR #223 で `scripts/dashboard/test_common.py` /
+`test_report.py` に 19 件のテストを追加した後、**それらが CI のどこからも
+実行されていない**ことが判明した件。
+
+### 背景: 実行経路がディレクトリごとにバラバラだった
+
+| テスト | 実行場所 | 実行条件 |
+|---|---|---|
+| `.github/scripts/test_*.py` | `auto-merge.yml` | auto-merge が起動したとき (D102) |
+| `scripts/bench/test_*.py` | `compare-windows.yml` | `workflow_dispatch`、または同 workflow 自身を変更する PR |
+| `scripts/dashboard/test_*.py` | **なし** | — |
+
+`ci.yml` は Rust (`cargo fmt` / `clippy` / `test` / `build`) のみで、
+Python テストのステップを持っていなかった。結果として
+`scripts/dashboard/` は完全に無防備、`scripts/bench/` も
+(`compare-windows.yml` を同時に触らない限り走らないため) 実質ほぼ無防備
+だった。性能計測基盤は「推測で直さない・数字で説明する」(Epic #57) を
+支える土台であり、その土台自体が回帰検知の外にあるのは望ましくない。
+
+### 決定1: `ci.yml` に 1 ステップ足し、テストのあるディレクトリを全部回す
+
+`git ls-files '*/test_*.py'` でテストファイルを列挙し、その親ディレクトリ
+ごとに `python3 -m unittest discover` を実行する。現時点の対象は
+`.github/scripts` / `scripts/bench` / `scripts/dashboard` の 3 つ
+(計 195 件)。追加コストは Linux ランナーで 1 秒未満。
+
+**ディレクトリごとに discover するのは、Issue の対応案どおり
+`-s scripts` の再帰探索が使えないため。** `scripts/bench` /
+`scripts/dashboard` はパッケージ化されておらず (各テストが `sys.path` に
+自分のディレクトリを足して隣のモジュールを import する作り)、
+`python3 -m unittest discover -s scripts` は **`Ran 0 tests` で緑になる**
+— 「実行している気になって実際は何も実行していない」という、#34 が防ごう
+とした形そのものである。テストを 1 件も集められなかった場合は明示的に
+`exit 1` する。
+
+### 決定2: `.github/scripts/` も含める (auto-merge.yml 側と重複させる)
+
+Issue #224 は「`.github/scripts/` を `ci.yml` 側へ寄せるか」を別途判断と
+していた。**寄せる (移す) のではなく、両方で回す**を選んだ。
+
+`auto-merge.yml` 側のステップは *auto-merge が起動したときだけ*走る。
+つまり判定ロジックを壊した PR は、それより前の段階では止まらない。とくに
+D107 で追加した `test_workflow_run_coverage.py` が守るのは
+「**auto-merge がそもそも起動しなくなる**」壊れ方なので、auto-merge の
+実行に依存した経路だけで検査するのは筋が悪い (起動しなければテストも
+走らない)。`auto-merge.yml` 側は D102 の経緯どおり残し、`ci.yml` を
+「PR なら必ず通る経路」として足す。
+
+`compare-windows.yml` 側の `scripts/bench/test_*.py` の実行も残す。
+あちらは **Windows 実機で `compare_browsers.py` の ctypes 実装を確認する**
+意味があり (D42/D50 の PSS/RSS の扱い)、Linux ランナーでの実行と目的が
+異なる。
+
+### Revisit condition
+
+(1) 依存は PyYAML のみ (`python3 -c "import yaml" || pip install`)。
+Python テストが他の third-party に依存し始めたら、依存の宣言方法
+(requirements ファイル等) を決める必要がある。
+(2) 探索は `git ls-files '*/test_*.py'` に依存する。リポジトリ直下に
+テストを置いた場合 (`test_foo.py`) はこのパターンに一致しないので、
+その時点で glob を見直す。
+(3) Python テストが増えて実行時間が無視できなくなったら、Rust の
+ジョブから独立させることを検討する (現状は 1 秒未満なので分ける理由が
+ない)。

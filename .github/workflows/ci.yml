@@ -15,6 +15,42 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
 
+      # Issue #224 / docs/decisions D108: リポジトリ内の Python テストを
+      # ここでまとめて回す。これを足すまで `scripts/dashboard/test_*.py` は
+      # **CI のどこからも実行されていなかった** (ci.yml は Rust のみ、
+      # `scripts/bench/test_*.py` は compare-windows.yml 自身を変更する PR
+      # でしか走らない)。性能計測基盤 (ダッシュボード・ベンチ) は「推測で
+      # 直さない・数字で説明する」(Epic #57) を支える土台なので、その土台が
+      # 回帰検知の外にあるのは望ましくない。
+      #
+      # `.github/scripts/` も含めるのは重複ではなく意図的:
+      # auto-merge.yml 側の同名ステップは **auto-merge が起動したときだけ**
+      # 走るので、判定ロジックを壊した PR がそれより前の段階で止まらない。
+      # とくに `test_workflow_run_coverage.py` (Issue #225 / D107) が守る
+      # のは「auto-merge がそもそも起動しなくなる」壊れ方なので、auto-merge
+      # の実行に依存した経路だけで検査するのは筋が悪い。
+      #
+      # ディレクトリごとに discover するのは、`scripts/bench` /
+      # `scripts/dashboard` がパッケージ化されておらず (各テストが
+      # `sys.path` に自分のディレクトリを足して隣のモジュールを import する
+      # 作り)、`-s scripts` の再帰探索では **0 件で緑になる**ため。
+      # テストを 1 件も集められなかったら明示的に失敗させる (#34 が防ごうと
+      # した「素通りして緑」の形をここでも作らない)。
+      - name: Python tests (.github/scripts, scripts/)
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          dirs=$(git ls-files '*/test_*.py' | xargs -n 1 dirname | sort -u)
+          if [ -z "$dirs" ]; then
+            echo "::error::Python テストが 1 件も見つからない (探索条件が壊れている)"
+            exit 1
+          fi
+          for dir in $dirs; do
+            echo "::group::$dir"
+            python3 -m unittest discover -s "$dir" -p "test_*.py" -v
+            echo "::endgroup::"
+          done
+
       - name: Install WebKitGTK + Xvfb
         run: |
           sudo apt-get update
