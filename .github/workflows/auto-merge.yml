@@ -51,6 +51,18 @@ name: Auto Merge
 # それが必要なら `AUTO_MERGE_TOKEN` シークレット (repo 権限の PAT) を
 # 登録すると、そちらが優先して使われる。
 on:
+  # ⚠️ **ここには「PR の check-runs に現れうる workflow」を漏れなく列挙する
+  # こと** (Issue #225 / D107)。`pull_request` トリガを持つ workflow が
+  # ここに無いと、**その workflow が最後に完了する PR で auto-merge が
+  # 二度と起きない** — CI 完了で起動した回はまだ実行中のそれを見て「待つ」
+  # と判断して終わり、その後の完了では誰も auto-merge を起こさないため。
+  # schedule は安全網にならない (1日144回のはずが実測36回、D103)。
+  #
+  # 列挙の漏れは `.github/scripts/test_workflow_run_coverage.py` が
+  # 検知する (`.github/workflows/*.yml` を走査し、`pull_request` トリガを
+  # 持つ workflow の `name:` がすべてこのリストにあることを検査する)。
+  # workflow を足す・`name:` を変えるときはテストが落ちるので、ここを
+  # 更新し忘れることはない。
   workflow_run:
     workflows:
       - CI
@@ -62,6 +74,21 @@ on:
       # (schedule 定期実行の fallback で最大 10 分遅れる程度)。
       # docs/decisions.md D63 参照。
       - Dependency Audit
+      # Issue #225: 以下の 4 つは「自身 (または自身が実行するスクリプト) を
+      # 変更する PR に限り `pull_request` で走る」設計 (D88 / release-*.yml
+      # と同じパターン) のため、そうした PR でだけ check-run として現れる。
+      # PR #223 では `Performance (Windows)` がここに無かったせいで、CI が
+      # 全部緑・`mergeable_state: clean` の状態で auto-merge が起動せず、
+      # 手動 dispatch するまで止まっていた。
+      #
+      # ⚠️ 名前は各 workflow の `name:` と**完全一致**させること。Issue #225
+      # の起票時点では `Performance (Windows, manual)` と書かれていたが、
+      # 週次スケジュール実行の追加 (D106) で "manual" は既に外れている。
+      # 上記テストはこの取り違えも検知する。
+      - Performance (Windows)
+      - Browser comparison (Windows, manual)
+      - Release (Linux)
+      - CodeQL
     types: [completed]
   # Issue #188 / docs/decisions.md D91: 猶予期間 (既定15分) を追加した分、
   # 定期実行だけに頼るケース (workflow_run で拾えなかった PR) の最悪遅延が
