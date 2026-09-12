@@ -87,15 +87,102 @@ pub const ESTIMATED_BYTES_PER_TAB: u64 = 64 * 1024 * 1024;
 /// 700 MiB, the same figure D56 measured (`VELOX_MEMORY_BUDGET_MB=700`) to
 /// land within budget at 1/5/10/20 tabs on `minimal.html` in this project's
 /// reference Linux/WebKitGTK environment (407 / 660 / 476 / 615 MiB —
-/// `docs/performance-targets.md` §12). A single, absolute, compiled-in
-/// number, not scaled to the machine's installed RAM — D90's Revisit
-/// condition records that limitation (Issue #176 is where a RAM-relative
-/// budget belongs).
+/// `docs/performance-targets.md` §12).
 ///
-/// `browser::settings::PerformanceSettings::default`'s `memory_budget_mb`
-/// mirrors this value in MiB so `Config::default().to_settings()` and
-/// `Settings::default()` agree (see that constant's doc comment).
+/// **Issue #176 / D93 案 C 以降、これは「実際に使われる予算」ではなく
+/// 「機械の情報が無いときの予算」である。** 起動時の既定値は搭載 RAM
+/// から [`memory_budget_for_ram`] が決め、この値はその**下限**
+/// ([`MIN_MEMORY_BUDGET_BYTES`]) と、RAM が読めなかったときの
+/// フォールバックを兼ねる。小容量機ではどちらの経路でもこの値のままに
+/// なるので、D90 の挙動は保たれる。
+///
+/// `Default` 実装 ([`SuspensionPolicy::default`]、
+/// `browser::settings::PerformanceSettings::default`) は**どちらも RAM を
+/// 見ない**でこの値を使う。搭載 RAM の読み取りは環境への問い合わせで
+/// あり、それを行う層は `config` だけだからである (D20 / CLAUDE.md の
+/// 4 層分離)。おかげで `Config::default().to_settings()` と
+/// `Settings::default()` は機械に依らず一致し続け、RAM 相対の値は
+/// `config::resolve_suspension` という 1 箇所からだけ入る。
 pub const DEFAULT_MEMORY_BUDGET_BYTES: u64 = 700 * 1024 * 1024;
+
+/// The smallest budget the RAM-relative default will produce
+/// ([`memory_budget_for_ram`]) — **today's fixed default, unchanged**.
+///
+/// **これが下限である理由は「今日より小さい予算を誰にも与えない」から**
+/// である (Issue #176 / D93 案 C)。RAM 相対にする動機は D112 決定4 の
+/// とおり**状態喪失の回数を減らすこと**であり、どこかのマシンで予算が
+/// 小さくなれば休止が増えて逆効果になる。したがって式は
+/// **現状からの緩和方向にしか動かさない。**
+///
+/// D93 が実測した制約とも整合する: 予算が約 397 MiB (休止では届かない
+/// 下限) を割ると予算として機能せず、500 MiB 以下では応答が飽和して
+/// `max_live_tabs=1` 相当に退化する。700 MiB はその両方より上にある
+/// 唯一の実測済みの値である。
+pub const MIN_MEMORY_BUDGET_BYTES: u64 = DEFAULT_MEMORY_BUDGET_BYTES;
+
+/// The largest budget the RAM-relative default will produce.
+///
+/// **これは実測ではなく製品判断である** (D93 は「上限は未検討」と書いて
+/// いた)。根拠は 2 つ:
+///
+/// - VeloX の立ち位置は「軽いブラウザ」であり、**2 GiB を使うブラウザは
+///   その時点で軽くない。** 予算は「使ってよい量の割り当て」ではなく
+///   **安全網**であって、搭載 RAM が増えた分だけ際限なく使ってよいと
+///   いう意味ではない。
+/// - Windows 実測の約 65 MiB/タブ (§31.5) で割ると **約 31 タブ**。
+///   現状の 700 MiB が約 10 タブで発動するのに対し 3 倍で、大容量機の
+///   利用者にとって十分な緩和である。
+///
+/// これより広げたい利用者には `VELOX_MEMORY_BUDGET_MB` と設定画面の
+/// 明示指定 (上限を受けない) がある。
+pub const MAX_MEMORY_BUDGET_BYTES: u64 = 2048 * 1024 * 1024;
+
+/// 搭載 RAM の何分の 1 を予算にするか (16 = 6.25%)。
+///
+/// **これも実測ではなく製品判断である。** D93 は「比率は測れない —
+/// 搭載 RAM を変えられるマシンが 1 台も無い」と明記しており、本決定でも
+/// その状況は変わっていない。16 を選んだ理由:
+///
+/// - 現状の 700 MiB は本プロジェクトの参考環境 (15.70 GiB) の **4.35%**
+///   にあたる。6.25% はその 1.4 倍で、**同じ桁に留まる**控えめな値である。
+/// - 16 GiB 機で 1024 MiB。§31.5 の約 65 MiB/タブで割ると発動は
+///   **約 10 タブ → 約 15 タブ**へ動く。「体感が変わるが、ブラウザが
+///   RAM を占有し始めたようには見えない」範囲を狙っている。
+/// - 2 の冪なのでシフトで割れ、丸め誤差の議論が要らない。
+const MEMORY_BUDGET_RAM_DIVISOR: u64 = 16;
+
+/// The default memory budget for a machine with `installed_ram_bytes` of
+/// physical RAM (Issue #176 / D93 子 Issue 案 C).
+///
+/// ```text
+/// clamp(MIN_MEMORY_BUDGET_BYTES, RAM / 16, MAX_MEMORY_BUDGET_BYTES)
+/// ```
+///
+/// `None` (RAM が分からない — macOS や `/proc` が読めない環境) では
+/// [`DEFAULT_MEMORY_BUDGET_BYTES`] をそのまま返す。**分からないときは
+/// 今日と同じ挙動**であり、呼び出し側に判断させない。
+///
+/// | 搭載 RAM | RAM / 16 | 実際の予算 | 今日 (700 MiB) との差 |
+/// | ---: | ---: | ---: | --- |
+/// | 4 GiB | 256 MiB | **700 MiB** | 変わらない (下限) |
+/// | 8 GiB | 512 MiB | **700 MiB** | 変わらない (下限) |
+/// | 16 GiB | 1024 MiB | **1024 MiB** | +46% |
+/// | 32 GiB | 2048 MiB | **2048 MiB** | +193% |
+/// | 64 GiB | 4096 MiB | **2048 MiB** | +193% (上限) |
+///
+/// **小容量機では今日と 1 バイトも変わらない。** D93 が「裸の比率」を
+/// 退けた理由 (4 GiB → 178 MiB / 8 GiB → 357 MiB がどちらも下限を割る)
+/// は、下限を today の値に置くことでそのまま解消される。
+///
+/// この関数は純粋である — 搭載 RAM は引数で受け取り、`/proc` も
+/// レジストリも読まない (モジュール冒頭の D20 の約束)。実際の読み取りは
+/// `config` が `browser::metrics::installed_ram_bytes()` で行う。
+pub fn memory_budget_for_ram(installed_ram_bytes: Option<u64>) -> u64 {
+    let Some(ram) = installed_ram_bytes else {
+        return DEFAULT_MEMORY_BUDGET_BYTES;
+    };
+    (ram / MEMORY_BUDGET_RAM_DIVISOR).clamp(MIN_MEMORY_BUDGET_BYTES, MAX_MEMORY_BUDGET_BYTES)
+}
 
 /// The automatic suspension policy — three independent, individually
 /// optional signals plus how often memory is checked. See the module doc
@@ -153,6 +240,22 @@ impl SuspensionPolicy {
     /// itself was no longer the deciding factor. Full numbers:
     /// `docs/decisions.md` D90, `docs/performance-targets.md` §23.
     pub const DEFAULT_MEMORY_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+    /// [`Self::default`] with the memory budget scaled to this machine's
+    /// physical RAM (Issue #176 / D93 案 C) — see [`memory_budget_for_ram`]
+    /// for the formula and why small machines are left exactly as they were.
+    ///
+    /// `Default` itself stays RAM-unaware on purpose: it is what a caller
+    /// with no machine information gets, and **that must keep meaning
+    /// today's behavior** (`DEFAULT_MEMORY_BUDGET_BYTES`). Reading the
+    /// machine's RAM is the impure step, so it belongs to the caller
+    /// (`config`), not to this module (D20).
+    pub fn for_installed_ram(installed_ram_bytes: Option<u64>) -> Self {
+        Self {
+            memory_budget_bytes: Some(memory_budget_for_ram(installed_ram_bytes)),
+            ..Self::default()
+        }
+    }
 
     /// Whether any signal is on at all. When `false`, the event loop has
     /// nothing to sweep and no deadline to wake up for.
@@ -473,6 +576,108 @@ mod tests {
             memory_budget_bytes: None,
             memory_check_interval: SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL,
         }
+    }
+
+    // --- RAM 相対の既定メモリ予算 (Issue #176 / D93 案 C) ---------------
+
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn memory_budget_for_ram_scales_with_installed_ram_between_the_floor_and_the_ceiling() {
+        // `memory_budget_for_ram` の doc コメントの表がそのまま実行可能な
+        // 形になったもの。この表は D114 の本文・README・設定画面の説明と
+        // 同じ数字なので、式を触ったらここが落ちて全部が目に入る。
+        let cases: [(u64, u64); 7] = [
+            (2 * GIB, 700 * MIB),   // 下限: RAM/16 = 128 MiB
+            (4 * GIB, 700 * MIB),   // 下限: RAM/16 = 256 MiB
+            (8 * GIB, 700 * MIB),   // 下限: RAM/16 = 512 MiB
+            (16 * GIB, 1024 * MIB), // ここから RAM 相対が効く
+            (32 * GIB, 2048 * MIB), // ちょうど上限
+            (64 * GIB, 2048 * MIB), // 上限
+            (512 * GIB, 2048 * MIB),
+        ];
+        for (ram, expected) in cases {
+            assert_eq!(
+                memory_budget_for_ram(Some(ram)),
+                expected,
+                "installed RAM = {} GiB",
+                ram / GIB
+            );
+        }
+    }
+
+    #[test]
+    fn memory_budget_for_ram_never_goes_below_todays_fixed_default() {
+        // **本決定の中心的な制約** (D112 決定4): RAM 相対にする動機は
+        // 状態喪失を減らすことなので、どこかのマシンで予算が今日より
+        // 小さくなったら目的に反する。1 MiB 刻みで 0〜64 GiB を掃く。
+        for gib_16ths in 0..=(64 * 16) {
+            let ram = gib_16ths * (GIB / 16);
+            assert!(
+                memory_budget_for_ram(Some(ram)) >= DEFAULT_MEMORY_BUDGET_BYTES,
+                "RAM {ram} bytes で予算が今日の既定を下回った"
+            );
+        }
+    }
+
+    #[test]
+    fn memory_budget_for_ram_is_monotonic_in_installed_ram() {
+        // 「RAM が多い機械ほど予算が大きい (少なくとも小さくならない)」。
+        // clamp の引数順を取り違えると壊れる性質である。
+        let mut previous = memory_budget_for_ram(Some(0));
+        for gib_16ths in 0..=(80 * 16) {
+            let budget = memory_budget_for_ram(Some(gib_16ths * (GIB / 16)));
+            assert!(budget >= previous, "RAM を増やしたのに予算が減った");
+            previous = budget;
+        }
+    }
+
+    #[test]
+    fn memory_budget_for_ram_falls_back_to_todays_default_when_ram_is_unknown() {
+        // macOS や `/proc` が読めない環境 (`installed_ram_bytes()` が
+        // `None`)。**分からないときは今日と同じ挙動**にして、呼び出し側に
+        // 判断を持ち込ませない。
+        assert_eq!(memory_budget_for_ram(None), DEFAULT_MEMORY_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn memory_budget_for_ram_does_not_panic_on_an_absurd_value() {
+        // `installed_ram_bytes()` の値は OS 由来なので、壊れた値が来ても
+        // 落ちないことを明示しておく (割り算なのでオーバーフローは無いが、
+        // 将来式を変えたときにここが番人になる)。
+        assert_eq!(
+            memory_budget_for_ram(Some(u64::MAX)),
+            MAX_MEMORY_BUDGET_BYTES
+        );
+        assert_eq!(memory_budget_for_ram(Some(0)), MIN_MEMORY_BUDGET_BYTES);
+    }
+
+    #[test]
+    fn for_installed_ram_changes_only_the_budget() {
+        // 予算以外の信号 (アイドル時間・タブ数・計測間隔) は D90 のまま
+        // でなければならない — RAM 相対化は**予算 1 つだけ**の変更である。
+        let policy = SuspensionPolicy::for_installed_ram(Some(32 * GIB));
+        assert_eq!(policy.memory_budget_bytes, Some(2048 * MIB));
+        assert_eq!(policy.idle_after, SuspensionPolicy::default().idle_after);
+        assert_eq!(
+            policy.max_live_tabs,
+            SuspensionPolicy::default().max_live_tabs
+        );
+        assert_eq!(
+            policy.memory_check_interval,
+            SuspensionPolicy::default().memory_check_interval
+        );
+        assert!(policy.is_enabled());
+    }
+
+    #[test]
+    fn for_installed_ram_with_no_ram_information_is_exactly_the_default_policy() {
+        // `Default` の意味を「機械の情報が無いときの挙動」に固定する。
+        // ここが崩れると、RAM を読めない環境だけ静かに別の設定で動く。
+        assert_eq!(
+            SuspensionPolicy::for_installed_ram(None),
+            SuspensionPolicy::default()
+        );
     }
 
     #[test]

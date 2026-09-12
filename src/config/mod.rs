@@ -376,6 +376,7 @@ impl Config {
             std::env::var("VELOX_MEMORY_CHECK_INTERVAL_MS")
                 .ok()
                 .as_deref(),
+            crate::browser::metrics::installed_ram_bytes(),
         );
         let content_blocking_site_exceptions = resolve_content_blocking_site_exceptions(
             std::env::var("VELOX_CONTENT_BLOCKING_ALLOW")
@@ -723,6 +724,7 @@ fn resolve_suspension(
     max_live_tabs_raw: Option<&str>,
     memory_budget_mb_raw: Option<&str>,
     check_interval_ms_raw: Option<&str>,
+    installed_ram_bytes: Option<u64>,
 ) -> SuspensionPolicy {
     /// A knob whose *default* may itself be `Some` (D90's memory budget):
     /// unset/blank/not-a-number keeps `default`, an explicit `0` disables
@@ -745,7 +747,12 @@ fn resolve_suspension(
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
     }
-    let defaults = SuspensionPolicy::default();
+    // 既定のメモリ予算だけは搭載 RAM で決まる (Issue #176 / D93 案 C)。
+    // **読み取りは呼び出し側が済ませて引数で渡す** — `suspension` は
+    // `/proc` を自分で読まない純粋ロジックであり (D20)、この関数も
+    // 同じ理由で環境をここで触らない (既存の env 値がすべて引数で
+    // 渡されているのと同じ形)。
+    let defaults = SuspensionPolicy::for_installed_ram(installed_ram_bytes);
     SuspensionPolicy {
         idle_after: overridable(
             idle_after_ms_raw,
@@ -1183,7 +1190,7 @@ mod tests {
         // Since D90, "nothing set" no longer means "everything off" — it
         // means "whatever `SuspensionPolicy::default` already is", which as
         // of D90 has the memory-budget signal on.
-        let policy = resolve_suspension(None, None, None, None);
+        let policy = resolve_suspension(None, None, None, None, None);
         assert_eq!(policy, SuspensionPolicy::default());
         assert!(policy.is_enabled());
         assert_eq!(policy.idle_after, None);
@@ -1195,8 +1202,59 @@ mod tests {
     }
 
     #[test]
+    fn resolve_suspension_scales_the_default_budget_to_installed_ram() {
+        // Issue #176 / D93 案 C: **RAM 相対の既定値が製品に入る唯一の
+        // 経路がここである。** `SuspensionPolicy::default()` も
+        // `Settings::default()` も RAM を見ないので、この関数が壊れると
+        // 利用者には従来の 700 MiB が黙って戻る (テストは全部緑のまま)。
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let policy = resolve_suspension(None, None, None, None, Some(32 * GIB));
+        assert_eq!(policy.memory_budget_bytes, Some(2048 * 1024 * 1024));
+        // 予算以外は D90 の既定のまま。
+        assert_eq!(policy.idle_after, None);
+        assert_eq!(policy.max_live_tabs, None);
+        assert_eq!(
+            policy.memory_check_interval,
+            SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL
+        );
+    }
+
+    #[test]
+    fn an_explicit_memory_budget_wins_over_the_ram_relative_default() {
+        // 搭載 RAM は**既定値**を決めるだけで、明示指定
+        // (`VELOX_MEMORY_BUDGET_MB` / 設定画面) には一切かからない —
+        // 上限 2048 MiB も下限 700 MiB もここでは効かない。
+        const GIB: u64 = 1024 * 1024 * 1024;
+        let big = resolve_suspension(None, None, Some("4096"), None, Some(64 * GIB));
+        assert_eq!(big.memory_budget_bytes, Some(4096 * 1024 * 1024));
+        let small = resolve_suspension(None, None, Some("300"), None, Some(64 * GIB));
+        assert_eq!(small.memory_budget_bytes, Some(300 * 1024 * 1024));
+        // `0` による無効化も RAM に関係なく効き続ける。
+        let off = resolve_suspension(None, None, Some("0"), None, Some(64 * GIB));
+        assert_eq!(off.memory_budget_bytes, None);
+        assert!(!off.is_enabled());
+    }
+
+    #[test]
+    fn a_small_machine_keeps_exactly_todays_default_budget() {
+        // D93 が「裸の比率」を退けた理由そのもの: 4 GiB / 8 GiB 機で
+        // 予算が下限を割ってはならない。ここが緩むと、小容量機ほど
+        // 休止が増えるという最悪の向きの退行になる。
+        const GIB: u64 = 1024 * 1024 * 1024;
+        for ram in [2 * GIB, 4 * GIB, 8 * GIB] {
+            let policy = resolve_suspension(None, None, None, None, Some(ram));
+            assert_eq!(
+                policy,
+                SuspensionPolicy::default(),
+                "{} GiB 機で既定が変わってしまった",
+                ram / GIB
+            );
+        }
+    }
+
+    #[test]
     fn resolve_suspension_parses_each_knob_independently() {
-        let policy = resolve_suspension(Some("30000"), Some("5"), Some("700"), Some("500"));
+        let policy = resolve_suspension(Some("30000"), Some("5"), Some("700"), Some("500"), None);
         assert_eq!(policy.idle_after, Some(Duration::from_secs(30)));
         assert_eq!(policy.max_live_tabs, Some(5));
         assert_eq!(policy.memory_budget_bytes, Some(700 * 1024 * 1024));
@@ -1206,7 +1264,7 @@ mod tests {
         // One knob alone is enough to enable the policy — isolated here by
         // explicitly turning the now-default-on memory signal off (`"0"`),
         // so this only demonstrates the tab-count knob.
-        let only_count = resolve_suspension(None, Some(" 3 "), Some("0"), None);
+        let only_count = resolve_suspension(None, Some(" 3 "), Some("0"), None, None);
         assert_eq!(only_count.max_live_tabs, Some(3));
         assert_eq!(only_count.idle_after, None);
         assert_eq!(only_count.memory_budget_bytes, None);
@@ -1221,7 +1279,7 @@ mod tests {
         // D90: falling back to "the default" is no longer always the same
         // as falling back to "off").
         for raw in ["", "  ", "-1", "abc", "1.5"] {
-            let policy = resolve_suspension(Some(raw), Some(raw), Some(raw), Some(raw));
+            let policy = resolve_suspension(Some(raw), Some(raw), Some(raw), Some(raw), None);
             assert_eq!(policy, SuspensionPolicy::default(), "raw was {raw:?}");
         }
     }
@@ -1231,7 +1289,7 @@ mod tests {
         // The escape hatch D90 requires: `0` always means "off", even for
         // the memory-budget signal whose *default* is on. Without this,
         // there would be no way to turn D90's default off via env var.
-        let policy = resolve_suspension(Some("0"), Some("0"), Some("0"), Some("0"));
+        let policy = resolve_suspension(Some("0"), Some("0"), Some("0"), Some("0"), None);
         assert!(!policy.is_enabled());
         assert_eq!(policy.idle_after, None);
         assert_eq!(policy.max_live_tabs, None);
@@ -1249,7 +1307,7 @@ mod tests {
         // The exact env var a user (or docs/README) would actually set:
         // `VELOX_MEMORY_BUDGET_MB=0`, nothing else. This must fully turn
         // automatic suspension off again, matching pre-D90 behavior.
-        let policy = resolve_suspension(None, None, Some("0"), None);
+        let policy = resolve_suspension(None, None, Some("0"), None, None);
         assert!(!policy.is_enabled());
         assert_eq!(policy.memory_budget_bytes, None);
         assert_eq!(policy.idle_after, None);
@@ -1260,7 +1318,7 @@ mod tests {
     fn resolve_suspension_interval_override_applies_independently_of_the_memory_signal() {
         // With the memory signal left at its default (on), an interval
         // override still applies on top of it.
-        let with_default_memory = resolve_suspension(None, None, None, Some("100"));
+        let with_default_memory = resolve_suspension(None, None, None, Some("100"), None);
         assert!(with_default_memory.is_enabled());
         assert_eq!(
             with_default_memory.memory_check_interval,
@@ -1268,7 +1326,7 @@ mod tests {
         );
         // And with the memory signal explicitly off, the interval override
         // still applies (it is simply irrelevant — no sampler runs).
-        let with_memory_off = resolve_suspension(None, None, Some("0"), Some("100"));
+        let with_memory_off = resolve_suspension(None, None, Some("0"), Some("100"), None);
         assert!(!with_memory_off.is_enabled());
         assert_eq!(
             with_memory_off.memory_check_interval,
@@ -1296,6 +1354,7 @@ mod tests {
             Some(&overflowing),
             Some(&overflowing),
             Some(&overflowing),
+            None,
         );
         assert_eq!(policy, SuspensionPolicy::default());
         // `resolve_perf_env` treats an unparseable value the same as an

@@ -428,6 +428,23 @@ fn default_max_tabs_per_web_process() -> usize {
 /// changed default. A key present as `null`, or `Some(0)` before
 /// `sanitize()` collapses it, still means "off" — this function only ever
 /// runs when the JSON key itself is absent.
+///
+/// **Issue #176 / D93 案 C: ここは搭載 RAM を見ない** — RAM 相対の既定値
+/// (`suspension::memory_budget_for_ram`) は `config::resolve_suspension`
+/// という 1 箇所からだけ入る。`settings.json` がまだ無い利用者 (= 既定値
+/// で動いている大多数) には `app::run` が `Config::to_settings()` 経由で
+/// その値を渡すので、実際の既定は起動ごとに RAM 相対になる。
+///
+/// この関数が使われるのは「機械の情報を持ち込みたくない」2 つの場面
+/// だけである:
+///
+/// - [`PerformanceSettings::default`] — `Settings::default()` が機械に
+///   よって変わると、`Config::default().to_settings()` との一致
+///   (`to_settings_on_a_default_config_matches_settings_default`) が
+///   マシン依存になり、テストが「どこで走らせたか」で結果を変える。
+/// - `settings.json` にこのキーだけが無い場合 — D90 より前に書かれた
+///   ファイルの移行であり、そこで従来値に落ちるのは退行ではない
+///   (設定画面を開いて保存すればキーが埋まる)。
 fn default_memory_budget_mb() -> Option<u64> {
     Some(DEFAULT_MEMORY_BUDGET_MB)
 }

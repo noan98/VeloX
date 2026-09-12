@@ -692,8 +692,10 @@ above, and D56 for the adaptive policy and its measured effect.
   the strip can render dormant tabs distinctly (dimmed, a 💤 marker).
 - **Automatic suspension** (Issue #63): `Config::suspension` is a
   `browser::suspension::SuspensionPolicy` — three independent, individually
-  optional signals, all off by default (`SuspensionPolicy::default()`,
-  so a fresh checkout never suspends a tab on its own — D9's rule):
+  optional signals. Two of them (idle time, live-tab cap) are off by
+  default; the memory budget is **on** since Issue #184 / D90, and since
+  Issue #176 / D114 its default value is derived from the machine's
+  installed RAM (`SuspensionPolicy::for_installed_ram`):
   - *idle time* (`idle_after`, `VELOX_AUTO_SUSPEND_AFTER_MS`): every
     background tab idle at least this long is suspended — the pre-#63
     behavior, unchanged;
@@ -701,7 +703,17 @@ above, and D56 for the adaptive policy and its measured effect.
     tabs than this have a live webview (the active tab counts), the least
     recently used background tabs are suspended until the count fits;
   - *memory budget* (`memory_budget_bytes`, `VELOX_MEMORY_BUDGET_MB`):
-    when the process tree's memory exceeds the budget, enough least
+    the one signal that is on by default. Its default is
+    `clamp(700 MiB, 搭載 RAM / 16, 2048 MiB)` — 700 MiB on machines with
+    8 GiB or less (exactly D90's fixed value, and also the fallback when
+    the RAM cannot be read), 1024 MiB at 16 GiB, 2048 MiB at 32 GiB and
+    above (Issue #176 / D114). The RAM is read once at startup by
+    `config::Config::from_env_and_args` via
+    `browser::metrics::installed_ram_bytes()` and passed into
+    `resolve_suspension`; `browser::suspension` itself stays pure (D20),
+    and an explicit `VELOX_MEMORY_BUDGET_MB` or settings-screen value is
+    subject to neither the floor nor the ceiling.
+    When the process tree's memory exceeds the budget, enough least
     recently used background tabs are suspended to be expected to bring it
     back under (`ESTIMATED_BYTES_PER_TAB`, 64 MiB, from D54's per-tab
     measurement) — the further over budget, the more tabs go in one sweep.
