@@ -660,12 +660,17 @@ jobs:
             if ($_.Name -match $abPattern) { $Matches[1] }
           } | Select-Object -Unique)
 
-          # tabs_N / tabs_hold_N は数値順に並べる (スケーリングを読むため)。
-          # それ以外は名前順。**`tabs_hold_` を勘定に入れ忘れると `tabs_hold_20`
-          # が名前順に落ちるうえ、下のスケーリング表からも漏れる** (run
-          # 34247895418 で実際に漏れた)。
+          # tabs_N / tabs_hold_N / tabs_hold_resume_N は数値順に並べる
+          # (スケーリングを読むため)。それ以外は名前順。
+          #
+          # ⚠️ **プレフィックスを 1 段足したら、この正規表現も足すこと。**
+          # `tabs_hold_` を勘定に入れ忘れて `tabs_hold_20` が名前順に落ちた
+          # 事故が run 34247895418 で実際に起きている。`tabs_hold_resume_`
+          # (Issue #176) でも同じ漏れをやりかけた — `hold_` の直後に数字を
+          # 要求する形だと `hold_resume_20` で外れ、`_1, _10, _20, _5, _50`
+          # という文字列順になる。
           $scenarioNames = @($scenarioNames | Sort-Object {
-            if ($_ -match '^tabs_(?:hold_)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
+            if ($_ -match '^tabs_(?:hold_(?:resume_)?)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
           }, { $_ })
 
           $compareKeys = @(
@@ -779,6 +784,14 @@ jobs:
           # ⚠️ `tabs_hold_N` を含めること。`^tabs_\d+$` だけだと
           # `tabs_hold_20` がマッチせず、**スケーリング表が丸ごと出ない**
           # (run 34247895418 で実際にそうなった)。
+          #
+          # ⚠️ **逆に `tabs_hold_resume_N` は意図的に外してある** (Issue
+          # #176)。上のソート用の正規表現とはここだけ食い違うが、これは
+          # 漏れではない: `tabs_hold_resume_N` の `rss_total_bytes` は
+          # **復帰ラウンドの後**の窓で測った値で、`tabs_hold_N` の定常値
+          # とは別物である (実測で 527.9 → 666.4 MiB)。同じスケーリング
+          # 表に並べると、`tabs_N` と `tabs_hold_N` を混ぜてはならない
+          # (D97) のと同じ誤読を招く。
           $tabScenarios = @($scenarioNames | Where-Object { $_ -match '^tabs_(?:hold_)?\d+$' })
           if ($tabScenarios.Count -gt 1) {
             $lines += "### タブ数スケーリング (Issue #197)"

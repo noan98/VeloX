@@ -470,6 +470,32 @@ const _: () = assert!(
 /// duration, is what the interval is derived from.
 const TARGET_STABILIZED_RSS_SAMPLES: u64 = 4;
 
+/// `tabs_hold_N` と `tabs_hold_resume_N` に共通の準備 — タブを間隔を空けて
+/// 開き、休止が落ち着くまで待ち、`mark` を打つところまでを返す。
+///
+/// **両シナリオでここが一致していることが、値を並べて読める条件そのもの
+/// である** (D110 決定3)。以前は同じ 4 行が 2 か所に書かれていて、一致は
+/// テストでしか守られていなかった。関数にまとめたことで、**片方だけ変える
+/// ことが構造的にできなくなった** — テストは「どちらかが `mark` の前に
+/// 何かを足していないか」を引き続き見張る。
+fn memory_hold_setup_lines(tab_count: u32, url: &str) -> Vec<String> {
+    // `TabCountMemory` (`tabs_N`) との違いは 3 つ (Issue #197、§27.5):
+    //   1. タブを開くたびに `STEP_SETTLE_MS` 待つ — 一気に開くと
+    //      休止判定が「まだ開いている途中」の状態を見てしまう。
+    //   2. 開き終えてから `MEMORY_HOLD_SETTLE_MS` 待つ — 既定の
+    //      5 秒周期でも判定が 2 回以上走る長さ。
+    //   3. そのあとに `mark` を打つ — ここから先のサンプルだけが
+    //      集計されるので、得られる値は**落ち着いた後**のものになる。
+    //      開いている最中の値は混ざらない。
+    let extra_tabs = tab_count.saturating_sub(1);
+    let mut lines: Vec<String> = (0..extra_tabs)
+        .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+        .collect();
+    lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
+    lines.push("mark".to_owned());
+    lines
+}
+
 /// Build the automation script text for `scenario`, given the fixed page
 /// `url` every trial should use (the same `--url` `velox-bench run` already
 /// requires for reproducibility — see docs/benchmarking.md). Returns `None`
@@ -584,28 +610,19 @@ pub fn generate_bench_script(
             lines
         }
         Scenario::TabCountMemoryHold(tab_count) => {
-            // `TabCountMemory` との違いは 3 つ (Issue #197、§27.5):
-            //   1. タブを開くたびに `STEP_SETTLE_MS` 待つ — 一気に開くと
-            //      休止判定が「まだ開いている途中」の状態を見てしまう。
-            //   2. 開き終えてから `MEMORY_HOLD_SETTLE_MS` 待つ — 既定の
-            //      5 秒周期でも判定が 2 回以上走る長さ。
-            //   3. そのあとに `mark` を打つ — ここから先のサンプルだけが
-            //      集計されるので、得られる値は**落ち着いた後の定常値**に
-            //      なる。開いている最中の値は混ざらない。
-            let extra_tabs = tab_count.saturating_sub(1);
-            let mut lines: Vec<String> = (0..extra_tabs)
-                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-                .collect();
-            lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
-            lines.push("mark".to_owned());
+            // 準備 (開く → 落ち着くまで待つ → mark) は
+            // `memory_hold_setup_lines` に切り出してある。このシナリオが
+            // その後に足すのは、**集計対象になる窓**だけ — ここで得られる
+            // のが「落ち着いた後の定常値」になる。
+            let mut lines = memory_hold_setup_lines(tab_count, url);
             lines.push(format!("wait {MEMORY_HOLD_WINDOW_MS}"));
             lines
         }
         Scenario::TabCountMemoryResume(tab_count) => {
-            // 準備は `TabCountMemoryHold` と**同一** — 同じ間隔で開き、
-            // 同じ 12 秒を待つ。既定のメモリチェック周期のままメモリ
-            // 予算に回収させ、「落ち着いた状態」を作るところまでが前提で
-            // あり、そこを変えると §31 の値と地続きに読めなくなる。
+            // 準備は `TabCountMemoryHold` と**同一の関数**を使う。同じ間隔
+            // で開き、同じ 12 秒を待つ — 既定のメモリチェック周期のまま
+            // メモリ予算に回収させ、「落ち着いた状態」を作るところまでが
+            // 前提であり、そこが分かれると §31 の値と地続きに読めなくなる。
             //
             // 違うのは `mark` の**後ろ**である。最長未使用のタブ (index 0
             // から) へ順に `switch` する。予算が休止したタブへの switch は
@@ -616,12 +633,7 @@ pub fn generate_bench_script(
             // 可能性が高い**から。休止は最長未使用から順に行われる
             // (`browser::suspension::reclaim_order`) ので、この順に戻すと
             // 「本当に休止されていたタブ」を測れる確率が最も高い。
-            let extra_tabs = tab_count.saturating_sub(1);
-            let mut lines: Vec<String> = (0..extra_tabs)
-                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-                .collect();
-            lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
-            lines.push("mark".to_owned());
+            let mut lines = memory_hold_setup_lines(tab_count, url);
             for index in 0..MEMORY_RESUME_ROUNDS {
                 lines.push(format!("switch {index}"));
                 lines.push(format!("wait {RESUME_SETTLE_MS}"));
@@ -1100,8 +1112,9 @@ mod tests {
     fn tabs_hold_resume_sets_up_exactly_like_tabs_hold_then_switches_back() {
         // Issue #176 Stage 1。このシナリオの値が §31 (`tabs_hold_N`) と
         // 地続きに読めるのは、**mark までの組み立てが同一だから**である。
-        // ここが分岐すると「同じ落ち着いた状態からの復帰」を測っている
-        // という前提が崩れるので、mark 前の列が一致することを固定する。
+        // 共通部分は `memory_hold_setup_lines` に切り出してあるので分岐は
+        // 起こりにくいが、**どちらかが `mark` より前に何かを足す**形なら
+        // 関数を共有していても前提は崩れる。そこをここで固定する。
         let url = "http://127.0.0.1:8731/minimal.html";
         let hold =
             parse_script(&generate_bench_script(Scenario::TabCountMemoryHold(5), url).unwrap())
