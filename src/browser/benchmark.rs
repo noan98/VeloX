@@ -136,6 +136,23 @@ pub enum MetricKey {
     TabResumeMs,
     RssTotalBytes,
     RssProcessCount,
+    /// RSS of VeloX's **own** process, excluding the engine's content /
+    /// network / GPU processes (Issue #176 Stage 1, `docs/decisions.md`
+    /// D118). With [`MetricKey::RssEngineBytes`] this splits
+    /// [`MetricKey::RssTotalBytes`] in two, exactly and on every platform —
+    /// the split keys on the sampler's root pid, not on a process name.
+    ///
+    /// **What moves this number**: VeloX's Rust allocations, `tao`'s
+    /// window, and whatever the engine keeps in-process. **What does
+    /// not**: page content, which lives in the engine's processes. Use it
+    /// to answer "is the footprint VeloX's own or the engine's", not "how
+    /// much did Rust allocate".
+    RssBrowserBytes,
+    /// RSS of every process in the tree except VeloX's own (Issue #176
+    /// Stage 1) — the engine's content/network/GPU processes, summed. Not
+    /// split further by role; see D118 for why that is Linux-only in
+    /// principle and therefore not done.
+    RssEngineBytes,
     /// PSS total (Issue #108 / D42): `None`/absent in the source `rss`
     /// event's `total_pss_bytes` field (unsupported platform, old kernel,
     /// permissions) yields no sample for this key, same as any other metric
@@ -188,7 +205,7 @@ impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 21] = [
+    pub const ALL: [MetricKey; 23] = [
         MetricKey::StartupEventLoopMs,
         MetricKey::StartupPreWindowSetupMs,
         MetricKey::StartupNativeWindowMs,
@@ -206,6 +223,8 @@ impl MetricKey {
         MetricKey::TabResumeMs,
         MetricKey::RssTotalBytes,
         MetricKey::RssProcessCount,
+        MetricKey::RssBrowserBytes,
+        MetricKey::RssEngineBytes,
         MetricKey::PssTotalBytes,
         MetricKey::PssProcessCount,
         MetricKey::CpuPercent,
@@ -233,6 +252,8 @@ impl MetricKey {
             MetricKey::TabResumeMs => "tab_resume_ms",
             MetricKey::RssTotalBytes => "rss_total_bytes",
             MetricKey::RssProcessCount => "rss_process_count",
+            MetricKey::RssBrowserBytes => "rss_browser_bytes",
+            MetricKey::RssEngineBytes => "rss_engine_bytes",
             MetricKey::PssTotalBytes => "pss_total_bytes",
             MetricKey::PssProcessCount => "pss_process_count",
             MetricKey::CpuPercent => "cpu_percent",
@@ -282,6 +303,13 @@ impl MetricKey {
             | MetricKey::TabSwitchMs
             | MetricKey::TabResumeMs => 20.0, // milliseconds
             MetricKey::RssTotalBytes | MetricKey::PssTotalBytes => 5.0 * 1024.0 * 1024.0, // 5 MiB
+            // Same 5 MiB floor as the total they split (Issue #176 Stage 1).
+            // Deliberately not a smaller floor for the browser half just
+            // because it is the smaller number: the floor exists to absorb
+            // this environment's measurement noise, and that noise is a
+            // property of how RSS is sampled, not of how large the figure
+            // happens to be.
+            MetricKey::RssBrowserBytes | MetricKey::RssEngineBytes => 5.0 * 1024.0 * 1024.0,
             MetricKey::RssProcessCount | MetricKey::PssProcessCount => 1.0, // whole processes
             // 5 percentage points of one core. Below that, the difference
             // between two runs on a shared machine is scheduling noise.
@@ -322,6 +350,8 @@ impl MetricKey {
             MetricKey::TabResumeMs => "tab_resume",
             MetricKey::RssTotalBytes
             | MetricKey::RssProcessCount
+            | MetricKey::RssBrowserBytes
+            | MetricKey::RssEngineBytes
             | MetricKey::PssTotalBytes
             | MetricKey::PssProcessCount => "rss",
             MetricKey::CpuPercent => "cpu",
@@ -350,6 +380,8 @@ impl MetricKey {
             MetricKey::TabResumeMs => "duration_ms",
             MetricKey::RssTotalBytes => "total_rss_bytes",
             MetricKey::RssProcessCount => "process_count",
+            MetricKey::RssBrowserBytes => "browser_rss_bytes",
+            MetricKey::RssEngineBytes => "engine_rss_bytes",
             MetricKey::PssTotalBytes => "total_pss_bytes",
             MetricKey::PssProcessCount => "pss_process_count",
             // The `cpu` event names its own field simply `percent`; the
@@ -2743,6 +2775,36 @@ mod tests {
         )];
         assert_eq!(MetricKey::RssTotalBytes.extract(&events), vec![1048576.0]);
         assert_eq!(MetricKey::RssProcessCount.extract(&events), vec![5.0]);
+    }
+
+    #[test]
+    fn extract_rss_reads_the_browser_engine_split() {
+        // Issue #176 Stage 1 / D118。VeloX 自身とエンジンの内訳。
+        let events = vec![event(
+            r#"{"event":"rss","ts_ms":1.0,"pid":42,"process_count":5,"total_rss_bytes":1048576,"browser_rss_bytes":262144,"engine_rss_bytes":786432}"#,
+        )];
+        assert_eq!(MetricKey::RssBrowserBytes.extract(&events), vec![262144.0]);
+        assert_eq!(MetricKey::RssEngineBytes.extract(&events), vec![786432.0]);
+        // 内訳の合計は総量と一致する (build_sample 側の不変条件が、
+        // イベントを経由しても保たれていること)。
+        assert_eq!(
+            MetricKey::RssBrowserBytes.extract(&events)[0]
+                + MetricKey::RssEngineBytes.extract(&events)[0],
+            MetricKey::RssTotalBytes.extract(&events)[0]
+        );
+    }
+
+    #[test]
+    fn extract_rss_split_is_absent_from_an_older_result_file() {
+        // D118 より前に書かれた結果ファイルにはこのキーが無い。**0 では
+        // なく「無い」**として扱われなければならない — 0 として集計すると
+        // 「VeloX 自身のメモリが 0 バイトだった run」という存在しない
+        // データ点ができる (PssTotalBytes と同じ規則)。
+        let events = vec![event(
+            r#"{"event":"rss","ts_ms":1.0,"pid":42,"process_count":5,"total_rss_bytes":1048576}"#,
+        )];
+        assert!(MetricKey::RssBrowserBytes.extract(&events).is_empty());
+        assert!(MetricKey::RssEngineBytes.extract(&events).is_empty());
     }
 
     #[test]
