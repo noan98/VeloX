@@ -358,6 +358,10 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     let environment = collect_environment(trials, flags.one("git-commit").map(str::to_owned));
     let result = BenchmarkResult {
         scenario: scenario_id.to_owned(),
+        // 実際に読ませたページをそのまま残す (Issue #176)。シナリオ ID は
+        // 「どのページで測ったか」を表さないため、これが無いと
+        // `minimal.html` と `dom_heavy.html` の結果が同じ顔で並ぶ。
+        url: url.map(str::to_owned),
         environment,
         metrics,
     };
@@ -504,6 +508,10 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
     let environment = collect_environment(trials, flags.one("git-commit").map(str::to_owned));
     let result = BenchmarkResult {
         scenario: scenario_id.to_owned(),
+        // `aggregate` は既に採り終えたログを読むだけで、**どのページで
+        // 採られたかを知る手段が無い。** 推測で埋めるくらいなら `None` の
+        // まま残す (Issue #176)。
+        url: None,
         environment,
         metrics,
     };
@@ -1165,8 +1173,10 @@ fn write_result(path: &str, result: &BenchmarkResult) -> Result<(), String> {
 
 fn print_result_summary(result: &BenchmarkResult) {
     println!(
-        "\nscenario={} os={} cpu={} trials={} commit={}",
+        "\nscenario={} page={} os={} cpu={} trials={} commit={}",
         result.scenario,
+        // どのページで測ったかは、数値の意味を変える (Issue #176)。
+        result.url.as_deref().unwrap_or("-"),
         result.environment.os,
         result.environment.cpu_count,
         result.environment.trials,

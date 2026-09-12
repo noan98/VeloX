@@ -571,6 +571,7 @@ Xvfb で仮想ディスプレイを用意しているが、Windows ランナー�
 ```json
 {
   "scenario": "cold_startup",
+  "url": "http://127.0.0.1:8731/minimal.html",
   "environment": {
     "os": "linux",
     "cpu_count": 4,
@@ -595,6 +596,20 @@ Xvfb で仮想ディスプレイを用意しているが、Windows ランナー�
   }
 }
 ```
+
+`url` は**全試行が読み込んだページ**を `--url` そのままで残したもの
+(Issue #176)。シナリオ ID は「何を測ったか」しか表さず、**どのページで
+測ったかを表さない** — `scripts/bench/pages/` には `minimal.html`
+(229 バイト) と `dom_heavy.html` (99 KB) の両方があり、`page_load_ms` は
+この差で桁が変わりうる。これが無いと、重いページで測った結果が
+`docs/performance-targets.md` の記録済みの値 (§21〜§31 はすべて
+`minimal.html`) と同じ顔をして並ぶ。
+
+- `aggregate` サブコマンドは既存ログを読むだけで、どのページで採られたか
+  を知る手段が無いため常に `null` になる。
+- このフィールドが無かった頃に保存された結果ファイル
+  (`results/baseline/` / `results/history/`) は `null` として読める
+  (`#[serde(default)]`、D104 が機種情報について置いたのと同じ後方互換)。
 
 `environment` が受け入れ条件の「実行環境情報 (OS、CPUコア数、VeloXのgit
 commit、実行日時、試行回数)」に対応する。`metrics` はレコードが 1 件も無い
