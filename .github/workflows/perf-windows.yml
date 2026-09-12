@@ -721,6 +721,8 @@ jobs:
             $lines += ""
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
             $lines += ""
+            $lines += "片側が ``-`` の行は、**その条件ではそのメトリクスが原理的に発生しない**ことを意味する (例: ``tab_resume_ms`` は B = 予算 OFF では休止が起きないため復帰も起きない)。差と比も ``-`` にしてある — 0 として引き算すると、存在しないことを「速い」と読み違える表になるため。"
+            $lines += ""
           }
 
           foreach ($sc in $scenarioNames) {
@@ -735,14 +737,36 @@ jobs:
               # 単一要素や空を返したときに配列で扱えるよう @() で包む。
               $a = @(Get-Medians $baselineFiles $key)
               $b = @(Get-Medians $compareFiles $key)
-              if ($a.Count -eq 0 -or $b.Count -eq 0) { continue }
-              $aAvg = ($a | Measure-Object -Average).Average
-              $bAvg = ($b | Measure-Object -Average).Average
+              # 両側とも無いメトリクスだけを飛ばす。**片側だけのメトリクス
+              # は行ごと消さずに出す** (Issue #176)。
+              #
+              # `tab_resume_ms` がこれに当たる: B (`VELOX_MEMORY_BUDGET_MB=0`)
+              # では予算が何も休止しないので復帰も起きず、B 側は構造的に
+              # 常に 0 件になる。両側必須のままだと、**A 側に値があっても
+              # 行が出ない** — run 34669308096 で実際にそうなり、
+              # `tabs_hold_resume_N` を回したのに復帰コストが 1 つも
+              # 表示されなかった。
+              #
+              # 片側が空のときは差と比を出さない ("-")。B が 0 件なのは
+              # 「B の値が 0」ではなく「B には存在しない」であり、
+              # 0 として引き算すると**休止しなかった条件の方が速いかの
+              # ような表**になってしまう。
+              if ($a.Count -eq 0 -and $b.Count -eq 0) { continue }
               $digits = if ($key -eq "rss_total_bytes" -or $key -eq "rss_process_count" -or $key -eq "suspended_tab_count") { 0 } else { 2 }
-              $aList = ($a | ForEach-Object { [math]::Round($_, $digits) }) -join ", "
-              $bList = ($b | ForEach-Object { [math]::Round($_, $digits) }) -join ", "
-              $ratio = if ($aAvg -ne 0) { [math]::Round($bAvg / $aAvg, 3) } else { "n/a" }
-              $lines += "| $key | $aList | $([math]::Round($aAvg, $digits)) | $bList | $([math]::Round($bAvg, $digits)) | $([math]::Round($bAvg - $aAvg, $digits)) | $ratio |"
+              $aList = if ($a.Count -gt 0) { ($a | ForEach-Object { [math]::Round($_, $digits) }) -join ", " } else { "-" }
+              $bList = if ($b.Count -gt 0) { ($b | ForEach-Object { [math]::Round($_, $digits) }) -join ", " } else { "-" }
+              $aAvgText = if ($a.Count -gt 0) { [math]::Round(($a | Measure-Object -Average).Average, $digits) } else { "-" }
+              $bAvgText = if ($b.Count -gt 0) { [math]::Round(($b | Measure-Object -Average).Average, $digits) } else { "-" }
+              if ($a.Count -gt 0 -and $b.Count -gt 0) {
+                $aAvg = ($a | Measure-Object -Average).Average
+                $bAvg = ($b | Measure-Object -Average).Average
+                $diffText = [math]::Round($bAvg - $aAvg, $digits)
+                $ratioText = if ($aAvg -ne 0) { [math]::Round($bAvg / $aAvg, 3) } else { "n/a" }
+              } else {
+                $diffText = "-"
+                $ratioText = "-"
+              }
+              $lines += "| $key | $aList | $aAvgText | $bList | $bAvgText | $diffText | $ratioText |"
             }
             $lines += ""
           }
