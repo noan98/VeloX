@@ -94,6 +94,8 @@ windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_ProcessStatus",
+    # Issue #176 / D93 案 B: `GlobalMemoryStatusEx` (搭載 RAM の検出)。
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
 ] }
 

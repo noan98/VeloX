@@ -1692,9 +1692,179 @@ mod imp {
     }
 }
 
+// ---------------------------------------------------------------------
+// Installed RAM (Issue #176 / D93 子 Issue 案 B)
+// ---------------------------------------------------------------------
+
+/// How much physical RAM the machine has, in bytes. `None` when this
+/// platform has no implementation yet, or when the OS would not say.
+///
+/// **なぜ必要か** (D93): メモリ予算の既定は現在 700 MiB という**絶対値**
+/// で、搭載 RAM を一切見ていない (D90)。4 GiB 機でも 64 GiB 機でも同じ
+/// 値になるため、前者では予算として機能せず、後者では実質 OFF になる
+/// (D93「なぜ裸の比率では成立しないか」)。式を RAM 相対にするには、
+/// まず搭載 RAM が分かる必要がある — **本関数はその材料を用意するだけ
+/// で、予算の式は一切変えない** (D93 子 Issue 案 B が案 C と分けられて
+/// いるのはこのため)。
+///
+/// **失敗はエラーにしない。** 呼び出し側にとって「RAM が分からない」は
+/// 異常ではなく、**絶対値の既定にフォールバックすればよいだけ**である
+/// (macOS が今まさにその状態)。`RssError` のような型を返すと、呼び出し
+/// 側に「どう失敗したか」を判断させることになるが、判断の余地は無い。
+///
+/// | OS | 実装 |
+/// | --- | --- |
+/// | Linux | `/proc/meminfo` の `MemTotal:` 行 (kB) |
+/// | Windows | `GlobalMemoryStatusEx` の `ullTotalPhys` |
+/// | macOS / その他 | 未実装 (`None`) — CLAUDE.md の OS 優先度に従う |
+pub fn installed_ram_bytes() -> Option<u64> {
+    ram_imp::installed_ram_bytes()
+}
+
+/// `/proc/meminfo` の `MemTotal:` 行からバイト単位の総メモリ量を取り出す。
+///
+/// 行の形は `MemTotal:       16307556 kB` で、**単位は kB 固定**
+/// (kernel の `meminfo` は常に kB で出す)。それでも単位を読み飛ばさずに
+/// 検査するのは、**将来 kernel が単位を変えたときに黙って 1024 倍ずれた
+/// 値を返すより、`None` を返す方が安全**だからである。
+///
+/// `velox-bench` の機種情報収集 (D104) も同じ行を読む必要があるため、
+/// パーサはここに一本化してあちらから呼ぶ (同じファイルを 2 か所で
+/// 解釈すると、片方だけ直したときに値が食い違う)。
+pub fn parse_mem_total_bytes(meminfo: &str) -> Option<u64> {
+    meminfo.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        if key.trim() != "MemTotal" {
+            return None;
+        }
+        let mut parts = value.split_whitespace();
+        let amount: u64 = parts.next()?.parse().ok()?;
+        // 単位が無い/kB 以外なら読まない (上記の理由)。
+        match parts.next() {
+            Some(unit) if unit.eq_ignore_ascii_case("kb") => amount.checked_mul(1024),
+            _ => None,
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+mod ram_imp {
+    pub(super) fn installed_ram_bytes() -> Option<u64> {
+        let contents = std::fs::read_to_string("/proc/meminfo").ok()?;
+        super::parse_mem_total_bytes(&contents)
+    }
+}
+
+#[cfg(target_os = "windows")]
+mod ram_imp {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+
+    pub(super) fn installed_ram_bytes() -> Option<u64> {
+        let mut status = MEMORYSTATUSEX {
+            dwLength: u32::try_from(std::mem::size_of::<MEMORYSTATUSEX>()).ok()?,
+            ..Default::default()
+        };
+        // SAFETY: `GlobalMemoryStatusEx` は呼び出し側が用意した
+        // `MEMORYSTATUSEX` を埋めるだけで、`dwLength` に構造体の大きさが
+        // 入っていることだけを要求する (上で設定済み)。ポインタは生存中の
+        // ローカル変数への排他参照であり、関数は同期的に返る。失敗時は
+        // 構造体を触らずエラーを返すので、未初期化の値を読むことも無い。
+        // CLAUDE.md の「unsafe は理由をコメントで明記」に従う。
+        unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
+        // 0 は「取れなかった」と区別がつかないので None にする
+        // (D105 の「観測できたものだけを書く」と同じ方向)。
+        (status.ullTotalPhys > 0).then_some(status.ullTotalPhys)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+mod ram_imp {
+    /// macOS などは未実装。`sysctl hw.memsize` で取れるが、CLAUDE.md の
+    /// OS 優先度 (Windows 最優先、macOS/Linux は最低限) に従い、**必要に
+    /// なるまで足さない。** 呼び出し側は絶対値の既定にフォールバックする
+    /// だけなので、`None` でも壊れない。
+    pub(super) fn installed_ram_bytes() -> Option<u64> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- installed RAM (Issue #176 / D93 案 B) --------------------------
+
+    #[test]
+    fn mem_total_is_read_as_kilobytes() {
+        // 実際の /proc/meminfo の先頭数行。MemTotal は MemFree より前に
+        // あるが、前後の行に引きずられないことも同時に確かめる。
+        let meminfo = "\
+MemTotal:       16307556 kB
+MemFree:         1234567 kB
+MemAvailable:    8901234 kB
+";
+        assert_eq!(
+            parse_mem_total_bytes(meminfo),
+            Some(16_307_556 * 1024),
+            "kB は 1024 倍でバイトにする"
+        );
+    }
+
+    #[test]
+    fn mem_total_ignores_similar_keys() {
+        // `MemTotalFoo` や `SwapTotal` を拾わないこと。前方一致ではなく
+        // キー完全一致で見ている。
+        let meminfo = "SwapTotal:  1000 kB\nMemTotalish: 2000 kB\nMemTotal: 4 kB\n";
+        assert_eq!(parse_mem_total_bytes(meminfo), Some(4096));
+    }
+
+    #[test]
+    fn mem_total_without_a_unit_is_not_guessed() {
+        // **単位が無い/違う行は読まない。** kernel が単位を変えたときに
+        // 黙って 1024 倍ずれた値を返すより、None の方が安全である
+        // (呼び出し側は絶対値の既定へフォールバックするだけ)。
+        assert_eq!(parse_mem_total_bytes("MemTotal: 16307556\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal: 16307556 MB\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal: kB\n"), None);
+    }
+
+    #[test]
+    fn mem_total_accepts_the_unit_case_insensitively() {
+        assert_eq!(parse_mem_total_bytes("MemTotal: 4 KB\n"), Some(4096));
+    }
+
+    #[test]
+    fn mem_total_absent_or_unparsable_is_none() {
+        assert_eq!(parse_mem_total_bytes(""), None);
+        assert_eq!(parse_mem_total_bytes("MemFree: 100 kB\n"), None);
+        assert_eq!(parse_mem_total_bytes("MemTotal: not-a-number kB\n"), None);
+        assert_eq!(parse_mem_total_bytes("no colon here\n"), None);
+    }
+
+    #[test]
+    fn mem_total_does_not_overflow_on_an_absurd_value() {
+        // u64::MAX kB は 1024 倍でオーバーフローする。パニックさせない。
+        let meminfo = format!("MemTotal: {} kB\n", u64::MAX);
+        assert_eq!(parse_mem_total_bytes(&meminfo), None);
+    }
+
+    /// 実際にこの環境で呼んでみる。**値そのものは環境依存なので検査
+    /// できない** — 検査するのは「呼んでもパニックせず、値が返るなら
+    /// 常識的な範囲にある」ことだけ。
+    #[test]
+    fn installed_ram_is_plausible_when_available() {
+        // `None` は異常ではない (Linux/Windows 以外、または /proc が
+        // 読めない環境) のでそのまま通す。
+        if let Some(bytes) = installed_ram_bytes() {
+            // 64 MiB 未満や 1 PiB 超はこの関数の読み違いを疑う値。
+            const PLAUSIBLE: std::ops::Range<u64> =
+                64 * 1024 * 1024..1024 * 1024 * 1024 * 1024 * 1024;
+            assert!(
+                PLAUSIBLE.contains(&bytes),
+                "搭載 RAM が {bytes} バイトはあり得ない"
+            );
+        }
+    }
 
     /// A [`StartupReport`] with all nine checkpoints set to distinct,
     /// chronologically ordered values. Shared by the `PerfRecord` tests so
