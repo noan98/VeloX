@@ -4,7 +4,7 @@
 
 ## 対象
 
-主担当は **D8–D15, D20, D22–D40, D74** の 29 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D8–D15, D20, D22–D40, D74, D119** の 30 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D8–D15** — tabs / suspension / persistence / history UI / private browsing / incognito
 - **D20** — explicit tab lifecycle state machine
@@ -24,7 +24,7 @@
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D8–D15, D20, D22–D40, D74** (29 件)
+**このカテゴリが主担当の Decision: D8–D15, D20, D22–D40, D74, D119** (30 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -63,6 +63,7 @@
 - [D39](./archive.md#d39-omnibox-candidates-in-private-mode--read-existing-data-record-nothing-new) — Omnibox candidates in private mode — read existing data, record nothing new
 - [D40](./archive.md#d40-startup-url-is-overridable---homepage--velox_homepage-default-is-google) — Startup URL is overridable (`--homepage` / `VELOX_HOMEPAGE`), default is Google
 - [D74](./archive.md#d74-プライベートブラウジング残りスコープ-27--private-window-を別ウィンドウとして開けるようにする分離は-d14d15-の既存メカニズムのままper-window-化だけを行う) — プライベートブラウジング、残りスコープ (#27) — Private Window を別ウィンドウとして開けるようにする。分離は D14/D15 の既存メカニズムのまま、per-window 化だけを行う
+- [D119](./archive.md#d119-タブの優先度は既存の-tabstate-とは別の軸である--5-段階は状態機械ではなく再訪likelihood-の梯子として定義する-issue-176-stage-1) — タブの「優先度」は既存の `TabState` とは別の軸である — 5 段階は状態機械ではなく再訪likelihood の梯子として定義する (Issue #176 Stage 1)
 
 ---
 
