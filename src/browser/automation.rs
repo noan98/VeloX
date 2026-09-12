@@ -440,6 +440,29 @@ const MEMORY_HOLD_SETTLE_MS: u64 = 12_000;
 /// 途中の値」と「落ち着いた後の値」を混ぜないための区切りが `mark`
 /// であり、この窓が後者にあたる。**
 const MEMORY_HOLD_WINDOW_MS: u64 = 8_000;
+/// `tabs_hold_resume_N` (`Scenario::TabCountMemoryResume`) が `mark` の
+/// 後に行う「休止済みタブへ戻る」ラウンド数 (Issue #176 Stage 1)。
+///
+/// **少なめにしてあるのは、各ラウンドが測定対象の状態そのものを変える
+/// から。** 1 回戻すたびに休止タブが 1 つ減り、そのタブの webview が
+/// 復活してメモリも増える。50 タブ中 48 タブ休止という状態 (§31.2) に
+/// 対して 4 ラウンドなら、測り終えても休止タブは 44 残っており、
+/// 「大量に休止された状態から戻る」という前提は保たれる。逆に
+/// `TAB_RESUME_REPEATS` (手動休止シナリオの回数) のような大きな値に
+/// すると、後半のラウンドは「あまり休止されていない状態からの復帰」を
+/// 測ることになり、シナリオの意味が途中で変わってしまう。
+///
+/// 中央値を出すには 4 点は少ないが、**この値は試行 (`--trials`) をまたい
+/// で積み上がる** — 2 試行なら 8 サンプルになる。
+const MEMORY_RESUME_ROUNDS: usize = 4;
+/// 「測り終えても大半のタブは休止のまま」をコンパイル時に固定する。
+/// §31.2 の実測 (50 タブで 48 休止) を基準に、戻す数がその 1/4 以下で
+/// あることを要求する — ここを緩めると、後半のラウンドが測るものが
+/// 「あまり休止されていない状態からの復帰」に変わってしまう。
+const _: () = assert!(
+    MEMORY_RESUME_ROUNDS * 4 <= 48,
+    "MEMORY_RESUME_ROUNDS が 50 タブでの休止数に対して多すぎる"
+);
 /// How many RSS/PSS samples [`recommended_rss_interval_ms`] aims to land
 /// inside the fixed [`MEMORY_STABILIZE_MS`] settle window at the end of a
 /// generated `tabs_N` script — see that function's doc comment and
@@ -578,6 +601,33 @@ pub fn generate_bench_script(
             lines.push(format!("wait {MEMORY_HOLD_WINDOW_MS}"));
             lines
         }
+        Scenario::TabCountMemoryResume(tab_count) => {
+            // 準備は `TabCountMemoryHold` と**同一** — 同じ間隔で開き、
+            // 同じ 12 秒を待つ。既定のメモリチェック周期のままメモリ
+            // 予算に回収させ、「落ち着いた状態」を作るところまでが前提で
+            // あり、そこを変えると §31 の値と地続きに読めなくなる。
+            //
+            // 違うのは `mark` の**後ろ**である。最長未使用のタブ (index 0
+            // から) へ順に `switch` する。予算が休止したタブへの switch は
+            // `tab_resume` を 1 件生む (生きているタブなら `tab_switch` に
+            // なるだけで、嘘の値は出ない)。
+            //
+            // index 0 から昇順なのは、**最長未使用 = 最も休止されている
+            // 可能性が高い**から。休止は最長未使用から順に行われる
+            // (`browser::suspension::reclaim_order`) ので、この順に戻すと
+            // 「本当に休止されていたタブ」を測れる確率が最も高い。
+            let extra_tabs = tab_count.saturating_sub(1);
+            let mut lines: Vec<String> = (0..extra_tabs)
+                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+                .collect();
+            lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
+            lines.push("mark".to_owned());
+            for index in 0..MEMORY_RESUME_ROUNDS {
+                lines.push(format!("switch {index}"));
+                lines.push(format!("wait {RESUME_SETTLE_MS}"));
+            }
+            lines
+        }
     };
     lines.push("quit".to_owned());
     Some(lines.join("\n") + "\n")
@@ -657,6 +707,14 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
                 u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
             open_ms + MEMORY_HOLD_SETTLE_MS + MEMORY_HOLD_WINDOW_MS
         }
+        Scenario::TabCountMemoryResume(tab_count) => {
+            // 準備は `TabCountMemoryHold` と同じ。違いは `mark` 後の窓が
+            // 固定の待ち時間ではなくラウンドの合計になること。
+            let open_ms =
+                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            let rounds_ms = MEMORY_RESUME_ROUNDS as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
+            open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms
+        }
     };
     script_ms / 1000 + STARTUP_DEFAULT_SECS + TEARDOWN_BUFFER_SECS
 }
@@ -708,6 +766,18 @@ pub fn recommended_rss_interval_ms(
         // 捨てられるサンプルしか生まない)。
         Scenario::TabCountMemoryHold(_) => {
             Some(MEMORY_HOLD_WINDOW_MS / TARGET_STABILIZED_RSS_SAMPLES)
+        }
+        // `tabs_hold_resume_N` の集計対象は `mark` 後のラウンド区間で、
+        // `tabs_hold_N` の 8 秒窓よりずっと短い。既定の 5000ms ではこの窓に
+        // サンプルが 1 つも落ちず、**`rss_total_bytes` が丸ごと欠測しうる**
+        // (§31.2 のような「復帰後のメモリ」が読めなくなる)。
+        //
+        // 窓の長さは「各ラウンドの `switch` にかかる時間 + `RESUME_SETTLE_MS`」
+        // の合計だが、前者は環境依存なので **`RESUME_SETTLE_MS` の分だけを
+        // 窓の下限**として間隔を決める。実際の窓はこれより長くなるので、
+        // 目標サンプル数を下回ることはない (安全側)。
+        Scenario::TabCountMemoryResume(_) => {
+            Some((MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS) / TARGET_STABILIZED_RSS_SAMPLES)
         }
         // Same reasoning for the CPU window (Issue #64): the default 5000ms
         // would fit at most one sample inside it, and one sample yields no
@@ -959,12 +1029,18 @@ mod tests {
             // 開き終えて休止が落ち着くまでの区間を集計から外す**ため。
             // 集計は最後の `measure_start` 以降しか見ないので、これで
             // 得られる値が定常値になる。
+            // `tabs_hold_resume_N` (Issue #176) も同じ理由で `mark` を
+            // 出すが、狙いは 1 段違う: **開き終えて休止が落ち着くまでを
+            // 外に出したうえで、その後の「戻す」操作だけを窓に入れる。**
+            // `tabs_hold_N` が定常値を測るのに対し、こちらはその定常状態
+            // から復帰するコストを測る。
             let expected = matches!(
                 scenario,
                 Scenario::TabCreateAt(_)
                     | Scenario::TabSwitchAt(_)
                     | Scenario::BackgroundCpu
                     | Scenario::TabCountMemoryHold(_)
+                    | Scenario::TabCountMemoryResume(_)
             );
             assert_eq!(has_mark, expected, "{scenario:?}");
         }
@@ -1018,6 +1094,77 @@ mod tests {
         };
         assert!(window > 0, "mark の後ろに窓が無いと何も集計されない");
         assert_eq!(commands.last(), Some(&AutomationCommand::Quit));
+    }
+
+    #[test]
+    fn tabs_hold_resume_sets_up_exactly_like_tabs_hold_then_switches_back() {
+        // Issue #176 Stage 1。このシナリオの値が §31 (`tabs_hold_N`) と
+        // 地続きに読めるのは、**mark までの組み立てが同一だから**である。
+        // ここが分岐すると「同じ落ち着いた状態からの復帰」を測っている
+        // という前提が崩れるので、mark 前の列が一致することを固定する。
+        let url = "http://127.0.0.1:8731/minimal.html";
+        let hold =
+            parse_script(&generate_bench_script(Scenario::TabCountMemoryHold(5), url).unwrap())
+                .unwrap();
+        let resume =
+            parse_script(&generate_bench_script(Scenario::TabCountMemoryResume(5), url).unwrap())
+                .unwrap();
+
+        let hold_mark = hold
+            .iter()
+            .position(|c| *c == AutomationCommand::Mark)
+            .expect("tabs_hold script must emit a mark");
+        let resume_mark = resume
+            .iter()
+            .position(|c| *c == AutomationCommand::Mark)
+            .expect("tabs_hold_resume script must emit a mark");
+        assert_eq!(
+            hold[..hold_mark],
+            resume[..resume_mark],
+            "mark までの組み立ては tabs_hold_N と同一でなければならない"
+        );
+
+        // mark の後ろ: 最長未使用のタブから順に戻す。休止は最長未使用
+        // から行われるので、この順でないと「休止されていたタブ」を
+        // 引き当てられない。
+        let switches: Vec<usize> = resume[resume_mark..]
+            .iter()
+            .filter_map(|c| match c {
+                AutomationCommand::Switch { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switches,
+            (0..MEMORY_RESUME_ROUNDS).collect::<Vec<_>>(),
+            "index 0 から昇順でなければならない"
+        );
+
+        // 各 switch の直後には待ちが要る。復帰後の再読み込みが終わる前に
+        // 次のラウンドへ進むと、測っているものが混ざる。
+        for (i, command) in resume.iter().enumerate() {
+            if matches!(command, AutomationCommand::Switch { .. }) {
+                assert!(
+                    matches!(resume[i + 1], AutomationCommand::Wait { .. }),
+                    "switch は必ず待ちを伴う: {resume:?}"
+                );
+            }
+        }
+        assert_eq!(resume.last(), Some(&AutomationCommand::Quit));
+    }
+
+    #[test]
+    fn tabs_hold_resume_samples_rss_inside_its_shorter_window() {
+        // `tabs_hold_N` の 8 秒窓と違い、こちらの窓はラウンドの合計で
+        // 短い。既定の 5000ms のままだとサンプルが落ちない。
+        let interval = recommended_rss_interval_ms(Scenario::TabCountMemoryResume(20))
+            .expect("tabs_hold_resume must override the RSS interval");
+        assert!(interval > 0);
+        let window_lower_bound = MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS;
+        assert!(
+            window_lower_bound / interval >= 2,
+            "窓の下限 {window_lower_bound}ms に間隔 {interval}ms では 2 サンプル入らない"
+        );
     }
 
     #[test]

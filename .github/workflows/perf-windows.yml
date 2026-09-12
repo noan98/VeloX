@@ -128,6 +128,11 @@ on:
           - tabs_hold_10
           - tabs_hold_20
           - tabs_hold_50
+          - tabs_hold_resume_1
+          - tabs_hold_resume_5
+          - tabs_hold_resume_10
+          - tabs_hold_resume_20
+          - tabs_hold_resume_50
       scenarios:
         description: "複数シナリオを 1 回の run で続けて計測する (カンマ区切り、例: tabs_1,tabs_5,tabs_10,tabs_20)。指定するとシナリオ選択より優先される。D96 の「Windows は run ごとに分ける」に従い、タブ数スケーリングのような複数点の比較はこれで同一 run に収める"
         type: string
@@ -685,9 +690,22 @@ jobs:
             # 休止による状態喪失 (再読み込みの発生) のコストが読み取れない
             # ため、`tab_suspend` イベントの件数 (`suspended_tab_count`、
             # `MetricKey::extract` が 1 trial につき 1 サンプルに畳んだ値)
-            # を並べる。復帰の速さそのものは別メトリクス `tab_resume_ms` が
-            # 対象であり、ここでは扱わない。
-            "suspended_tab_count"
+            # を並べる。
+            "suspended_tab_count",
+            # Issue #176 Stage 1。**休止の「対価」の側**を測る鍵。
+            # `tabs_hold_resume_N` (Scenario::TabCountMemoryResume) は
+            # `tabs_hold_N` と同じ手順で落ち着かせたあと、最長未使用の
+            # タブへ戻る。予算が休止したタブへの switch が
+            # `tab_resume` を生むので、ここに値が出る。
+            #
+            # ⚠️ **他のシナリオでは行ごと出ない。** 戻る操作をしない
+            # シナリオでは `tab_resume` イベント自体が発生せず、この
+            # ループは値が 0 件の鍵を `continue` で飛ばす。行が無いのは
+            # 計測の失敗ではなく「そのシナリオは復帰を測っていない」と
+            # いう意味である。逆に `tabs_hold_resume_N` で行が出ない
+            # ときは**予算が 1 つも休止しなかった**ことを意味する
+            # (生きているタブへの switch は `tab_switch` になる)。
+            "tab_resume_ms"
           )
 
           if ($scenarioNames.Count -gt 0) {

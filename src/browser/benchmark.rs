@@ -2226,6 +2226,43 @@ pub mod scenario {
         /// rather than the moments while tabs are still opening.
         /// `tab_count` is one of [`Scenario::TAB_COUNTS`].
         TabCountMemoryHold(u32),
+        /// What it costs the user to get a tab back that the **memory
+        /// budget** suspended (Issue #176 Stage 1, D97 Revisit condition
+        /// (4)'s second half).
+        ///
+        /// [`Scenario::TabCountMemoryHold`] answers "how little memory does
+        /// VeloX use with N tabs open" — 527.9 MiB at 50 tabs
+        /// (`docs/performance-targets.md` §31). What it does not say is that
+        /// the figure is the *price* of having dropped 48 of those 50 tabs'
+        /// webviews: §31.8 records the landing value and the suspended-tab
+        /// count side by side precisely because the second number is what
+        /// the first one cost.
+        ///
+        /// This variant sets up exactly like `tabs_hold_N` — same pauses,
+        /// same 12-second settle, so the memory budget fires at its default
+        /// period — and then, **after** the `mark`, switches to the least
+        /// recently used tabs in turn. Each switch to a tab the budget
+        /// suspended produces one [`MetricKey::TabResumeMs`] sample (plus
+        /// the reload's `page_load`), so the measured window describes
+        /// *coming back from* the settled state rather than the settled
+        /// state itself.
+        ///
+        /// ⚠️ **The samples only exist if the budget actually suspended
+        /// something.** Switching to a tab that is still live logs
+        /// `tab_switch`, not `tab_resume`, so at tab counts where the
+        /// budget never fires (measured on Windows: 1 and 5 tabs, §31.3)
+        /// this scenario reports no `tab_resume_ms` at all. That absence is
+        /// itself the honest answer — nothing was suspended, so nothing had
+        /// to be restored — but it means the useful points of this family
+        /// are the larger ones. `tab_count` is one of
+        /// [`Scenario::TAB_COUNTS`].
+        ///
+        /// This is deliberately **not** the same thing as
+        /// [`Scenario::TabResume`], which suspends one tab by hand
+        /// (`suspend <index>`) with a handful of tabs open. That measures
+        /// the mechanism; this measures the situation the product actually
+        /// puts users in.
+        TabCountMemoryResume(u32),
     }
 
     impl Scenario {
@@ -2257,6 +2294,11 @@ pub mod scenario {
                     .iter()
                     .map(|&n| Scenario::TabCountMemoryHold(n)),
             );
+            scenarios.extend(
+                Self::TAB_COUNTS
+                    .iter()
+                    .map(|&n| Scenario::TabCountMemoryResume(n)),
+            );
             scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabCreateAt(n)));
             scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabSwitchAt(n)));
             scenarios
@@ -2278,6 +2320,7 @@ pub mod scenario {
                 Scenario::TabSwitchAt(n) => format!("tab_switch_{n}"),
                 Scenario::TabCountMemory(n) => format!("tabs_{n}"),
                 Scenario::TabCountMemoryHold(n) => format!("tabs_hold_{n}"),
+                Scenario::TabCountMemoryResume(n) => format!("tabs_hold_resume_{n}"),
             }
         }
 
@@ -2311,6 +2354,16 @@ pub mod scenario {
             // `None` になる (`tabs_hold_is_not_swallowed_by_tabs` が
             // これを守っている)。
             for (prefix, build) in [
+                // `tabs_hold_resume_` は `tabs_hold_` より **前**。同じ
+                // 理由 (先に一致したプレフィックスで return する) で、
+                // 逆にすると "tabs_hold_resume_20" が `tabs_hold_` に
+                // 食われて残り "resume_20" のパースに失敗し `None` に
+                // なる (`tabs_hold_resume_is_not_swallowed_by_tabs_hold`
+                // がこれを守っている)。
+                (
+                    "tabs_hold_resume_",
+                    Scenario::TabCountMemoryResume as fn(u32) -> Scenario,
+                ),
                 (
                     "tabs_hold_",
                     Scenario::TabCountMemoryHold as fn(u32) -> Scenario,
@@ -2358,7 +2411,8 @@ pub mod scenario {
                 | Scenario::TabCreateAt(_)
                 | Scenario::TabSwitchAt(_)
                 | Scenario::TabCountMemory(_)
-                | Scenario::TabCountMemoryHold(_) => true,
+                | Scenario::TabCountMemoryHold(_)
+                | Scenario::TabCountMemoryResume(_) => true,
             }
         }
     }
@@ -2394,6 +2448,24 @@ pub mod scenario {
         }
 
         #[test]
+        fn tabs_hold_resume_is_not_swallowed_by_tabs_hold() {
+            // `tabs_hold_` が `tabs_hold_resume_` より前にあると
+            // "tabs_hold_resume_20" が None になる。
+            // `tabs_hold_is_not_swallowed_by_tabs` と同じ形の事故を、
+            // プレフィックスが 1 段深くなった側でも固定する。
+            assert_eq!(
+                Scenario::parse("tabs_hold_resume_20"),
+                Some(Scenario::TabCountMemoryResume(20))
+            );
+            assert_eq!(
+                Scenario::parse("tabs_hold_20"),
+                Some(Scenario::TabCountMemoryHold(20))
+            );
+            assert_eq!(Scenario::parse("tabs_hold_resume_7"), None);
+            assert_eq!(Scenario::parse("tabs_hold_resume_"), None);
+        }
+
+        #[test]
         fn parse_rejects_unknown_tab_counts() {
             assert_eq!(Scenario::parse("tabs_7"), None);
             assert_eq!(Scenario::parse("tabs_"), None);
@@ -2420,11 +2492,12 @@ pub mod scenario {
         }
 
         #[test]
-        fn all_covers_eight_fixed_plus_four_parameterized_families() {
-            // 固定 8 + タブ数でパラメータ化された 4 系統
-            // (`tabs_N` / `tabs_hold_N` / `tab_create_N` / `tab_switch_N`)。
-            // `tabs_hold_N` は Issue #197 で追加。
-            assert_eq!(Scenario::all().len(), 8 + 4 * Scenario::TAB_COUNTS.len());
+        fn all_covers_eight_fixed_plus_five_parameterized_families() {
+            // 固定 8 + タブ数でパラメータ化された 5 系統 (`tabs_N` /
+            // `tabs_hold_N` / `tabs_hold_resume_N` / `tab_create_N` /
+            // `tab_switch_N`)。`tabs_hold_N` は Issue #197、
+            // `tabs_hold_resume_N` は Issue #176 で追加。
+            assert_eq!(Scenario::all().len(), 8 + 5 * Scenario::TAB_COUNTS.len());
         }
 
         #[test]
