@@ -49,10 +49,15 @@ speed can be built on top of it rather than bolted on.
 ### Performance
 
 - [x] Tab suspension driven by idle time, tab count and a memory budget —
-      the memory-budget signal (700 MiB) is **on by default** as of Issue
-      #184 (docs/decisions.md D90); idle time and tab count stay opt-in.
-      Set `VELOX_MEMORY_BUDGET_MB=0` (or the settings screen's Performance
-      tab) to turn even that off
+      the memory-budget signal is **on by default** as of Issue #184
+      (docs/decisions.md D90); idle time and tab count stay opt-in.
+      Since Issue #176 (D114) the default budget scales with the machine's
+      installed RAM: `clamp(700 MiB, RAM / 16, 2048 MiB)`, i.e. 700 MiB up
+      to 8 GiB (unchanged from D90, and the fallback when the RAM cannot be
+      read), 1024 MiB at 16 GiB, 2048 MiB at 32 GiB and above. Set
+      `VELOX_MEMORY_BUDGET_MB` (or the settings screen's Performance tab)
+      to pin an exact value — neither the floor nor the ceiling applies to
+      an explicit one — or `0` to turn even that off
 - [x] Performance instrumentation and a benchmark suite (`velox-bench`),
       including IPC volume/latency accounting
 - [x] Performance regression gate in CI, and a dashboard that tracks results
@@ -258,7 +263,8 @@ Measured and settled:
 - **Memory** — the leak audit found and fixed an unbounded map, and long-run
   growth under repeated tab churn is bounded (D79). Footprint at 20 tabs used
   to be **+245% versus Chromium with the default settings**; as of Issue
-  #184 (D90) the memory-budget signal is on by default (700 MiB), bringing
+  #184 (D90) the memory-budget signal is on by default (700 MiB at the time
+  of that measurement; RAM-relative since D114), bringing
   the default-settings figure down to **+32%**, and it drops further to
   **+20% with an explicit `VELOX_MAX_LIVE_TABS=4`** — still short of the
   +10% target either way (D48 / D56 / D90)
