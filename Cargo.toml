@@ -86,7 +86,7 @@ winresource = "0.1"
 # rather than adding `windows-sys` or another crate (CLAUDE.md "依存クレート
 # は必要最小限に保つ").
 [target.'cfg(windows)'.dependencies]
-webview2-com = "0.38"
+webview2-com = "0.39"
 windows = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
