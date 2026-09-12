@@ -161,8 +161,12 @@ on:
           - minimal.html
           - dom_heavy.html
           - text.html
+      pages:
+        description: "複数ページを 1 回の run で続けて計測する (カンマ区切り、例: minimal.html,dom_heavy.html)。指定するとページ選択より優先される。D96 の「run をまたいだ絶対値は比較できない」に従い、ページ差を見る計測はこれで同一 run に収める (Issue #231)"
+        type: string
+        default: ""
       url:
-        description: "計測対象ページの URL。空欄なら scripts/bench/pages/ の固定ページ (上の page) を loopback 配信して使う"
+        description: "計測対象ページの URL。空欄なら scripts/bench/pages/ の固定ページ (上の page / pages) を loopback 配信して使う。指定すると page / pages は無視される"
         type: string
         default: ""
   # この workflow 自身を変更する PR でのみ実行して検証する (docs/
@@ -274,27 +278,99 @@ jobs:
       # 未指定/空なら scripts/bench/pages/ の固定ページを loopback 配信し、
       # ネットワーク非依存の再現可能な数値にする (perf-gate.yml / D46 と
       # 同じ方針)。
+      # 入力はシェルへ直接展開せず環境変数で渡す (script injection 対策)。
+      # `pages` は choice ではなく自由記述なので、とくにここが要る。
       - name: Determine benchmark URL
         id: bench_url
         shell: pwsh
+        env:
+          INPUT_URL: ${{ inputs.url }}
+          INPUT_PAGE: ${{ inputs.page }}
+          INPUT_PAGES: ${{ inputs.pages }}
         run: |
-          $url = "${{ inputs.url }}"
+          $ErrorActionPreference = "Stop"
+          $url = $env:INPUT_URL
           # ⚠️ `inputs.*` は workflow_dispatch 以外のイベント (schedule /
           # pull_request) では**常に空文字列**になる (GitHub の仕様、D106
           # で実際に踏んだ罠)。既定値をここで補わないと、週次実行と自己
           # テストが「ページ未指定」で落ちる。
-          $page = "${{ inputs.page }}"
+          $page = $env:INPUT_PAGE
           if ([string]::IsNullOrWhiteSpace($page)) { $page = "minimal.html" }
-          if ([string]::IsNullOrWhiteSpace($url)) {
-            "url=http://127.0.0.1:8731/$page" >> $env:GITHUB_OUTPUT
-            "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
-            "page=$page" >> $env:GITHUB_OUTPUT
+
+          # Issue #231。ページの重さによる違いは **同一 run 内でしか読めない**
+          # (D96 決定 3: run ごとにランナーの機種が変わり、絶対値は 23% 動く)。
+          # `scenarios` が複数シナリオに対して解いたのと同じ問題なので、同じ形で
+          # 複数ページを 1 つのジョブに収める。
+          $pagesRaw = $env:INPUT_PAGES
+          if (-not [string]::IsNullOrWhiteSpace($pagesRaw)) {
+            $pageList = @($pagesRaw -split ',' |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            if ($pageList.Count -eq 0) {
+              throw "pages の書式が不正です: '$pagesRaw' (カンマ区切りのファイル名を指定してください)"
+            }
           } else {
+            $pageList = @($page)
+          }
+
+          # シナリオ専用のフィクスチャ。**汎用の計測対象ページではない**
+          # ので `page` の choice には載せていない (`background_cpu` は
+          # `busy.html` を `?idle=1` 付きで読む、など)。
+          # `.github/scripts/test_perf_windows_inputs.py` が、この一覧と
+          # choice の一覧が食い違わないことを検査する。
+          $fixturePages = @("busy.html", "download.html", "network_activity.html")
+          $usedFixtures = @()
+
+          if ([string]::IsNullOrWhiteSpace($url)) {
+            # **ファイル名として安全な字だけを通す。** ここは URL の組み立てと
+            # 結果ファイル名の両方に使われるので、`..` やスラッシュを通すと
+            # 配信ディレクトリの外を指しうるし、結果ファイルの置き場所も
+            # ずれる。`pages` は choice ではなく自由記述なので、ここで弾く。
+            foreach ($p in $pageList) {
+              if ($p -notmatch '^[A-Za-z0-9_.-]+$') {
+                throw "pages / page に使えない文字が含まれています: '$p' (英数字・アンダースコア・ハイフン・ドットのみ)"
+              }
+              if ($p -eq "." -or $p -eq "..") {
+                throw "pages / page が不正です: '$p'"
+              }
+              if (-not (Test-Path "scripts\bench\pages\$p")) {
+                throw "scripts/bench/pages/$p が存在しません (指定できるのは固定ページのファイル名です)"
+              }
+              # Issue #231 のレビュー指摘。`page` (choice) は**シナリオ専用
+              # フィクスチャを意図的に載せていない**が、`pages` は自由記述
+              # なので同じ制約が効かない。
+              #
+              # **ここで弾きはしない。** `url` を指定すると loopback 配信
+              # 自体が止まる (`serve_fixed_pages=false`) ため、弾くと
+              # 「busy.html を 20 タブ開いたときのメモリを測る」のような
+              # 正当な計測に逃げ道が無くなる。
+              #
+              # 危ないのは**結果の読み違え**の方である。これらのページは
+              # ただ重いのではなく**何かをする** (CPU を回す / ダウンロード
+              # を起こす / ポーリングする) ので、§21〜§34 の「ページの重さ」
+              # の系列と同じ表に並ぶと、別の現象を重さの違いとして読んで
+              # しまう。そこで Job Summary に出る警告を残す。
+              if ($fixturePages -contains $p) {
+                Write-Host "::warning::'$p' はシナリオ専用のフィクスチャです (ただ重いのではなく、CPU を回す・ダウンロードを起こす等の動作をします)。ページの重さの比較として読まないでください"
+                $usedFixtures += $p
+              }
+            }
+            "url=http://127.0.0.1:8731/$($pageList[0])" >> $env:GITHUB_OUTPUT
+            "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
+            "page=$($pageList -join ', ')" >> $env:GITHUB_OUTPUT
+            "pages=$($pageList -join ',')" >> $env:GITHUB_OUTPUT
+            "fixture_pages=$($usedFixtures -join ', ')" >> $env:GITHUB_OUTPUT
+          } else {
+            # 外部 URL を渡した場合、`page` / `pages` 入力は使われない。
+            # 表示も「固定ページのどれか」ではなく URL そのものにする。
             "url=$url" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=false" >> $env:GITHUB_OUTPUT
-            # 外部 URL を渡した場合、`page` 入力は使われない。表示も
-            # 「固定ページのどれか」ではなく URL そのものにする。
             "page=$url" >> $env:GITHUB_OUTPUT
+            # 1 件だけ。URL を複数受け取る入力は用意していない
+            # (loopback 配信の固定ページと違い、外部 URL は比較の前提が
+            # 揃っているとは限らないため)。
+            "pages=" >> $env:GITHUB_OUTPUT
+            "fixture_pages=" >> $env:GITHUB_OUTPUT
           }
 
       # ⚠️ ここは以前 `Start-Sleep -Seconds 2` の固定待ちだった。run
@@ -438,6 +514,7 @@ jobs:
           INPUT_REPEATS: ${{ inputs.repeats }}
           EVENT_NAME: ${{ github.event_name }}
           BENCH_URL: ${{ steps.bench_url.outputs.url }}
+          BENCH_PAGES: ${{ steps.bench_url.outputs.pages }}
         run: |
           $ErrorActionPreference = "Stop"
           $scenario = $env:INPUT_SCENARIO
@@ -509,12 +586,12 @@ jobs:
             return $names
           }
 
-          function Invoke-Bench([string] $sc, [string] $outfile, [string] $label) {
+          function Invoke-Bench([string] $sc, [string] $url, [string] $outfile, [string] $label) {
             Write-Host "=== $label -> $outfile ==="
             & target\release\velox-bench.exe run `
               --scenario $sc `
               --trials $trials `
-              --url "$env:BENCH_URL" `
+              --url "$url" `
               --output $outfile
             if ($LASTEXITCODE -ne 0) {
               throw "velox-bench run が失敗しました (条件: $label, exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
@@ -541,21 +618,57 @@ jobs:
           $compareEnv | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           "VELOX_EOF" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          foreach ($sc in $scenarioList) {
-            if ([string]::IsNullOrWhiteSpace($compareEnv)) {
-              # 従来どおりの単独計測。ファイル名も従来のまま
-              # (§21/§24 の結果と同じ名前で artifact に並ぶ)。
-              Invoke-Bench $sc "results\$sc-windows.json" "[$sc] A (既定)"
-            } else {
-              Write-Host "[$sc] A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
-              for ($r = 1; $r -le $repeats; $r++) {
-                Invoke-Bench $sc "results\$sc-windows-baseline-$r.json" "[$sc] A (既定) #$r"
-                $names = Set-EnvFromSpec $compareEnv
-                try {
-                  Invoke-Bench $sc "results\$sc-windows-compare-$r.json" "[$sc] B ($compareEnv) #$r"
-                } finally {
-                  foreach ($name in $names) {
-                    Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+          # Issue #231。計測するページの一覧。`pages` 未指定 (= 従来の
+          # 1 ページ) と外部 URL 指定のときは 1 件だけになり、その場合の
+          # 挙動・ファイル名は**従来と 1 バイトも変わらない** (下記
+          # `Get-ResultPrefix` を参照)。
+          $pagesRaw = $env:BENCH_PAGES
+          if (-not [string]::IsNullOrWhiteSpace($pagesRaw)) {
+            $pageList = @($pagesRaw -split ',' |
+              ForEach-Object { $_.Trim() } |
+              Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+          } else {
+            # 外部 URL 指定。ページ名という概念が無いので 1 件の空文字列で
+            # 回し、URL は BENCH_URL をそのまま使う。
+            $pageList = @("")
+          }
+          Write-Host "計測するページ: $(($pageList | ForEach-Object { if ($_) { $_ } else { $env:BENCH_URL } }) -join ', ')"
+
+          # 結果ファイル名の接頭辞。
+          #
+          # ⚠️ **1 ページのときは接頭辞をシナリオ名のままにする。**
+          # `cold_startup-windows.json` のような名前は docs
+          # (§21.x / §26.x) から参照されており、複数ページ対応のために
+          # 全 run の名前を変えると、過去の記録との対応が取れなくなる。
+          # ページを名前に含めるのは**含めないと衝突する場合だけ**に絞る。
+          function Get-ResultPrefix([string] $sc, [string] $page) {
+            if ($pageList.Count -le 1) { return $sc }
+            # `minimal.html` -> `minimal`。`@` はシナリオ ID に現れない
+            # ので、後段のサマリはここで分解できる。
+            $slug = [System.IO.Path]::GetFileNameWithoutExtension($page)
+            return "$sc@$slug"
+          }
+
+          foreach ($pg in $pageList) {
+            $url = if ($pg) { "http://127.0.0.1:8731/$pg" } else { $env:BENCH_URL }
+            foreach ($sc in $scenarioList) {
+              $prefix = Get-ResultPrefix $sc $pg
+              $tag = if ($pageList.Count -le 1) { $sc } else { "$sc / $pg" }
+              if ([string]::IsNullOrWhiteSpace($compareEnv)) {
+                # 従来どおりの単独計測。ファイル名も従来のまま
+                # (§21/§24 の結果と同じ名前で artifact に並ぶ)。
+                Invoke-Bench $sc $url "results\$prefix-windows.json" "[$tag] A (既定)"
+              } else {
+                Write-Host "[$tag] A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
+                for ($r = 1; $r -le $repeats; $r++) {
+                  Invoke-Bench $sc $url "results\$prefix-windows-baseline-$r.json" "[$tag] A (既定) #$r"
+                  $names = Set-EnvFromSpec $compareEnv
+                  try {
+                    Invoke-Bench $sc $url "results\$prefix-windows-compare-$r.json" "[$tag] B ($compareEnv) #$r"
+                  } finally {
+                    foreach ($name in $names) {
+                      Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
+                    }
                   }
                 }
               }
@@ -613,6 +726,14 @@ jobs:
           # dom_heavy.html (99 KB) で桁が変わりうる。ランナー情報と同じ
           # 理由 (D96: 条件が違う数値を並べさせない) でサマリに出す。
           BENCH_PAGE: ${{ steps.bench_url.outputs.page }}
+          # Issue #231。表をページごとに分けるために、解決済みの一覧を
+          # **入力順のまま**受け取る (アルファベット順に並べ替えない —
+          # 指定した順に読めた方が突き合わせやすい)。
+          BENCH_PAGES: ${{ steps.bench_url.outputs.pages }}
+          # Issue #231 のレビュー指摘。フィクスチャを計測対象にした run は、
+          # **その表を読む人の目の前**に注意書きを出す (ログの警告だけでは
+          # 後から表だけを見た人に届かない)。
+          BENCH_FIXTURE_PAGES: ${{ steps.bench_url.outputs.fixture_pages }}
         run: |
           $ErrorActionPreference = "Continue"
           $files = @(Get-ChildItem -Path results -Filter "*-windows*.json" -ErrorAction SilentlyContinue |
@@ -683,17 +804,50 @@ jobs:
             if ($_.Name -match $abPattern) { $Matches[1] }
           } | Select-Object -Unique)
 
+          # Issue #231。複数ページを 1 run で回すと、グループ名は
+          # `<scenario>@<page-slug>` になる (1 ページのときは従来どおり
+          # シナリオ名のまま)。以降は必ずここで分解してから扱う。
+          function Split-GroupName([string] $name) {
+            $i = $name.IndexOf('@')
+            if ($i -lt 0) { return @{ scenario = $name; page = "" } }
+            return @{
+              scenario = $name.Substring(0, $i)
+              page     = $name.Substring($i + 1)
+            }
+          }
+
+          # ページの並び順は**入力順**にする (アルファベット順ではない)。
+          # `minimal.html,dom_heavy.html` と指定したら軽い方から読める。
+          $pageOrder = @()
+          if (-not [string]::IsNullOrWhiteSpace($env:BENCH_PAGES)) {
+            $pageOrder = @($env:BENCH_PAGES -split ',' |
+              ForEach-Object { [System.IO.Path]::GetFileNameWithoutExtension($_.Trim()) })
+          }
+          function Get-PageRank([string] $slug) {
+            if ([string]::IsNullOrWhiteSpace($slug)) { return -1 }
+            $i = $pageOrder.IndexOf($slug)
+            if ($i -lt 0) { return [int]::MaxValue }
+            return $i
+          }
+
           # tabs_N / tabs_hold_N / tabs_hold_resume_N は数値順に並べる
-          # (スケーリングを読むため)。それ以外は名前順。
+          # (スケーリングを読むため)。それ以外は名前順。**ページが違うもの
+          # は先にページで束ねる** — 表もページごとに分かれるので、並び順も
+          # それに合わせないと読み手が行き来することになる。
           #
           # ⚠️ **プレフィックスを 1 段足したら、この正規表現も足すこと。**
           # `tabs_hold_` を勘定に入れ忘れて `tabs_hold_20` が名前順に落ちた
           # 事故が run 34247895418 で実際に起きている。`tabs_hold_resume_`
           # (Issue #176) でも同じ漏れをやりかけた — `hold_` の直後に数字を
           # 要求する形だと `hold_resume_20` で外れ、`_1, _10, _20, _5, _50`
-          # という文字列順になる。
+          # という文字列順になる。ページ接尾辞 (`@minimal`) を足した
+          # Issue #231 でも同じ罠があるので、**分解してからシナリオ名だけを
+          # 正規表現にかける。**
           $scenarioNames = @($scenarioNames | Sort-Object {
-            if ($_ -match '^tabs_(?:hold_(?:resume_)?)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
+            Get-PageRank (Split-GroupName $_).page
+          }, {
+            $sc = (Split-GroupName $_).scenario
+            if ($sc -match '^tabs_(?:hold_(?:resume_)?)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
           }, { $_ })
 
           $compareKeys = @(
@@ -747,8 +901,23 @@ jobs:
             }
             $lines += "計測したランナー: $env:RUNNER_CPU / $env:RUNNER_CORES 論理コア / RAM $env:RUNNER_RAM_GIB GiB。**``windows-latest`` は run ごとに別スペックのマシンが割り当てられる (§26.4 事実 2)。この行が違う run どうしの絶対値を比較してはならない。**"
             $lines += ""
-            $lines += "計測ページ: ``$env:BENCH_PAGE``。**記録済みの値 (§21〜§31) はすべて ``minimal.html`` のもの。ページが違う run の ``page_load_ms`` を並べてはならない** (ランナーが違う run の絶対値を並べてはならないのと同じ理由)。"
-            $lines += ""
+            if ($pageOrder.Count -gt 1) {
+              # Issue #231。ページを 1 run に収めたときだけ出る案内。
+              # **「同一 run 内だから比較してよい」と「表はページごとに
+              # 分けてある」を両方言う。** 前者だけだと、読み手が別ページの
+              # 行を目で並べて比べにかかる。
+              $lines += "計測ページ: ``$env:BENCH_PAGE`` (Issue #231: 同一 run 内で複数ページを計測)。**ページ間の比較はこの run の中でだけ成立する** — 機種差が混ざらないためであり、これがこの入力を足した理由そのものである (D96 決定 3)。"
+              $lines += ""
+              $lines += "⚠️ **表はページごとに分けてある。見出しの ``(ページ名)`` が違う表の行を、同じ列だからといって並べて読まないこと。** 比べるなら、同じシナリオ・違うページの表を突き合わせる。"
+              $lines += ""
+            } else {
+              $lines += "計測ページ: ``$env:BENCH_PAGE``。**記録済みの値 (§21〜§31) はすべて ``minimal.html`` のもの。ページが違う run の ``page_load_ms`` を並べてはならない** (ランナーが違う run の絶対値を並べてはならないのと同じ理由)。"
+              $lines += ""
+            }
+            if (-not [string]::IsNullOrWhiteSpace($env:BENCH_FIXTURE_PAGES)) {
+              $lines += "⚠️ **``$env:BENCH_FIXTURE_PAGES`` はシナリオ専用のフィクスチャである。** ただ重いのではなく**何かをする**ページ (CPU を回す / ダウンロードを起こす / ポーリングする) なので、``page`` の選択肢には載せていない。**この行の値を §21〜§34 の「ページの重さ」の系列と並べて読まないこと** — 別の現象を重さの違いとして読むことになる。"
+              $lines += ""
+            }
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
             $lines += ""
             $lines += "片側が ``-`` の行は、**その条件ではそのメトリクスが原理的に発生しない**ことを意味する (例: ``tab_resume_ms`` は B = 予算 OFF では休止が起きないため復帰も起きない)。差と比も ``-`` にしてある — 0 として引き算すると、存在しないことを「速い」と読み違える表になるため。"
@@ -759,7 +928,12 @@ jobs:
             $baselineFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-baseline-*" })
             $compareFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-compare-*" })
             if ($baselineFiles.Count -eq 0 -or $compareFiles.Count -eq 0) { continue }
-            $lines += "#### ``$sc``"
+            $parts = Split-GroupName $sc
+            if ($parts.page) {
+              $lines += "#### ``$($parts.scenario)`` ($($parts.page))"
+            } else {
+              $lines += "#### ``$sc``"
+            }
             $lines += ""
             $lines += "| メトリクス | A の各 run の median | A 平均 | B の各 run の median | B 平均 | 差 (B-A) | 比 (B/A) |"
             $lines += "| --- | --- | ---: | --- | ---: | ---: | ---: |"
@@ -817,50 +991,68 @@ jobs:
           # とは別物である (実測で 527.9 → 666.4 MiB)。同じスケーリング
           # 表に並べると、`tabs_N` と `tabs_hold_N` を混ぜてはならない
           # (D97) のと同じ誤読を招く。
-          $tabScenarios = @($scenarioNames | Where-Object { $_ -match '^tabs_(?:hold_)?\d+$' })
-          if ($tabScenarios.Count -gt 1) {
-            $lines += "### タブ数スケーリング (Issue #197)"
-            $lines += ""
-            $lines += "``rss_total_bytes`` の平均を MiB で、``rss_process_count`` の平均をプロセス数で示す。**同一 run 内の比較なので、この表の行どうしは並べて読んでよい。**"
-            $lines += ""
-            $lines += "プロセス数の列は **休止で WebView2 のプロセスが実際に減っているか** を見るためのもの (D97 Revisit (1))。``suspend_tab`` は webview を drop するだけなので、プロセスまで消えるかは RSS だけでは区別がつかない。"
-            $lines += ""
-            $lines += "休止タブ数の列は **616.8 MiB のような着地値が背景タブを何個休止した結果か** を見るためのもの (D97 Revisit (4) / D105)。復帰の速さそのものは別メトリクス ``tab_resume_ms`` が対象であり、この表では扱わない。"
-            $lines += ""
-            $lines += "⚠️ ``tabs_N`` と ``tabs_hold_N`` は**測定条件が違う** (前者は回収が終わる前に測る。D97)。同じ表に並んでも、**系統をまたいで比較してはならない。**"
-            $lines += ""
-            $lines += "| シナリオ | A (既定) MiB | B (compare_env) MiB | 差 (MiB) | 比 (B/A) | A プロセス数 | B プロセス数 | A 休止タブ数 | B 休止タブ数 |"
-            $lines += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
-            foreach ($sc in $tabScenarios) {
-              $baselineFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-baseline-*" })
-              $compareFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-compare-*" })
-              $a = @(Get-Medians $baselineFiles "rss_total_bytes")
-              $b = @(Get-Medians $compareFiles "rss_total_bytes")
-              if ($a.Count -eq 0 -or $b.Count -eq 0) { continue }
-              $aMiB = ($a | Measure-Object -Average).Average / 1MB
-              $bMiB = ($b | Measure-Object -Average).Average / 1MB
-              $ratio = if ($aMiB -ne 0) { [math]::Round($bMiB / $aMiB, 3) } else { "n/a" }
-              # プロセス数・休止タブ数はどちらも欠損しうる (古い結果ファイル)
-              # ので、その場合は表に "-" を置いて RSS の行そのものは落とさない。
-              $aProc = @(Get-Medians $baselineFiles "rss_process_count")
-              $bProc = @(Get-Medians $compareFiles "rss_process_count")
-              $aProcText = if ($aProc.Count -gt 0) {
-                [math]::Round(($aProc | Measure-Object -Average).Average, 1)
-              } else { "-" }
-              $bProcText = if ($bProc.Count -gt 0) {
-                [math]::Round(($bProc | Measure-Object -Average).Average, 1)
-              } else { "-" }
-              $aSuspended = @(Get-Medians $baselineFiles "suspended_tab_count")
-              $bSuspended = @(Get-Medians $compareFiles "suspended_tab_count")
-              $aSuspendedText = if ($aSuspended.Count -gt 0) {
-                [math]::Round(($aSuspended | Measure-Object -Average).Average, 0)
-              } else { "-" }
-              $bSuspendedText = if ($bSuspended.Count -gt 0) {
-                [math]::Round(($bSuspended | Measure-Object -Average).Average, 0)
-              } else { "-" }
-              $lines += "| $sc | $([math]::Round($aMiB, 1)) | $([math]::Round($bMiB, 1)) | $([math]::Round($bMiB - $aMiB, 1)) | $ratio | $aProcText | $bProcText | $aSuspendedText | $bSuspendedText |"
+          #
+          # ⚠️ **ページをまたいだ行を 1 つの表に並べない** (Issue #231)。
+          # 同一 run 内ならページ差は機種差を含まないので比較できるが、
+          # `tabs_N` と `tabs_hold_N` を混ぜない (D97) のと同じ理由で、
+          # **測定条件が違う系統を同じ表の行として並べると誤読を生む** —
+          # RSS の絶対値はページの重さで動くので、タブ数スケーリングの
+          # 傾きを読む表にページの違う行が混ざると傾きが読めなくなる。
+          # そこでページごとに表を分ける。
+          $tabScenarios = @($scenarioNames |
+            Where-Object { (Split-GroupName $_).scenario -match '^tabs_(?:hold_)?\d+$' })
+          $tabPages = @($tabScenarios | ForEach-Object { (Split-GroupName $_).page } |
+            Select-Object -Unique | Sort-Object { Get-PageRank $_ })
+          foreach ($tabPage in $tabPages) {
+            $tabScenariosOnPage = @($tabScenarios | Where-Object { (Split-GroupName $_).page -eq $tabPage })
+            if ($tabScenariosOnPage.Count -gt 1) {
+              if ($tabPage) {
+                $lines += "### タブ数スケーリング — $tabPage (Issue #197 / #231)"
+              } else {
+                $lines += "### タブ数スケーリング (Issue #197)"
+              }
+              $lines += ""
+              $lines += "``rss_total_bytes`` の平均を MiB で、``rss_process_count`` の平均をプロセス数で示す。**同一 run 内の比較なので、この表の行どうしは並べて読んでよい。**"
+              $lines += ""
+              $lines += "プロセス数の列は **休止で WebView2 のプロセスが実際に減っているか** を見るためのもの (D97 Revisit (1))。``suspend_tab`` は webview を drop するだけなので、プロセスまで消えるかは RSS だけでは区別がつかない。"
+              $lines += ""
+              $lines += "休止タブ数の列は **616.8 MiB のような着地値が背景タブを何個休止した結果か** を見るためのもの (D97 Revisit (4) / D105)。復帰の速さそのものは別メトリクス ``tab_resume_ms`` が対象であり、この表では扱わない。"
+              $lines += ""
+              $lines += "⚠️ ``tabs_N`` と ``tabs_hold_N`` は**測定条件が違う** (前者は回収が終わる前に測る。D97)。同じ表に並んでも、**系統をまたいで比較してはならない。**"
+              $lines += ""
+              $lines += "| シナリオ | A (既定) MiB | B (compare_env) MiB | 差 (MiB) | 比 (B/A) | A プロセス数 | B プロセス数 | A 休止タブ数 | B 休止タブ数 |"
+              $lines += "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+              foreach ($sc in $tabScenariosOnPage) {
+                $baselineFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-baseline-*" })
+                $compareFiles = @($abFiles | Where-Object { $_.Name -like "$sc-windows-compare-*" })
+                $a = @(Get-Medians $baselineFiles "rss_total_bytes")
+                $b = @(Get-Medians $compareFiles "rss_total_bytes")
+                if ($a.Count -eq 0 -or $b.Count -eq 0) { continue }
+                $aMiB = ($a | Measure-Object -Average).Average / 1MB
+                $bMiB = ($b | Measure-Object -Average).Average / 1MB
+                $ratio = if ($aMiB -ne 0) { [math]::Round($bMiB / $aMiB, 3) } else { "n/a" }
+                # プロセス数・休止タブ数はどちらも欠損しうる (古い結果ファイル)
+                # ので、その場合は表に "-" を置いて RSS の行そのものは落とさない。
+                $aProc = @(Get-Medians $baselineFiles "rss_process_count")
+                $bProc = @(Get-Medians $compareFiles "rss_process_count")
+                $aProcText = if ($aProc.Count -gt 0) {
+                  [math]::Round(($aProc | Measure-Object -Average).Average, 1)
+                } else { "-" }
+                $bProcText = if ($bProc.Count -gt 0) {
+                  [math]::Round(($bProc | Measure-Object -Average).Average, 1)
+                } else { "-" }
+                $aSuspended = @(Get-Medians $baselineFiles "suspended_tab_count")
+                $bSuspended = @(Get-Medians $compareFiles "suspended_tab_count")
+                $aSuspendedText = if ($aSuspended.Count -gt 0) {
+                  [math]::Round(($aSuspended | Measure-Object -Average).Average, 0)
+                } else { "-" }
+                $bSuspendedText = if ($bSuspended.Count -gt 0) {
+                  [math]::Round(($bSuspended | Measure-Object -Average).Average, 0)
+                } else { "-" }
+                $lines += "| $((Split-GroupName $sc).scenario) | $([math]::Round($aMiB, 1)) | $([math]::Round($bMiB, 1)) | $([math]::Round($bMiB - $aMiB, 1)) | $ratio | $aProcText | $bProcText | $aSuspendedText | $bSuspendedText |"
+              }
+              $lines += ""
             }
-            $lines += ""
           }
 
           $summary = $lines -join "`n"
@@ -871,7 +1063,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: velox-perf-windows-${{ inputs.scenarios != '' && 'multi' || (inputs.scenario || 'cold_startup') }}
+          # `scenarios` と `pages` はどちらも「1 run に複数の計測を収める」
+          # 入力なので、**どちらが指定されていても `multi` にする**
+          # (Issue #231 のレビュー指摘)。`pages` だけを指定した run が
+          # `velox-perf-windows-cold_startup` という名前で残ると、
+          # artifact 名から複数ページ run だと読み取れない。
+          name: velox-perf-windows-${{ (inputs.scenarios != '' || inputs.pages != '') && 'multi' || (inputs.scenario || 'cold_startup') }}
           path: |
             results/
             diag/

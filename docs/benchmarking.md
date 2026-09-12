@@ -541,8 +541,34 @@ Windows では不要になる (Windows には Xvfb/D-Bus セッションバス�
 | 入力 | 意味 | 既定 |
 | --- | --- | --- |
 | `scenario` | `velox-bench list-scenarios` の一覧から選ぶシナリオ ID | `cold_startup` |
+| `scenarios` | 複数シナリオを 1 run で続けて計測する (カンマ区切り)。指定すると `scenario` より優先される | (空) |
 | `trials` | 試行回数 | `10` |
-| `url` | 計測対象ページの URL。空欄なら `scripts/bench/pages/` の固定ページ (`minimal.html`) を loopback 配信して使う (Linux の `perf-gate.yml` と同じ「ネットワーク非依存の固定ページで測る」方針) | (空、固定ページを使用) |
+| `compare_env` | A/B 比較の B 条件で追加する環境変数 (`KEY=VALUE`、複数はセミコロン区切り)。空欄なら A 条件だけを 1 回計測する | `VELOX_MEMORY_BUDGET_MB=0` |
+| `common_env` | A/B の両方に共通で設定する環境変数。測定条件を成立させるための設定に使う | (空) |
+| `repeats` | A/B のペアを何回繰り返すか | `2` |
+| `page` | loopback で配信する `scripts/bench/pages/` の固定ページ | `minimal.html` |
+| `pages` | 複数ページを 1 run で続けて計測する (カンマ区切り)。指定すると `page` より優先される | (空) |
+| `url` | 計測対象ページの URL。空欄なら `scripts/bench/pages/` の固定ページ (`page` / `pages`) を loopback 配信して使う (Linux の `perf-gate.yml` と同じ「ネットワーク非依存の固定ページで測る」方針)。指定すると `page` / `pages` は無視される | (空、固定ページを使用) |
+
+**`scenarios` と `pages` は同じ問題への同じ答えである** (Issue #197 /
+Issue #231、D96 決定 3)。`windows-latest` は run ごとに別スペックのマシンを
+割り当てるため、**run をまたいだ絶対値の比較は成立しない。** 複数のタブ数を
+比べたいなら `scenarios` で、複数のページを比べたいなら `pages` で、
+**同じ 1 つの run の中に収める**しかない。
+
+両方を同時に指定すると「ページ × シナリオ」のすべての組を順に計測する。
+実行時間はその積に比例し、ジョブには `timeout-minutes: 30` があるので、
+組合せを増やすときは `trials` / `repeats` を下げること
+(`tabs_hold_resume_N` は `trials: 2` / `repeats: 2` が上限の目安 —
+`docs/performance-targets.md` §33.1)。
+
+複数ページを指定したときだけ、結果ファイル名にページ名が入る
+(`tabs_hold_20@dom_heavy-windows-baseline-1.json`)。**1 ページのときの
+ファイル名は従来のまま**で、§21〜§33 が名前で参照している結果との対応は
+崩れない。Job Summary の表も**ページごとに分かれる** — 同一 run 内なので
+ページ間の比較は成立するが、行を 1 つの表に混ぜると RSS の絶対値がページの
+重さで動く分だけタブ数スケーリングの傾きが読めなくなるため
+(`tabs_N` と `tabs_hold_N` を混ぜない D97 と同じ理由)。
 
 実行が終わると、結果 JSON (`velox-bench run --output` の出力そのもの、
 `aggregate`/`compare`/`gate` にそのままかけられる形式) と実行環境の情報
