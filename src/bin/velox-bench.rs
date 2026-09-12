@@ -98,8 +98,18 @@ gate の終了コード: 0=OK, 1=FAIL (CIをブロックすべき), 3=WARN (非�
 // ---------------------------------------------------------------------
 
 fn cmd_list_scenarios() -> Result<i32, String> {
-    println!("{:<16} 自動実行 (run)", "scenario");
-    for scenario in Scenario::all() {
+    let scenarios = Scenario::all();
+    // 列幅は実際の ID から決める。固定値 (以前は 16) だと、それより
+    // 長い ID を持つシナリオが増えた時点で列が崩れる —
+    // `tabs_hold_resume_50` (19 文字、Issue #176) で実際に崩れた。
+    let width = scenarios
+        .iter()
+        .map(|scenario| scenario.id().chars().count())
+        .chain(std::iter::once("scenario".chars().count()))
+        .max()
+        .unwrap_or(16);
+    println!("{:<width$} 自動実行 (run)", "scenario");
+    for scenario in scenarios {
         // Every scenario is unattended as of Issue #112 (see
         // `Scenario::is_unattended`'s doc comment); what differs is
         // whether `run` needs `--url` to build a
@@ -109,7 +119,7 @@ fn cmd_list_scenarios() -> Result<i32, String> {
         } else {
             "可 (run で自動実行可能)"
         };
-        println!("{:<16} {}", scenario.id(), note);
+        println!("{:<width$} {}", scenario.id(), note);
     }
     Ok(0)
 }
