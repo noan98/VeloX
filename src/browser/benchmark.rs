@@ -846,6 +846,25 @@ pub struct BenchmarkResult {
     /// Scenario identifier, e.g. `"cold_startup"`, `"tabs_5"` — see
     /// [`scenario::Scenario::id`].
     pub scenario: String,
+    /// The page every trial loaded (`velox-bench run --url`), recorded
+    /// verbatim (Issue #176).
+    ///
+    /// **なぜ必要か**: シナリオ ID は「何を測ったか」しか表さず、**どの
+    /// ページで測ったかを表さない。** `scripts/bench/pages/` には
+    /// `minimal.html` (229 バイト) と `dom_heavy.html` (99 KB) の両方が
+    /// あり、`page_load_ms` はこの差で桁が変わりうる。ところが結果 JSON は
+    /// 両者を区別できず、**同じ `scenario` の値として並ぶ。**
+    ///
+    /// これは D104 が機種情報について解決したのと同じ形の問題である
+    /// (「`environment-info.md` に別立てで保存しているだけで、機械的に
+    /// 突き合わせられない」)。§21〜§31 の記録済みの値はすべて
+    /// `minimal.html` のものなので、重いページで測った結果がそれと同じ
+    /// 顔をして並ぶと、比較してはいけないものを比較することになる。
+    ///
+    /// `None` はこのフィールドが無かった頃に書かれた結果か、URL を必要と
+    /// しない起動系 3 シナリオ (`--url` 省略可) である。
+    #[serde(default)]
+    pub url: Option<String>,
     pub environment: RunEnvironment,
     /// One entry per [`MetricKey`] that had at least one sample, keyed by
     /// [`MetricKey::as_str`].
@@ -1585,6 +1604,7 @@ mod gate_tests {
     fn result_with_stats(scenario: &str, metrics: &[(&str, Stats)]) -> BenchmarkResult {
         BenchmarkResult {
             scenario: scenario.to_owned(),
+            url: None,
             environment: RunEnvironment {
                 os: "linux".to_owned(),
                 cpu_count: 4,
@@ -3222,11 +3242,52 @@ mod tests {
         assert_eq!(restored, env);
     }
 
+    // -- BenchmarkResult: 計測ページの記録 (Issue #176) ------------------
+
+    /// `url` を追加する前に保存された結果ファイルはこのキーを持たない。
+    /// `#[serde(default)]` により `None` へ落ち、**既存の
+    /// `results/baseline/` / `results/history/` が読めなくならない**ことを
+    /// 確認する (D104 が機種情報について同じ保証を置いたのと同じ理由)。
+    #[test]
+    fn benchmark_result_deserializes_without_url() {
+        let json = r#"{
+            "scenario": "tabs_hold_20",
+            "environment": {
+                "os": "windows",
+                "cpu_count": 4,
+                "git_commit": "abc123",
+                "generated_at": "2026-09-01T00:00:00Z",
+                "trials": 2
+            },
+            "metrics": {}
+        }"#;
+        let result: BenchmarkResult = serde_json::from_str(json).unwrap();
+        assert_eq!(result.scenario, "tabs_hold_20");
+        assert_eq!(result.url, None);
+    }
+
+    /// 記録したページがラウンドトリップで保たれること。**ここが壊れると
+    /// 「どのページで測ったか」が静かに失われ、`minimal.html` と
+    /// `dom_heavy.html` の結果が区別できなくなる。**
+    #[test]
+    fn benchmark_result_roundtrips_with_url() {
+        let mut result = result_with("tabs_hold_resume_20", &[("tab_resume_ms", 119.4)]);
+        result.url = Some("http://127.0.0.1:8731/dom_heavy.html".to_owned());
+        let json = serde_json::to_string(&result).unwrap();
+        let restored: BenchmarkResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, result);
+        assert_eq!(
+            restored.url.as_deref(),
+            Some("http://127.0.0.1:8731/dom_heavy.html")
+        );
+    }
+
     // -- compare -------------------------------------------------------
 
     fn result_with(scenario: &str, metrics: &[(&str, f64)]) -> BenchmarkResult {
         BenchmarkResult {
             scenario: scenario.to_owned(),
+            url: None,
             environment: RunEnvironment {
                 os: "linux".to_owned(),
                 cpu_count: 8,

@@ -153,8 +153,16 @@ on:
         description: "A/B のペアを何回繰り返すか (compare_env が空のときは無視される)"
         type: string
         default: "2"
+      page:
+        description: "loopback で配信する scripts/bench/pages/ の固定ページ。ページの重さで page_load_ms は桁が変わるので、記録済みの値 (§21〜§31 はすべて minimal.html) と比べるときは必ず揃えること。url を指定した場合は無視される"
+        type: choice
+        default: minimal.html
+        options:
+          - minimal.html
+          - dom_heavy.html
+          - text.html
       url:
-        description: "計測対象ページの URL。空欄なら scripts/bench/pages/minimal.html を loopback 配信して使う"
+        description: "計測対象ページの URL。空欄なら scripts/bench/pages/ の固定ページ (上の page) を loopback 配信して使う"
         type: string
         default: ""
   # この workflow 自身を変更する PR でのみ実行して検証する (docs/
@@ -271,12 +279,22 @@ jobs:
         shell: pwsh
         run: |
           $url = "${{ inputs.url }}"
+          # ⚠️ `inputs.*` は workflow_dispatch 以外のイベント (schedule /
+          # pull_request) では**常に空文字列**になる (GitHub の仕様、D106
+          # で実際に踏んだ罠)。既定値をここで補わないと、週次実行と自己
+          # テストが「ページ未指定」で落ちる。
+          $page = "${{ inputs.page }}"
+          if ([string]::IsNullOrWhiteSpace($page)) { $page = "minimal.html" }
           if ([string]::IsNullOrWhiteSpace($url)) {
-            "url=http://127.0.0.1:8731/minimal.html" >> $env:GITHUB_OUTPUT
+            "url=http://127.0.0.1:8731/$page" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
+            "page=$page" >> $env:GITHUB_OUTPUT
           } else {
             "url=$url" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=false" >> $env:GITHUB_OUTPUT
+            # 外部 URL を渡した場合、`page` 入力は使われない。表示も
+            # 「固定ページのどれか」ではなく URL そのものにする。
+            "page=$url" >> $env:GITHUB_OUTPUT
           }
 
       # ⚠️ ここは以前 `Start-Sleep -Seconds 2` の固定待ちだった。run
@@ -590,6 +608,11 @@ jobs:
           RUNNER_CPU: ${{ steps.env_info.outputs.cpu }}
           RUNNER_CORES: ${{ steps.env_info.outputs.cores }}
           RUNNER_RAM_GIB: ${{ steps.env_info.outputs.ram_gib }}
+          # Issue #176。**どのページで測ったかは数値の意味を変える** —
+          # とくに page_load_ms は minimal.html (229 バイト) と
+          # dom_heavy.html (99 KB) で桁が変わりうる。ランナー情報と同じ
+          # 理由 (D96: 条件が違う数値を並べさせない) でサマリに出す。
+          BENCH_PAGE: ${{ steps.bench_url.outputs.page }}
         run: |
           $ErrorActionPreference = "Continue"
           $files = @(Get-ChildItem -Path results -Filter "*-windows*.json" -ErrorAction SilentlyContinue |
@@ -723,6 +746,8 @@ jobs:
               $lines += ""
             }
             $lines += "計測したランナー: $env:RUNNER_CPU / $env:RUNNER_CORES 論理コア / RAM $env:RUNNER_RAM_GIB GiB。**``windows-latest`` は run ごとに別スペックのマシンが割り当てられる (§26.4 事実 2)。この行が違う run どうしの絶対値を比較してはならない。**"
+            $lines += ""
+            $lines += "計測ページ: ``$env:BENCH_PAGE``。**記録済みの値 (§21〜§31) はすべて ``minimal.html`` のもの。ページが違う run の ``page_load_ms`` を並べてはならない** (ランナーが違う run の絶対値を並べてはならないのと同じ理由)。"
             $lines += ""
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
             $lines += ""
