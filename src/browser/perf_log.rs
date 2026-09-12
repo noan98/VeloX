@@ -159,6 +159,8 @@ mod tests {
                 total_pss_bytes: None,
                 pss_process_count: 0,
                 total_cpu_seconds: None,
+                browser_rss_bytes: 0,
+                engine_rss_bytes: 0,
             }),
             Duration::from_millis(10),
         );

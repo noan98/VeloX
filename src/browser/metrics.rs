@@ -449,6 +449,33 @@ pub struct RssSample {
     /// which can make a delta *negative*; callers must clamp rather than
     /// assume monotonicity.
     pub total_cpu_seconds: Option<f64>,
+    /// RSS of the **root process alone** — VeloX's own process, i.e. the
+    /// Rust heap plus `tao`'s window and whatever the engine keeps
+    /// in-process (Issue #176 Stage 1).
+    ///
+    /// **This is the "Rust heap vs engine" split**, and it is exact on
+    /// every platform because it keys on the pid the sampler was given, not
+    /// on a process name. `total_rss_bytes = browser_rss_bytes +
+    /// engine_rss_bytes` always holds.
+    ///
+    /// ⚠️ **"root process" is not "everything VeloX allocated".** Both
+    /// engines put page content in *other* processes, and some of what
+    /// those hold was requested by VeloX. The split answers "how much of
+    /// the footprint is outside the engine's content processes", which is
+    /// the question #176 needs (see D118), not "how much did Rust
+    /// `malloc`".
+    pub browser_rss_bytes: u64,
+    /// RSS of every process in the tree **except** the root — the engine's
+    /// content/network/GPU processes (Issue #176 Stage 1).
+    ///
+    /// Not broken down further by role. On Linux/WebKitGTK the process
+    /// names would allow it (`WebKitWebProcess` / `WebKitNetworkProcess` /
+    /// `WebKitGPUProcess`), but **on Windows — the priority OS — WebView2
+    /// runs every role under the same `msedgewebview2.exe`**, and the role
+    /// only appears in the command line, which the process-tree snapshot
+    /// does not carry. See D118 for why a partial, Linux-only breakdown was
+    /// not worth the asymmetry.
+    pub engine_rss_bytes: u64,
 }
 
 impl fmt::Display for RssSample {
@@ -586,8 +613,19 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
     let mut pss_process_count = 0usize;
     let mut total_cpu_seconds = 0.0f64;
     let mut cpu_process_count = 0usize;
-    for info in tree.iter().filter_map(|pid| processes.get(pid)) {
+    // Issue #176 Stage 1: split the root process off from its descendants.
+    // Keying on the pid the caller gave us (rather than on a process name)
+    // makes this exact and identical on every platform — see
+    // `RssSample::browser_rss_bytes`.
+    let mut browser_rss_bytes = 0u64;
+    for (pid, info) in tree
+        .iter()
+        .filter_map(|pid| processes.get(pid).map(|info| (*pid, info)))
+    {
         total_rss_bytes += info.rss_bytes;
+        if pid == root_pid {
+            browser_rss_bytes = info.rss_bytes;
+        }
         if let Some(pss) = info.pss_bytes {
             total_pss_bytes += pss;
             pss_process_count += 1;
@@ -604,6 +642,12 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
         total_pss_bytes: (pss_process_count > 0).then_some(total_pss_bytes),
         pss_process_count,
         total_cpu_seconds: (cpu_process_count > 0).then_some(total_cpu_seconds),
+        browser_rss_bytes,
+        // Saturating rather than `-`: the two are summed in the same loop
+        // so `browser <= total` always holds, but a future edit that breaks
+        // that invariant should give a wrong-looking 0 rather than panic in
+        // a metrics sampler.
+        engine_rss_bytes: total_rss_bytes.saturating_sub(browser_rss_bytes),
     })
 }
 
@@ -1140,6 +1184,20 @@ impl PerfRecord {
                 fields.insert(
                     "total_cpu_seconds".to_owned(),
                     json!(sample.total_cpu_seconds),
+                );
+                // Issue #176 Stage 1. Appended after the existing keys, never
+                // inserted among them — same rule D42 followed when it added
+                // the PSS fields, so a consumer matching the old shape keeps
+                // working. Both are plain `u64` (not `Option`): the split is
+                // exact whenever the tree could be walked at all, because it
+                // keys on the root pid rather than on a process name.
+                fields.insert(
+                    "browser_rss_bytes".to_owned(),
+                    json!(sample.browser_rss_bytes),
+                );
+                fields.insert(
+                    "engine_rss_bytes".to_owned(),
+                    json!(sample.engine_rss_bytes),
                 );
             }
             PerfRecord::Ipc {
@@ -2215,6 +2273,83 @@ MemAvailable:    8901234 kB
         assert_eq!(sample.total_rss_bytes, 999);
     }
 
+    // -- RSS: VeloX 自身とエンジンの分離 (Issue #176 Stage 1 / D118) ----
+
+    /// `ProcInfo` を短く書くための補助。RSS 以外は本節の主題ではない。
+    fn proc_with_rss(ppid: u32, rss_bytes: u64) -> ProcInfo {
+        ProcInfo {
+            ppid,
+            rss_bytes,
+            pss_bytes: None,
+            cpu_seconds: None,
+        }
+    }
+
+    #[test]
+    fn build_sample_splits_the_root_process_from_its_descendants() {
+        // 1 (root, VeloX 自身) -> 2 -> 3、および無関係な 4。
+        let mut processes = HashMap::new();
+        processes.insert(1, proc_with_rss(0, 1000));
+        processes.insert(2, proc_with_rss(1, 2000));
+        processes.insert(3, proc_with_rss(2, 3000));
+        processes.insert(4, proc_with_rss(0, 4000)); // ツリー外
+
+        let sample = build_sample(1, &processes).unwrap();
+        assert_eq!(sample.browser_rss_bytes, 1000, "root のみ");
+        assert_eq!(sample.engine_rss_bytes, 5000, "子孫の合計 (ツリー外は除く)");
+    }
+
+    #[test]
+    fn the_browser_engine_split_always_adds_up_to_the_total() {
+        // **本分割の中心的な不変条件。** 片方だけを別経路で足し引きする
+        // 実装に変えると、内訳の合計が総量と食い違い、表を読む側が
+        // 「どこかに消えたメモリがある」と誤読する。
+        let mut processes = HashMap::new();
+        processes.insert(10, proc_with_rss(0, 7));
+        processes.insert(11, proc_with_rss(10, 13));
+        processes.insert(12, proc_with_rss(11, 29));
+
+        let sample = build_sample(10, &processes).unwrap();
+        assert_eq!(
+            sample.browser_rss_bytes + sample.engine_rss_bytes,
+            sample.total_rss_bytes
+        );
+    }
+
+    #[test]
+    fn a_root_with_no_children_puts_everything_on_the_browser_side() {
+        // エンジンがまだ 1 プロセスも起動していない瞬間 (起動直後など)。
+        // ここで `engine_rss_bytes` が 0 になるのは「測れなかった」では
+        // なく「本当に無い」である。
+        let mut processes = HashMap::new();
+        processes.insert(5, proc_with_rss(0, 999));
+
+        let sample = build_sample(5, &processes).unwrap();
+        assert_eq!(sample.browser_rss_bytes, 999);
+        assert_eq!(sample.engine_rss_bytes, 0);
+        assert_eq!(sample.total_rss_bytes, 999);
+    }
+
+    #[test]
+    fn the_split_keys_on_the_root_pid_not_on_tree_position() {
+        // 同じプロセス集合でも、どの pid を root として渡したかで分割が
+        // 変わる。**プロセス名に依存しない**というのが D118 決定1 の要点
+        // で、その裏返しとして「root として渡した pid が VeloX 自身で
+        // なければ意味のない数字になる」ことも固定しておく。
+        let mut processes = HashMap::new();
+        processes.insert(1, proc_with_rss(0, 100));
+        processes.insert(2, proc_with_rss(1, 200));
+        processes.insert(3, proc_with_rss(2, 400));
+
+        let from_root = build_sample(1, &processes).unwrap();
+        assert_eq!(from_root.browser_rss_bytes, 100);
+        assert_eq!(from_root.engine_rss_bytes, 600);
+
+        let from_middle = build_sample(2, &processes).unwrap();
+        assert_eq!(from_middle.browser_rss_bytes, 200);
+        assert_eq!(from_middle.engine_rss_bytes, 400);
+    }
+
     #[test]
     fn build_sample_errors_for_unknown_root() {
         let processes = HashMap::new();
@@ -2337,6 +2472,8 @@ MemAvailable:    8901234 kB
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 3,
             total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
         };
         assert_eq!(
             sample.to_string(),
@@ -2353,6 +2490,8 @@ MemAvailable:    8901234 kB
             total_pss_bytes: None,
             pss_process_count: 0,
             total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
         };
         assert_eq!(
             sample.to_string(),
@@ -2484,6 +2623,8 @@ MemAvailable:    8901234 kB
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 3,
             total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
         };
         let expected = sample.to_string();
         assert_eq!(PerfRecord::rss(sample).to_text(), expected);
@@ -2515,6 +2656,8 @@ MemAvailable:    8901234 kB
             total_pss_bytes: None,
             pss_process_count: 0,
             total_cpu_seconds: cpu,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
         };
         // 2 CPU-seconds over 1 second of wall time = two cores busy.
         let percent = PerfRecord::cpu_percent_between(
@@ -2702,6 +2845,8 @@ MemAvailable:    8901234 kB
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 2,
             total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         assert_eq!(value["pid"], 42);
@@ -2720,6 +2865,8 @@ MemAvailable:    8901234 kB
             total_pss_bytes: None,
             pss_process_count: 0,
             total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         // `null`, not an absent key — a consumer must be able to tell

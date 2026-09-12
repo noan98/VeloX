@@ -205,6 +205,8 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | (集計対象の境界) | `measure_start` | フィールド無し。`mark` コマンドが書き込むマーカーで、これより前のイベントは集計から捨てられる (Issue #60) |
 | `rss_total_bytes` | `rss` | `total_rss_bytes` |
 | `rss_process_count` | `rss` | `process_count` |
+| `rss_browser_bytes` | `rss` | `browser_rss_bytes` |
+| `rss_engine_bytes` | `rss` | `engine_rss_bytes` |
 | `pss_total_bytes` | `rss` | `total_pss_bytes` |
 | `pss_process_count` | `rss` | `pss_process_count` |
 
@@ -216,6 +218,24 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 `docs/performance-targets.md` §24.2 にある。また `startup_toolbar_ready_ms`
 と `startup_first_load_ms` は独立した経路から来るため**順序が保証されず**、
 この 2 つの差は区間として読んではいけない (D92)。
+
+`rss_browser_bytes` / `rss_engine_bytes` は `rss_total_bytes` を 2 つに
+割ったもので (Issue #176 Stage 1 / D118)、**合計は必ず `rss_total_bytes` と
+一致します。** 分割の基準は**サンプラに渡した root pid** — つまり VeloX
+自身のプロセスか、その子孫 (エンジンのコンテンツ / ネットワーク / GPU
+プロセス) か — であって、プロセス名ではありません。したがって OS にもエンジン
+にも依らず同じ意味になります。
+
+休止はエンジンのプロセスを落とす操作なので、**予算が効いていれば
+`rss_engine_bytes` が動き、`rss_browser_bytes` はほぼ動かないはず**です。
+そうなっていない A/B は、予算とは別の何かが動いていることを意味します。
+
+⚠️ `rss_browser_bytes` は「Rust が確保した量」ではありません。root プロセスの
+RSS には `tao` のウィンドウやエンジンがプロセス内に置くものも含まれます
+(D118 決定3)。ロール別 (WebProcess / NetworkProcess / GPU) の細分は
+**実装していません** — Windows の WebView2 は全ロールを同じ
+`msedgewebview2.exe` で動かし、ロールはコマンドラインにしか現れないためです
+(D118 決定2)。
 
 **`pss_total_bytes` (Issue #108 / D42), not `rss_total_bytes`, is the metric
 to use when comparing memory footprint across builds or against another

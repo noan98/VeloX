@@ -858,6 +858,14 @@ jobs:
             "startup_first_load_ms",
             "page_load_ms",
             "rss_total_bytes",
+            # Issue #176 Stage 1 / D118。**VeloX 自身とエンジンの内訳。**
+            # `rss_total_bytes` がどちらの側で動いたのかは総量だけでは
+            # 分からない — 休止はエンジンのプロセスを落とす操作なので、
+            # 効いていれば `rss_engine_bytes` が動き `rss_browser_bytes` は
+            # ほぼ変わらないはずである。そうなっていない A/B は、予算とは
+            # 別の何かが動いている。
+            "rss_browser_bytes",
+            "rss_engine_bytes",
             # D97 Revisit condition (1)。**「休止で WebView2 のプロセスが
             # 実際に減っているか」**を見るための鍵。suspend_tab は
             # tab.webview.take() で webview を drop するだけなので、
