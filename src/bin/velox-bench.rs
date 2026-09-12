@@ -1001,17 +1001,21 @@ fn parse_cpu_model_from_proc_cpuinfo(contents: &str) -> Option<String> {
     })
 }
 
-/// `/proc/meminfo` の `MemTotal:` 行 (kB 単位) からバイト単位の総メモリ量
-/// を取り出す。
+/// `/proc/meminfo` の `MemTotal:` 行からバイト単位の総メモリ量を取り出す。
+///
+/// **実装は `browser::metrics::parse_mem_total_bytes` に一本化した**
+/// (Issue #176 / D93 案 B)。以前はここに独自のパーサがあったが、同じ
+/// ファイルの同じ行を 2 か所で解釈していると、**片方だけ直したときに
+/// 機種情報 (D104) とメモリ予算が違う値を見る**ことになる。
+///
+/// 移譲にあたり挙動が 2 点変わっている。どちらも本関数の利用者
+/// (結果 JSON の `total_memory_bytes`) にとっては安全側である:
+///
+/// - 単位が `kB` でない行を読まなくなった (以前は単位を見ずに 1024 倍
+///   していた)。
+/// - 桁あふれで `u64::MAX` に飽和せず `None` を返すようになった。
 fn parse_total_memory_bytes_from_proc_meminfo(contents: &str) -> Option<u64> {
-    contents.lines().find_map(|line| {
-        let (key, value) = line.split_once(':')?;
-        if key.trim() != "MemTotal" {
-            return None;
-        }
-        let kb: u64 = value.split_whitespace().next()?.parse().ok()?;
-        Some(kb.saturating_mul(1024))
-    })
+    velox::browser::metrics::parse_mem_total_bytes(contents)
 }
 
 /// Windows: `.github/workflows/perf-windows.yml` の "Record environment
@@ -1245,6 +1249,22 @@ MemFree:         1234567 kB
         assert_eq!(
             parse_total_memory_bytes_from_proc_meminfo("MemFree: 1234 kB\n"),
             None
+        );
+    }
+
+    #[test]
+    fn total_memory_bytes_delegates_to_the_shared_parser() {
+        // Issue #176 / D93 案 B で `browser::metrics` へ一本化した。
+        // **委譲が外れてローカル実装に戻ったら気付けるように**、共有
+        // パーサ側でしか通らない挙動 (単位を検査する) をここで確かめる。
+        assert_eq!(
+            parse_total_memory_bytes_from_proc_meminfo("MemTotal: 16336864\n"),
+            None,
+            "単位の無い行を 1024 倍してはならない"
+        );
+        assert_eq!(
+            parse_total_memory_bytes_from_proc_meminfo("MemTotal: 4 kB\n"),
+            velox::browser::metrics::parse_mem_total_bytes("MemTotal: 4 kB\n"),
         );
     }
 
