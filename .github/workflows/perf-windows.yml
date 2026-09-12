@@ -313,6 +313,14 @@ jobs:
             $pageList = @($page)
           }
 
+          # シナリオ専用のフィクスチャ。**汎用の計測対象ページではない**
+          # ので `page` の choice には載せていない (`background_cpu` は
+          # `busy.html` を `?idle=1` 付きで読む、など)。
+          # `.github/scripts/test_perf_windows_inputs.py` が、この一覧と
+          # choice の一覧が食い違わないことを検査する。
+          $fixturePages = @("busy.html", "download.html", "network_activity.html")
+          $usedFixtures = @()
+
           if ([string]::IsNullOrWhiteSpace($url)) {
             # **ファイル名として安全な字だけを通す。** ここは URL の組み立てと
             # 結果ファイル名の両方に使われるので、`..` やスラッシュを通すと
@@ -328,11 +336,30 @@ jobs:
               if (-not (Test-Path "scripts\bench\pages\$p")) {
                 throw "scripts/bench/pages/$p が存在しません (指定できるのは固定ページのファイル名です)"
               }
+              # Issue #231 のレビュー指摘。`page` (choice) は**シナリオ専用
+              # フィクスチャを意図的に載せていない**が、`pages` は自由記述
+              # なので同じ制約が効かない。
+              #
+              # **ここで弾きはしない。** `url` を指定すると loopback 配信
+              # 自体が止まる (`serve_fixed_pages=false`) ため、弾くと
+              # 「busy.html を 20 タブ開いたときのメモリを測る」のような
+              # 正当な計測に逃げ道が無くなる。
+              #
+              # 危ないのは**結果の読み違え**の方である。これらのページは
+              # ただ重いのではなく**何かをする** (CPU を回す / ダウンロード
+              # を起こす / ポーリングする) ので、§21〜§34 の「ページの重さ」
+              # の系列と同じ表に並ぶと、別の現象を重さの違いとして読んで
+              # しまう。そこで Job Summary に出る警告を残す。
+              if ($fixturePages -contains $p) {
+                Write-Host "::warning::'$p' はシナリオ専用のフィクスチャです (ただ重いのではなく、CPU を回す・ダウンロードを起こす等の動作をします)。ページの重さの比較として読まないでください"
+                $usedFixtures += $p
+              }
             }
             "url=http://127.0.0.1:8731/$($pageList[0])" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
             "page=$($pageList -join ', ')" >> $env:GITHUB_OUTPUT
             "pages=$($pageList -join ',')" >> $env:GITHUB_OUTPUT
+            "fixture_pages=$($usedFixtures -join ', ')" >> $env:GITHUB_OUTPUT
           } else {
             # 外部 URL を渡した場合、`page` / `pages` 入力は使われない。
             # 表示も「固定ページのどれか」ではなく URL そのものにする。
@@ -343,6 +370,7 @@ jobs:
             # (loopback 配信の固定ページと違い、外部 URL は比較の前提が
             # 揃っているとは限らないため)。
             "pages=" >> $env:GITHUB_OUTPUT
+            "fixture_pages=" >> $env:GITHUB_OUTPUT
           }
 
       # ⚠️ ここは以前 `Start-Sleep -Seconds 2` の固定待ちだった。run
@@ -702,6 +730,10 @@ jobs:
           # **入力順のまま**受け取る (アルファベット順に並べ替えない —
           # 指定した順に読めた方が突き合わせやすい)。
           BENCH_PAGES: ${{ steps.bench_url.outputs.pages }}
+          # Issue #231 のレビュー指摘。フィクスチャを計測対象にした run は、
+          # **その表を読む人の目の前**に注意書きを出す (ログの警告だけでは
+          # 後から表だけを見た人に届かない)。
+          BENCH_FIXTURE_PAGES: ${{ steps.bench_url.outputs.fixture_pages }}
         run: |
           $ErrorActionPreference = "Continue"
           $files = @(Get-ChildItem -Path results -Filter "*-windows*.json" -ErrorAction SilentlyContinue |
@@ -882,6 +914,10 @@ jobs:
               $lines += "計測ページ: ``$env:BENCH_PAGE``。**記録済みの値 (§21〜§31) はすべて ``minimal.html`` のもの。ページが違う run の ``page_load_ms`` を並べてはならない** (ランナーが違う run の絶対値を並べてはならないのと同じ理由)。"
               $lines += ""
             }
+            if (-not [string]::IsNullOrWhiteSpace($env:BENCH_FIXTURE_PAGES)) {
+              $lines += "⚠️ **``$env:BENCH_FIXTURE_PAGES`` はシナリオ専用のフィクスチャである。** ただ重いのではなく**何かをする**ページ (CPU を回す / ダウンロードを起こす / ポーリングする) なので、``page`` の選択肢には載せていない。**この行の値を §21〜§34 の「ページの重さ」の系列と並べて読まないこと** — 別の現象を重さの違いとして読むことになる。"
+              $lines += ""
+            }
             $lines += "**A 同士のばらつき (下表の「A の各 run」) が A/B 差と同程度なら、その差は結論にしてはならない。**"
             $lines += ""
             $lines += "片側が ``-`` の行は、**その条件ではそのメトリクスが原理的に発生しない**ことを意味する (例: ``tab_resume_ms`` は B = 予算 OFF では休止が起きないため復帰も起きない)。差と比も ``-`` にしてある — 0 として引き算すると、存在しないことを「速い」と読み違える表になるため。"
@@ -1027,7 +1063,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: velox-perf-windows-${{ inputs.scenarios != '' && 'multi' || (inputs.scenario || 'cold_startup') }}
+          # `scenarios` と `pages` はどちらも「1 run に複数の計測を収める」
+          # 入力なので、**どちらが指定されていても `multi` にする**
+          # (Issue #231 のレビュー指摘)。`pages` だけを指定した run が
+          # `velox-perf-windows-cold_startup` という名前で残ると、
+          # artifact 名から複数ページ run だと読み取れない。
+          name: velox-perf-windows-${{ (inputs.scenarios != '' || inputs.pages != '') && 'multi' || (inputs.scenario || 'cold_startup') }}
           path: |
             results/
             diag/

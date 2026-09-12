@@ -45,6 +45,11 @@ PAGES_DIR = ROOT / "scripts" / "bench" / "pages"
 SORT_REGEX = r"^tabs_(?:hold_(?:resume_)?)?(\d+)$"
 SCALING_REGEX = r"^tabs_(?:hold_)?\d+$"
 
+# シナリオ専用のフィクスチャ (汎用の計測対象ページではない)。workflow 側の
+# `$fixturePages` と同じ内容でなければならない — 下の
+# `test_the_fixture_list_matches_the_one_the_workflow_warns_about` が検査する。
+FIXTURE_PAGES = ("busy.html", "download.html", "network_activity.html")
+
 
 def _on_section(doc: dict) -> dict:
     """workflow の `on:` セクション。PyYAML は裸の `on` を `True` と読む。"""
@@ -96,14 +101,37 @@ class PerfWindowsInputsTest(unittest.TestCase):
         上のコメントの理由を、後から `page` の choice を「ディレクトリと
         揃える」方向に直されないよう固定しておく。
         """
-        fixtures = ("busy.html", "download.html", "network_activity.html")
-        offered = [f for f in fixtures if f in self.page_options]
+        offered = [f for f in FIXTURE_PAGES if f in self.page_options]
         self.assertEqual(
             [],
             offered,
             "シナリオ専用のフィクスチャが `page` の choice に入っている。"
             "汎用の計測対象ページではない: " + ", ".join(offered),
         )
+
+    def test_the_fixture_list_matches_the_one_the_workflow_warns_about(self) -> None:
+        """フィクスチャ一覧が workflow 側とこちらでずれていないこと。
+
+        `pages` は自由記述なので `page` の choice による保護が効かない。
+        workflow 側は弾く代わりに **Job Summary に警告を出す** (弾くと
+        `url` に逃げ道が無い — `url` を指定すると loopback 配信自体が
+        止まるため)。その警告の対象一覧がここと食い違うと、**新しい
+        フィクスチャを足したときに警告だけが漏れる。**
+        """
+        declared = '$fixturePages = @(' + ", ".join(
+            f'"{name}"' for name in FIXTURE_PAGES
+        ) + ')'
+        self.assertIn(
+            declared,
+            self.text,
+            "workflow 側の $fixturePages と、このテストの FIXTURE_PAGES が"
+            f"食い違っている。期待した宣言: {declared}",
+        )
+
+    def test_every_fixture_actually_exists(self) -> None:
+        """一覧に実在しないファイル名が残っていると、警告が永久に出ない。"""
+        missing = [f for f in FIXTURE_PAGES if not (PAGES_DIR / f).is_file()]
+        self.assertEqual([], missing, "実在しないフィクスチャ: " + ", ".join(missing))
 
     def test_pages_input_exists_and_is_free_text(self) -> None:
         """`pages` は choice ではなくカンマ区切りの文字列である。
