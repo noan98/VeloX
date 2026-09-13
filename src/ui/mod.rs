@@ -10,6 +10,8 @@ pub mod toolbar;
 pub mod webview2_blocking;
 #[cfg(windows)]
 pub mod webview2_print;
+#[cfg(windows)]
+pub mod webview2_suspend;
 pub mod window;
 
 pub use window::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};

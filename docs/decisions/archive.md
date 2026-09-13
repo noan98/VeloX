@@ -15178,3 +15178,132 @@ Stage 3 で優先度を作るなら、ここが最も価値が高く、同時に
 こと — 利用者が明示した「残したい」であり、推測が要らない唯一の入力である。
 (3) `form-input` の検出手段が見つかったら、D105 の「状態喪失を数値化
 できていない」という積み残しごと再検討する。
+
+## D120: WebView2 の休止 API は 2 つとも実機で使える — ただし「使える」と「効く」は別で、効き目はまだ測っていない (Issue #176 Stage 2)
+
+**対象**: Issue #176 Stage 2 (Memory Pressure 対応) の 8 項目すべて。
+**本決定は調査結果と実装方針で、メモリ回収そのものはまだ入れていない。**
+入れたのは可用性を確かめる probe だけである。
+
+### 決定1: 可用性は推測せず、実機で確かめた — 両方とも `true`
+
+`src/ui/webview2_suspend.rs` を足し、起動時に一度だけ
+`QueryInterface` の成否を stderr に出す。perf-windows の
+「Diagnose VeloX launch」ステップでその出力を拾った結果:
+
+```text
+velox: webview2 suspend support: TrySuspend=true MemoryUsageTargetLevel=true (Issue #176 Stage 2 probe)
+```
+
+つまり windows-latest (GitHub Actions) の WebView2 Runtime は
+`ICoreWebView2_3` (TrySuspend / Resume / IsSuspended) と
+`ICoreWebView2_19` (MemoryUsageTargetLevel) の**両方**を実装している。
+
+**なぜ実機確認が要ったか。** バインディング
+(`webview2-com` 0.38.2) に型があることと、利用者の PC に入っている
+Runtime がそのインターフェースを実装していることは**別の話**である。
+COM のインターフェース番号 (`_3`, `_19`) は Runtime のバージョンに
+対応していて、古い Runtime では新しい番号の `QueryInterface` が
+`E_NOINTERFACE` で落ちる。Evergreen Runtime は自動更新なので普通は
+新しいが、「普通は」を前提に実装方針を決めるのは D46 (測る前に数字を
+決めない) に反する。可用性は boolean だが、確かめ方の性質は同じである。
+
+probe は消さずに残す。実装が入ったあと「動かない」という報告が来た
+ときに、Runtime が古いのか実装が悪いのかを切り分ける最初の材料に
+なる。コストは起動時 1 回の `QueryInterface` 2 本 (`std::sync::Once`
+で 1 度だけ) で、計測できる量ではない。
+
+### 決定2: TrySuspend の前提条件は、現行コードが既に満たしている
+
+`TrySuspend` は「WebView が非表示であること」を要求し、表示中に
+呼ぶと失敗する。VeloX はタブ切替時に背景側へ
+`WebView::set_visible(false)` を呼んでいる (`src/ui/window.rs:1488`)。
+
+したがって Stage 2 の実装で**ライフサイクルを作り変える必要は無い**。
+「背景タブは既に非表示」という現行の性質に、休止の呼び出しを
+足すだけで足りる。これは調査前に想定していたより軽い。
+
+### 決定3: これは現行の休止の「代替」であって「追加」である可能性が高い
+
+3 つの手段が同じ目的 (背景タブのメモリを返す) を争っている。
+
+| | 現行 = webview を drop (D9 / D20) | `TrySuspend` | `MemoryUsageTargetLevel(LOW)` |
+| --- | --- | --- | --- |
+| webview オブジェクト | 消える | 残る | 残る |
+| ページの状態 (スクロール位置・フォーム入力) | **失われる** (D105 / D119) | 残る | 残る |
+| 戻るときの対価 | **110〜130 ms** (D112 / §32) | 未計測 | ほぼ無いはず |
+| 返るメモリ量 | プロセスまるごと | **未計測** | **未計測** |
+| 実装コスト | 済 | 非同期 COM + `unsafe` | 同期 setter + `unsafe` |
+
+**もし `TrySuspend` が「状態を保ったままプロセス 1 個分のメモリを
+返す」なら、D112 (対価は下げられない) と D105 (状態が失われる) の
+両方が同時に消える。** Stage 1 の結論は「動かせるレバーはエンジンの
+プロセスをいくつ生かしておくかだけ」(§36 / D118) だったが、
+`TrySuspend` はそのレバーを**対価をほとんど払わずに引ける**可能性が
+ある。Stage 2 で最も価値が高い問いはここである。
+
+ただし上の表で「はず」「可能性」と書いたものは**ひとつも測って
+いない**。Microsoft のドキュメントが何と書いていようと、VeloX の
+構成でどれだけ返るかは別の数字である (§36 で「ロール別に割れない」と
+分かったのと同じ理由で、外から予想できない)。D46 に従い、ここで
+どちらを採るかは決めない。**測ってから決める。**
+
+### 決定4: `unsafe` の使い方を、実装を書く前に決めておく
+
+3 つの API はすべて `unsafe fn` である (COM の生 vtable 呼び出し)。
+CLAUDE.md は「`unsafe` は原則使用しない。使う場合は理由をコメントで
+明記」としているので、後から流儀を決めずに済むよう先に置く。
+
+1. **`unsafe` は `src/ui/webview2_suspend.rs` の中だけに閉じる。**
+   呼び出し側 (`window.rs` / `app.rs`) には safe な関数しか見せない。
+   既存の `webview2_blocking` (D59 / D76) と同じ形である。
+2. 各 `unsafe` ブロックに「なぜ安全か」を書く — ポインタの出所と、
+   呼び出しの間そのポインタが生きている理由。
+3. `TrySuspend` は完了ハンドラを取る**非同期** API なので、結果は
+   `UserEvent` でメインスレッドへ戻す。全状態変更をメインスレッドの
+   ディスパッチに集約する既存の原則 (docs/architecture.md) を崩さない。
+4. 失敗はクラッシュさせない。休止できなかったタブは休止しないまま
+   続行し、stderr に記録する (`app.rs` の `log_failure` パターン)。
+
+### 決定5: Linux 側は Stage 2 では進めない (Issue #240)
+
+`WebKitMemoryPressureSettings` の調査は完了した。結論は**到達経路が
+二手に割れ、価値のある側が届かない**である。
+
+| 対象 | 設定方法 | 届くか |
+| --- | --- | --- |
+| **content process** (§36 が示した大きい側) | `WebContext` の construct property `memory-pressure-settings` | **届かない** — wry 0.56 は `WebContext` を内部で作り、`wry::webkitgtk` は `pub(crate)`、`WebContextExt::context()` は `&WebContext` を不変で返す。upstream の wry 変更が要る |
+| **network process** | `WebsiteDataManager::set_memory_pressure_settings` (静的関数) | 届く。ただし §36 が示すとおり小さい側で、`webkit2gtk` を直接依存に足す対価に見合わない。加えて `kill_threshold` は文字通りプロセスを kill する |
+
+CLAUDE.md の「対応 OS の優先度」は Windows 最優先で、Linux は
+「ビルドが通り既存機能を壊していない」ことを維持できれば十分と
+している。Linux が CI と性能計測の実行環境であることは変わらないが、
+**メモリ回収の作り込みを Linux で先にやる理由は無い。**
+
+よって Stage 2 の Linux 残り 3 項目 (conservative / strict /
+kill threshold の評価、polling interval、回収の副作用計測) は
+到達経路が無い以上「評価できない」。Issue #240 に切り出し、wry 側の
+事情が変わるまで着手しない。
+
+### 決定6: `CoreWebView2Environment` の共有は、測る価値が薄い (Issue #241)
+
+wry 0.56 は `WebViewBuilderExtWindows::with_environment` を持ち、
+VeloX はこれを使っていない (webview ごとに `ICoreWebView2Environment`
+を作っている)。しかし**プロセスは既に共有されている**: 1 タブで 8
+プロセス (本 probe の run のスナップショット)、20 タブで 27 プロセス
+(§28 / §31) — つまり固定 8 個 + タブ 1 個につき 1 個である。環境を
+明示的に共有しても、この形が変わると考える根拠が無い。
+
+Issue #241 として残すが、優先度は低い。Stage 4 (Cache / Process
+Policy) でプロセス構成を触るときに、ついでに確かめれば足りる。
+
+### Revisit condition
+
+(1) 実装 Issue で `TrySuspend` / `MemoryUsageTargetLevel(LOW)` の
+解放量と復帰コストを測ったら、その数字で「現行の drop 方式を
+置き換えるか」を決める。置き換えるなら D9 / D20 / D105 / D112 を
+まとめて見直すことになる — Stage 1 の結論そのものが変わる。
+(2) probe が `false` を出す環境の報告が来たら、対応する Runtime の
+バージョン下限を決め、古い環境では現行の drop 方式へ落とす。
+(3) wry が `WebContext` の構築をフックできるようになったら #240 を
+再開する。

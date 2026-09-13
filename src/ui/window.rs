@@ -1244,6 +1244,11 @@ impl BrowserWindow {
         // *built* `wry::WebView` (specifically `WebViewExtWindows::webview`)
         // to reach the raw `ICoreWebView2`, which does not exist yet on a
         // bare `WebViewBuilder`.
+        // Issue #176 Stage 2 の調査 probe。休止はしない — この実行環境の
+        // WebView2 Runtime が休止 API を持っているかを 1 回だけ記録する
+        // (`ui::webview2_suspend` の module doc を参照)。
+        #[cfg(windows)]
+        crate::ui::webview2_suspend::log_support_once(&content);
         #[cfg(windows)]
         crate::ui::webview2_blocking::attach(
             &content,

@@ -442,8 +442,24 @@ jobs:
           $env:VELOX_PERF_OUTPUT = $out
           $env:VELOX_DATA_DIR = "diag\data"
 
+          # ⚠️ **VeloX 自身の stdout/stderr を拾う。** これを入れるまで、
+          # 「Diagnose VeloX launch」と名乗りながら**診断対象の出力を一切
+          # 見ていなかった** — 起動時のエラーメッセージも、Issue #176
+          # Stage 2 の WebView2 休止 API probe
+          # (`ui::webview2_suspend::log_support_once`) の結果も、どこにも
+          # 出ないまま捨てられていた。
+          #
+          # 計測ステップと違い**ここはリダイレクトして安全である**: この
+          # ステップは数値を採らない診断専用で、`page_load_ms` のような
+          # 測定値に影響しない (固定ページを配信する `http.server` を
+          # リダイレクトしたときの §26.4 付随の問題は、測定中の I/O
+          # ブロックが原因だった)。
+          $stdout = "diag\velox-stdout.txt"
+          $stderr = "diag\velox-stderr.txt"
           $proc = Start-Process -FilePath "target\release\velox.exe" `
             -ArgumentList "--homepage", "${{ steps.bench_url.outputs.url }}" `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
             -PassThru
           Start-Sleep -Seconds 8
 
@@ -456,6 +472,17 @@ jobs:
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           } else {
             Write-Host "velox.exe が診断中に自発的に終了していた (ExitCode=$($proc.ExitCode))"
+          }
+
+          # stderr を先に出す: 起動が失敗していれば理由はここにある。
+          foreach ($stream in @(@{ name = "stderr"; path = $stderr },
+                                @{ name = "stdout"; path = $stdout })) {
+            Write-Host "--- velox $($stream.name) ---"
+            if ((Test-Path $stream.path) -and (Get-Item $stream.path).Length -gt 0) {
+              Get-Content $stream.path | Write-Host
+            } else {
+              Write-Host "(空)"
+            }
           }
 
           Write-Host "--- perf log ---"
