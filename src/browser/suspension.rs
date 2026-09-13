@@ -66,7 +66,7 @@
 
 use std::time::Duration;
 
-use super::tab::TabId;
+use super::tab::{TabId, TabState};
 
 /// Rough memory reclaimed by suspending one background tab, used only to
 /// turn "we are N bytes over budget" into "so suspend about this many tabs
@@ -377,6 +377,32 @@ impl SuspendMechanism {
             _ => None,
         }
     }
+}
+
+/// Whether a **late** "the engine could not freeze this tab" answer may
+/// still throw that tab's webview away (Issue #243).
+///
+/// [`SuspendMechanism::Freeze`] is asynchronous: VeloX marks the tab
+/// suspended, asks the engine to freeze it, and learns the answer some time
+/// later. In between, the user can click straight back to the tab — which
+/// resumes it, in place, while the freeze is still in flight. The engine
+/// then reports failure precisely *because* the tab became visible again.
+///
+/// Acting on that answer unconditionally would drop the webview of a tab
+/// that is awake, very possibly the one on screen. Nothing would rebuild it:
+/// `Tabs` no longer thinks the tab is suspended, so no later activation
+/// takes the resume path, and the user is left looking at a blank tab with
+/// no way back.
+///
+/// So the answer is only actionable while the tab is *still* suspended —
+/// which is exactly `state == Some(TabState::Suspended)`. `None` (the tab
+/// was closed while the freeze was in flight) is likewise nothing to do.
+///
+/// [`TabState::Restoring`] deliberately does **not** qualify: the tab is on
+/// its way back up and its webview is being made ready, so discarding it
+/// would race the restore.
+pub fn late_freeze_failure_may_discard(state: Option<TabState>) -> bool {
+    matches!(state, Some(TabState::Suspended))
 }
 
 /// One live (not suspended) tab as [`plan`] sees it — the active tab
@@ -1189,5 +1215,26 @@ mod tests {
         for raw in ["", "  ", "drop", "suspend", "true", "1", "freze"] {
             assert_eq!(SuspendMechanism::parse(raw), None, "raw = {raw:?}");
         }
+    }
+
+    #[test]
+    fn a_late_freeze_failure_only_discards_a_tab_that_is_still_suspended() {
+        // The answer arrived while the tab is still suspended: acting on it
+        // is what the mechanism is for.
+        assert!(late_freeze_failure_may_discard(Some(TabState::Suspended)));
+
+        // The user clicked back to the tab before the engine answered. The
+        // webview is awake — very possibly the one on screen — and `Tabs`
+        // no longer thinks it is suspended, so nothing would ever rebuild
+        // it. Discarding here is the blank-tab bug.
+        for state in [TabState::Active, TabState::Background, TabState::Restoring] {
+            assert!(
+                !late_freeze_failure_may_discard(Some(state)),
+                "state = {state:?}"
+            );
+        }
+
+        // The tab was closed while the freeze was in flight.
+        assert!(!late_freeze_failure_may_discard(None));
     }
 }

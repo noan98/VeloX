@@ -26,7 +26,7 @@ use crate::browser::{
     shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
     HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, Settings,
-    SiteExceptions, SitePermissionStore, TabId, Tabs, WindowId, Windows,
+    SiteExceptions, SitePermissionStore, Tab, TabId, Tabs, WindowId, Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -2256,11 +2256,30 @@ fn handle_user_event(
             success,
             error,
         } => {
+            // The freeze is asynchronous, so by now the tab may have stopped
+            // being suspended: the user can click straight back to it
+            // between the `TrySuspend` call and its answer, which resumes it
+            // in place — and the engine then reports failure *because* the
+            // tab became visible again. Decide once, and let both branches
+            // below read it, so neither acts on a stale answer.
+            let still_suspended = suspension::late_freeze_failure_may_discard(
+                tabs_of(state, window_id).get(tab_id).map(Tab::state),
+            );
             // A window closed while its freeze was in flight is a safe
             // no-op, like every other window-addressed async result here.
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
+            if !still_suspended {
+                // Nothing to do either way, but say so rather than claiming
+                // a freeze that no longer describes the tab: these lines are
+                // what a measurement reads to tell whether the `freeze` arm
+                // actually froze anything (docs/performance-targets.md §37).
+                eprintln!(
+                    "velox: tab {tab_id:?} の freeze 結果 (success={success}) は届いたが、既に休止が解けている (#243)"
+                );
+                return;
+            }
             if success {
                 // Logged, not silent: this is the only positive evidence
                 // that the `freeze` arm of a measurement actually froze
@@ -2283,9 +2302,10 @@ fn handle_user_event(
                 }
                 return;
             }
-            // WebView2 declined, so the tab is marked suspended but still
-            // holds a live webview. Fall back to what `Discard` would have
-            // done rather than leaving it awake — see the variant's docs.
+            // WebView2 declined and the tab really is still suspended, so it
+            // is marked suspended while holding a live webview. Fall back to
+            // what `Discard` would have done rather than leaving it awake —
+            // see the variant's docs.
             match error {
                 Some(reason) => eprintln!(
                     "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243): {reason}"

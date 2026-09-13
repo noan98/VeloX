@@ -1647,11 +1647,19 @@ impl BrowserWindow {
     /// "suspended" while holding a full renderer.
     ///
     /// Deliberately *not* `suspend_tab` with the mechanism forced: this is
-    /// the tail of a suspension that already happened, so it neither
-    /// re-checks the active tab (a tab cannot have become active without
-    /// being resumed first, which would have dropped the pending freeze's
-    /// relevance) nor logs an unknown id as a problem — a tab closed while
-    /// its freeze was in flight is ordinary.
+    /// the tail of a suspension that already happened, so an unknown id is
+    /// not a problem to log — a tab closed while its freeze was in flight is
+    /// ordinary.
+    ///
+    /// **This method does not decide whether discarding is appropriate; the
+    /// caller must.** It takes the webview whatever state the tab is in,
+    /// active included. An early draft reasoned that a tab could not have
+    /// become active without being resumed first, and that being resumed
+    /// would have made the pending freeze irrelevant. The second half was
+    /// wrong: the in-flight `TrySuspend` still answers, and it answers
+    /// *failure* precisely because the tab became visible. `app.rs` guards
+    /// the call with `browser::suspension::late_freeze_failure_may_discard`
+    /// for exactly that reason.
     pub fn discard_tab_webview(&mut self, id: TabId) -> wry::Result<()> {
         if let Some(tab) = self.contents.get_mut(&id) {
             tab.webview.take();
