@@ -66,7 +66,7 @@
 
 use std::time::Duration;
 
-use super::tab::TabId;
+use super::tab::{TabId, TabState};
 
 /// Rough memory reclaimed by suspending one background tab, used only to
 /// turn "we are N bytes over budget" into "so suspend about this many tabs
@@ -311,6 +311,98 @@ impl SuspendReason {
             SuspendReason::Memory => "memory",
         }
     }
+}
+
+/// **How** a suspended tab's memory is reclaimed (Issue #243) — as opposed
+/// to [`SuspendReason`], which says *why* the tab was picked. The policy in
+/// this module chooses which tabs to suspend and never looks at this; the UI
+/// layer reads it to decide what to do to the webview.
+///
+/// Deliberately named for the effect rather than the API, so the same two
+/// values describe WebKitGTK if a path is ever found there (docs/decisions.md
+/// D120 決定5 — today there is none, so Linux always uses [`Self::Discard`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SuspendMechanism {
+    /// Throw the webview away (`ui::window::BrowserWindow::suspend_tab`
+    /// `take()`s it). The whole renderer goes, so this reclaims the most —
+    /// but the page's state goes with it (docs/decisions.md D105) and coming
+    /// back costs a rebuild, about 110〜130 ms (D112,
+    /// `docs/performance-targets.md` §32).
+    ///
+    /// The default, and the only thing VeloX did before Issue #243.
+    #[default]
+    Discard,
+    /// Ask the engine to suspend the page in place, keeping the webview
+    /// object. The page's state survives and coming back is a plain
+    /// `Resume` call rather than a rebuild.
+    ///
+    /// **Measured, and it does not reclaim memory** (docs/decisions.md D121,
+    /// `docs/performance-targets.md` §37): at 20 tabs this used **1.888× the
+    /// memory of [`Self::Discard`]** (859.6 MiB → 1622.6 MiB) because
+    /// `TrySuspend` suspends the renderer rather than ending it —
+    /// `rss_process_count` went 15 → 27. What it *did* buy is resume cost:
+    /// `tab_resume_ms` 117.5 → **6.25 ms**.
+    ///
+    /// So this is **not** a memory mechanism and must not become the
+    /// default. It is kept because "returns no memory but returns instantly"
+    /// may suit the `Recent` rung of the priority ladder (D119 決定2) that
+    /// Stage 3 will build — for tabs the user is likely to come straight
+    /// back to. D121 決定4 spells out what has to be settled first.
+    ///
+    /// Only Windows implements this (`ICoreWebView2_3::TrySuspend`,
+    /// confirmed available on the target runtime by D120 決定1). Everywhere
+    /// else, and whenever the engine refuses a particular tab, the UI layer
+    /// falls back to [`Self::Discard`] so the tab is still suspended —
+    /// never silently left awake.
+    Freeze,
+}
+
+impl SuspendMechanism {
+    /// Stable lowercase name, for logs and settings round-trips.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuspendMechanism::Discard => "discard",
+            SuspendMechanism::Freeze => "freeze",
+        }
+    }
+
+    /// Parse the `VELOX_SUSPEND_MECHANISM` spelling. `None` for anything
+    /// unrecognized, so the caller can fall back to the default rather than
+    /// letting a typo pick a mechanism the measurements never covered — the
+    /// same conservative rule every other knob in `config` follows.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "discard" => Some(SuspendMechanism::Discard),
+            "freeze" => Some(SuspendMechanism::Freeze),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a **late** "the engine could not freeze this tab" answer may
+/// still throw that tab's webview away (Issue #243).
+///
+/// [`SuspendMechanism::Freeze`] is asynchronous: VeloX marks the tab
+/// suspended, asks the engine to freeze it, and learns the answer some time
+/// later. In between, the user can click straight back to the tab — which
+/// resumes it, in place, while the freeze is still in flight. The engine
+/// then reports failure precisely *because* the tab became visible again.
+///
+/// Acting on that answer unconditionally would drop the webview of a tab
+/// that is awake, very possibly the one on screen. Nothing would rebuild it:
+/// `Tabs` no longer thinks the tab is suspended, so no later activation
+/// takes the resume path, and the user is left looking at a blank tab with
+/// no way back.
+///
+/// So the answer is only actionable while the tab is *still* suspended —
+/// which is exactly `state == Some(TabState::Suspended)`. `None` (the tab
+/// was closed while the freeze was in flight) is likewise nothing to do.
+///
+/// [`TabState::Restoring`] deliberately does **not** qualify: the tab is on
+/// its way back up and its webview is being made ready, so discarding it
+/// would race the restore.
+pub fn late_freeze_failure_may_discard(state: Option<TabState>) -> bool {
+    matches!(state, Some(TabState::Suspended))
 }
 
 /// One live (not suspended) tab as [`plan`] sees it — the active tab
@@ -1099,5 +1191,50 @@ mod tests {
         assert_eq!(SuspendReason::Idle.as_str(), "idle");
         assert_eq!(SuspendReason::TabCount.as_str(), "tab_count");
         assert_eq!(SuspendReason::Memory.as_str(), "memory");
+    }
+
+    // -- SuspendMechanism (Issue #243) ------------------------------------
+
+    #[test]
+    fn suspend_mechanism_defaults_to_discard() {
+        // The pre-#243 behavior must stay the default: `Freeze` was added
+        // before anything measured how much it actually returns (D120 決定3).
+        assert_eq!(SuspendMechanism::default(), SuspendMechanism::Discard);
+    }
+
+    #[test]
+    fn suspend_mechanism_parses_its_own_names_and_rejects_everything_else() {
+        for mechanism in [SuspendMechanism::Discard, SuspendMechanism::Freeze] {
+            assert_eq!(SuspendMechanism::parse(mechanism.as_str()), Some(mechanism));
+        }
+        // Case and surrounding space are tolerated; nothing else is.
+        assert_eq!(
+            SuspendMechanism::parse("  FREEZE "),
+            Some(SuspendMechanism::Freeze)
+        );
+        for raw in ["", "  ", "drop", "suspend", "true", "1", "freze"] {
+            assert_eq!(SuspendMechanism::parse(raw), None, "raw = {raw:?}");
+        }
+    }
+
+    #[test]
+    fn a_late_freeze_failure_only_discards_a_tab_that_is_still_suspended() {
+        // The answer arrived while the tab is still suspended: acting on it
+        // is what the mechanism is for.
+        assert!(late_freeze_failure_may_discard(Some(TabState::Suspended)));
+
+        // The user clicked back to the tab before the engine answered. The
+        // webview is awake — very possibly the one on screen — and `Tabs`
+        // no longer thinks it is suspended, so nothing would ever rebuild
+        // it. Discarding here is the blank-tab bug.
+        for state in [TabState::Active, TabState::Background, TabState::Restoring] {
+            assert!(
+                !late_freeze_failure_may_discard(Some(state)),
+                "state = {state:?}"
+            );
+        }
+
+        // The tab was closed while the freeze was in flight.
+        assert!(!late_freeze_failure_may_discard(None));
     }
 }

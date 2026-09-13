@@ -26,7 +26,7 @@ use crate::browser::{
     shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
     HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, Settings,
-    SiteExceptions, SitePermissionStore, TabId, Tabs, WindowId, Windows,
+    SiteExceptions, SitePermissionStore, Tab, TabId, Tabs, WindowId, Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -240,6 +240,26 @@ pub enum UserEvent {
         window_id: WindowId,
         tab_id: TabId,
         destination: PathBuf,
+        success: bool,
+        error: Option<String>,
+    },
+    /// `ICoreWebView2_3::TrySuspend` finished for tab `tab_id` in window
+    /// `window_id` (Issue #243, `ui::webview2_suspend::try_suspend`).
+    ///
+    /// `TrySuspend` is a "try" API — it can decline (the page is playing
+    /// media, a download is in flight) — and it is asynchronous, so the
+    /// answer comes back here rather than at the call site, exactly like
+    /// [`Self::PdfExportFinished`] (D75).
+    ///
+    /// **A `success: false` is not cosmetic.** By the time this arrives the
+    /// tab is already marked suspended on the `browser::Tabs` side, so a
+    /// refusal would leave a "suspended" tab holding a full, awake webview —
+    /// the worst of both. The handler therefore falls back to discarding the
+    /// webview for that tab, which is what the tab would have got under
+    /// `SuspendMechanism::Discard` anyway.
+    TabFreezeFinished {
+        window_id: WindowId,
+        tab_id: TabId,
         success: bool,
         error: Option<String>,
     },
@@ -1273,6 +1293,10 @@ fn record_perf_event(
         // Same for Issue #40's PDF export — no performance budget calls
         // for it either.
         | UserEvent::PdfExportFinished { .. }
+        // Issue #243's freeze result is not perf-tracked either: what the
+        // measurement wants is the RSS and `tab_resume_ms` the existing
+        // events already carry, not a timestamp for the COM round-trip.
+        | UserEvent::TabFreezeFinished { .. }
         // Same for Issue #45's View Source: no performance budget calls for
         // it either.
         | UserEvent::ViewSourceReady { .. }
@@ -2225,6 +2249,83 @@ fn handle_user_event(
                 }
             };
             log_failure("show print status", window.set_print_status(Some(&message)));
+        }
+        UserEvent::TabFreezeFinished {
+            window_id,
+            tab_id,
+            success,
+            error,
+        } => {
+            // A window closed while its freeze was in flight is a safe
+            // no-op, like every other window-addressed async result here.
+            //
+            // **This check must stay first.** `tabs_of` below resolves
+            // `window_id` with `.expect()`, on the documented assumption that
+            // the caller already established the window exists — and closing
+            // a window drops it from `ui_windows` and `state.windows`
+            // together (`close_window_by_tao_id`). Doing the lookup first
+            // would turn this very case, the one the paragraph above calls a
+            // safe no-op, into a panic.
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            // The freeze is asynchronous, so by now the tab may have stopped
+            // being suspended: the user can click straight back to it
+            // between the `TrySuspend` call and its answer, which resumes it
+            // in place — and the engine then reports failure *because* the
+            // tab became visible again. Decide once, and let both branches
+            // below read it, so neither acts on a stale answer.
+            let still_suspended = suspension::late_freeze_failure_may_discard(
+                tabs_of(state, window_id).get(tab_id).map(Tab::state),
+            );
+            if !still_suspended {
+                // Nothing to do either way, but say so rather than claiming
+                // a freeze that no longer describes the tab: these lines are
+                // what a measurement reads to tell whether the `freeze` arm
+                // actually froze anything (docs/performance-targets.md §37).
+                eprintln!(
+                    "velox: tab {tab_id:?} の freeze 結果 (success={success}) は届いたが、既に休止が解けている (#243)"
+                );
+                return;
+            }
+            if success {
+                // Logged, not silent: this is the only positive evidence
+                // that the `freeze` arm of a measurement actually froze
+                // anything. Suspensions are rare enough (tens per
+                // benchmark run) that one line each is not noise.
+                eprintln!("velox: tab {tab_id:?} を freeze しました (#243)");
+                // The engine's own answer, for runs that are debugging the
+                // mechanism rather than measuring it — see
+                // `BrowserWindow::engine_reports_tab_suspended` for why this
+                // is not asked unconditionally.
+                if std::env::var_os("VELOX_DEBUG").is_some() {
+                    match window.engine_reports_tab_suspended(tab_id) {
+                        Some(engine_state) => eprintln!(
+                            "velox: tab {tab_id:?} engine IsSuspended={engine_state} (#243)"
+                        ),
+                        None => eprintln!(
+                            "velox: tab {tab_id:?} engine IsSuspended は取得できません (#243)"
+                        ),
+                    }
+                }
+                return;
+            }
+            // WebView2 declined and the tab really is still suspended, so it
+            // is marked suspended while holding a live webview. Fall back to
+            // what `Discard` would have done rather than leaving it awake —
+            // see the variant's docs.
+            match error {
+                Some(reason) => eprintln!(
+                    "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243): {reason}"
+                ),
+                None => eprintln!(
+                    "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243)"
+                ),
+            }
+            log_failure(
+                "discard frozen tab webview",
+                window.discard_tab_webview(tab_id),
+            );
         }
         UserEvent::ViewSourceReady {
             window_id,
