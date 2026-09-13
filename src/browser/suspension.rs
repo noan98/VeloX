@@ -313,6 +313,61 @@ impl SuspendReason {
     }
 }
 
+/// **How** a suspended tab's memory is reclaimed (Issue #243) — as opposed
+/// to [`SuspendReason`], which says *why* the tab was picked. The policy in
+/// this module chooses which tabs to suspend and never looks at this; the UI
+/// layer reads it to decide what to do to the webview.
+///
+/// Deliberately named for the effect rather than the API, so the same two
+/// values describe WebKitGTK if a path is ever found there (docs/decisions.md
+/// D120 決定5 — today there is none, so Linux always uses [`Self::Discard`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SuspendMechanism {
+    /// Throw the webview away (`ui::window::BrowserWindow::suspend_tab`
+    /// `take()`s it). The whole renderer goes, so this reclaims the most —
+    /// but the page's state goes with it (docs/decisions.md D105) and coming
+    /// back costs a rebuild, about 110〜130 ms (D112,
+    /// `docs/performance-targets.md` §32).
+    ///
+    /// The default, and the only thing VeloX did before Issue #243.
+    #[default]
+    Discard,
+    /// Ask the engine to suspend the page in place, keeping the webview
+    /// object. The page's state survives and coming back is a plain
+    /// `Resume` call rather than a rebuild — but how much memory this
+    /// actually returns was unmeasured when the knob was added, which is
+    /// the whole reason it is a knob (D120 決定3).
+    ///
+    /// Only Windows implements this (`ICoreWebView2_3::TrySuspend`,
+    /// confirmed available on the target runtime by D120 決定1). Everywhere
+    /// else, and whenever the engine refuses a particular tab, the UI layer
+    /// falls back to [`Self::Discard`] so the tab is still suspended —
+    /// never silently left awake.
+    Freeze,
+}
+
+impl SuspendMechanism {
+    /// Stable lowercase name, for logs and settings round-trips.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SuspendMechanism::Discard => "discard",
+            SuspendMechanism::Freeze => "freeze",
+        }
+    }
+
+    /// Parse the `VELOX_SUSPEND_MECHANISM` spelling. `None` for anything
+    /// unrecognized, so the caller can fall back to the default rather than
+    /// letting a typo pick a mechanism the measurements never covered — the
+    /// same conservative rule every other knob in `config` follows.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "discard" => Some(SuspendMechanism::Discard),
+            "freeze" => Some(SuspendMechanism::Freeze),
+            _ => None,
+        }
+    }
+}
+
 /// One live (not suspended) tab as [`plan`] sees it — the active tab
 /// included, flagged, so the policy knows which process group it pins.
 /// Built by the caller from `Tabs` plus whatever the engine side knows
@@ -1099,5 +1154,29 @@ mod tests {
         assert_eq!(SuspendReason::Idle.as_str(), "idle");
         assert_eq!(SuspendReason::TabCount.as_str(), "tab_count");
         assert_eq!(SuspendReason::Memory.as_str(), "memory");
+    }
+
+    // -- SuspendMechanism (Issue #243) ------------------------------------
+
+    #[test]
+    fn suspend_mechanism_defaults_to_discard() {
+        // The pre-#243 behavior must stay the default: `Freeze` was added
+        // before anything measured how much it actually returns (D120 決定3).
+        assert_eq!(SuspendMechanism::default(), SuspendMechanism::Discard);
+    }
+
+    #[test]
+    fn suspend_mechanism_parses_its_own_names_and_rejects_everything_else() {
+        for mechanism in [SuspendMechanism::Discard, SuspendMechanism::Freeze] {
+            assert_eq!(SuspendMechanism::parse(mechanism.as_str()), Some(mechanism));
+        }
+        // Case and surrounding space are tolerated; nothing else is.
+        assert_eq!(
+            SuspendMechanism::parse("  FREEZE "),
+            Some(SuspendMechanism::Freeze)
+        );
+        for raw in ["", "  ", "drop", "suspend", "true", "1", "freze"] {
+            assert_eq!(SuspendMechanism::parse(raw), None, "raw = {raw:?}");
+        }
     }
 }

@@ -54,6 +54,7 @@ use crate::browser::metrics::{self, IpcDirection};
 use crate::browser::perf_log::IpcLog;
 use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
+use crate::browser::suspension::SuspendMechanism;
 use crate::browser::{
     group_by_date, parse_sentinel, Candidate, DownloadEntry, FilterList, HistoryEntry, ShortcutId,
     SiteExceptions, TabId, WindowId, SHORTCUT_TABLE,
@@ -781,6 +782,66 @@ fn webview_is_playing_audio(_webview: &WebView) -> bool {
     false
 }
 
+/// Ask the engine to freeze `webview` in place (Issue #243), returning
+/// whether the request was *dispatched*. `false` means the caller must fall
+/// back to discarding the webview; `true` means the answer will arrive as
+/// [`UserEvent::TabFreezeFinished`], which discards it if the engine
+/// declined.
+///
+/// Windows only — `ICoreWebView2_3::TrySuspend`, confirmed present on the
+/// target runtime by docs/decisions.md D120 決定1.
+#[cfg(windows)]
+fn freeze_webview(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    window_id: WindowId,
+    id: TabId,
+) -> bool {
+    match crate::ui::webview2_suspend::try_suspend(webview, proxy.clone(), window_id, id) {
+        Ok(()) => true,
+        Err(err) => {
+            // Overwhelmingly likely to be `E_NOINTERFACE` on a WebView2
+            // Runtime older than `ICoreWebView2_3`. Logged once per attempt
+            // rather than once per process: this is the path a measurement
+            // needs to see, and if it fires at all the `freeze` arm is
+            // silently measuring `discard`.
+            eprintln!("velox: tab {id:?} の freeze を発行できませんでした (#243): {err}");
+            false
+        }
+    }
+}
+
+/// No engine-level freeze exists off Windows, so a `Freeze` request always
+/// falls back to discarding (Issue #243). Linux's `WebKitMemoryPressure
+/// Settings` is unreachable through wry 0.56 — docs/decisions.md D120 決定5,
+/// Issue #240.
+#[cfg(not(windows))]
+fn freeze_webview(
+    _webview: &WebView,
+    _proxy: &EventLoopProxy<UserEvent>,
+    _window_id: WindowId,
+    _id: TabId,
+) -> bool {
+    false
+}
+
+/// Undo [`freeze_webview`] for a tab whose webview survived suspension
+/// (Issue #243). Never fails the resume: a webview that was not actually
+/// frozen resumes to a no-op, and an error here would only mean the tab
+/// wakes the way it always did, so it is logged rather than propagated
+/// (the `log_failure` posture of `app.rs`).
+#[cfg(windows)]
+fn thaw_webview(webview: &WebView, id: TabId) {
+    if let Err(err) = crate::ui::webview2_suspend::resume(webview) {
+        eprintln!("velox: tab {id:?} の resume に失敗しました (#243): {err}");
+    }
+}
+
+/// A tab cannot have been frozen off Windows ([`freeze_webview`] always
+/// declines there), so there is nothing to undo (Issue #243).
+#[cfg(not(windows))]
+fn thaw_webview(_webview: &WebView, _id: TabId) {}
+
 /// One tab's content webview.
 struct ContentTab {
     /// The tab's webview.
@@ -945,6 +1006,10 @@ pub struct BrowserWindow {
     /// ([`pick_process_group`], D54/D57) — `Config::max_tabs_per_web_process`
     /// as of window creation.
     max_tabs_per_web_process: usize,
+    /// How a suspended tab's memory is reclaimed (Issue #243) —
+    /// `Config::suspend_mechanism` as of window creation. See
+    /// [`Self::suspend_tab`].
+    suspend_mechanism: SuspendMechanism,
     /// The `WebContext` shared by the toolbar and every tab's content
     /// webview (see docs/decisions.md D49). `Some` only in non-private mode:
     /// `wry`'s WebKitGTK backend ignores any custom context passed via
@@ -1293,6 +1358,7 @@ impl BrowserWindow {
             active: Some(initial_tab),
             next_process_group: 1,
             max_tabs_per_web_process: config.max_tabs_per_web_process,
+            suspend_mechanism: config.suspend_mechanism,
             context,
             private,
             blocklist,
@@ -1521,17 +1587,76 @@ impl BrowserWindow {
             eprintln!("velox: suspend_tab: refusing to suspend the active tab {id:?}");
             return Ok(());
         }
-        match self.contents.get_mut(&id) {
-            Some(tab) => {
-                // Dropped here: this is the memory reclaim.
-                tab.webview.take();
-                Ok(())
-            }
-            None => {
-                eprintln!("velox: suspend_tab: unknown tab {id:?}");
-                Ok(())
+        let Some(tab) = self.contents.get_mut(&id) else {
+            eprintln!("velox: suspend_tab: unknown tab {id:?}");
+            return Ok(());
+        };
+        // Issue #243: `Freeze` keeps the webview and asks the engine to
+        // suspend the page in place. It is only ever *attempted* — a
+        // platform without a freeze path, a runtime too old for
+        // `ICoreWebView2_3`, or a page the engine declines all fall through
+        // to the discard below, so a tab is never left awake while
+        // `browser::Tabs` believes it is suspended.
+        if self.suspend_mechanism == SuspendMechanism::Freeze {
+            if let Some(webview) = tab.webview.as_ref() {
+                if freeze_webview(webview, &self.proxy, self.id, id) {
+                    // The webview stays; whether the engine actually
+                    // suspended it arrives later as
+                    // `UserEvent::TabFreezeFinished`, which discards it if
+                    // the answer is no.
+                    return Ok(());
+                }
             }
         }
+        // Dropped here: this is the memory reclaim.
+        tab.webview.take();
+        Ok(())
+    }
+
+    /// What the **engine** thinks tab `id`'s suspension state is (Issue
+    /// #243), as opposed to what `browser::Tabs` records. `None` when the
+    /// tab is unknown, has no webview left (so there is nothing to ask), or
+    /// the platform has no freeze path at all.
+    ///
+    /// A cross-check, not a source of truth — VeloX's own state stays
+    /// authoritative. It exists because the freeze arm of a measurement is
+    /// worthless if the engine quietly disagrees, and `success: true` from
+    /// `TrySuspend` only says the call returned, not that the page is still
+    /// suspended some time later.
+    ///
+    /// **Only ever called behind `VELOX_DEBUG`** (`app.rs`). Querying a
+    /// suspended WebView2 should not disturb it — `IsSuspended` is the
+    /// documented way to ask — but "should not" is not a measurement, and a
+    /// benchmark run must not be the place that finds out otherwise.
+    pub fn engine_reports_tab_suspended(&self, id: TabId) -> Option<bool> {
+        let _webview = self.contents.get(&id)?.webview.as_ref()?;
+        #[cfg(windows)]
+        {
+            crate::ui::webview2_suspend::is_suspended(_webview).ok()
+        }
+        #[cfg(not(windows))]
+        {
+            None
+        }
+    }
+
+    /// Throw tab `id`'s webview away, whatever mechanism suspended it
+    /// (Issue #243). Used by `app.rs` when a [`SuspendMechanism::Freeze`]
+    /// attempt comes back refused: the tab is already suspended on the
+    /// `browser::Tabs` side, so the webview must go or the tab would be
+    /// "suspended" while holding a full renderer.
+    ///
+    /// Deliberately *not* `suspend_tab` with the mechanism forced: this is
+    /// the tail of a suspension that already happened, so it neither
+    /// re-checks the active tab (a tab cannot have become active without
+    /// being resumed first, which would have dropped the pending freeze's
+    /// relevance) nor logs an unknown id as a problem — a tab closed while
+    /// its freeze was in flight is ordinary.
+    pub fn discard_tab_webview(&mut self, id: TabId) -> wry::Result<()> {
+        if let Some(tab) = self.contents.get_mut(&id) {
+            tab.webview.take();
+        }
+        Ok(())
     }
 
     /// Whether tab `id`'s page is currently playing audio, for the
@@ -1570,24 +1695,41 @@ impl BrowserWindow {
             .map(|tab| tab.process_group)
     }
 
-    /// Rebuild a suspended tab's content webview, loading `url` (its last
-    /// known address — everything else, scroll position, in-progress form
-    /// input, and JS-side session history, was lost when the webview was
-    /// dropped by [`Self::suspend_tab`]), and make it the visible tab.
+    /// Wake suspended tab `id` and make it the visible tab.
     ///
-    /// This is exactly [`Self::open_tab`] followed by [`Self::activate_tab`]
-    /// — rebuilding a dropped webview for a `TabId` that `contents` already
-    /// tracks is the same operation as building the first one for a new
-    /// tab, so there is nothing suspension-specific to do here beyond
-    /// reusing that path.
+    /// Which of two things this does is decided by what the tab still has,
+    /// not by re-reading [`Self::suspend_mechanism`] — the knob can only be
+    /// read at window creation, but a tab suspended before it mattered must
+    /// still resume correctly:
     ///
-    /// `is_loading` is passed through to [`Self::open_tab`].
+    /// - **The webview is gone** ([`SuspendMechanism::Discard`], and any
+    ///   failed freeze): rebuild it, loading `url` — its last known address,
+    ///   because everything else (scroll position, in-progress form input,
+    ///   JS-side session history) went with the webview. This is exactly
+    ///   [`Self::open_tab`] followed by [`Self::activate_tab`]: rebuilding a
+    ///   dropped webview for a `TabId` that `contents` already tracks is the
+    ///   same operation as building the first one for a new tab.
+    /// - **The webview is still there** ([`SuspendMechanism::Freeze`],
+    ///   Issue #243): resume it in place and show it. `url` is not reloaded
+    ///   — the point of freezing is that the page, and its state, survived.
+    ///
+    /// `is_loading` is passed through to [`Self::open_tab`] in the first
+    /// case and unused in the second (nothing is being loaded).
     pub fn resume_tab(
         &mut self,
         id: TabId,
         url: &str,
         is_loading: impl Fn(TabId) -> bool,
     ) -> wry::Result<()> {
+        // Issue #243. A frozen tab kept its webview, so there is nothing to
+        // rebuild — `activate_tab` below makes it visible, and touching a
+        // suspended WebView2 resumes it implicitly anyway; the explicit
+        // `Resume` here keeps VeloX's intent in the code rather than
+        // relying on that side effect.
+        if let Some(webview) = self.contents.get(&id).and_then(|tab| tab.webview.as_ref()) {
+            thaw_webview(webview, id);
+            return self.activate_tab(id);
+        }
         self.open_tab(id, url, is_loading)?;
         self.activate_tab(id)
     }

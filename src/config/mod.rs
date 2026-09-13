@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::browser::metrics::PerfFormat;
 use crate::browser::navigation;
-use crate::browser::suspension::SuspensionPolicy;
+use crate::browser::suspension::{SuspendMechanism, SuspensionPolicy};
 
 /// Default interval between process-tree RSS samples when performance
 /// metrics are enabled but no explicit interval was requested.
@@ -188,6 +188,21 @@ pub struct Config {
     /// `VELOX_MAX_LIVE_TABS`, `VELOX_MEMORY_BUDGET_MB` and
     /// `VELOX_MEMORY_CHECK_INTERVAL_MS` — see [`Config::from_env_and_args`].
     pub suspension: SuspensionPolicy,
+    /// **How** a suspended tab's memory is reclaimed (Issue #243) — the
+    /// policy above decides *which* tabs, this decides what is done to them.
+    ///
+    /// Defaults to [`SuspendMechanism::Discard`], the only thing VeloX did
+    /// before #243: throw the webview away. `VELOX_SUSPEND_MECHANISM=freeze`
+    /// switches to `ICoreWebView2_3::TrySuspend` on Windows, which keeps the
+    /// page's state and makes coming back a `Resume` instead of a rebuild.
+    ///
+    /// **This is a measurement knob, not a recommendation.** D120 決定3 spelled
+    /// out why it has to be one: `Freeze` obviously costs less to undo, but
+    /// how much memory it actually returns was unknown when it was written,
+    /// and a mechanism that keeps the renderer alive could easily return far
+    /// less than dropping it. Until `docs/performance-targets.md` carries
+    /// that number, the default stays on the measured behavior (D46).
+    pub suspend_mechanism: SuspendMechanism,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
     /// data store and page visits are not recorded to `HistoryStore`.
@@ -248,6 +263,7 @@ impl Default for Config {
             history_panel_limit: 200,
             max_tabs_per_web_process: DEFAULT_MAX_TABS_PER_WEB_PROCESS,
             suspension: SuspensionPolicy::default(),
+            suspend_mechanism: SuspendMechanism::default(),
             private: false,
             search_engine: SearchEngine::default(),
             perf_metrics: false,
@@ -290,6 +306,14 @@ impl Config {
     ///   `WebKitWebProcess` (Linux/BSD only, docs/decisions.md D54/D57).
     ///   `1` turns sharing off. Unset, `0` or not a number keeps the
     ///   default (4).
+    /// - `VELOX_SUSPEND_MECHANISM` — how a suspended tab's memory is
+    ///   reclaimed (Issue #243): `discard` throws the webview away (the
+    ///   default, and everything VeloX did before #243), `freeze` asks the
+    ///   engine to suspend it in place, keeping the page's state
+    ///   (`ICoreWebView2_3::TrySuspend`, Windows only). Unset or an
+    ///   unrecognized spelling keeps `discard`. On a platform without a
+    ///   freeze path, and for any tab the engine refuses to freeze, VeloX
+    ///   falls back to `discard` for that tab so it is still suspended.
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
     ///   `browser::suspension`). Off by default; unset or not a number
@@ -383,6 +407,14 @@ impl Config {
                 .ok()
                 .as_deref(),
         );
+        // Issue #243. Unrecognized spellings keep the default rather than
+        // erroring: a typo must never silently pick a mechanism the
+        // measurements never covered (the same rule as every knob above).
+        let suspend_mechanism = std::env::var("VELOX_SUSPEND_MECHANISM")
+            .ok()
+            .as_deref()
+            .and_then(SuspendMechanism::parse)
+            .unwrap_or_default();
         let restore_previous_session = std::env::var_os("VELOX_RESTORE_SESSION").is_some();
         Self {
             homepage,
@@ -390,6 +422,7 @@ impl Config {
             search_engine,
             max_tabs_per_web_process,
             suspension,
+            suspend_mechanism,
             perf_metrics,
             perf_rss_interval,
             perf_format,
@@ -1736,5 +1769,18 @@ mod tests {
     fn to_settings_is_already_sanitized() {
         let settings = Config::default().to_settings();
         assert_eq!(settings.clone().sanitize(), settings);
+    }
+
+    // -- suspend_mechanism (Issue #243) -----------------------------------
+
+    #[test]
+    fn suspend_mechanism_defaults_to_the_pre_243_behavior() {
+        // The knob exists to *measure* `Freeze`, not to ship it: nothing had
+        // measured how much memory it returns when it was added (D120 決定3),
+        // so an unset `VELOX_SUSPEND_MECHANISM` must keep discarding.
+        assert_eq!(
+            Config::default().suspend_mechanism,
+            SuspendMechanism::Discard
+        );
     }
 }

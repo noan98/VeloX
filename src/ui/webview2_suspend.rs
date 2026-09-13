@@ -1,9 +1,17 @@
-//! WebView2 の休止 API (`TrySuspend` / `MemoryUsageTargetLevel`) が
-//! **この実行環境で使えるか**を調べるだけのモジュール (Issue #176 Stage 2)。
+//! WebView2 の休止 API (`TrySuspend` / `Resume` / `IsSuspended`) を包む
+//! モジュール (Issue #176 Stage 2 → Issue #243)。
 //!
-//! **ここでは休止しない。** Stage 2 のチェック項目は「調査・実装検討」で
-//! あり、本モジュールはその「調査」の側を、**推測ではなく実行時の事実**に
-//! するためのものである。
+//! 二段階で育った。Stage 2 では**使えるかを確かめる probe だけ**を置き
+//! (D120 決定1、[`probe`] / [`log_support_once`])、Issue #243 で**実際に
+//! 休止させる呼び出し**を足した ([`try_suspend`] / [`resume`] /
+//! [`is_suspended`])。後者は既定では使われない — `VELOX_SUSPEND_MECHANISM=
+//! freeze` を明示したときだけ `ui::window` がこちらを通る
+//! (`browser::suspension::SuspendMechanism`)。
+//!
+//! **`unsafe` はこのファイルに閉じる** (D120 決定4)。呼び出し側には
+//! `wry::WebView` を取る safe な関数だけを見せ、COM の生 vtable 呼び出しは
+//! ここから外に出さない。`ui::webview2_blocking` (D59) /
+//! `ui::webview2_print` (D75) と同じ流儀である。
 //!
 //! ## なぜこれが #176 にとって重要か
 //!
@@ -40,9 +48,14 @@
 //! COM の `QueryInterface` (`windows-core` の `cast`) で目的の
 //! インターフェースへ降りる。
 
+use tao::event_loop::EventLoopProxy;
 use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_19, ICoreWebView2_3};
+use webview2_com::TrySuspendCompletedHandler;
 use windows::core::Interface;
 use wry::{WebView, WebViewExtWindows};
+
+use crate::app::UserEvent;
+use crate::browser::{TabId, WindowId};
 
 /// この実行環境の WebView2 Runtime が持っている休止関連 API。
 ///
@@ -118,6 +131,94 @@ pub fn log_support_once(webview: &WebView) {
             );
         }
     });
+}
+
+/// 背景タブ `webview` を**破棄せずに**休止させる (Issue #243)。
+///
+/// `ICoreWebView2_3::TrySuspend` は名前のとおり「試す」API で、成功が
+/// 保証されない。したがってこの関数の戻り値は**呼び出しを発行できたか**
+/// だけを表す — 実際に休止できたかは WebView2 の完了ハンドラから
+/// [`UserEvent::TabFreezeFinished`] として後から届く。
+/// `ui::webview2_print::export_as_pdf` (D75) と同じ二段構えである。
+///
+/// `Err` は「そもそも始められなかった」場合だけで、いちばんありうるのは
+/// Runtime が古くて `ICoreWebView2_3` を実装していないケース
+/// (`QueryInterface` が `E_NOINTERFACE`)。呼び出し側 (`ui::window`) は
+/// これを受けて**その場で従来どおり webview を捨てる**ので、タブが休止
+/// されないまま残ることはない。
+///
+/// ⚠️ 休止中の webview に触れると暗黙に復帰するため、休止後は
+/// [`resume`] を通すまで触らないこと。`set_visible(false)` 済みの背景タブ
+/// にしか呼ばない前提である (D120 決定2)。
+pub fn try_suspend(
+    webview: &WebView,
+    proxy: EventLoopProxy<UserEvent>,
+    window_id: WindowId,
+    tab_id: TabId,
+) -> windows::core::Result<()> {
+    let core = webview.webview();
+
+    // SAFETY: `core` は wry 自身の `WebViewExtWindows::webview()` が返す
+    // 生きた COM 参照で、借用している `webview` が生きている間は有効
+    // (このモジュールの doc コメント参照)。`.cast::<T>()` はただの
+    // `QueryInterface` で、Runtime が古ければ不正なオブジェクトではなく
+    // `Err` を返す (`?` で伝搬する)。完了ハンドラのクロージャが触るのは
+    // move で所有権を取った値 (`proxy` / `window_id` / `tab_id`) と、
+    // WebView2 がこの 1 回のコールバックで渡してくる引数だけで、
+    // この関数が有効性を保証できないポインタには一切触れない。
+    unsafe {
+        core.cast::<ICoreWebView2_3>()?
+            .TrySuspend(&TrySuspendCompletedHandler::create(Box::new(
+                move |result, is_successful| {
+                    let error = match &result {
+                        Ok(()) if is_successful => None,
+                        // 「発行はできたが休止しなかった」ケース。ページ側の
+                        // 事情 (再生中のメディア、進行中のダウンロードなど) で
+                        // WebView2 が断ることがある。
+                        Ok(()) => Some("WebView2 が休止を拒否しました".to_owned()),
+                        Err(err) => Some(err.to_string()),
+                    };
+                    let _ = proxy.send_event(UserEvent::TabFreezeFinished {
+                        window_id,
+                        tab_id,
+                        success: result.is_ok() && is_successful,
+                        error,
+                    });
+                    Ok(())
+                },
+            )))
+    }
+}
+
+/// [`try_suspend`] で休止させた `webview` を戻す (Issue #243)。
+///
+/// `TrySuspend` と違い同期で、こちらは「試す」API ではない。休止して
+/// いない webview に対しても成功する (何も起きない) ので、呼び出し側は
+/// 休止済みかどうかを先に確かめなくてよい。
+pub fn resume(webview: &WebView) -> windows::core::Result<()> {
+    let core = webview.webview();
+    // SAFETY: [`try_suspend`] と同じ COM 参照の議論。`Resume` は引数を
+    // 取らない単純なメソッド呼び出しである。
+    unsafe { core.cast::<ICoreWebView2_3>()?.Resume() }
+}
+
+/// `webview` が今 (エンジンから見て) 休止しているか (Issue #243)。
+///
+/// VeloX 自身は休止状態を `browser::Tabs` 側で持っているので通常の動作で
+/// は使わない。**エンジンの認識と VeloX の認識が食い違っていないか**を
+/// 確かめるための窓であり、計測時の検証に使う。
+pub fn is_suspended(webview: &WebView) -> windows::core::Result<bool> {
+    let core = webview.webview();
+    let mut suspended = windows::core::BOOL::from(false);
+    // SAFETY: [`try_suspend`] と同じ COM 参照の議論。`IsSuspended` は
+    // 出力引数 (`*mut BOOL`) に書き込むだけで、渡しているのはこの関数の
+    // スタック上に確保した `suspended` へのポインタ。呼び出しの間ずっと
+    // 生きており、書き込みは 1 回で、他から参照されていない。
+    unsafe {
+        core.cast::<ICoreWebView2_3>()?
+            .IsSuspended(&mut suspended)?
+    };
+    Ok(suspended.as_bool())
 }
 
 #[cfg(test)]
