@@ -113,7 +113,8 @@ pub fn log_support_once(webview: &WebView) {
         eprintln!("velox: {support} (Issue #176 Stage 2 probe)");
         if support.is_none() {
             eprintln!(
-                "velox: この WebView2 Runtime は休止 API を 1 つも持っていない                  — #176 Stage 2 の Windows 側は、この環境では検討の余地が無い"
+                "velox: この WebView2 Runtime は休止 API を 1 つも持っていない — \
+#176 Stage 2 の Windows 側は、この環境では検討の余地が無い"
             );
         }
     });
