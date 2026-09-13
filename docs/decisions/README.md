@@ -16,7 +16,7 @@ VeloX の設計判断は、実装の経緯・代替案・トレードオフま�
 |---|---|---|
 | [01-foundation.md](./01-foundation.md) | エンジン、UI、依存関係、基本アーキテクチャ | D1–D7 |
 | [02-tabs-session.md](./02-tabs-session.md) | タブ、履歴、ブックマーク、プライバシー、omnibox | D8–D15, D20, D22–D40, D74, D119 |
-| [03-performance.md](./03-performance.md) | メトリクス、ベンチマーク、メモリ、プロファイリング、回帰検知 | D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118 |
+| [03-performance.md](./03-performance.md) | メトリクス、ベンチマーク、メモリ、プロファイリング、回帰検知 | D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118, D120 |
 | [04-browser-features.md](./04-browser-features.md) | コンテンツブロック、DevTools、ダウンロード、権限、サイトデータ、検索 | D17–D18, D59–D60, D64, D66, D69, D71–D72, D75–D78 |
 | [05-platform-release.md](./05-platform-release.md) | Windows、アイコン、CI、リリース、マルチウィンドウ | D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108 |
 | [06-security-maintenance.md](./06-security-maintenance.md) | 入力値堅牢性、依存監査、セッション復元、設定 | D61–D63, D65, D67, D102, D116 |
