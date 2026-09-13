@@ -2256,6 +2256,19 @@ fn handle_user_event(
             success,
             error,
         } => {
+            // A window closed while its freeze was in flight is a safe
+            // no-op, like every other window-addressed async result here.
+            //
+            // **This check must stay first.** `tabs_of` below resolves
+            // `window_id` with `.expect()`, on the documented assumption that
+            // the caller already established the window exists — and closing
+            // a window drops it from `ui_windows` and `state.windows`
+            // together (`close_window_by_tao_id`). Doing the lookup first
+            // would turn this very case, the one the paragraph above calls a
+            // safe no-op, into a panic.
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
             // The freeze is asynchronous, so by now the tab may have stopped
             // being suspended: the user can click straight back to it
             // between the `TrySuspend` call and its answer, which resumes it
@@ -2265,11 +2278,6 @@ fn handle_user_event(
             let still_suspended = suspension::late_freeze_failure_may_discard(
                 tabs_of(state, window_id).get(tab_id).map(Tab::state),
             );
-            // A window closed while its freeze was in flight is a safe
-            // no-op, like every other window-addressed async result here.
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
             if !still_suspended {
                 // Nothing to do either way, but say so rather than claiming
                 // a freeze that no longer describes the tab: these lines are
