@@ -334,9 +334,20 @@ pub enum SuspendMechanism {
     Discard,
     /// Ask the engine to suspend the page in place, keeping the webview
     /// object. The page's state survives and coming back is a plain
-    /// `Resume` call rather than a rebuild — but how much memory this
-    /// actually returns was unmeasured when the knob was added, which is
-    /// the whole reason it is a knob (D120 決定3).
+    /// `Resume` call rather than a rebuild.
+    ///
+    /// **Measured, and it does not reclaim memory** (docs/decisions.md D121,
+    /// `docs/performance-targets.md` §37): at 20 tabs this used **1.888× the
+    /// memory of [`Self::Discard`]** (859.6 MiB → 1622.6 MiB) because
+    /// `TrySuspend` suspends the renderer rather than ending it —
+    /// `rss_process_count` went 15 → 27. What it *did* buy is resume cost:
+    /// `tab_resume_ms` 117.5 → **6.25 ms**.
+    ///
+    /// So this is **not** a memory mechanism and must not become the
+    /// default. It is kept because "returns no memory but returns instantly"
+    /// may suit the `Recent` rung of the priority ladder (D119 決定2) that
+    /// Stage 3 will build — for tabs the user is likely to come straight
+    /// back to. D121 決定4 spells out what has to be settled first.
     ///
     /// Only Windows implements this (`ICoreWebView2_3::TrySuspend`,
     /// confirmed available on the target runtime by D120 決定1). Everywhere

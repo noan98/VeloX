@@ -196,12 +196,13 @@ pub struct Config {
     /// switches to `ICoreWebView2_3::TrySuspend` on Windows, which keeps the
     /// page's state and makes coming back a `Resume` instead of a rebuild.
     ///
-    /// **This is a measurement knob, not a recommendation.** D120 決定3 spelled
-    /// out why it has to be one: `Freeze` obviously costs less to undo, but
-    /// how much memory it actually returns was unknown when it was written,
-    /// and a mechanism that keeps the renderer alive could easily return far
-    /// less than dropping it. Until `docs/performance-targets.md` carries
-    /// that number, the default stays on the measured behavior (D46).
+    /// **This is a measurement knob, not a recommendation — and the
+    /// measurement came back against `Freeze`.** At 20 tabs it used 1.888×
+    /// the memory of `Discard`, because `TrySuspend` suspends the renderer
+    /// instead of ending it (docs/decisions.md D121,
+    /// `docs/performance-targets.md` §37). It did cut `tab_resume_ms` from
+    /// 117.5 to 6.25 ms, which is why the knob still exists (D121 決定2),
+    /// but the default must stay `Discard`.
     pub suspend_mechanism: SuspendMechanism,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
