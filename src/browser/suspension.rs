@@ -379,6 +379,60 @@ impl SuspendMechanism {
     }
 }
 
+/// How much memory a **background but still awake** tab is asked to use
+/// (Issue #242).
+///
+/// **This is not suspension, and it is orthogonal to [`SuspendMechanism`].**
+/// Suspension decides what happens to tabs the policy picks for reclaim;
+/// this is a standing hint given to every tab that is merely not on screen,
+/// suspended or not. A tab can be at [`Self::Low`] and never be suspended at
+/// all — indeed with the memory budget off, *every* background tab is.
+///
+/// The mechanism on Windows is `ICoreWebView2_19::SetMemoryUsageTargetLevel`,
+/// confirmed available on the target runtime by docs/decisions.md D120 決定1.
+/// Nothing equivalent is reachable elsewhere, so off Windows this is inert.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BackgroundMemoryTarget {
+    /// Say nothing to the engine — background tabs are treated exactly like
+    /// foreground ones, which is everything VeloX did before Issue #242.
+    ///
+    /// The default, and it stays that way until a measurement says
+    /// otherwise (D46).
+    #[default]
+    Normal,
+    /// Tell the engine a background tab may economize.
+    ///
+    /// Unlike [`SuspendMechanism::Freeze`], which D121 measured and rejected
+    /// because `TrySuspend` keeps the renderer process alive, this asks the
+    /// renderer to shrink rather than to stop. Whether that is a distinction
+    /// the engine actually honours is the open question — **D121 決定5's
+    /// Revisit condition (3) says explicitly that #243's result must not be
+    /// used to prejudge it.**
+    Low,
+}
+
+impl BackgroundMemoryTarget {
+    /// Stable lowercase name, for logs and settings round-trips.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BackgroundMemoryTarget::Normal => "normal",
+            BackgroundMemoryTarget::Low => "low",
+        }
+    }
+
+    /// Parse the `VELOX_BACKGROUND_MEMORY_TARGET` spelling. `None` for
+    /// anything unrecognized, so the caller falls back to the default rather
+    /// than letting a typo pick behavior the measurements never covered —
+    /// the same rule [`SuspendMechanism::parse`] follows.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "normal" => Some(BackgroundMemoryTarget::Normal),
+            "low" => Some(BackgroundMemoryTarget::Low),
+            _ => None,
+        }
+    }
+}
+
 /// Whether a **late** "the engine could not freeze this tab" answer may
 /// still throw that tab's webview away (Issue #243).
 ///
@@ -1236,5 +1290,31 @@ mod tests {
 
         // The tab was closed while the freeze was in flight.
         assert!(!late_freeze_failure_may_discard(None));
+    }
+
+    // -- BackgroundMemoryTarget (Issue #242) ------------------------------
+
+    #[test]
+    fn background_memory_target_defaults_to_saying_nothing_to_the_engine() {
+        assert_eq!(
+            BackgroundMemoryTarget::default(),
+            BackgroundMemoryTarget::Normal
+        );
+    }
+
+    #[test]
+    fn background_memory_target_parses_its_own_names_and_rejects_everything_else() {
+        for target in [BackgroundMemoryTarget::Normal, BackgroundMemoryTarget::Low] {
+            assert_eq!(BackgroundMemoryTarget::parse(target.as_str()), Some(target));
+        }
+        assert_eq!(
+            BackgroundMemoryTarget::parse("  LOW "),
+            Some(BackgroundMemoryTarget::Low)
+        );
+        // Neighbouring vocabulary must not leak in: `freeze` / `discard`
+        // belong to `SuspendMechanism`, and this knob is a different axis.
+        for raw in ["", "  ", "freeze", "discard", "high", "1", "true", "lo"] {
+            assert_eq!(BackgroundMemoryTarget::parse(raw), None, "raw = {raw:?}");
+        }
     }
 }
