@@ -97,21 +97,42 @@ docs/decisions.md D91 参照)。workflow の YAML にはこのロジックをベ
    (workflow の `env.CLAUDE_REVIEWER_LOGINS`、カンマ区切り) で明示的に
    設定された場合のみ有効になり、**既定は空集合 = 常に不成立** (Codex の
    利用上限緩和 A のみで判断する、従来どおりの安全側)。判定シグナルは
-   **`latestReviews[].commit.oid` が head SHA と完全一致する Claude の
-   レビュー 1 つだけ**である — 「依頼より後の Claude のコメント」は
-   進捗コメント (Issue #203) と完了レビューを区別できないため数えない
-   (理由は `_claude_reviewed_head_sha` の docstring)。
+   次の 2 つの OR である:
+     a. `latestReviews[].commit.oid` が head SHA と完全一致する Claude の
+        レビュー (`_claude_reviewed_head_sha`)。
+     b. 依頼コメントより後に投稿された、**完了見出しを持つ** Claude の
+        コメント (`_claude_completed_review_after`)。
+   b が要るのは、`anthropics/claude-code-action` が**正式な PR レビューを
+   作れない**ためである (実行時プロンプトに明記。PR #216 で実測、レビュー
+   オブジェクトは 0 件だった)。a だけに頼ると**フォールバックは永久に
+   成立しない。** 進捗コメント (Issue #203 の懸念) は完了見出しを持たない
+   ので数えない — 詳細は `_claude_completed_review_after` の docstring。
    Codex と異なり `__typename == "Bot"` は要求しない (Claude 側の実装が
    Bot か User か不明なため)。
 
+   **応答が無いまま止まらないためのタイムアウト (Issue #207)**: 上記の
+   緩和はいずれも「Codex が*利用上限メッセージという特定の文言*を返した」
+   ことを前提にしている。**Codex が沈黙した場合や、別の文言で断った場合は
+   緩和が成立せず、待ち時間に上限が無いため、その head SHA は二度とマージ
+   できない。** 実測 (Issue #207) では Codex が「To use Codex here, create
+   a Codex account and connect to github.」と返したために PR #202 / #204 が
+   CI 全緑のまま同時に停止した。そこで、`@codex review` の依頼コメントの
+   `createdAt` から `codex_response_timeout_minutes` (既定 60 分) を過ぎても
+   レビューも上限メッセージも観測できない場合、**B (Claude フォールバック)
+   にだけ**合流させる。**A (この PR の過去のレビューで代替) には合流させ
+   ない** — A は「別の commit へのレビューで現在の head を通す」最も強い
+   緩和であり、沈黙を根拠にそれを許すと「Codex が死んでいる間は過去の
+   レビューだけで何でも通る」ことになるため。`claude_logins` が空
+   (フォールバック未設定) のときもタイムアウト緩和は働かない — レビューを
+   誰も行わないまま要件だけが消えるのを防ぐ。
+
    > ⚠️ 利用上限メッセージの検出は **Codex 側のメッセージ文言との文字列
-   > マッチ**であり、Codex がこの文言を変更すると検出できなくなる。その
-   > 場合は緩和が発動せず「厳格なまま待ち続ける」= 安全側に倒れる (誤って
-   > マージされる方向には壊れない)。
-   > ⚠️ **`@claude` メンションが実際に応答を得られるかは未検証**
-   > (`claude-code-action` 等の workflow がこのリポジトリに存在しない
-   > ため)。応答が無い場合、PR は `automerge-without-codex` ラベルを
-   > 付けるまで止まる。docs/decisions.md D91 の Revisit condition 参照。
+   > マッチ**であり、Codex がこの文言を変更すると検出できなくなる。ただし
+   > その場合もタイムアウト (Issue #207) が働くため、**永久ブロックには
+   > ならない** — 緩和の成立が遅れるだけである。
+   > ✅ **`@claude` メンションによるレビューは実地で動作確認済み**
+   > (Issue #194 / PR #216、2026-09-09)。応答する仕組みは
+   > `.github/workflows/claude.yml`。D91 の「検証」節を参照。
 
    Codex ログインの照合は **完全一致** (許可リスト `_CODEX_LOGINS`) で行う
    — `chatgpt-codex-connector-review` のような別名アカウントが前方一致で
@@ -251,6 +272,22 @@ _CLAUDE_COMPLETION_RE = re.compile(
 #: 依頼する (往復を 1 つ省く)。**短すぎると往復が復活し、長すぎると Codex の
 #: 上限が回復しても使わなくなる。** 上限は数時間で回復する運用実感から 6 時間。
 CODEX_USAGE_LIMIT_LOOKBACK_HOURS = 6
+
+#: `@codex review` を投稿してから、Codex の応答をどれだけ待つか (分単位)。
+#: これを過ぎたら「応答が来ない」と判断し、Claude フォールバックへ回す
+#: (Issue #207)。
+#:
+#: **なぜ要るか**: 従来、緩和が成立するのは Codex が *`_USAGE_LIMIT_PHRASE`
+#: という特定の文言* を返したときだけだった。**沈黙した場合や、別の文言で
+#: 断られた場合は待ち続ける。待ち時間に上限が無いので、その head SHA は
+#: 二度とマージできない。** 実測 (Issue #207 / PR #202・#204) では、Codex が
+#: 「To use Codex here, create a Codex account and connect to github.」と
+#: 返したために 2 件の PR が CI 全緑のまま同時に停止した。
+#:
+#: 既定を 60 分にしたのは、実測で Codex の応答が数十秒〜数分であり、
+#: 60 分なら通常のレビュー所要時間を跨がないため (Issue #207 の検討事項)。
+#: `0` を渡すとこの緩和を無効化して従来の「無限に待つ」挙動に戻せる。
+CODEX_RESPONSE_TIMEOUT_MINUTES = 60
 
 
 def _parse_iso8601(value: str) -> datetime:
@@ -539,6 +576,26 @@ def _codex_usage_limit_within(
     return False
 
 
+def _codex_request_timed_out(
+    request_created_at: str,
+    now_iso: str,
+    timeout_minutes: int,
+) -> bool:
+    """`@codex review` の依頼から `timeout_minutes` 以上、応答が無いか (Issue #207)。
+
+    起点は**依頼コメントの `createdAt`** である (head の push 時刻ではない)。
+    「リクエストは届いたが返事が無い」を測りたいのであって、「head が古い」
+    を測りたいのではないため — Issue #207 の検討事項どおり。
+
+    呼び出し側は、Codex のレビューも利用上限メッセージも見つからなかった
+    ことを確認したうえでこれを呼ぶ。ここでは時間だけを見る。
+    """
+    if timeout_minutes <= 0 or not request_created_at or not now_iso:
+        return False
+    deadline = _parse_iso8601(request_created_at) + timedelta(minutes=timeout_minutes)
+    return _parse_iso8601(now_iso) >= deadline
+
+
 def _find_codex_usage_limit_after(
     comment_nodes: list[dict[str, Any]],
     after_iso: str,
@@ -636,6 +693,7 @@ def evaluate_review_gate(
     pr_comments: dict[str, Any] | None = None,
     claude_logins: frozenset[str] = frozenset(),
     codex_usage_limit_lookback_hours: int = CODEX_USAGE_LIMIT_LOOKBACK_HOURS,
+    codex_response_timeout_minutes: int = CODEX_RESPONSE_TIMEOUT_MINUTES,
 ) -> dict[str, Any]:
     """マージしてよいかを判定する。
 
@@ -831,6 +889,22 @@ def evaluate_review_gate(
                     codex_usage_limit_lookback_hours,
                     codex_logins,
                 )
+                # C (Issue #207): 依頼から一定時間が経っても Codex が
+                # レビューも上限メッセージも返さない。**待ち時間に上限が
+                # 無いと、その head SHA は二度とマージできない** (実測で
+                # PR #202 / #204 が CI 全緑のまま同時停止した)。
+                #
+                # `limit_recent` と同じく **Claude フォールバックが設定されて
+                # いるときだけ**有効にする。未設定で緩和すると、レビューを
+                # 誰も行わないまま Codex 要件だけが消える — 「沈黙していれば
+                # 通る」という、レビューゲートとして最悪の抜け方になる。
+                request_timed_out = (
+                    bool(claude_logins)
+                    and not limit_strict
+                    and _codex_request_timed_out(
+                        request_created_at, now, codex_response_timeout_minutes
+                    )
+                )
                 if request_comment is None and not limit_recent:
                     # まだこの head SHA への @codex review リクエストを
                     # 投稿していない。呼び出し側に投稿させる。
@@ -845,7 +919,12 @@ def evaluate_review_gate(
                     # `limit_recent` が立っていれば依頼を投げる前でもここに来る
                     # (B)。その場合 `request_created_at` は空。
                     limit_reached = limit_strict or limit_recent
-                    if not limit_reached:
+                    # Issue #207: 待ちを解く理由は 2 種類ある —「上限に
+                    # 達していると分かった」と「待っても返事が来ない」。
+                    # **後者は上限ではない**ので変数を分け、下の緩和メッセージ
+                    # でも区別する (ログを読む人が理由を取り違えないように)。
+                    relax_wait = limit_reached or request_timed_out
+                    if not relax_wait:
                         head_short = head_sha[:7]
                         reasons.append(
                             "wait: Codex に @codex review を自動リクエスト"
@@ -863,10 +942,21 @@ def evaluate_review_gate(
                             )
                         )
                     else:
-                        # Codex が利用上限に達している。A. この PR の過去の
+                        # Codex が利用上限に達している、または依頼から
+                        # 一定時間応答が無い (Issue #207)。A. この PR の過去の
                         # レビューで代替 (従来どおり) を試し、それが無理な
                         # 場合のみ B. Claude フォールバックを試す
                         # (2026-09-07 ユーザ決定)。
+                        #
+                        # ⚠️ **タイムアウトは A には決して合流させない。**
+                        # A は「別の commit へのレビューで現在の head を通す」
+                        # という最も強い緩和であり、その根拠は「Codex は
+                        # 応答したが上限だった」という積極的な観測である。
+                        # 沈黙を根拠に A を許すと、**Codex が死んでいる間は
+                        # 過去のレビューだけで何でも通る**ことになる。
+                        # 下の `limit_strict` 条件がそれを担保している
+                        # (`request_timed_out` は `not limit_strict` のときしか
+                        # 立たないので、A に入ることは構造的にありえない)。
                         any_codex_review = any(
                             _is_codex_author(r.get("author"), codex_logins)
                             for r in latest_reviews_nodes
@@ -890,6 +980,19 @@ def evaluate_review_gate(
                                 "判定は引き続き有効です)"
                             )
                         elif claude_logins:
+                            # Issue #207: ログを読む人が理由を取り違えない
+                            # ように、待ちを解いた根拠をそのまま文言にする。
+                            # 「上限だった」と「返事が来なかった」は、次に
+                            # 取るべき行動 (待つ / Codex 側を調べる) が違う。
+                            cause = (
+                                "Codex の利用上限到達を検知し、"
+                                if limit_reached
+                                else (
+                                    f"@codex review の依頼から{codex_response_timeout_minutes}"
+                                    "分が経過しても Codex がレビューも利用上限"
+                                    "メッセージも返さないため (Issue #207)、"
+                                )
+                            )
                             claude_request_comment = _find_request_marker(
                                 comment_nodes, head_sha, _CLAUDE_REQUEST_MARKER_RE
                             )
@@ -913,7 +1016,7 @@ def evaluate_review_gate(
                                 matched = True
                                 claude_relaxed = True
                                 claude_relaxed_detail = (
-                                    "Codex の利用上限到達を検知し、この PR は"
+                                    f"{cause}この PR は"
                                     "Codex に一度もレビューされていないため、"
                                     f"head SHA `{head_short}` への再レビュー"
                                     "要件を Claude のレビューで代替"
@@ -924,14 +1027,14 @@ def evaluate_review_gate(
                             elif claude_request_comment is None:
                                 claude_review_request_needed = True
                                 reasons.append(
-                                    "wait: Codex の利用上限到達を検知しました。"
+                                    f"wait: {cause}"
                                     "この PR は一度も Codex にレビューされて"
                                     "いないため、Claude にレビューを依頼します"
                                     f" (head SHA `{head_short}`)"
                                 )
                             else:
                                 reasons.append(
-                                    "wait: Codex の利用上限到達により Claude に"
+                                    f"wait: {cause}Claude に"
                                     f"レビューを依頼済みです (head SHA "
                                     f"`{head_short}`)。応答を待っています"
                                 )
@@ -1021,6 +1124,9 @@ def main(argv: list[str]) -> int:
     フォールバックは常に不成立)。`prTitle` は `@claude` への依頼コメント
     に含める PR タイトル (省略可)。`codexUsageLimitLookbackHours` は Codex の
     利用上限を「今も続いている」とみなす時間 (省略時 6 時間、`0` で無効化)。
+    `codexResponseTimeoutMinutes` は `@codex review` の依頼から応答を待つ
+    時間 (省略時 60 分、`0` で無効化)。これを過ぎたら Claude フォールバック
+    へ回す (Issue #207)。
     """
     if len(argv) > 1:
         with open(argv[1], "r", encoding="utf-8") as f:
@@ -1048,6 +1154,14 @@ def main(argv: list[str]) -> int:
             payload.get(
                 "codexUsageLimitLookbackHours",
                 CODEX_USAGE_LIMIT_LOOKBACK_HOURS,
+            )
+        ),
+        # Issue #207: 省略時は既定 (60 分)。`0` を渡すとタイムアウト緩和を
+        # 無効化して、従来の「応答が来るまで無限に待つ」挙動に戻せる。
+        codex_response_timeout_minutes=int(
+            payload.get(
+                "codexResponseTimeoutMinutes",
+                CODEX_RESPONSE_TIMEOUT_MINUTES,
             )
         ),
     )
