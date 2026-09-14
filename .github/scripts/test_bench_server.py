@@ -113,15 +113,42 @@ class PerInstanceTest(unittest.TestCase):
         # first は 1 件だけなので 0、second が 3 -> 95 で +92。
         self.assertEqual(summary["hidden"]["advanced_frames"], 92)
 
-    def test_a_counter_going_backwards_within_one_instance_is_clamped(self):
-        # 同じ id でカウンタが戻ることは無いはずだが、戻っても
-        # 進んだ量を負にしない。壊れた入力で指標を壊すより安全側。
+    def test_a_smaller_value_arriving_later_is_reordering_not_corruption(self):
+        """同一インスタンスでカウンタが減ることは**原理的に無い**。
+
+        `frames` / `ticks` は単調増加しかしない。したがって小さい値が
+        後から届いたら、それは「カウンタが戻った」のではなく
+        **beacon の到着順が入れ替わった**ということである
+        (`fetch` は投げっぱなしで、応答も順序も待たない)。
+
+        そこで min/max で範囲を取る。**進んだ量は 0 ではなく 40 が
+        正しい** — 送信側は 10 から 50 まで確かに進んでいる。
+        """
         counts = BeaconCounts()
         counts.record("state=hidden&f=50&t=50&id=A")
         counts.record("state=hidden&f=10&t=10&id=A")
         summary = counts.summary()
-        self.assertEqual(summary["hidden"]["advanced_frames"], 0)
-        self.assertEqual(summary["hidden"]["advanced_ticks"], 0)
+        self.assertEqual(summary["hidden"]["advanced_frames"], 40)
+        self.assertEqual(summary["hidden"]["advanced_ticks"], 40)
+        # 負にはならない。これは min/max を取る限り構造的に保証される。
+        self.assertGreaterEqual(summary["hidden"]["advanced_frames"], 0)
+
+    def test_out_of_order_arrival_does_not_shrink_the_advance(self):
+        """`fetch` は投げっぱなしなので、到着順は送信順と一致しない。
+
+        PR #255 のレビュー指摘。先に届いたほうを first と決め打つと、
+        順序が入れ替わっただけで進んだ量が縮む。**last を `max` で
+        守って first を守らないのは非対称である。**
+        """
+        counts = BeaconCounts()
+        # 送信順は 10 -> 30 -> 50 だが、30 が最初に届いた。
+        counts.record("state=hidden&f=30&t=30&id=A")
+        counts.record("state=hidden&f=10&t=10&id=A")
+        counts.record("state=hidden&f=50&t=50&id=A")
+        summary = counts.summary()
+        # 到着順によらず 10 -> 50 で +40。
+        self.assertEqual(summary["hidden"]["advanced_frames"], 40)
+        self.assertEqual(summary["hidden"]["advanced_ticks"], 40)
 
     def test_beacons_without_an_id_collapse_into_one_instance(self):
         """`id=` を送らない古いページは 1 実体として扱う。

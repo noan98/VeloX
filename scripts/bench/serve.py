@@ -126,9 +126,17 @@ class BeaconCounts:
                 }
                 return
             entry["count"] += 1
-            # 同じインスタンスの中でカウンタが戻ることは無いはずだが、
-            # 戻ったら**進んだ量を負にしない** — 壊れた入力で指標を
-            # 壊すより、その 1 歩を捨てるほうが安全側である。
+            # **同一インスタンスでカウンタが減ることは原理的に無い。**
+            # `frames` / `ticks` は単調増加しかしないので、小さい値が
+            # 後から届いたら「カウンタが戻った」のではなく
+            # **beacon の到着順が入れ替わった**ということである
+            # (ページは `fetch` を投げっぱなしにし、応答も順序も待たない)。
+            #
+            # そこで min/max で範囲を取る。先に届いたほうを first と
+            # 決め打つと、順序が入れ替わっただけで進んだ量が縮む。
+            # この形なら **進んだ量は構造的に負にならない。**
+            entry["first_frames"] = min(entry["first_frames"], frames)
+            entry["first_ticks"] = min(entry["first_ticks"], ticks)
             entry["last_frames"] = max(entry["last_frames"], frames)
             entry["last_ticks"] = max(entry["last_ticks"], ticks)
 
