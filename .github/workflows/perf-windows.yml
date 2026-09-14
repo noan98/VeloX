@@ -165,6 +165,10 @@ on:
         description: "複数ページを 1 回の run で続けて計測する (カンマ区切り、例: minimal.html,dom_heavy.html)。指定するとページ選択より優先される。D96 の「run をまたいだ絶対値は比較できない」に従い、ページ差を見る計測はこれで同一 run に収める (Issue #231)"
         type: string
         default: ""
+      beacon:
+        description: "busy.html の beacon を数える (Issue #247)。背景タブで rAF / setInterval が進んでいるかを、ページ自身が投げる HTTP リクエストとしてブラウザの外側から数える。タイトルを読む方法だと計測対象のタブで JS を評価することになり、測ろうとしているものを乱しうるため。page / pages に busy.html を含めたときだけ意味がある"
+        type: boolean
+        default: false
       url:
         description: "計測対象ページの URL。空欄なら scripts/bench/pages/ の固定ページ (上の page / pages) を loopback 配信して使う。指定すると page / pages は無視される"
         type: string
@@ -287,6 +291,7 @@ jobs:
           INPUT_URL: ${{ inputs.url }}
           INPUT_PAGE: ${{ inputs.page }}
           INPUT_PAGES: ${{ inputs.pages }}
+          INPUT_BEACON: ${{ inputs.beacon }}
         run: |
           $ErrorActionPreference = "Stop"
           $url = $env:INPUT_URL
@@ -355,7 +360,14 @@ jobs:
                 $usedFixtures += $p
               }
             }
-            "url=http://127.0.0.1:8731/$($pageList[0])" >> $env:GITHUB_OUTPUT
+            # Issue #247。`?beacon=1` を付けると `busy.html` は report()
+            # のたびに loopback へ 1 本投げる。`background_cpu` は
+            # 前景タブ用に `&idle=1` を足すので (`browser::automation`)、
+            # ここで `?` を使っておくと両方のタブが beacon を投げる —
+            # 隠れている側と見えている側を `state=` で区別できる。
+            $beaconQuery = ""
+            if ($env:INPUT_BEACON -eq "true") { $beaconQuery = "?beacon=1" }
+            "url=http://127.0.0.1:8731/$($pageList[0])$beaconQuery" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
             "page=$($pageList -join ', ')" >> $env:GITHUB_OUTPUT
             "pages=$($pageList -join ',')" >> $env:GITHUB_OUTPUT
@@ -395,8 +407,19 @@ jobs:
           # ファイルになるとその I/O が応答をブロックしうる — これが原因か
           # どうかを確かめるため、まずリダイレクトを外した状態で測り直す
           # (§26.4 付随)。起動できなかったときの診断はプロセス一覧で足りる。
-          Start-Process -FilePath python -ArgumentList "-m", "http.server", "8731" `
-            -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden
+          # Issue #247: beacon を数えるときだけ自前のサーバを使う。
+          # **既定の計測環境を黙って変えないため**に切り替え式にしてある
+          # (`scripts/bench/serve.py` の冒頭に理由を書いた)。
+          # serve.py はリクエストごとのログを出さないので、§26.4 が
+          # 記録した「stderr のリダイレクトで page_load_ms が 38 倍」の
+          # 危険はむしろ減る方向である。
+          if ("${{ inputs.beacon }}" -eq "true") {
+            Start-Process -FilePath python -ArgumentList "scripts\bench\serve.py", "--port", "8731" `
+              -WindowStyle Hidden
+          } else {
+            Start-Process -FilePath python -ArgumentList "-m", "http.server", "8731" `
+              -WorkingDirectory "scripts\bench\pages" -WindowStyle Hidden
+          }
 
           $deadline = (Get-Date).AddSeconds(30)
           $ready = $false
@@ -700,6 +723,39 @@ jobs:
                 }
               }
             }
+          }
+
+      # Issue #247。**ブラウザに触れずに**背景タブの実行状況を読む唯一の
+      # 経路。`busy.html` は report() のたびに `beacon?state=..&f=..&t=..`
+      # を投げ、`serve.py` がそれを state ごとに数えている。
+      #
+      # 見るのは `advanced_frames` / `advanced_ticks` — **最後に見た値と
+      # 最初に見た値の差**である。`state=hidden` の側でこれが 0 なら、
+      # 隠れているタブで rAF / setInterval が一度も進まなかったことに
+      # なる。`count` も一緒に出しているのは、beacon が 1 件しか来て
+      # いない (差が 0 になるのは当然) 場合と区別するため。
+      #
+      # 集計の取得に失敗してもジョブは落とさない。これは診断であって
+      # 計測結果そのものではない。
+      - name: Show background beacon counts (Issue #247)
+        if: steps.bench_url.outputs.serve_fixed_pages == 'true' && inputs.beacon
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          try {
+            $summary = Invoke-WebRequest -Uri "http://127.0.0.1:8731/beacon-summary" `
+              -UseBasicParsing -TimeoutSec 10 -ErrorAction Stop
+            Write-Host "--- beacon 集計 (state ごと) ---"
+            Write-Host $summary.Content
+            $parsed = $summary.Content | ConvertFrom-Json
+            foreach ($state in $parsed.PSObject.Properties.Name) {
+              $e = $parsed.$state
+              Write-Host ("{0}: count={1} frames {2} -> {3} (+{4}) / ticks {5} -> {6} (+{7})" -f `
+                $state, $e.count, $e.first_frames, $e.last_frames, $e.advanced_frames, `
+                $e.first_ticks, $e.last_ticks, $e.advanced_ticks)
+            }
+          } catch {
+            Write-Host "beacon 集計を取得できませんでした: $_"
           }
 
       - name: Show result summary
