@@ -311,5 +311,157 @@ class BeaconWiringTest(unittest.TestCase):
                 self.assertNotIn("inputs.beacon }}", step.get("run") or "")
 
 
+class IngestHistoryWiringTest(unittest.TestCase):
+    """取り込みジョブ (Issue #211 項目4 後半 / D106 Revisit (1)) の配線。
+
+    このジョブは **週 1 回の schedule 実行でしか走らない。** 壊れていても
+    PR の CI は緑のままなので、Linux 上で突き合わせられることは全部ここで
+    突き合わせる。とくに書き込み権限を持つジョブなので、「起動条件」と
+    「権限の範囲」は字面で固定する。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.text = WORKFLOW.read_text(encoding="utf-8")
+        cls.doc = yaml.safe_load(cls.text)
+        cls.bench = cls.doc["jobs"]["perf-windows"]
+        cls.ingest = cls.doc["jobs"]["ingest-history"]
+
+    def _runs(self, *, code_only: bool = False) -> str:
+        """取り込みジョブの `run:` を連結する。
+
+        `code_only=True` なら行頭 `#` のコメント行を落とす — 「この書き方を
+        してはならない」をコメントで説明している箇所を、実際のコードと
+        取り違えないため。
+        """
+        scripts = [s.get("run") or "" for s in self.ingest["steps"]]
+        if not code_only:
+            return "\n".join(scripts)
+        lines = [ln for script in scripts for ln in script.splitlines() if not ln.strip().startswith("#")]
+        return "\n".join(lines)
+
+    def _uses(self, prefix: str) -> list[str]:
+        found = []
+        for job in self.doc["jobs"].values():
+            for step in job["steps"]:
+                uses = step.get("uses") or ""
+                if uses.startswith(prefix):
+                    found.append(uses)
+        return found
+
+    def test_the_artifact_name_output_matches_the_upload_step_verbatim(self) -> None:
+        """片方だけ直したら落ちること。
+
+        **ここが食い違うと、取り込みジョブは存在しない artifact を取りに
+        いって失敗する** — しかも失敗するのは週次実行だけである。
+        """
+        upload = [s for s in self.bench["steps"] if (s.get("uses") or "").startswith("actions/upload-artifact")]
+        self.assertEqual(len(upload), 1)
+        self.assertEqual(self.bench["outputs"]["artifact_name"], upload[0]["with"]["name"])
+
+    def test_upload_and_download_artifact_share_a_major_version(self) -> None:
+        """artifact の upload/download は major を跨いだ組み合わせが動かない。"""
+        uploads = self._uses("actions/upload-artifact@")
+        downloads = self._uses("actions/download-artifact@")
+        self.assertTrue(uploads and downloads)
+        majors = {u.rsplit("@", 1)[1] for u in uploads} | {d.rsplit("@", 1)[1] for d in downloads}
+        self.assertEqual(len(majors), 1, f"バージョンが揃っていない: {majors}")
+
+    def test_the_ingest_job_never_runs_for_a_pull_request(self) -> None:
+        """fork からの PR で書き込み権限つきジョブを起動しない。"""
+        condition = self.ingest["if"]
+        self.assertIn("github.event_name == 'schedule'", condition)
+        self.assertIn("github.repository == 'noan98/VeloX'", condition)
+        # `workflow_dispatch` を許すのは main 上だけ。
+        self.assertIn("github.ref == 'refs/heads/main'", condition)
+        self.assertNotIn("pull_request", condition)
+
+    def test_only_the_ingest_job_gets_write_permission(self) -> None:
+        """計測ジョブ (pull_request でも走る) に書き込み権限を広げない。"""
+        self.assertEqual(self.ingest["permissions"], {"contents": "write", "pull-requests": "write"})
+        self.assertNotIn("permissions", self.bench)
+        self.assertNotIn("permissions", self.doc)
+
+    def test_the_bench_step_publishes_the_conditions_it_actually_used(self) -> None:
+        """`inputs.compare_env` は schedule では空。補完後の値を渡すこと。
+
+        ここを `inputs.*` から読み直すと、B 腕の結果が「条件不明」として
+        取り込まれなくなる (`perf_history_plan.py` の RefusalTest)。
+        """
+        for key in ("compare_env", "common_env"):
+            with self.subTest(key=key):
+                self.assertEqual(self.bench["outputs"][key], "${{ steps.bench_run.outputs." + key + " }}")
+                self.assertIn(f'"{key}=$', self.text)
+
+    def test_the_ingest_job_refuses_to_touch_anything_outside_the_history(self) -> None:
+        """書き込み権限を持つ自動ジョブの被害範囲を字面で固定する。"""
+        runs = self._runs(code_only=True)
+        self.assertIn("grep -v '^results/history/'", runs)
+        self.assertIn("git add results/history", runs)
+
+    def test_the_emptiness_check_can_see_a_brand_new_history_file(self) -> None:
+        """`git diff` は未追跡ファイルを見ない。
+
+        履歴ファイルは初回だけ新規作成なので、`git diff --quiet` で判定すると
+        **1 回目の取り込みが「変更なし」として静かに捨てられる。**
+        """
+        runs = self._runs(code_only=True)
+        self.assertIn("git status --porcelain", runs)
+        self.assertNotIn("git diff --quiet", runs)
+
+    def test_untracked_directories_are_not_collapsed(self) -> None:
+        """既定の porcelain は未追跡ディレクトリを 1 行に畳む。
+
+        初回は `results/history/windows/` ごと未追跡なので、畳まれると
+        `?? results/` としか出ず、**範囲外判定が初回で必ず落ちる。**
+        `--untracked-files=all` が無ければこの配線は 1 度も成功しない。
+        """
+        self.assertIn("--untracked-files=all", self._runs(code_only=True))
+
+    def test_the_artifact_is_unpacked_outside_the_work_tree(self) -> None:
+        """リポジトリ内に展開すると、未追跡ファイルが範囲外検査を汚す。"""
+        download = [
+            s for s in self.ingest["steps"] if (s.get("uses") or "").startswith("actions/download-artifact")
+        ]
+        self.assertEqual(len(download), 1)
+        self.assertIn("runner.temp", download[0]["with"]["path"])
+
+    def test_the_checkout_uses_the_same_token_that_opens_the_pull_request(self) -> None:
+        """`GITHUB_TOKEN` の push は `synchronize` を発火させない (D91 と同じ罠)。
+
+        作成だけ PAT にしても、2 回目以降の更新で CI が回らなくなる。
+        """
+        checkout = [s for s in self.ingest["steps"] if (s.get("uses") or "").startswith("actions/checkout")]
+        self.assertEqual(len(checkout), 1)
+        self.assertIn("AUTO_MERGE_TOKEN", checkout[0]["with"]["token"])
+
+    def test_the_pull_request_body_file_exists(self) -> None:
+        runs = self._runs(code_only=True)
+        match = re.search(r"--body-file (\S+)", runs)
+        self.assertIsNotNone(match, "--body-file が見つからない")
+        assert match is not None
+        self.assertTrue((ROOT / match.group(1)).is_file(), match.group(1))
+
+    def test_the_generated_pull_request_never_closes_an_issue(self) -> None:
+        """毎週作られる PR が Issue を閉じてしまわないこと (D128 / D131)。
+
+        本文の定型文と、ジョブが作るコミットメッセージの両方を見る。
+        """
+        import sys
+
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from check_closing_keywords import extract_closing_issues
+
+        runs = self._runs(code_only=True)
+        match = re.search(r"--body-file (\S+)", runs)
+        assert match is not None
+        body = (ROOT / match.group(1)).read_text(encoding="utf-8")
+        self.assertEqual(extract_closing_issues(body), [])
+        # コミットメッセージは Markdown として解釈されない (D131 決定3)。
+        for commit_message in re.findall(r'-m "([^"]*)"', runs):
+            with self.subTest(message=commit_message):
+                self.assertEqual(extract_closing_issues(commit_message, markdown=False), [])
+
+
 if __name__ == "__main__":
     unittest.main()

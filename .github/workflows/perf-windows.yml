@@ -46,10 +46,12 @@ name: Performance (Windows)
 # (cold_startup、A/B 比較) で機械的に run を積み重ねる。機種ごとに系列を
 # 分けて蓄積できるのは、Issue #211 項目2 (`docs/decisions.md` D106、
 # `scripts/dashboard/common.py` の `machine_key`) が「同一 session_id でも
-# 機種が違えば比較しない」を保証しているおかげであり、schedule 自体は
-# `record.py`/`results/history/` への取り込みまでは行わない (§の末尾、
-# 「Upload results」ステップの直前を参照 — artifact として残すのみで、
-# history への commit 導線は今回のスコープでは未着手のまま)。
+# 機種が違えば比較しない」を保証しているおかげである。
+#
+# **取り込みの導線はこのファイル末尾の `ingest-history` ジョブにある**
+# (D132)。D106 の時点では artifact に残すだけで、`results/history/` への
+# commit 導線は「誰が commit を作るか」の運用設計が要るとして未着手のまま
+# だった — その設計が D132 である。
 #
 # **ここではまだ fail させない (ゲート化しない)。** 理由:
 #   - Issue #211 項目3 (同一機種内での分散の実測) が未着手で、「どこからが
@@ -211,6 +213,20 @@ jobs:
     # main に対して走る (Issue #211 項目4)。pull_request では上の paths
     # フィルタにより、この workflow 自身を変更する PR だけがここに来る。
     timeout-minutes: 30
+    # Issue #211 項目4 の後半 / D106 Revisit condition (1)。取り込みジョブ
+    # (ingest-history) へ渡す値。
+    #
+    # ⚠️ `artifact_name` は下の「Upload results」の `name:` と**字面が完全に
+    # 一致していなければならない。** 片方だけ直すと、取り込みジョブが
+    # 存在しない artifact を取りにいって失敗する — しかも失敗するのは
+    # **週 1 回の schedule 実行だけ**で、PR の CI は緑のままである。
+    # 重複を承知でここに置き、`test_perf_windows_inputs.py` が 2 箇所の
+    # 字面を突き合わせる (同ファイルが正規表現に対してやっているのと同じ
+    # 方法 — 「片方だけ直したら必ず落ちる」状態を作る)。
+    outputs:
+      artifact_name: velox-perf-windows-${{ (inputs.scenarios != '' || inputs.pages != '') && 'multi' || (inputs.scenario || 'cold_startup') }}
+      compare_env: ${{ steps.bench_run.outputs.compare_env }}
+      common_env: ${{ steps.bench_run.outputs.common_env }}
     steps:
       - uses: actions/checkout@v7
 
@@ -623,6 +639,16 @@ jobs:
           if (-not [int]::TryParse($repeatsRaw, [ref]$repeats) -or $repeats -lt 1) {
             throw "repeats は 1 以上の整数で指定してください (受け取った値: '$repeatsRaw')"
           }
+
+          # Issue #211 項目4 の後半 / D106 Revisit condition (1)。
+          # 取り込みジョブ (ingest-history) が「どの条件で測った数値か」を
+          # 系列 ID に埋めるために要る。**既定値の補完はこのステップの中で
+          # 行われる**ので、`inputs.compare_env` を ingest 側で読み直しては
+          # ならない — schedule 実行では常に空文字列になり、B 腕の結果が
+          # 「条件不明」として取り込まれなくなる (`perf_history_plan.py` の
+          # RefusalTest が固定している挙動)。
+          "compare_env=$compareEnv" >> $env:GITHUB_OUTPUT
+          "common_env=$commonEnv" >> $env:GITHUB_OUTPUT
 
           # "KEY=VALUE;KEY2=VALUE2" を実際の環境変数として設定し、設定した
           # 名前の一覧を返す (解除に使う)。
@@ -1230,3 +1256,194 @@ jobs:
             diag/
           retention-days: 30
           if-no-files-found: warn
+
+  # -------------------------------------------------------------------------
+  # Issue #211 項目4 の後半 / docs/decisions.md D106 Revisit condition (1)。
+  #
+  # D106 は schedule を足すところまでを行い、**結果を `results/history/` へ
+  # 取り込む導線は意図的に未着手のまま残した** — 「誰が commit を作るか」
+  # (作者・タイミング・競合・fork/権限) が独立した運用設計を要するため。
+  # ここがその設計である。
+  #
+  # ## なぜ PR を作るのか (main へ直接 push しないのか)
+  #
+  # `main` には active な ruleset があり `pull_request` ルールを含む。bypass
+  # は admin ロールのみで `GITHUB_TOKEN` は該当しないため、**workflow から
+  # `main` へ直接 push する選択肢は最初から無い。** 承認は 0 件でよい設定
+  # なので、PR を作れば既存の auto-merge がそのまま処理できる。
+  #
+  # ## なぜ PAT で PR を作るのか
+  #
+  # **`GITHUB_TOKEN` で作った PR は `on: pull_request` を発火させない**
+  # (GitHub のループ防止仕様)。CI が 1 件も走らず、auto-merge の起動契機で
+  # ある `workflow_run` も来ないため、**PR が誰にも気付かれないまま放置
+  # される。** D91 が `@claude` メンションで実測した「GITHUB_TOKEN だと後続
+  # の自動処理が動かない」と同じ罠なので、同じ対処 (`AUTO_MERGE_TOKEN`) を
+  # 採る。未設定でも PR は作るが、`::warning::` を出して手動対応に落とす。
+  #
+  # ## なぜ Linux で走らせるのか
+  #
+  # 計測は Windows でしかできないが、**git と PR 作成は OS に依存しない。**
+  # Windows ランナーは課金単価が高いので、artifact を挟んで Linux 側で行う。
+  #
+  # ## なぜ fork/PR から絶対に起動しないのか
+  #
+  # `perf-windows.yml` は「この workflow 自身を変更する PR」でも走る (D88)。
+  # fork からの PR では `GITHUB_TOKEN` が読み取り専用なので push は失敗する
+  # が、**より悪いのは起動してしまうこと自体**である — 外部から出された PR
+  # の内容で、書き込み権限を持つジョブを動かすことになる。`schedule` と
+  # 「main 上の `workflow_dispatch`」以外では起動しない。
+  ingest-history:
+    name: Record results into results/history
+    needs: perf-windows
+    runs-on: ubuntu-latest
+    if: >-
+      github.repository == 'noan98/VeloX'
+      && (github.event_name == 'schedule'
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+    # 書き込み権限は**このジョブにだけ**与える。workflow 全体に付けると、
+    # `pull_request` でも走る計測ジョブにまで書き込み権限が広がる。
+    permissions:
+      contents: write
+      pull-requests: write
+    timeout-minutes: 15
+    env:
+      HISTORY_BRANCH: perf/windows-history
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          # 取り込み先ブランチを fetch し直すため全履歴が要る
+          # (shallow だと `origin/main` とのマージができない)。
+          fetch-depth: 0
+          # **push も PAT で行う。** `GITHUB_TOKEN` による push は
+          # `pull_request` の `synchronize` を発火させないため、既存の取り込み
+          # PR を更新したときに **CI が再実行されないまま auto-merge の判定に
+          # 入る。** 作成だけ PAT にしても、2 回目以降で同じ罠を踏む。
+          token: ${{ secrets.AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      # ⚠️ `upload-artifact` と **major を揃える** (混在は動作保証外)。
+      # `test_perf_windows_inputs.py` が 2 つのバージョンを突き合わせる。
+      #
+      # 展開先を作業ツリーの外に置くのは意図的である。**リポジトリ内に置くと
+      # `git status` に未追跡ファイルとして現れ、「範囲外の差分」の検査を
+      # 自分で汚す。**
+      - uses: actions/download-artifact@v7
+        with:
+          name: ${{ needs.perf-windows.outputs.artifact_name }}
+          path: ${{ runner.temp }}/bench-artifact
+
+      - name: Prepare the history branch
+        id: branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # 既に open な取り込み PR があれば、その上に積む。**新しい PR を
+          # 作り直すと、まだマージされていない前回分のデータが失われる。**
+          open_pr=$(gh pr list --head "$HISTORY_BRANCH" --state open \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$open_pr" ]; then
+            echo "open な取り込み PR #${open_pr} があるので、その続きとして積みます"
+            git fetch origin "$HISTORY_BRANCH"
+            git checkout -B "$HISTORY_BRANCH" "origin/$HISTORY_BRANCH"
+            # `results/history/` には追記しか起きないので main 側と競合する
+            # ことは実質ない。競合したらジョブを落として気付く。
+            git merge --no-edit origin/main
+          else
+            # open な PR が無いのにブランチだけ残っている場合、**取り込み分が
+            # main に入っているとは限らない** (PR がマージされずに閉じられた
+            # 等)。その状態で main から作り直すと push が non-fast-forward で
+            # 弾かれ、原因の分かりにくいエラーになる。先に見て説明する。
+            if git fetch origin "$HISTORY_BRANCH" 2>/dev/null; then
+              if ! git merge-base --is-ancestor FETCH_HEAD origin/main; then
+                echo "::error::ブランチ ${HISTORY_BRANCH} に main へ入っていない commit が残っています (PR がマージされずに閉じられた可能性)。内容を確認し、不要ならブランチを削除してから再実行してください。"
+                exit 1
+              fi
+            fi
+            git checkout -B "$HISTORY_BRANCH" origin/main
+          fi
+          echo "open_pr=${open_pr}" >> "$GITHUB_OUTPUT"
+
+      # 入力はシェルへ直接展開せず環境変数で渡す (script injection 対策)。
+      - name: Append results to results/history
+        id: append
+        env:
+          COMPARE_ENV: ${{ needs.perf-windows.outputs.compare_env }}
+          COMMON_ENV: ${{ needs.perf-windows.outputs.common_env }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/perf_history_plan.py \
+            --results-dir "$RUNNER_TEMP/bench-artifact/results" \
+            --history-dir results/history \
+            --run-id "$RUN_ID" \
+            --run-url "$RUN_URL" \
+            --compare-env "$COMPARE_ENV" \
+            --common-env "$COMMON_ENV"
+
+      - name: Commit and open the pull request
+        env:
+          GH_TOKEN: ${{ secrets.AUTO_MERGE_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_PAT: ${{ secrets.AUTO_MERGE_TOKEN != '' }}
+          OPEN_PR: ${{ steps.branch.outputs.open_pr }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # ⚠️ `git diff` は**未追跡ファイルを見ない。** 履歴ファイルは
+          # 初回だけ新規作成なので、`git diff --quiet` で判定すると
+          # **1 回目の取り込みが「変更なし」として静かに捨てられる。**
+          #
+          # ⚠️ さらに `--untracked-files=all` が要る。既定の
+          # `git status --porcelain` は**未追跡ディレクトリを 1 行に畳む**
+          # ので、初回は個々のファイルではなく `?? results/` とだけ出る。
+          # それを範囲外判定に掛けると、**初回の取り込みが必ず「範囲外の
+          # 差分あり」として落ちる。**
+          changed=$(git status --porcelain --untracked-files=all)
+          if [ -z "$changed" ]; then
+            echo "履歴に変更がありません (取り込み済みの run だった可能性)。何もしません。"
+            exit 0
+          fi
+
+          # **このジョブが触ってよいのは results/history/ の下だけである。**
+          # 書き込み権限を持つ自動ジョブなので、範囲外の差分が出た時点で
+          # 何が起きているか分からない — マージさせずにここで落とす。
+          # `cut -c4-` は porcelain の状態欄 (3 文字) を落とす。rename は
+          # `a -> b` の形で残るが、それも範囲外として扱ってよい (このジョブは
+          # 追記しかしないので、rename が出る時点で想定外である)。
+          outside=$(echo "$changed" | cut -c4- | grep -v '^results/history/' || true)
+          if [ -n "$outside" ]; then
+            echo "::error::results/history/ の外に差分があります。取り込みを中止します:"
+            echo "$outside"
+            exit 1
+          fi
+
+          git add results/history
+          # ⚠️ コミットメッセージにクロージングキーワードと番号を隣接させない
+          # (CLAUDE.md / D128 / D131)。GitHub 本体はコミットメッセージも解析
+          # し、そこでは Markdown のコードスパンが効かない。
+          git commit -m "perf(windows): 週次計測の結果を results/history に取り込む" \
+            -m "Issue #211 項目4 の後半 / D106 Revisit condition (1)。自動生成。" \
+            -m "$RUN_URL"
+          git push -u origin "$HISTORY_BRANCH"
+
+          if [ -n "$OPEN_PR" ]; then
+            echo "既存の PR #${OPEN_PR} を更新しました"
+            exit 0
+          fi
+
+          if [ "$HAS_PAT" != "true" ]; then
+            echo "::warning::AUTO_MERGE_TOKEN が未設定です。GITHUB_TOKEN で作った PR は on: pull_request を発火させないため、CI も auto-merge も動きません (D91 と同じ罠)。この PR は手動で確認・マージしてください。"
+          fi
+
+          gh pr create \
+            --base main \
+            --head "$HISTORY_BRANCH" \
+            --title "perf(windows): 週次計測の結果を results/history に取り込む" \
+            --label automerge-without-codex \
+            --body-file .github/pr-body-perf-history.md
