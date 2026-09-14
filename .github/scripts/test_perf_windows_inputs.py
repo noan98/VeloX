@@ -27,6 +27,8 @@
 from __future__ import annotations
 
 import re
+import shlex
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -49,6 +51,15 @@ SCALING_REGEX = r"^tabs_(?:hold_)?\d+$"
 # `$fixturePages` と同じ内容でなければならない — 下の
 # `test_the_fixture_list_matches_the_one_the_workflow_warns_about` が検査する。
 FIXTURE_PAGES = ("busy.html", "download.html", "network_activity.html")
+
+# 取り込みジョブの「範囲外の差分」検査。**workflow 本体にこの字面どおり
+# 書かれている前提**であり、`IngestHistoryWiringTest` が字面の一致と
+# 実際の挙動の両方を検査する (書いてあるが効かない、を許さない)。
+OUTSIDE_CHECK = (
+    "echo \"$changed\" | cut -c4- | awk -F' -> ' "
+    "'{ for (i = 1; i <= NF; i++) print $i }' | grep -v '^results/history/'"
+)
+OUTSIDE_CHECK_STATEMENT = f"outside=$({OUTSIDE_CHECK} || true)"
 
 
 def _on_section(doc: dict) -> dict:
@@ -396,8 +407,38 @@ class IngestHistoryWiringTest(unittest.TestCase):
     def test_the_ingest_job_refuses_to_touch_anything_outside_the_history(self) -> None:
         """書き込み権限を持つ自動ジョブの被害範囲を字面で固定する。"""
         runs = self._runs(code_only=True)
-        self.assertIn("grep -v '^results/history/'", runs)
+        self.assertIn(OUTSIDE_CHECK, runs)
         self.assertIn("git add results/history", runs)
+
+    def test_the_outside_check_catches_a_rename_out_of_the_history(self) -> None:
+        """`git status` の rename 行は `old -> new` で**両方**入る。
+
+        行全体を 1 パスとして検査すると、**`results/history/x -> 範囲外/y`
+        が「results/history/ で始まる」ために素通りする** — 範囲外へ持ち出す
+        向きだけが漏れる、という最悪の抜け方になる。
+
+        字面を固定するだけでなく、**同じ字面を実際に実行して**挙動を確かめる
+        (この検査は書き込み権限を持つジョブの最後の歯止めなので、「書いて
+        あるが効かない」を許せない)。
+        """
+        cases = [
+            # (git status --porcelain --untracked-files=all の出力, 範囲外と判定されるべきか)
+            ("?? results/history/windows/cold_startup.jsonl", False),
+            (" M results/history/linux/cold_startup.jsonl", False),
+            ("?? src/main.rs", True),
+            ("R  results/history/a.jsonl -> results/history/b.jsonl", False),
+            # ここが本題 — 範囲外へ持ち出す向きの rename
+            ("R  results/history/a.jsonl -> docs/leaked.json", True),
+            # 逆向き (範囲外から持ち込む) も検知されてよい
+            ("R  docs/x.json -> results/history/a.jsonl", True),
+        ]
+        for changed, should_flag in cases:
+            with self.subTest(changed=changed):
+                script = f'changed={shlex.quote(changed)}\n{OUTSIDE_CHECK_STATEMENT}\nprintf "%s" "$outside"\n'
+                result = subprocess.run(
+                    ["bash", "-c", script], capture_output=True, text=True, check=True
+                )
+                self.assertEqual(bool(result.stdout.strip()), should_flag, result.stdout)
 
     def test_the_emptiness_check_can_see_a_brand_new_history_file(self) -> None:
         """`git diff` は未追跡ファイルを見ない。

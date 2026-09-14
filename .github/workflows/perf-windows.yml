@@ -1413,10 +1413,16 @@ jobs:
           # **このジョブが触ってよいのは results/history/ の下だけである。**
           # 書き込み権限を持つ自動ジョブなので、範囲外の差分が出た時点で
           # 何が起きているか分からない — マージさせずにここで落とす。
-          # `cut -c4-` は porcelain の状態欄 (3 文字) を落とす。rename は
-          # `a -> b` の形で残るが、それも範囲外として扱ってよい (このジョブは
-          # 追記しかしないので、rename が出る時点で想定外である)。
-          outside=$(echo "$changed" | cut -c4- | grep -v '^results/history/' || true)
+          #
+          # `cut -c4-` は porcelain の状態欄 (3 文字) を落とす。
+          #
+          # ⚠️ rename は `old -> new` の形で 1 行に**両方**残る。行全体を
+          # 1 つのパスとして検査すると、**`results/history/x -> 範囲外/y`
+          # が「results/history/ で始まる」ために素通りする** — 範囲外へ
+          # 持ち出す向きの rename だけが検知から漏れる、という最悪の抜け方に
+          # なる。`awk -F' -> '` で両側に割ってから検査する (rename でない行は
+          # NF=1 なのでそのまま 1 パスとして出る)。
+          outside=$(echo "$changed" | cut -c4- | awk -F' -> ' '{ for (i = 1; i <= NF; i++) print $i }' | grep -v '^results/history/' || true)
           if [ -n "$outside" ]; then
             echo "::error::results/history/ の外に差分があります。取り込みを中止します:"
             echo "$outside"
