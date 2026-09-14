@@ -3541,6 +3541,40 @@ fn resolve_permission(
     }
 }
 
+/// Whether wry's download-completed callback can report a **successful**
+/// download as failed because some *earlier* download failed (Issue #128,
+/// docs/decisions.md D140).
+///
+/// `true` only on WebKitGTK, and that is checked against all three of wry
+/// 0.56.1's backends rather than assumed from
+/// [`DOWNLOAD_HANDLERS_PER_CONTEXT`]:
+///
+/// - **WebKitGTK** (`webkitgtk/web_context.rs:315`): one
+///   `failed: Rc<RefCell<bool>>` per `register_download_handler` call,
+///   created *outside* `connect_download_started`, set by every download's
+///   `connect_failed` and never cleared. Every later `connect_finished`
+///   reports `(!failed)` for both the flag and the path. **Poisoned.**
+/// - **WebView2** (`webview2/mod.rs:896`): `success` is
+///   `state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED`, read from *that*
+///   download operation. Nothing is shared between downloads.
+/// - **WKWebView** (`wkwebview/download.rs`): `download_did_finish` passes
+///   `true`, `download_did_fail` passes `false`, per download. Nothing is
+///   shared. (`path` is always `None` there — D28 — which is a separate
+///   matter.)
+///
+/// This is deliberately its own constant rather than a reuse of
+/// [`DOWNLOAD_HANDLERS_PER_CONTEXT`]. The two ask different questions
+/// (*where* handlers are registered vs. *whether a flag is shared*) and
+/// happen to have the same answer today; tying them together would mean a
+/// future change to one silently moving the other.
+pub const DOWNLOAD_SUCCESS_FLAG_IS_SHARED: bool = cfg!(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+));
+
 /// Whether wry registers a webview's download handlers on the
 /// [`WebContext`] the webview is built against rather than on the webview
 /// itself. `true` on WebKitGTK, where `with_download_started_handler` /

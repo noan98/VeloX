@@ -2080,8 +2080,52 @@ fn handle_user_event(
             success,
         } => {
             let now = now_unix();
-            match state.downloads.resolve_completion(&url, path.as_deref()) {
-                Some(id) if success => {
+            // Issue #128 / D140. The `success` flag alone is not reliable on
+            // Linux: wry 0.56 shares one set-only `failed` flag across every
+            // download of a registration, and D53 made that registration
+            // session-wide — so after any single failure every later
+            // download is reported failed (and with `path: None`) even
+            // though its file lands correctly. Reproduced end to end.
+            //
+            // The destination this entry recorded when it *started* is the
+            // check: on a real failure WebKitGTK removes the partial file,
+            // so a file that is there means the download finished. See
+            // `downloads::completion_succeeded` for the truth table and why
+            // presence — not size — is the signal.
+            //
+            // **Gated to the backend that actually has the bug**
+            // (`DOWNLOAD_SUCCESS_FLAG_IS_SHARED`, D140 決定5). WebView2 and
+            // WKWebView answer per download, so their `false` is real and
+            // overruling it would misreport a genuine failure as a success
+            // — on Windows, the priority OS, on the strength of behavior
+            // nobody has measured there.
+            //
+            // Reading the filesystem is why this lives here and not in
+            // `browser::downloads`, which stays pure (D20): that module
+            // gets the two booleans and decides.
+            let resolved = state.downloads.resolve_completion(&url, path.as_deref());
+            let succeeded = resolved.is_some_and(|id| {
+                // Only the poisoned backend gets its verdict second-guessed,
+                // and only then is the filesystem touched at all.
+                let exists = crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED
+                    && state
+                        .downloads
+                        .get(id)
+                        .is_some_and(|entry| entry.destination.exists());
+                downloads::completion_succeeded(
+                    success,
+                    exists,
+                    crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED,
+                )
+            });
+            if std::env::var_os("VELOX_DEBUG").is_some() {
+                eprintln!(
+                    "velox: download completion url={url:?} path={path:?} \
+reported_success={success} recorded_as_success={succeeded}"
+                );
+            }
+            match resolved {
+                Some(id) if succeeded => {
                     state.downloads.complete(id, now);
                 }
                 Some(id) => {
