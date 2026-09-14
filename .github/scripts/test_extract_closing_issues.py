@@ -141,6 +141,40 @@ class ExtractClosingIssuesTest(unittest.TestCase):
     def test_colon_after_keyword(self) -> None:
         self.assertEqual(extract_closing_issues("Closes: #123"), [123])
 
+    def test_inline_code_keyword_ignored(self) -> None:
+        # Issue #252: PR #249 は「入れていません」という否定文なのに、
+        # バッククォート囲みの文字列が拾われて #247 が誤クローズされた。
+        # 実際の文面をそのまま回帰テストにする。
+        body = (
+            "**この PR に `Closes #247` は入れていません。** 項目1 は未解決の"
+            "ままなので、\n#247 をその 1 点に絞って書き換えました。"
+        )
+        self.assertEqual(extract_closing_issues(body), [])
+
+    def test_inline_code_double_backtick_ignored(self) -> None:
+        self.assertEqual(extract_closing_issues("``Closes #123``"), [])
+
+    def test_inline_code_does_not_swallow_real_keyword(self) -> None:
+        # 本文に別のコードスパンがあっても、独立行のキーワードは拾う。
+        body = "Closes #5\n\n`cargo test --lib` を通しました。"
+        self.assertEqual(extract_closing_issues(body), [5])
+
+    def test_issue_number_in_inline_code_after_keyword(self) -> None:
+        # 番号側だけがコードスパンなら、キーワードは素のままなので拾う。
+        body = "Closes #77 (`#77` は Epic の子)"
+        self.assertEqual(extract_closing_issues(body), [77])
+
+    def test_unclosed_backtick_does_not_swallow_following_lines(self) -> None:
+        # 閉じていないバッククォートは書き損じとみなし、その行だけで止める。
+        # 行をまたいで消すと下にある正当なキーワードを巻き添えにする。
+        body = "途中で ` を書き損じた行\nCloses #9"
+        self.assertEqual(extract_closing_issues(body), [9])
+
+    def test_keyword_split_across_inline_code_boundary(self) -> None:
+        # コードスパンの外にキーワード、中に番号 — GitHub 本体は
+        # コードスパン内の参照をリンクしないので閉じない側に倒す。
+        self.assertEqual(extract_closing_issues("Closes `#123`"), [])
+
     def test_epic_body_from_claude_md_example(self) -> None:
         body = "Closes #115\nCloses #116\nCloses #154"
         self.assertEqual(extract_closing_issues(body), [115, 116, 154])
