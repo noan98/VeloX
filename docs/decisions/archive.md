@@ -4918,9 +4918,7 @@ GUI 起動 (WebView2) が安定して動くことを実際の CI 実行で確認
 固有の問題なのか実コードの Windows 対応不足なのかを切り分ける — 初回の
 `resolve_unix_download_dir` は後者だった。
 
-## D62: セキュリティ・入力値堅牢性 (#35) — スキーム許可リストは維持、IPC に
-サイズ上限、JS 埋め込みに追加エスケープ、ブックマークの壊れた `folder_id` を
-ロード時に自己修復
+## D62: セキュリティ・入力値堅牢性 (#35) — スキーム許可リストは維持、IPC にサイズ上限、JS 埋め込みに追加エスケープ、ブックマークの壊れた `folder_id` をロード時に自己修復
 
 **対象**: Issue #35。外部入力の境界 (URL 正規化、トールバー IPC、Rust→JS の
 文字列埋め込み、`history.json`/`bookmarks.json`/`input_history.json` の永続化
@@ -5919,9 +5917,7 @@ WebKitGTK 実装が完了を待たない非同期発火型であることの影�
 macOS の実機検証 (`clear_all_browsing_data` が実際にファイルを消すこと)
 は今回の環境では不可能だった。
 
-## D67: 設定画面と永続設定基盤 (#30) — `browser::settings` に一元化し、
-`Config::apply_settings`/`to_settings` で相互変換、Appearance のみ即時
-反映・他は次回起動反映
+## D67: 設定画面と永続設定基盤 (#30) — `browser::settings` に一元化し、`Config::apply_settings`/`to_settings` で相互変換、Appearance のみ即時反映・他は次回起動反映
 
 **対象**: Issue #30 (関連 #10)。CLAUDE.md「対応 OS の優先度」により
 Windows を最優先の判断基準としたが、実装・実測は本リポジトリの他 Issue
@@ -6939,9 +6935,7 @@ release workflow 追加に着手できる環境が整ったとき。(2) 実際�
 (AppImage/deb) の要望が具体化したとき。(4) コード署名 (#42) 着手時に
 `release-windows.yml`/`release-linux.yml` の署名ステップを追加する。
 
-## D71: ダークモードとブラウザ UI テーマ (#31) — #30 の資産の棚卸しを行い、
-「明示的な Light/Dark がネイティブウィンドウ枠と Private Window 配色に
-届いていなかった」2 点のギャップだけを埋める
+## D71: ダークモードとブラウザ UI テーマ (#31) — #30 の資産の棚卸しを行い、「明示的な Light/Dark がネイティブウィンドウ枠と Private Window 配色に届いていなかった」2 点のギャップだけを埋める
 
 **対象**: Issue #31 (依存: #30、D67 で実装済み)。CLAUDE.md「対応 OS の
 優先度」により Windows を最優先の判断基準としたが、開発・実測は他の
@@ -7753,8 +7747,7 @@ cross-window リークを修正する Issue に着手するとき — `window_id
 context を wry が公開するようになったとき。
 
 
-## D75: 印刷・PDF保存 (#40) — 印刷は `wry::WebView::print()` (unsafe 不要)、
-PDF直接書き出しは Windows のみ `ICoreWebView2_7::PrintToPdf`
+## D75: 印刷・PDF保存 (#40) — 印刷は `wry::WebView::print()` (unsafe 不要)、PDF直接書き出しは Windows のみ `ICoreWebView2_7::PrintToPdf`
 
 **対象**: Issue #40。CLAUDE.md「対応 OS の優先度」により Windows を最優先し、
 D59/D66/D69 と同じ「issue の指示に頼らず、ビルダーメソッドだけでなく拡張
@@ -8236,8 +8229,7 @@ Windows での検証ができるようになったとき、上記の未検証事
 追加する。
 
 
-## D77: キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと
-`browser::shortcuts::SHORTCUT_TABLE` への集約、衝突検出、信頼境界は不変
+## D77: キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと `browser::shortcuts::SHORTCUT_TABLE` への集約、衝突検出、信頼境界は不変
 
 **対象**: Issue #38 の受け入れ条件 4 点 (主要ショートカットの一元定義、
 OS 別 modifier 表示、キー衝突検出、テストでの主要 mapping 保証)。依存

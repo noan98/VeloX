@@ -33,11 +33,11 @@
 - [D64](./archive.md#d64-easylisteasyprivacy-対応-23--自前パーサを拡張実データは同梱もダウンロードもしない) — EasyList/EasyPrivacy 対応 (#23) — 自前パーサを拡張、実データは同梱もダウンロードもしない
 - [D66](./archive.md#d66-サイトデータ管理-26--wrywebviewclear_all_browsing_data-で全消去origin-単位はエンジンごとに非対称で見送り) — サイトデータ管理 (#26) — `wry::WebView::clear_all_browsing_data()` で全消去、origin 単位はエンジンごとに非対称で見送り
 - [D69](./archive.md#d69-ページ内検索-43--3-エンジンとも自前-js-実装ネイティブ-find-api-は-windows-を優先する限り使えないと判明) — ページ内検索 (#43) — 3 エンジンとも自前 JS 実装、ネイティブ find API は Windows を優先する限り使えないと判明
-- [D71](./archive.md#d71-ダークモードとブラウザ-ui-テーマ-31--30-の資産の棚卸しを行い) — ダークモードとブラウザ UI テーマ (#31) — #30 の資産の棚卸しを行い、
+- [D71](./archive.md#d71-ダークモードとブラウザ-ui-テーマ-31--30-の資産の棚卸しを行い明示的な-lightdark-がネイティブウィンドウ枠と-private-window-配色に届いていなかった2-点のギャップだけを埋める) — ダークモードとブラウザ UI テーマ (#31) — #30 の資産の棚卸しを行い、「明示的な Light/Dark がネイティブウィンドウ枠と Private Window 配色に届いていなかった」2 点のギャップだけを埋める
 - [D72](./archive.md#d72-view-source-45--documentdocumentelementouterhtml-を取得しhtml-エスケープ済みテキストとして新規タブに-data-url-で表示する) — View Source (#45) — `document.documentElement.outerHTML` を取得し、HTML エスケープ済みテキストとして新規タブに `data:` URL で表示する
-- [D75](./archive.md#d75-印刷pdf保存-40--印刷は-wrywebviewprint-unsafe-不要) — 印刷・PDF保存 (#40) — 印刷は `wry::WebView::print()` (unsafe 不要)、
+- [D75](./archive.md#d75-印刷pdf保存-40--印刷は-wrywebviewprint-unsafe-不要pdf直接書き出しは-windows-のみ-icorewebview2_7printtopdf) — 印刷・PDF保存 (#40) — 印刷は `wry::WebView::print()` (unsafe 不要)、PDF直接書き出しは Windows のみ `ICoreWebView2_7::PrintToPdf`
 - [D76](./archive.md#d76-名前を付けて保存-46--windows-は-webview2-の-calldevtoolsprotocolmethod-で-mhtml-保存--ネイティブ-save-as-ダイアログmacoslinux-は-outerhtml-の素の保存に留める) — 名前を付けて保存 (#46) — Windows は WebView2 の `CallDevToolsProtocolMethod` で MHTML 保存 + ネイティブ Save-As ダイアログ、macOS/Linux は outerHTML の素の保存に留める
-- [D77](./archive.md#d77-キーボードショートカット管理-38--既存ショートカットの棚卸しと) — キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと
+- [D77](./archive.md#d77-キーボードショートカット管理-38--既存ショートカットの棚卸しと-browsershortcutsshortcut_table-への集約衝突検出信頼境界は不変) — キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと `browser::shortcuts::SHORTCUT_TABLE` への集約、衝突検出、信頼境界は不変
 - [D78](./archive.md#d78-コンテキストメニュー-39--ネイティブ-api-ではなく-js-描画を採用content-webview-からの入力は専用の境界付き第-3-チャネルとして扱う) — コンテキストメニュー (#39) — ネイティブ API ではなく JS 描画を採用、content webview からの入力は専用の境界付き第 3 チャネルとして扱う
 
 ---
