@@ -2751,32 +2751,29 @@ fn handle_toolbar_command(
         ToolbarCommand::OmniboxInput { input } => {
             // Issue #20: history/bookmark matches, then previously-typed
             // search queries, ranked by `browser::ranking` — see
-            // docs/decisions.md D36-D39. Both sources read `state.history`/
-            // `state.bookmarks`/`state.input_history` as they stand right
-            // now regardless of this window's own privacy (private mode
-            // blocks new *writes* to these stores, not reads of what was
-            // already recorded before it started — see D39), so this needs
-            // no extra gating of its own.
+            // docs/decisions.md D36-D39.
             //
-            // **Known gap, Issue #27/D74**: these stores are shared by every
-            // window in the process (unchanged by this issue — see
-            // `AppState`'s doc comment), so a *private* window's omnibox can
-            // surface a history/bookmark/search-query entry a *normal*
-            // window in the same running process recorded moments earlier.
-            // D39's premise ("reads of what was recorded before private mode
-            // started are fine") held when private browsing was whole-app —
-            // there was no concurrently running normal window to leak from —
-            // and no longer fully holds now that the two can coexist. Left
-            // unfixed here: filtering candidates by the querying window's
-            // own privacy would need `window_id` threaded into
-            // `omnibox::build_candidates`/`HistoryBookmarkSource`/
-            // `InputHistorySource`, and a decision on what a private
-            // window's candidates should look like at all (real browsers
-            // typically still show bookmarks in an incognito omnibox, so
-            // this is not simply "read nothing"). See the PR description.
+            // **A private window reads neither history nor typed queries**
+            // (Issue #157, D136). The three stores are shared by every
+            // window in the process (see `AppState`'s doc comment), so
+            // without this a private window's omnibox surfaces what a
+            // *normal* window recorded moments earlier — while the user is
+            // typing, on screen, which is exactly the situation private
+            // browsing exists for. D39's premise ("reads of what was
+            // recorded before private mode started are fine") held when
+            // private browsing was whole-app; it stopped holding when #27
+            // made the two coexist.
+            //
+            // Bookmarks stay: real browsers show them in an incognito
+            // omnibox, and a bookmark is something the user saved on
+            // purpose, not a trace of where they have been.
+            //
+            // `window_is_private` answers `true` for a window it does not
+            // know, so an unknown id shows *less*, never more.
+            let private = window_is_private(state, window_id);
             let now = now_unix();
             let history_bookmark_source = HistoryBookmarkSource {
-                history: &state.history,
+                history: (!private).then_some(&state.history),
                 bookmarks: &state.bookmarks,
                 now,
             };
@@ -2786,11 +2783,18 @@ fn handle_toolbar_command(
                 search_query_template: &config.search_engine.query_template,
                 now,
             };
+            // The typed-query source is dropped wholesale rather than
+            // emptied: there is no "bookmarks half" of it worth keeping.
+            let sources: Vec<&dyn omnibox::CandidateSource> = if private {
+                vec![&history_bookmark_source]
+            } else {
+                vec![&history_bookmark_source, &input_history_source]
+            };
             let candidates = omnibox::build_candidates(
                 &input,
                 &config.search_engine.name,
                 &config.search_engine.query_template,
-                &[&history_bookmark_source, &input_history_source],
+                &sources,
                 omnibox::DEFAULT_CANDIDATE_LIMIT,
             );
             let open = if candidates.is_empty() {
@@ -3854,6 +3858,10 @@ fn sync_block_count(window: &BrowserWindow, tabs: &Tabs) {
 /// direction, matching `TabId`'s own "a stale id is a no-op" convention:
 /// treating a vanished window as private only ever means "record one fewer
 /// visit than strictly necessary", never the other, much worse way around.
+///
+/// Issue #157 added a *read*-side consumer (which omnibox candidate sources
+/// a window may draw from). The same direction is safe there for the same
+/// reason: an unknown window shows one fewer suggestion, never one more.
 fn window_is_private(state: &AppState, window_id: WindowId) -> bool {
     state.windows.is_private(window_id).unwrap_or(true)
 }
@@ -4497,6 +4505,21 @@ mod tests {
         let id = record_visit_if_enabled(&mut state, test_window_id(), "https://example.com/", 0);
         assert!(id.is_none());
         assert!(state.history.entries().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_window_is_treated_as_private() {
+        // The direction this defaults in is a safety property, not an
+        // implementation detail: `record_visit_if_enabled` and (since
+        // Issue #157) the omnibox's candidate sources both branch on it.
+        // Defaulting the other way would record a visit, or surface another
+        // window's browsing, for a window nobody can account for.
+        let state = state_with_history_enabled(true);
+        assert!(!window_is_private(&state, test_window_id()));
+        assert!(
+            window_is_private(&state, WindowId::from(9999)),
+            "未知のウィンドウが private 扱いになっていない — 記録も候補表示も安全側に倒れない"
+        );
     }
 
     #[test]
