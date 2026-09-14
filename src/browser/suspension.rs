@@ -402,12 +402,23 @@ pub enum BackgroundMemoryTarget {
     Normal,
     /// Tell the engine a background tab may economize.
     ///
-    /// Unlike [`SuspendMechanism::Freeze`], which D121 measured and rejected
-    /// because `TrySuspend` keeps the renderer process alive, this asks the
-    /// renderer to shrink rather than to stop. Whether that is a distinction
-    /// the engine actually honours is the open question — **D121 決定5's
-    /// Revisit condition (3) says explicitly that #243's result must not be
-    /// used to prejudge it.**
+    /// **Measured, and it works** (docs/decisions.md D122,
+    /// `docs/performance-targets.md` §38): at 20 tabs with suspension turned
+    /// off entirely, this cut the footprint from 1596.6 MiB to **700.7 MiB
+    /// (0.439×)** while every tab stayed awake and instantly usable.
+    /// `tab_switch_ms` and `cpu_percent` did not measurably move.
+    ///
+    /// It also disproved the reason D121 gave for rejecting
+    /// [`SuspendMechanism::Freeze`]. `rss_process_count` stayed at 27 here
+    /// too — so "the renderer process survives, therefore the memory
+    /// survives" was wrong. What separates the two is *what is asked*:
+    /// `TrySuspend` says stop, this says shrink, and the engine only obeys
+    /// the second.
+    ///
+    /// **Not the default yet.** §38 was measured with the memory budget off,
+    /// to isolate this knob from suspension — which is not the configuration
+    /// users run. D122 決定3 names the two same-run follow-ups that have to
+    /// come first.
     Low,
 }
 

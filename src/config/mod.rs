@@ -214,11 +214,14 @@ pub struct Config {
     /// #242. `VELOX_BACKGROUND_MEMORY_TARGET=low` switches to
     /// `ICoreWebView2_19::SetMemoryUsageTargetLevel(LOW)` on Windows.
     ///
-    /// **A measurement knob.** D121 rejected `SuspendMechanism::Freeze`
-    /// because `TrySuspend` keeps the renderer process alive; this asks the
-    /// renderer to shrink instead of to stop, which may or may not be a
-    /// distinction the engine honours. D121 決定5 Revisit condition (3) is
-    /// explicit that #243's result must not be used to prejudge it.
+    /// **Measured, and unlike `SuspendMechanism::Freeze` it works**: at 20
+    /// tabs with suspension off, `low` cut the footprint to 0.439× with no
+    /// measurable cost in `tab_switch_ms` or `cpu_percent`
+    /// (docs/decisions.md D122, `docs/performance-targets.md` §38).
+    ///
+    /// It is still not the default, because §38 was measured with the memory
+    /// budget off in order to isolate it — not the configuration users run.
+    /// D122 決定3 names the two same-run follow-ups that decide that.
     pub background_memory_target: BackgroundMemoryTarget,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
