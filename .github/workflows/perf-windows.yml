@@ -368,6 +368,11 @@ jobs:
             $beaconQuery = ""
             if ($env:INPUT_BEACON -eq "true") { $beaconQuery = "?beacon=1" }
             "url=http://127.0.0.1:8731/$($pageList[0])$beaconQuery" >> $env:GITHUB_OUTPUT
+            # 診断ステップ専用の beacon 無し URL。診断は velox を 8 秒だけ
+            # 単独起動するもので、計測の自動操作とは無関係だが、beacon 付き
+            # URL を渡すとその 8 秒分が計測と同じカウンタに混ざる。
+            # 最初の計測ではこれに気付かず、混ざった側だけを数えていた。
+            "url_plain=http://127.0.0.1:8731/$($pageList[0])" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=true" >> $env:GITHUB_OUTPUT
             "page=$($pageList -join ', ')" >> $env:GITHUB_OUTPUT
             "pages=$($pageList -join ',')" >> $env:GITHUB_OUTPUT
@@ -376,6 +381,7 @@ jobs:
             # 外部 URL を渡した場合、`page` / `pages` 入力は使われない。
             # 表示も「固定ページのどれか」ではなく URL そのものにする。
             "url=$url" >> $env:GITHUB_OUTPUT
+            "url_plain=$url" >> $env:GITHUB_OUTPUT
             "serve_fixed_pages=false" >> $env:GITHUB_OUTPUT
             "page=$url" >> $env:GITHUB_OUTPUT
             # 1 件だけ。URL を複数受け取る入力は用意していない
@@ -396,6 +402,9 @@ jobs:
       - name: Serve fixed benchmark pages (default URL only)
         if: steps.bench_url.outputs.serve_fixed_pages == 'true'
         shell: pwsh
+        # 入力はシェルへ直接展開せず環境変数で渡す (script injection 対策)。
+        env:
+          INPUT_BEACON: ${{ inputs.beacon }}
         run: |
           $ErrorActionPreference = "Stop"
           # ⚠️ **stdout/stderr をリダイレクトしない。** 一度は診断用に
@@ -413,7 +422,7 @@ jobs:
           # serve.py はリクエストごとのログを出さないので、§26.4 が
           # 記録した「stderr のリダイレクトで page_load_ms が 38 倍」の
           # 危険はむしろ減る方向である。
-          if ("${{ inputs.beacon }}" -eq "true") {
+          if ($env:INPUT_BEACON -eq "true") {
             Start-Process -FilePath python -ArgumentList "scripts\bench\serve.py", "--port", "8731" `
               -WindowStyle Hidden
           } else {
@@ -480,7 +489,7 @@ jobs:
           $stdout = "diag\velox-stdout.txt"
           $stderr = "diag\velox-stderr.txt"
           $proc = Start-Process -FilePath "target\release\velox.exe" `
-            -ArgumentList "--homepage", "${{ steps.bench_url.outputs.url }}" `
+            -ArgumentList "--homepage", "${{ steps.bench_url.outputs.url_plain }}" `
             -RedirectStandardOutput $stdout `
             -RedirectStandardError $stderr `
             -PassThru
@@ -565,6 +574,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           BENCH_URL: ${{ steps.bench_url.outputs.url }}
           BENCH_PAGES: ${{ steps.bench_url.outputs.pages }}
+          INPUT_BEACON: ${{ inputs.beacon }}
         run: |
           $ErrorActionPreference = "Stop"
           $scenario = $env:INPUT_SCENARIO
@@ -699,8 +709,17 @@ jobs:
             return "$sc@$slug"
           }
 
+          # Issue #247。`bench_url` の `url` 出力には beacon クエリが
+          # 付いているが、**固定ページを配信するときこの分岐は使われない**
+          # — `$pg` が常に非空になるため、素の URL がここで組み直される。
+          # 最初の計測ではそれに気付かず、beacon を数えたつもりで
+          # 「診断ステップの単発起動」だけを数えていた (§41 / D125 を撤回)。
+          # クエリの組み立ては `bench_url` ステップと同じ規則で行う。
+          $beaconQuery = ""
+          if ($env:INPUT_BEACON -eq "true") { $beaconQuery = "?beacon=1" }
+
           foreach ($pg in $pageList) {
-            $url = if ($pg) { "http://127.0.0.1:8731/$pg" } else { $env:BENCH_URL }
+            $url = if ($pg) { "http://127.0.0.1:8731/$pg$beaconQuery" } else { $env:BENCH_URL }
             foreach ($sc in $scenarioList) {
               $prefix = Get-ResultPrefix $sc $pg
               $tag = if ($pageList.Count -le 1) { $sc } else { "$sc / $pg" }
