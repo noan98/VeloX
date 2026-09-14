@@ -57,6 +57,7 @@ def _evaluate(
     pr_comments=_EMPTY_PR_COMMENTS,
     claude_logins=frozenset(),
     codex_usage_limit_lookback_hours=None,
+    codex_response_timeout_minutes=None,
 ):
     """条件1/2/4 (Codex 非依存の条件) を検証するための既定ヘルパー。
 
@@ -81,6 +82,15 @@ def _evaluate(
             else {
                 "codex_usage_limit_lookback_hours": (
                     codex_usage_limit_lookback_hours
+                )
+            }
+        ),
+        **(
+            {}
+            if codex_response_timeout_minutes is None
+            else {
+                "codex_response_timeout_minutes": (
+                    codex_response_timeout_minutes
                 )
             }
         ),
@@ -2013,6 +2023,178 @@ class PR185RegressionTest(unittest.TestCase):
         # Codex 自体は head SHA を正しくレビュー済みなので、自動リクエストは
         # 不要 (条件3はブロック理由に含まれない)。
         self.assertFalse(result["codex_review_request_needed"])
+
+
+class CodexResponseTimeoutTest(unittest.TestCase):
+    """`@codex review` に応答が来ないまま永久ブロックされる穴 (Issue #207)。
+
+    従来、待ちが解けるのは Codex が**利用上限という特定の文言**を返した
+    ときだけだった。沈黙した場合や別の文言で断られた場合は待ち続け、
+    待ち時間に上限が無いため **その head SHA は二度とマージできない。**
+
+    実測 (Issue #207 / PR #202・#204、2026-09-08):
+
+    | 時刻 | 出来事 |
+    | --- | --- |
+    | 01:42:55 | Codex が PR オープンに反応し「利用上限」 |
+    | 01:48:06 | auto-merge が `@codex review` を自動投稿 (マーカー付き) |
+    | 01:48:11 | Codex の返答「To use Codex here, create a Codex account…」 |
+
+    上限メッセージは**マーカーより前**なので厳密判定は成立せず、マーカー後の
+    返答は上限の文言を含まない。結果、CI 全緑の PR が 2 件同時に停止した。
+    """
+
+    _CLAUDE_LOGIN = "claude[bot]"
+    # マーカー投稿から _NOW (16:31:14) まで 91 分。既定 (60 分) を超える。
+    _MARKER_AT_91_MIN_AGO = "2026-09-07T15:00:00Z"
+    # マーカー投稿から _NOW まで 31 分。既定 (60 分) 以内。
+    _MARKER_AT_31_MIN_AGO = "2026-09-07T16:00:00Z"
+
+    def _marker(self, created_at: str) -> dict:
+        return {
+            "author": {"login": "github-actions[bot]", "__typename": "Bot"},
+            "body": (
+                "@codex review\n\n"
+                f"<!-- auto-merge:codex-review-request:{_HEAD_SHA} -->\n"
+            ),
+            "createdAt": created_at,
+        }
+
+    def _codex_refusal(self, created_at: str) -> dict:
+        """**利用上限の文言を含まない**拒否。これが #207 の引き金だった。"""
+        return {
+            "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+            "body": (
+                "To use Codex here, create a Codex account and connect to github."
+            ),
+            "createdAt": created_at,
+        }
+
+    def _run(self, comments, claude_logins=None, timeout=None):
+        return _evaluate(
+            codex_bypass=False,
+            pr_comments={"nodes": comments},
+            claude_logins=(
+                frozenset({self._CLAUDE_LOGIN})
+                if claude_logins is None
+                else claude_logins
+            ),
+            codex_response_timeout_minutes=timeout,
+        )
+
+    def _reasons(self, result) -> str:
+        return " / ".join(result["reasons"])
+
+    # --- #207 の事象そのもの -----------------------------------------
+
+    def test_a_silent_codex_no_longer_blocks_forever(self) -> None:
+        """依頼から既定時間が過ぎたら Claude へ回す (本 Issue の主眼)。"""
+        result = self._run(
+            [
+                self._marker(self._MARKER_AT_91_MIN_AGO),
+                self._codex_refusal("2026-09-07T15:00:05Z"),
+            ]
+        )
+        self.assertTrue(
+            result["claude_review_request_needed"],
+            f"Claude へ回されていない: {self._reasons(result)}",
+        )
+
+    def test_the_reason_says_it_was_a_timeout_not_a_usage_limit(self) -> None:
+        """ログを読む人が理由を取り違えないこと。
+
+        「上限だった」と「返事が来なかった」では、次に取るべき行動
+        (待つ / Codex 側を調べる) が違う。
+        """
+        result = self._run([self._marker(self._MARKER_AT_91_MIN_AGO)])
+        reasons = self._reasons(result)
+        self.assertIn("Issue #207", reasons, reasons)
+        self.assertNotIn("利用上限到達を検知", reasons, reasons)
+
+    def test_before_the_timeout_it_still_waits(self) -> None:
+        """既定時間内は従来どおり待つ (Codex の通常の応答時間を跨がない)。"""
+        result = self._run([self._marker(self._MARKER_AT_31_MIN_AGO)])
+        self.assertFalse(result["claude_review_request_needed"])
+        self.assertTrue(result["blocked"])
+
+    # --- 緩めすぎないこと ---------------------------------------------
+
+    def test_without_a_claude_fallback_the_timeout_does_not_relax(self) -> None:
+        """フォールバック未設定なら緩めない。
+
+        緩めてしまうと、**レビューを誰も行わないまま Codex 要件だけが
+        消える** — 「沈黙していれば通る」という最悪の抜け方になる。
+        """
+        result = self._run(
+            [self._marker(self._MARKER_AT_91_MIN_AGO)], claude_logins=frozenset()
+        )
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["codex_relaxed"])
+        self.assertFalse(result["claude_relaxed"])
+        self.assertFalse(result["claude_review_request_needed"])
+
+    def test_the_timeout_never_unlocks_the_past_review_shortcut(self) -> None:
+        """タイムアウトを A (過去のレビューで代替) に合流させない。
+
+        A は「別の commit へのレビューで現在の head を通す」最も強い緩和で、
+        その根拠は「Codex は応答したが上限だった」という積極的な観測である。
+        **沈黙を根拠に A を許すと、Codex が死んでいる間は過去のレビューだけで
+        何でも通る。**
+        """
+        old_codex_review = {
+            "pageInfo": {"hasNextPage": False},
+            "nodes": [
+                {
+                    "state": "COMMENTED",
+                    "body": "**Reviewed commit:** `deadbeef12`",
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "commit": {"oid": "deadbeef12" + "0" * 30},
+                }
+            ],
+        }
+        result = evaluate_review_gate(
+            _EMPTY_THREADS,
+            old_codex_review,
+            _HEAD_PUSH_OBSERVED_1H_AGO,
+            _NOW,
+            _GRACE,
+            reactions=_EMPTY_REACTIONS,
+            head_sha=_HEAD_SHA,
+            codex_bypass=False,
+            pr_comments={"nodes": [self._marker(self._MARKER_AT_91_MIN_AGO)]},
+            claude_logins=frozenset({self._CLAUDE_LOGIN}),
+        )
+        # 過去のレビューで通してはならない。Claude に新しく見てもらう。
+        self.assertFalse(result["codex_relaxed"], self._reasons(result))
+        self.assertTrue(result["claude_review_request_needed"])
+
+    def test_zero_restores_the_old_wait_forever_behaviour(self) -> None:
+        """`0` で無効化できること (退避経路を残す)。"""
+        result = self._run([self._marker(self._MARKER_AT_91_MIN_AGO)], timeout=0)
+        self.assertTrue(result["blocked"])
+        self.assertFalse(result["claude_review_request_needed"])
+
+    def test_a_usage_limit_after_the_marker_still_takes_the_strict_path(self) -> None:
+        """タイムアウトを足しても既存の厳密判定を壊さないこと。"""
+        result = self._run(
+            [
+                self._marker(self._MARKER_AT_91_MIN_AGO),
+                {
+                    "author": {"login": _CODEX_LOGIN, "__typename": "Bot"},
+                    "body": "You have reached your Codex usage limits.",
+                    "createdAt": "2026-09-07T15:01:00Z",
+                },
+            ]
+        )
+        reasons = self._reasons(result)
+        self.assertIn("利用上限到達", reasons, reasons)
+        self.assertNotIn("Issue #207", reasons, reasons)
+
+    def test_no_marker_means_no_timeout(self) -> None:
+        """依頼していないのにタイムアウトで緩めない (起点が無い)。"""
+        result = self._run([])
+        self.assertTrue(result["codex_review_request_needed"])
+        self.assertFalse(result["claude_review_request_needed"])
 
 
 if __name__ == "__main__":
