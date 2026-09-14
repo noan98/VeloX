@@ -29,6 +29,7 @@ import re
 import unittest
 
 from decision_index import (
+    ARCHIVE,
     CATEGORY_FILES,
     DECISIONS_DIR,
     category_of,
@@ -173,6 +174,55 @@ class DecisionIndexTest(unittest.TestCase):
             "window_created--toolbar_ready", slug("window_created → toolbar_ready")
         )
         self.assertEqual("タブプロセス", slug("タブ/プロセス"))
+
+
+class HeadingIsOneLineTest(unittest.TestCase):
+    """`## Dxx:` の見出しが 1 行に収まっていること (Issue #237)。
+
+    **なぜ検査するか**
+
+    Markdown の ATX 見出し (`## ...`) は**改行で終わる。** 長い見出しを
+    折り返して書くと、2 行目以降は見出しではなく**直後の段落**になる。
+    書いた人にはそう見えないので、次のことが静かに起きる:
+
+    - 見出しが文の途中で終わっているように表示される
+    - アンカーが 1 行目だけから作られ、リンク先が意図と食い違う
+    - `decision_index.py` が生成する索引にも、切れた見出しがそのまま載る
+
+    **文言が消えるわけではない**ので、読めば意味は通る。だから誰も直さない
+    まま残る — 実際 D62 / D67 / D71 / D75 / D77 の 5 件が (起票時点では
+    4 件として) 放置されていた。
+
+    判定はヒューリスティックではない: **見出しの直後の行が空行でなければ
+    それは見出しの続きとして書かれたものである。** 起票時点の 134 見出しに
+    対してちょうど 5 件が該当し、誤検知は 0 件だった。
+    """
+
+    def test_every_decision_heading_is_followed_by_a_blank_line(self) -> None:
+        lines = ARCHIVE.read_text(encoding="utf-8").split("\n")
+        offenders = [
+            (i + 1, line, lines[i + 1])
+            for i, line in enumerate(lines)
+            if line.startswith("## D") and i + 1 < len(lines) and lines[i + 1].strip()
+        ]
+        self.assertEqual(
+            [],
+            offenders,
+            "見出しの直後が空行でない = 見出しを折り返して書いている。"
+            "Markdown は 1 行目しか見出しにしないので、残りは段落になり"
+            "アンカーも 1 行目からしか作られない。1 行にまとめること:\n"
+            + "\n".join(f"  L{n}: {h}\n        続き: {nxt}" for n, h, nxt in offenders),
+        )
+
+    def test_the_check_would_catch_a_wrapped_heading(self) -> None:
+        """検査が本当に折り返しを捕まえること (通るだけでは固定できない)。"""
+        sample = ["## D999: 折り返した", "見出しの続き", "", "本文"]
+        offenders = [
+            i
+            for i, line in enumerate(sample)
+            if line.startswith("## D") and i + 1 < len(sample) and sample[i + 1].strip()
+        ]
+        self.assertEqual([0], offenders)
 
 
 if __name__ == "__main__":
