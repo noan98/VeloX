@@ -113,6 +113,10 @@ class BeaconCounts:
         if frames is None or ticks is None:
             return
         instance = (params.get("id") or [self.UNKNOWN_INSTANCE])[0]
+        # JS ヒープ (Issue #247)。Chromium 以外では送られてこないので
+        # 欠けていてもよい。**欠けていることと 0 は違う**ので、
+        # 集計側も届いた beacon の数を別に数える。
+        heap = _first_int(params.get("h"))
         with self._lock:
             instances = self._states.setdefault(state, {})
             entry = instances.get(instance)
@@ -123,6 +127,9 @@ class BeaconCounts:
                     "first_ticks": ticks,
                     "last_frames": frames,
                     "last_ticks": ticks,
+                    "heap_count": 0 if heap is None else 1,
+                    "heap_sum": 0 if heap is None else heap,
+                    "heap_max": 0 if heap is None else heap,
                 }
                 return
             entry["count"] += 1
@@ -139,6 +146,10 @@ class BeaconCounts:
             entry["first_ticks"] = min(entry["first_ticks"], ticks)
             entry["last_frames"] = max(entry["last_frames"], frames)
             entry["last_ticks"] = max(entry["last_ticks"], ticks)
+            if heap is not None:
+                entry["heap_count"] += 1
+                entry["heap_sum"] += heap
+                entry["heap_max"] = max(entry["heap_max"], heap)
 
     def summary(self) -> dict[str, dict[str, int]]:
         """集計を JSON にできる形で返す。
@@ -151,6 +162,13 @@ class BeaconCounts:
         `instances` はその state に何個のページ実体が居たか。
         `background_cpu` なら背景タブの数 × 起動回数に近い値になるはずで、
         **1 なら `id=` が届いていない**ことを疑う。
+
+        `heap_*` は `performance.memory.usedJSHeapSize` (Issue #247)。
+        `MemoryUsageTargetLevel(LOW)` が何を縮めたのかの 3 候補
+        (JS ヒープ / 描画バッファ / キャッシュ) のうち、**ページから
+        見えるのはこれだけ**である (D129 決定6)。Chromium 系にしか
+        無いので、**1 件も届かなければ列ごと落とす** — 0 を
+        「ヒープが 0」と読ませないため。
         """
         with self._lock:
             return self._summary_locked()
@@ -180,11 +198,25 @@ class BeaconCounts:
                 "instances": len(instances),
                 "advanced_frames": 0,
                 "advanced_ticks": 0,
+                "heap_count": 0,
+                "heap_sum": 0,
+                "heap_max": 0,
             }
             for entry in instances.values():
                 total["count"] += entry["count"]
                 total["advanced_frames"] += entry["last_frames"] - entry["first_frames"]
                 total["advanced_ticks"] += entry["last_ticks"] - entry["first_ticks"]
+                total["heap_count"] += entry["heap_count"]
+                total["heap_sum"] += entry["heap_sum"]
+                total["heap_max"] = max(total["heap_max"], entry["heap_max"])
+            # 平均は**届いた beacon の数で割る。** count で割ると、
+            # `performance.memory` の無い環境で値が薄まる。
+            # 0 件のときは列ごと落とす — 0 を「ヒープが 0」と読ませない。
+            if total["heap_count"]:
+                total["heap_mean"] = total["heap_sum"] // total["heap_count"]
+            else:
+                for key in ("heap_count", "heap_sum", "heap_max"):
+                    del total[key]
             out[state] = total
         return out
 
