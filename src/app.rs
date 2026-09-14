@@ -1630,7 +1630,10 @@ fn sweep_tabs(
         |id| window.is_playing_audio(id),
         |id| window.process_group_of(id),
     );
-    let planned = suspension::plan(policy, &candidates, memory);
+    // 機構は「設定値」ではなく「このウィンドウが実際に使うもの」を渡す
+    // (D138 決定3)。メモリ信号の算術は、その休止がメモリを返すかどうかに
+    // 依存しているため。
+    let planned = suspension::plan(policy, &candidates, memory, window.suspend_mechanism());
     if !planned.is_empty() {
         for (id, reason) in planned {
             if suspend_tab(window, window_id, state, id) {

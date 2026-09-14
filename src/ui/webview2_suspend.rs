@@ -111,6 +111,20 @@ pub fn probe(webview: &WebView) -> SuspendSupport {
     }
 }
 
+/// [`probe`] の結果。**プロセスにつき 1 回だけ調べ、以後は同じ値を返す。**
+///
+/// 答えはプロセス内で変わらない — 全 webview が同じ Runtime を共有する
+/// ので、2 つ目以降のウィンドウで問い直しても同じ答えになる。
+///
+/// [`log_support_once`] が stderr へ出すのと**同じ値**であることが重要で
+/// ある。調査ログと、その調査に基づいて実際に振る舞いを変える側
+/// (`ui::window` の休止機構の決定、D138 決定3) が食い違うと、ログを見て
+/// 挙動を説明できなくなる。
+pub fn support(webview: &WebView) -> SuspendSupport {
+    static SUPPORT: std::sync::OnceLock<SuspendSupport> = std::sync::OnceLock::new();
+    *SUPPORT.get_or_init(|| probe(webview))
+}
+
 /// [`probe`] をプロセスにつき 1 回だけ実行し、結果を stderr に出す。
 ///
 /// **これが Stage 2 の「利用可否を確認」の実体である。** 静的な調査では
@@ -126,7 +140,7 @@ pub fn probe(webview: &WebView) -> SuspendSupport {
 pub fn log_support_once(webview: &WebView) {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let support = probe(webview);
+        let support = support(webview);
         eprintln!("velox: {support} (Issue #176 Stage 2 probe)");
         if support.is_none() {
             eprintln!(

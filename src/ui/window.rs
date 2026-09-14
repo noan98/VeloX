@@ -815,6 +815,55 @@ fn apply_memory_target(webview: &WebView, target: BackgroundMemoryTarget) {
 #[cfg(not(windows))]
 fn apply_memory_target(_webview: &WebView, _target: BackgroundMemoryTarget) {}
 
+/// The mechanism this window will *actually* use, given the configured one
+/// (Issue #176 Stage 3, docs/decisions.md D138 決定3).
+///
+/// **`Freeze` is a request, not a guarantee.** [`freeze_webview`] falls
+/// back to discarding whenever the engine has no freeze path, and off
+/// Windows there is none at all. That fallback is fine for suspending —
+/// the tab still goes — but it is *not* fine for the memory budget, which
+/// has to know whether a suspension will return memory before it decides
+/// how many to order (`browser::suspension::plan`). Asking for `Freeze` and
+/// silently getting `Discard` would switch the memory signal off on a build
+/// where suspension does reclaim, which is the opposite mistake to the one
+/// D138 決定1 fixes.
+///
+/// So the answer is resolved **once, here, at window creation**, from the
+/// same side-effect-free probe the Stage 2 diagnostic logs
+/// (`webview2_suspend::support`) — the runtime cannot gain or lose
+/// `ICoreWebView2_3` while the process runs. Storing the resolved value
+/// also keeps `suspend_tab` from retrying, and log-failing, a dispatch that
+/// is known to be impossible.
+#[cfg(windows)]
+fn effective_suspend_mechanism(
+    configured: SuspendMechanism,
+    webview: &WebView,
+) -> SuspendMechanism {
+    if configured == SuspendMechanism::Freeze
+        && !crate::ui::webview2_suspend::support(webview).try_suspend
+    {
+        eprintln!(
+            "velox: VELOX_SUSPEND_MECHANISM=freeze を指定されたが、この \
+WebView2 Runtime は TrySuspend を持っていない — discard で続行する (#243)"
+        );
+        return SuspendMechanism::Discard;
+    }
+    configured
+}
+
+/// Off Windows there is no engine-level freeze at all (see
+/// [`freeze_webview`]), so a `Freeze` request always ends up discarding.
+/// Resolving that here rather than per suspension is what lets the memory
+/// budget keep working on Linux/macOS even when the knob says `freeze`
+/// (docs/decisions.md D138 決定3).
+#[cfg(not(windows))]
+fn effective_suspend_mechanism(
+    _configured: SuspendMechanism,
+    _webview: &WebView,
+) -> SuspendMechanism {
+    SuspendMechanism::Discard
+}
+
 /// Ask the engine to freeze `webview` in place (Issue #243), returning
 /// whether the request was *dispatched*. `false` means the caller must fall
 /// back to discarding the webview; `true` means the answer will arrive as
@@ -1040,8 +1089,10 @@ pub struct BrowserWindow {
     /// as of window creation.
     max_tabs_per_web_process: usize,
     /// How a suspended tab's memory is reclaimed (Issue #243) —
-    /// `Config::suspend_mechanism` as of window creation. See
-    /// [`Self::suspend_tab`].
+    /// `Config::suspend_mechanism` as of window creation, **downgraded to
+    /// what this build and this runtime can actually do**
+    /// ([`effective_suspend_mechanism`], D138 決定3). See
+    /// [`Self::suspend_tab`] and [`Self::suspend_mechanism`].
     suspend_mechanism: SuspendMechanism,
     /// What background-but-awake tabs are told about memory (Issue #242) —
     /// `Config::background_memory_target` as of window creation. Applied by
@@ -1351,6 +1402,10 @@ impl BrowserWindow {
         // (`ui::webview2_suspend` の module doc を参照)。
         #[cfg(windows)]
         crate::ui::webview2_suspend::log_support_once(&content);
+        // 設定された機構を、この build / この Runtime が実際にできることへ
+        // 落とす (D138 決定3)。`content` がタブへ move される前にここで
+        // 一度だけ解決する — 答えはプロセス内で変わらない。
+        let suspend_mechanism = effective_suspend_mechanism(config.suspend_mechanism, &content);
         #[cfg(windows)]
         crate::ui::webview2_blocking::attach(
             &content,
@@ -1395,7 +1450,7 @@ impl BrowserWindow {
             active: Some(initial_tab),
             next_process_group: 1,
             max_tabs_per_web_process: config.max_tabs_per_web_process,
-            suspend_mechanism: config.suspend_mechanism,
+            suspend_mechanism,
             background_memory_target: config.background_memory_target,
             context,
             private,
@@ -1763,6 +1818,14 @@ impl BrowserWindow {
             .get(&id)
             .filter(|tab| tab.webview.is_some())
             .map(|tab| tab.process_group)
+    }
+
+    /// The mechanism this window will actually carry a suspension out with
+    /// ([`effective_suspend_mechanism`]) — what `app.rs` hands to
+    /// `browser::suspension::plan` so the memory signal's arithmetic matches
+    /// what will really happen (docs/decisions.md D138 決定1・決定3).
+    pub fn suspend_mechanism(&self) -> SuspendMechanism {
+        self.suspend_mechanism
     }
 
     /// Wake suspended tab `id` and make it the visible tab.
