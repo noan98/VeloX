@@ -309,6 +309,46 @@ impl DownloadStore {
     }
 }
 
+/// Whether a completion wry reported as `success = false` should still be
+/// recorded as a completed download, given whether the destination file
+/// [`DownloadStore::start`] recorded is there now (Issue #128, D140).
+///
+/// **`success` cannot be trusted on its own, and this is measured, not
+/// suspected.** wry 0.56.1 creates *one* `failed: Rc<RefCell<bool>>` per
+/// `register_download_handler` call — outside `connect_download_started`,
+/// so it is shared by every download of that registration — sets it in each
+/// download's `connect_failed`, and **never sets it back to `false`**
+/// (`wry-0.56.1/src/webkitgtk/web_context.rs:315`). Every later
+/// `connect_finished` then reports `(!failed)` for both the success flag
+/// and the path. Since D53 consolidated Linux's registration onto the one
+/// shared `WebContext`, the blast radius is the whole session: **after any
+/// single failed download, every subsequent download is reported as failed
+/// even though its file lands correctly.** Reproduced end to end — see D140
+/// and `downloads_stay_correct_after_one_fails` in `tests/integration.rs`.
+///
+/// The rule is therefore "trust a reported success; verify a reported
+/// failure":
+///
+/// | reported `success` | destination on disk | outcome |
+/// | --- | --- | --- |
+/// | `true` | (not consulted) | completed |
+/// | `false` | present | **completed** — the poisoned flag |
+/// | `false` | absent | failed |
+///
+/// **Why "present" is enough to overrule the flag**: on a real failure
+/// WebKitGTK removes the partial file. Measured (D140 実験3): a truncated
+/// HTTP/1.1 transfer reported `success = false` *and* left the download
+/// directory empty. A genuine failure therefore cannot look like a success
+/// here — the file it would have to leave behind is not there.
+///
+/// This is deliberately *not* a size or content check: VeloX is never told
+/// the expected length (wry exposes no progress callback at all, Issue
+/// #103), so there is nothing to compare against. Presence is the only
+/// signal available, and the measurement says it is the right one.
+pub fn completion_succeeded(reported_success: bool, destination_exists: bool) -> bool {
+    reported_success || destination_exists
+}
+
 // --- Filename sanitization (security-critical: see docs/decisions.md D28
 // and the issue's own "ファイル名のサニタイズ" note) ---
 
@@ -619,6 +659,30 @@ pub fn spawn_open(path: &Path) -> std::io::Result<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Issue #128 / D140: wry の `failed` フラグ汚染への備え ---
+
+    #[test]
+    fn a_reported_success_is_taken_at_face_value() {
+        // 成功と言われたものを疑う理由は無い。フラグが誤る向きは
+        // 「成功を失敗と言う」の一方向だけである (D140)。
+        assert!(completion_succeeded(true, true));
+        assert!(completion_succeeded(true, false));
+    }
+
+    #[test]
+    fn a_reported_failure_with_the_file_present_is_the_poisoned_flag() {
+        // これが Issue #128 の本体。1 件失敗した後の成功が
+        // `success = false` で届くが、ファイルは正しく置かれている。
+        assert!(completion_succeeded(false, true));
+    }
+
+    #[test]
+    fn a_reported_failure_with_no_file_is_a_real_failure() {
+        // 止めすぎていないことの確認。本当に失敗したときは
+        // WebKitGTK が部分ファイルを消すので、ここに来る。
+        assert!(!completion_succeeded(false, false));
+    }
 
     // --- DownloadState / DownloadEntry transitions ---
 

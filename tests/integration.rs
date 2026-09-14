@@ -83,6 +83,8 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus};
 use std::sync::Mutex;
@@ -1043,6 +1045,172 @@ fn downloads_with_several_tabs_open_are_handled_exactly_once() {
          {uncorrelated} uncorrelated completion(s) means duplicate or orphaned completion \
          events (D53).\nstderr:\n{stderr}"
     );
+}
+
+// ---------------------------------------------------------------------
+// 4b. One failed download does not make every later one look failed.
+// ---------------------------------------------------------------------
+
+/// A one-shot HTTP/1.1 server that announces a 10 MB attachment, writes ten
+/// bytes and drops the connection — the cheapest way to make WebKitGTK emit
+/// a *real* download failure (`connect_failed`).
+///
+/// **HTTP/1.1 is load-bearing, not incidental** (Issue #128 / D140 実験2).
+/// Under HTTP/1.0 a closed connection is a legitimate end of body, so
+/// WebKitGTK treats the very same truncation as a completed download and
+/// `connect_failed` never fires — which makes the whole test vacuous while
+/// still passing. Python's `http.server` defaults to HTTP/1.0, which is very
+/// likely what made D53's own attempt read as "no completion event at all".
+///
+/// **No `Connection: close` header, also deliberately.** With one, libsoup
+/// accepts the early close as a legitimate end of message and reports the
+/// download as a success, `Content-Length` notwithstanding — measured, and
+/// it silently made an earlier draft of this test vacuous (three successes
+/// instead of a failure and two successes). Leaving it out means the client
+/// still expects the connection to be reusable, so the close 9,999,990
+/// bytes short is unambiguously an error.
+///
+/// Returns the base URL. The listener thread serves requests until the
+/// process exits; it is detached on purpose — nothing here needs to join it,
+/// and the test's own timeout bounds the whole run.
+fn spawn_truncating_server() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            // Read just enough to let the client finish sending its request;
+            // the path does not matter, this server has one answer.
+            let mut buf = [0u8; 1024];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                b"HTTP/1.1 200 OK\r\n\
+                  Content-Type: application/octet-stream\r\n\
+                  Content-Disposition: attachment; filename=\"truncated.bin\"\r\n\
+                  Content-Length: 10000000\r\n\r\n",
+            );
+            let _ = stream.write_all(b"0123456789");
+            let _ = stream.flush();
+            // Dropping `stream` closes the connection 9,999,990 bytes short.
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+/// Guarantees the Issue #128 / D140 fix end to end: **after a download that
+/// genuinely fails, a later download that genuinely succeeds is still
+/// recorded as a success.**
+///
+/// Without the fix it is not. wry 0.56.1 creates one
+/// `failed: Rc<RefCell<bool>>` per `register_download_handler` call, outside
+/// `connect_download_started`, sets it in every download's `connect_failed`
+/// and never clears it (`wry-0.56.1/src/webkitgtk/web_context.rs:315`); every
+/// later `connect_finished` then reports `success = false` and `path = None`.
+/// D53 consolidated Linux's registration onto the one shared `WebContext`, so
+/// one failure poisons the rest of the session. Reproduced by hand before the
+/// fix: the two `download.html` downloads below both arrived as
+/// `success = false` with their files sitting correctly on disk.
+///
+/// The assertions deliberately check the **recorded outcome**, not the flag
+/// wry reported: should wry start reporting these correctly, this test keeps
+/// passing rather than failing because the bug was fixed upstream.
+#[test]
+fn downloads_stay_correct_after_one_fails() {
+    skip_without_gui!("downloads_stay_correct_after_one_fails");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("downloads-after-failure");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let download_dir = dir.join("downloads");
+    let stderr_path = dir.join("stderr.log");
+    let homepage = fixture_url("minimal.html");
+    let download_page = fixture_url("download.html");
+    let base = spawn_truncating_server();
+
+    // Fail first, then succeed. The detour through `minimal.html` is the
+    // same one `downloads_with_several_tabs_open_are_handled_exactly_once`
+    // needs, for the same reason: without it the second `navigate` to
+    // `download.html` is a same-URL no-op. The fixed `wait`s (rather than
+    // `wait_load`) are also for that test's documented reason — a download
+    // finishing is not a condition `wait_load` promises anything about.
+    let script = format!(
+        "navigate {base}/truncated.bin\nwait 6000\n\
+         navigate {download_page}\nwait 4000\n\
+         navigate {homepage}\nwait_load\n\
+         navigate {download_page}\nwait 4000\nquit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(60),
+        &[
+            ("VELOX_DOWNLOAD_DIR", download_dir.as_path()),
+            ("VELOX_DEBUG", Path::new("1")),
+        ],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!("velox did not exit on its own within 60s.\nstderr:\n{stderr}");
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let outcomes: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("velox: download completion"))
+        .map(|line| {
+            if line.contains("recorded_as_success=true") {
+                "success"
+            } else {
+                "failure"
+            }
+        })
+        .collect();
+    assert_eq!(
+        outcomes,
+        vec!["failure", "success", "success"],
+        "the truncated transfer must be recorded as a failure and the two \
+         `download.html` downloads that followed it as successes — \
+         `failure, failure, failure` is the Issue #128 poisoning.\nstderr:\n{stderr}"
+    );
+
+    // And the files back that up: both successes landed, the failure left
+    // nothing behind (WebKitGTK removes the partial file — the very fact
+    // `completion_succeeded` relies on).
+    let mut names: Vec<String> = fs::read_dir(&download_dir)
+        .unwrap_or_else(|err| panic!("read {}: {err}", download_dir.display()))
+        .map(|entry| {
+            entry
+                .expect("read dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["velox-test (1).txt".to_owned(), "velox-test.txt".to_owned()],
+        "expected only the two successful downloads; a `truncated.bin` here \
+         would mean WebKitGTK kept the partial file, which would undermine \
+         `downloads::completion_succeeded`'s presence check (D140).\nstderr:\n{stderr}"
+    );
+
+    let uncorrelated = stderr
+        .lines()
+        .filter(|line| line.contains("could not correlate download completion"))
+        .count();
+    assert_eq!(uncorrelated, 0, "stderr:\n{stderr}");
 }
 
 // ---------------------------------------------------------------------
