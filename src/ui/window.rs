@@ -771,7 +771,17 @@ fn webview_is_playing_audio(webview: &WebView) -> bool {
         && inner.property::<bool>("is-playing-audio")
 }
 
+/// Windows reads the same thing from WebView2 (Issue #247). Until then this
+/// fell through to the `false` below, so the "never auto-suspend a tab that
+/// is playing" protection (D56) had never applied on the OS VeloX treats as
+/// its priority target.
+#[cfg(windows)]
+fn webview_is_playing_audio(webview: &WebView) -> bool {
+    crate::ui::webview2_suspend::is_playing_audio(webview)
+}
+
 #[cfg(not(any(
+    windows,
     target_os = "linux",
     target_os = "dragonfly",
     target_os = "freebsd",
@@ -1581,8 +1591,21 @@ impl BrowserWindow {
             if let Some(webview) = &previous.webview {
                 webview.set_visible(false)?;
                 // Issue #242: the tab just left the screen, so it may
-                // economize. A no-op at the default `Normal`.
-                apply_memory_target(webview, self.background_memory_target);
+                // economize — unless the user is listening to it (#247).
+                //
+                // The automatic suspension policy already refuses to reclaim
+                // a tab that is playing (`browser::suspension`, D56), and
+                // CLAUDE.md's design principle 5 says the same. Asking a tab
+                // we have decided is too valuable to suspend to economize
+                // anyway would be inconsistent, so the hint follows the same
+                // rule rather than waiting for a measurement to say whether
+                // the engine happens to keep audio intact under `Low`.
+                let target = if webview_is_playing_audio(webview) {
+                    BackgroundMemoryTarget::Normal
+                } else {
+                    self.background_memory_target
+                };
+                apply_memory_target(webview, target);
             }
         }
         match self.contents.get(&id) {
