@@ -175,6 +175,30 @@ class ExtractClosingIssuesTest(unittest.TestCase):
         # コードスパン内の参照をリンクしないので閉じない側に倒す。
         self.assertEqual(extract_closing_issues("Closes `#123`"), [])
 
+    def test_a_stray_backtick_earlier_on_the_line_shifts_the_pairing(self) -> None:
+        """既知のエッジケース。**意図した挙動として固定する。**
+
+        同じ行に未閉じのバッククォートが先にあると、それが後続の
+        コードスパンの開き側とペアになり、囲んだつもりのキーワードが
+        地の文として残る。
+
+        **これは CommonMark に忠実な結果である。** 仕様は「最左の
+        バッククォート列と、それに続く最初の同じ長さの列をペアにする」
+        と定めており、GitHub 本体も同じ行を同じように解釈する — つまり
+        本体もこのキーワードを地の文として扱う。D83 の「本体の挙動に
+        合わせる」という前提の範囲内なので、ここを本体より安全側へ
+        倒すことはしない。
+
+        PR #250 のレビューで指摘された経路。
+        """
+        body = "未閉じの ` の後に `Closes #5` と書いた行"
+        self.assertEqual(extract_closing_issues(body), [5])
+
+    def test_an_even_number_of_stray_backticks_keeps_the_span_intact(self) -> None:
+        """裸のバッククォートが偶数個なら、ペアがずれず漏れない。"""
+        body = "a ` b ` c `Closes #7` d"
+        self.assertEqual(extract_closing_issues(body), [])
+
     def test_epic_body_from_claude_md_example(self) -> None:
         body = "Closes #115\nCloses #116\nCloses #154"
         self.assertEqual(extract_closing_issues(body), [115, 116, 154])
