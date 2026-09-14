@@ -50,7 +50,7 @@
 
 use tao::event_loop::EventLoopProxy;
 use webview2_com::Microsoft::Web::WebView2::Win32::{
-    ICoreWebView2_19, ICoreWebView2_3, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+    ICoreWebView2_19, ICoreWebView2_3, ICoreWebView2_8, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
     COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
 };
 use webview2_com::TrySuspendCompletedHandler;
@@ -253,6 +253,38 @@ pub fn set_memory_usage_target(
         core.cast::<ICoreWebView2_19>()?
             .SetMemoryUsageTargetLevel(level)
     }
+}
+
+/// Whether `webview`'s page is currently playing audio (Issue #247).
+///
+/// Lives in this module rather than a new one because the only reason VeloX
+/// asks is memory policy: the automatic suspension policy protects a tab the
+/// user is listening to (`browser::suspension`, D56), and Issue #247 extends
+/// the same protection to the `Low` memory hint. The `unsafe` stays where the
+/// rest of the WebView2 memory `unsafe` already is (D120 決定4).
+///
+/// **This closes a gap that predates #242.** `ui::window::is_playing_audio`
+/// read WebKitGTK's `is-playing-audio` property and returned `false`
+/// everywhere else — so on Windows, the "never auto-suspend a tab that is
+/// playing" protection has never actually applied. `ICoreWebView2_8` is
+/// older than the `ICoreWebView2_19` the probe already confirmed (D120 決定1),
+/// so any runtime that has the memory hint has this too.
+///
+/// Errors are reported as `false`. A tab whose audio state cannot be read is
+/// treated as silent, which is the pre-#247 behavior on this platform — it
+/// loses the protection rather than gaining a wrong one.
+pub fn is_playing_audio(webview: &WebView) -> bool {
+    let core = webview.webview();
+    let mut playing = windows::core::BOOL::from(false);
+    // SAFETY: [`try_suspend`] と同じ COM 参照の議論。`IsDocumentPlayingAudio`
+    // は出力引数 (`*mut BOOL`) に書き込むだけで、渡しているのはこの関数の
+    // スタック上に確保した `playing` へのポインタ。呼び出しの間ずっと生きて
+    // おり、書き込みは 1 回で、他から参照されていない。
+    let read = unsafe {
+        core.cast::<ICoreWebView2_8>()
+            .and_then(|core| core.IsDocumentPlayingAudio(&mut playing))
+    };
+    read.is_ok() && playing.as_bool()
 }
 
 #[cfg(test)]
