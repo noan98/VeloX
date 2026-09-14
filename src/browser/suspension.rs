@@ -15,6 +15,19 @@
 //! | tab count | [`SuspensionPolicy::max_live_tabs`] | when more than this many tabs have a live webview, the least recently used background tabs are suspended until the count fits |
 //! | memory | [`SuspensionPolicy::memory_budget_bytes`] | when the process tree's memory (PSS, `metrics::sample_process_tree_rss`) exceeds the budget, enough least recently used background tabs are suspended to be expected to bring it back under (see [`ESTIMATED_BYTES_PER_TAB`]) — the further over budget, the more tabs go in one sweep, which is the "adaptive" part |
 //!
+//! **The memory signal is the only one that depends on *how* a suspension
+//! is carried out** (Issue #176 Stage 3, docs/decisions.md D138). Its
+//! arithmetic — "we are N bytes over, so take about N / 64 MiB tabs" —
+//! silently assumes every suspension hands memory back. When it does not
+//! (`SuspendMechanism::Freeze`, measured at
+//! `docs/performance-targets.md` §37.1), that assumption has **no fixed
+//! point**: the sample never falls, so each sweep asks for more tabs until
+//! there are none left, still over budget (§37.2 watched it take 19 of 20).
+//! So [`plan`] takes the mechanism and asks it how much one suspension is
+//! worth ([`SuspendMechanism::expected_reclaim_bytes_per_tab`]); an answer
+//! of zero makes the demand zero. The idle and tab-count signals are not
+//! about memory and are unaffected.
+//!
 //! Every signal is optional (`None` = off). **As of Issue #184
 //! (docs/decisions.md D90), the default policy has the memory-budget signal
 //! on** ([`DEFAULT_MEMORY_BUDGET_BYTES`], 700 MiB) while idle time and
@@ -68,9 +81,16 @@ use std::time::Duration;
 
 use super::tab::{TabId, TabState};
 
-/// Rough memory reclaimed by suspending one background tab, used only to
-/// turn "we are N bytes over budget" into "so suspend about this many tabs
-/// in this sweep". D54 measured 63.3 MiB per additional tab on
+/// Rough memory reclaimed by suspending one background tab **with
+/// [`SuspendMechanism::Discard`]**, used only to turn "we are N bytes over
+/// budget" into "so suspend about this many tabs in this sweep".
+///
+/// **Not every mechanism reclaims this much, or anything at all** — which
+/// is why [`plan`] reaches this through
+/// [`SuspendMechanism::expected_reclaim_bytes_per_tab`] rather than using
+/// it directly (docs/decisions.md D138).
+///
+/// D54 measured 63.3 MiB per additional tab on
 /// `minimal.html` under WebKitGTK in the reference environment
 /// (`docs/memory-analysis.md` §10.2), rounded to 64 MiB here.
 ///
@@ -366,6 +386,31 @@ impl SuspendMechanism {
         }
     }
 
+    /// How much memory suspending one background tab with this mechanism is
+    /// expected to return — the number [`plan`]'s memory signal divides the
+    /// overage by to decide how many tabs to take in one sweep.
+    ///
+    /// **`Freeze` returns zero, and that is the measured value, not a
+    /// placeholder** (docs/decisions.md D121 / D138,
+    /// `docs/performance-targets.md` §37.1): at 20 tabs `freeze` landed at
+    /// 1622.6 MiB against `discard`'s 859.6 MiB, which is where the same 20
+    /// tabs land with no suspension at all. `TrySuspend` says *stop*, not
+    /// *shrink* (D122 決定2), so the renderer keeps its heap.
+    ///
+    /// This is what stops the memory signal from running away. A signal that
+    /// believes every suspension frees 64 MiB, driving a mechanism that frees
+    /// none, has **no fixed point**: the sample never falls, so the next
+    /// sweep demands more tabs, and the one after that, until every eligible
+    /// tab is gone — 19 of 20 in §37.2, still over budget. Answering zero
+    /// makes the memory demand zero, so the signal orders nothing rather than
+    /// everything (D138 決定1).
+    pub fn expected_reclaim_bytes_per_tab(self) -> u64 {
+        match self {
+            SuspendMechanism::Discard => ESTIMATED_BYTES_PER_TAB,
+            SuspendMechanism::Freeze => 0,
+        }
+    }
+
     /// Parse the `VELOX_SUSPEND_MECHANISM` spelling. `None` for anything
     /// unrecognized, so the caller can fall back to the default rather than
     /// letting a typo pick a mechanism the measurements never covered — the
@@ -537,6 +582,12 @@ pub struct MemorySample {
 ///   compares against [`SuspensionPolicy::max_live_tabs`].
 /// - `memory`: a fresh memory sample, or `None` to skip the memory signal
 ///   this sweep (no new sample, or memory checking is off).
+/// - `mechanism`: how the caller will carry these suspensions out. The
+///   memory signal needs it because **its arithmetic is only valid for a
+///   mechanism that actually returns memory** — see
+///   [`SuspendMechanism::expected_reclaim_bytes_per_tab`] and D138 決定1.
+///   It does not affect the idle or tab-count signals, which are not about
+///   memory: those keep working under every mechanism.
 ///
 /// Returns the tabs to suspend, in the order they should be suspended,
 /// each tagged with the signal that demanded it. The active tab and tabs
@@ -558,6 +609,7 @@ pub fn plan(
     policy: &SuspensionPolicy,
     candidates: &[Candidate],
     memory: Option<MemorySample>,
+    mechanism: SuspendMechanism,
 ) -> Vec<(TabId, SuspendReason)> {
     if !policy.is_enabled() {
         return Vec::new();
@@ -582,7 +634,11 @@ pub fn plan(
         .map(|max| live_tabs.saturating_sub(max.max(1)))
         .unwrap_or(0);
     let memory_demand = match (policy.memory_budget_bytes, memory) {
-        (Some(budget), Some(sample)) => tabs_to_free(sample.total_bytes, budget),
+        (Some(budget), Some(sample)) => tabs_to_free(
+            sample.total_bytes,
+            budget,
+            mechanism.expected_reclaim_bytes_per_tab(),
+        ),
         _ => 0,
     };
     // Whatever the idle signal already takes counts toward both demands.
@@ -675,12 +731,22 @@ pub fn reclaim_order(candidates: &[Candidate]) -> Vec<Vec<&Candidate>> {
 /// How many tabs' worth of memory `total` is over `budget`, rounded up —
 /// zero when at or under budget. The adaptive core of the memory signal:
 /// 10 MiB over frees one tab, 200 MiB over frees four in the same sweep.
-fn tabs_to_free(total: u64, budget: u64) -> usize {
+///
+/// `per_tab` is how much one suspension is expected to return
+/// ([`SuspendMechanism::expected_reclaim_bytes_per_tab`]). **Zero means
+/// "suspending does not help here", and the answer is zero tabs, not every
+/// tab.** Dividing by it would be the arithmetic this function used to
+/// imply and the runaway D138 決定1 describes; refusing to divide is the
+/// whole fix.
+fn tabs_to_free(total: u64, budget: u64, per_tab: u64) -> usize {
+    if per_tab == 0 {
+        return 0;
+    }
     let excess = total.saturating_sub(budget);
     if excess == 0 {
         return 0;
     }
-    let tabs = excess.div_ceil(ESTIMATED_BYTES_PER_TAB).max(1);
+    let tabs = excess.div_ceil(per_tab).max(1);
     usize::try_from(tabs).unwrap_or(usize::MAX)
 }
 
@@ -726,6 +792,20 @@ mod tests {
         let mut all = candidates.to_vec();
         all.push(active(1000, 1000));
         all
+    }
+
+    /// [`plan`] を既定の機構 (`Discard`) で呼ぶ短縮形。
+    ///
+    /// 大半のテストは**機構に依らない**挙動 (どのタブをどの順で選ぶか) を
+    /// 見ており、そこに `SuspendMechanism::Discard` を並べても読みにくく
+    /// なるだけである。機構そのものが効く挙動を見るテストは `plan` を
+    /// 直接呼び、どちらの機構かを式の中に書く。
+    fn plan_discarding(
+        policy: &SuspensionPolicy,
+        candidates: &[Candidate],
+        memory: Option<MemorySample>,
+    ) -> Vec<(TabId, SuspendReason)> {
+        plan(policy, candidates, memory, SuspendMechanism::Discard)
     }
 
     fn ids(planned: &[(TabId, SuspendReason)]) -> Vec<u64> {
@@ -879,7 +959,7 @@ mod tests {
         // returns nothing — bit-for-bit the same as the old fully-off
         // default for everyone who never approaches 700 MiB.
         let candidates = [tab(1, 3600), tab(2, 3600)];
-        assert!(plan(
+        assert!(plan_discarding(
             &SuspensionPolicy::default(),
             &with_active(&candidates),
             None
@@ -888,7 +968,7 @@ mod tests {
         let under_budget = Some(MemorySample {
             total_bytes: 400 * MIB,
         });
-        assert!(plan(
+        assert!(plan_discarding(
             &SuspensionPolicy::default(),
             &with_active(&candidates),
             under_budget
@@ -906,7 +986,7 @@ mod tests {
         let over_budget = Some(MemorySample {
             total_bytes: 900 * MIB,
         });
-        let planned = plan(
+        let planned = plan_discarding(
             &SuspensionPolicy::default(),
             &with_active(&candidates),
             over_budget,
@@ -915,13 +995,101 @@ mod tests {
         assert!(planned.iter().all(|(_, r)| *r == SuspendReason::Memory));
     }
 
+    // -- 機構とメモリ信号の噛み合わせ (Issue #176 Stage 3 / D138) ---------
+
+    /// 20 個の背景タブ + アクティブタブ。`freeze` の実測着地点で予算を
+    /// 大きく超えている状態を作る。
+    fn over_budget_with_twenty_tabs() -> (SuspensionPolicy, Vec<Candidate>, Option<MemorySample>) {
+        let policy = SuspensionPolicy {
+            memory_budget_bytes: Some(700 * MIB),
+            ..disabled_policy()
+        };
+        let candidates: Vec<Candidate> = (1..=20).map(|i| tab(i, i * 10)).collect();
+        // §37.1 の `freeze` 側の着地点。休止を重ねても動かなかった値。
+        let sample = Some(MemorySample {
+            total_bytes: 1622 * MIB,
+        });
+        (policy, with_active(&candidates), sample)
+    }
+
+    #[test]
+    fn the_memory_signal_orders_nothing_when_suspending_returns_nothing() {
+        // §37.2 の暴走そのもの。`Freeze` はメモリを返さない (§37.1) ので
+        // サンプルが下がらず、予算に届かないまま次のスイープがまた要求する。
+        // この修正の前は 1 スイープで 15 個 (= 922 MiB 超過 / 64 MiB) を
+        // 命じ、次のスイープで残りも取っていた。
+        let (policy, candidates, sample) = over_budget_with_twenty_tabs();
+        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Freeze);
+        assert!(
+            planned.is_empty(),
+            "メモリを返さない機構なのに休止を命じている: {:?}",
+            ids(&planned)
+        );
+    }
+
+    #[test]
+    fn the_memory_signal_still_orders_suspensions_that_do_return_memory() {
+        // 止めすぎていないことの確認。同じ入力でも `Discard` なら働く。
+        let (policy, candidates, sample) = over_budget_with_twenty_tabs();
+        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Discard);
+        assert_eq!(planned.len(), 15, "{:?}", ids(&planned));
+        assert!(planned.iter().all(|(_, r)| *r == SuspendReason::Memory));
+    }
+
+    #[test]
+    fn the_other_two_signals_are_unaffected_by_the_mechanism() {
+        // idle と tab-count はメモリの話ではないので、`Freeze` でも
+        // 今までどおり効く。ここを一緒に止めてしまうと、状態を保ったまま
+        // 実行だけ止める用途 (D138 決定2) が丸ごと死ぬ。
+        let policy = SuspensionPolicy {
+            idle_after: Some(Duration::from_secs(60)),
+            max_live_tabs: Some(2),
+            ..disabled_policy()
+        };
+        let candidates = [tab(1, 10), tab(2, 60), tab(3, 600)];
+        let frozen = plan(
+            &policy,
+            &with_active(&candidates),
+            None,
+            SuspendMechanism::Freeze,
+        );
+        let discarded = plan(
+            &policy,
+            &with_active(&candidates),
+            None,
+            SuspendMechanism::Discard,
+        );
+        assert_eq!(ids(&frozen), ids(&discarded));
+        assert!(!frozen.is_empty());
+    }
+
+    #[test]
+    fn expected_reclaim_is_the_estimate_for_discard_and_zero_for_freeze() {
+        // `tabs_to_free` の割り算の分母。ここが 0 でなくなると
+        // §37.2 の暴走がそのまま戻る。
+        assert_eq!(
+            SuspendMechanism::Discard.expected_reclaim_bytes_per_tab(),
+            ESTIMATED_BYTES_PER_TAB
+        );
+        assert_eq!(SuspendMechanism::Freeze.expected_reclaim_bytes_per_tab(), 0);
+    }
+
+    #[test]
+    fn a_zero_estimate_never_divides() {
+        // 0 で割らないことを `tabs_to_free` の水準で直接固定する。
+        // 上の 3 つは `plan` 越しなので、ここが素通りしても気付きにくい。
+        assert_eq!(tabs_to_free(10_000 * MIB, 700 * MIB, 0), 0);
+        assert_eq!(tabs_to_free(10_000 * MIB, 700 * MIB, 64 * MIB), 146);
+        assert_eq!(tabs_to_free(700 * MIB, 700 * MIB, 64 * MIB), 0);
+    }
+
     #[test]
     fn disabled_policy_never_plans_anything() {
         let candidates = [tab(1, 3600), tab(2, 3600)];
         let memory = Some(MemorySample {
             total_bytes: 10_000 * MIB,
         });
-        assert!(plan(&disabled_policy(), &with_active(&candidates), memory).is_empty());
+        assert!(plan_discarding(&disabled_policy(), &with_active(&candidates), memory).is_empty());
     }
 
     // -- idle signal (pre-#63 behavior) ------------------------------------
@@ -933,7 +1101,7 @@ mod tests {
             ..disabled_policy()
         };
         let candidates = [tab(1, 10), tab(2, 60), tab(3, 600)];
-        let planned = plan(&policy, &with_active(&candidates), None);
+        let planned = plan_discarding(&policy, &with_active(&candidates), None);
         // Longest idle first; the tab under the threshold is left alone.
         assert_eq!(ids(&planned), vec![3, 2]);
         assert!(planned.iter().all(|(_, r)| *r == SuspendReason::Idle));
@@ -949,7 +1117,7 @@ mod tests {
         };
         // 5 live tabs (active + 4 background): two must go.
         let candidates = [tab(1, 5), tab(2, 50), tab(3, 1), tab(4, 20)];
-        let planned = plan(&policy, &with_active(&candidates), None);
+        let planned = plan_discarding(&policy, &with_active(&candidates), None);
         assert_eq!(ids(&planned), vec![2, 4]);
         assert!(planned.iter().all(|(_, r)| *r == SuspendReason::TabCount));
     }
@@ -961,7 +1129,7 @@ mod tests {
             ..disabled_policy()
         };
         let candidates = [tab(1, 5), tab(2, 50)];
-        assert!(plan(&policy, &with_active(&candidates), None).is_empty());
+        assert!(plan_discarding(&policy, &with_active(&candidates), None).is_empty());
     }
 
     #[test]
@@ -974,7 +1142,7 @@ mod tests {
         // live = active + 2 background = 3; with a floor of 1 live tab,
         // exactly the two background tabs go (never "3").
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), None)),
+            ids(&plan_discarding(&policy, &with_active(&candidates), None)),
             vec![2, 1]
         );
     }
@@ -995,26 +1163,46 @@ mod tests {
         };
         // Just over: one tab. 64 MiB over: still one. 65 MiB over: two.
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), over_by(1))),
+            ids(&plan_discarding(
+                &policy,
+                &with_active(&candidates),
+                over_by(1)
+            )),
             vec![5]
         );
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), over_by(64))),
+            ids(&plan_discarding(
+                &policy,
+                &with_active(&candidates),
+                over_by(64)
+            )),
             vec![5]
         );
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), over_by(65))),
+            ids(&plan_discarding(
+                &policy,
+                &with_active(&candidates),
+                over_by(65)
+            )),
             vec![5, 4]
         );
         // 200 MiB over: four tabs in one sweep.
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), over_by(200))),
+            ids(&plan_discarding(
+                &policy,
+                &with_active(&candidates),
+                over_by(200)
+            )),
             vec![5, 4, 3, 2]
         );
         // Far more than there are tabs to free: everything eligible, no
         // panic.
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), over_by(100_000))),
+            ids(&plan_discarding(
+                &policy,
+                &with_active(&candidates),
+                over_by(100_000)
+            )),
             vec![5, 4, 3, 2, 1]
         );
     }
@@ -1028,7 +1216,7 @@ mod tests {
         let candidates = [tab(1, 1), tab(2, 2)];
         for total in [0, 100 * MIB, 500 * MIB] {
             let memory = Some(MemorySample { total_bytes: total });
-            assert!(plan(&policy, &with_active(&candidates), memory).is_empty());
+            assert!(plan_discarding(&policy, &with_active(&candidates), memory).is_empty());
         }
     }
 
@@ -1041,20 +1229,21 @@ mod tests {
         let candidates = [tab(1, 1), tab(2, 2)];
         // Budget is effectively zero, but with no sample this sweep the
         // memory signal must stay quiet.
-        assert!(plan(&policy, &with_active(&candidates), None).is_empty());
+        assert!(plan_discarding(&policy, &with_active(&candidates), None).is_empty());
     }
 
     #[test]
     fn tabs_to_free_rounds_up_and_never_returns_zero_when_over() {
-        assert_eq!(tabs_to_free(100, 100), 0);
-        assert_eq!(tabs_to_free(99, 100), 0);
-        assert_eq!(tabs_to_free(101, 100), 1);
-        assert_eq!(tabs_to_free(100 + ESTIMATED_BYTES_PER_TAB, 100), 1);
-        assert_eq!(tabs_to_free(101 + ESTIMATED_BYTES_PER_TAB, 100), 2);
+        const PER_TAB: u64 = ESTIMATED_BYTES_PER_TAB;
+        assert_eq!(tabs_to_free(100, 100, PER_TAB), 0);
+        assert_eq!(tabs_to_free(99, 100, PER_TAB), 0);
+        assert_eq!(tabs_to_free(101, 100, PER_TAB), 1);
+        assert_eq!(tabs_to_free(100 + PER_TAB, 100, PER_TAB), 1);
+        assert_eq!(tabs_to_free(101 + PER_TAB, 100, PER_TAB), 2);
         // Absurd excess: no overflow, no panic, just "a lot".
         assert_eq!(
-            tabs_to_free(u64::MAX, 0),
-            u64::MAX.div_ceil(ESTIMATED_BYTES_PER_TAB) as usize
+            tabs_to_free(u64::MAX, 0, PER_TAB),
+            u64::MAX.div_ceil(PER_TAB) as usize
         );
     }
 
@@ -1084,7 +1273,7 @@ mod tests {
         });
         // Every signal is screaming, yet only the plain tab goes.
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), memory)),
+            ids(&plan_discarding(&policy, &with_active(&candidates), memory)),
             vec![3]
         );
     }
@@ -1101,7 +1290,7 @@ mod tests {
         // Live = 5, limit 3 -> two must go. Tab 4 is idle anyway, so the
         // tab-count signal only needs one more (the next LRU: tab 2).
         let candidates = [tab(1, 5), tab(2, 50), tab(3, 1), tab(4, 500)];
-        let planned = plan(&policy, &with_active(&candidates), None);
+        let planned = plan_discarding(&policy, &with_active(&candidates), None);
         assert_eq!(
             planned,
             vec![
@@ -1123,7 +1312,7 @@ mod tests {
         let memory = Some(MemorySample {
             total_bytes: 650 * MIB,
         });
-        let planned = plan(&policy, &with_active(&candidates), memory);
+        let planned = plan_discarding(&policy, &with_active(&candidates), memory);
         assert_eq!(
             planned,
             vec![
@@ -1144,7 +1333,7 @@ mod tests {
         // deterministically.
         let candidates = [tab(7, 10), tab(8, 10), tab(9, 10)];
         assert_eq!(
-            ids(&plan(&policy, &with_active(&candidates), None)),
+            ids(&plan_discarding(&policy, &with_active(&candidates), None)),
             vec![7, 8]
         );
     }
@@ -1168,7 +1357,7 @@ mod tests {
             grouped(5, 50, 1),
             active(6, 1),
         ];
-        let planned = plan(&policy, &candidates, None);
+        let planned = plan_discarding(&policy, &candidates, None);
         assert_eq!(ids(&planned), vec![1, 2, 3, 4]);
         // The overshoot is credited to the signal the group went for.
         assert!(planned.iter().all(|(_, r)| *r == SuspendReason::TabCount));
@@ -1189,7 +1378,7 @@ mod tests {
             grouped(4, 8, 1),
             active(9, 7),
         ];
-        let planned = plan(&policy, &candidates, None);
+        let planned = plan_discarding(&policy, &candidates, None);
         assert_eq!(ids(&planned), vec![3, 4, 1, 2]);
     }
 
@@ -1219,7 +1408,7 @@ mod tests {
                 ..tab(6, 450)
             },
         ];
-        let planned = plan(&policy, &candidates, None);
+        let planned = plan_discarding(&policy, &candidates, None);
         // Emptyable group 2 first (whole), then leftovers by idle: 1
         // (500), 6 (450), 3 (300). Tab 2 (loading) never.
         assert_eq!(ids(&planned), vec![4, 5, 1, 6, 3]);
@@ -1245,7 +1434,7 @@ mod tests {
         // newest tab (30) is older than groups 0 (10) and 1 (20), so it
         // goes first — and whole (its own tabs least recently used first):
         // demand 2 is met by it alone.
-        let planned = plan(&policy, &candidates, None);
+        let planned = plan_discarding(&policy, &candidates, None);
         assert_eq!(ids(&planned), vec![4, 3]);
     }
 
@@ -1261,7 +1450,7 @@ mod tests {
         let memory = Some(MemorySample {
             total_bytes: 10_000 * MIB,
         });
-        assert!(plan(&policy, &candidates, memory).is_empty());
+        assert!(plan_discarding(&policy, &candidates, memory).is_empty());
     }
 
     #[test]
