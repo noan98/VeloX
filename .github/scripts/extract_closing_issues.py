@@ -14,8 +14,9 @@ GitHub 本体の挙動に合わせて以下をサポートする:
 - キーワード: close/closes/closed, fix/fixes/fixed, resolve/resolves/resolved
   (大文字小文字を区別しない)
 - 1 行に複数 (`Closes #77, closes #73`) / 複数行にまたがる併記
-- フェンスコードブロック (``` ... ```) 内と、引用行 (`>` で始まる行) 内の
-  キーワードは無視する (CLAUDE.md 「Issue と PR の紐付け」節と同じ注意書き)
+- フェンスコードブロック (``` ... ```) 内、インラインコードスパン
+  (`` `...` ``) 内、引用行 (`>` で始まる行) 内のキーワードは無視する
+  (CLAUDE.md 「Issue と PR の紐付け」節と同じ注意書き)
 - `owner/repo#123` のような他リポジトリ参照は拾わない (キーワード直後に
   空白 + `#数字` が続く形しか受け付けないため、`owner/repo#123` のように
   `#` の直前が `/` を含む識別子の場合は自然にマッチしない)
@@ -33,6 +34,18 @@ import sys
 # 全体を安全側 (コードとみなして無視) に倒すため DOTALL で欲張りに消す。
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _UNCLOSED_CODE_BLOCK_RE = re.compile(r"```.*\Z", re.DOTALL)
+
+# インラインコードスパン (`...` / ``...``)。GitHub はコードスパン内の `#123` を
+# Issue リンクにすらしない (当然 close もしない) ため、本体に合わせて除去する。
+# Issue #252: PR #249 の「`Closes #247` は入れていません」という否定文が拾われ、
+# マージ 3 秒後に #247 が誤クローズされた。
+#
+# 開始と同じ数のバッククォートが「同一行内で」閉じている場合だけ除去する。
+# 閉じていないバッククォートは地の文の書き損じとみなして手を付けない
+# (行をまたいで欲張りに消すと、下の行にある正当な `Closes #N` まで巻き添えに
+# するため)。フェンス除去の後に適用するので、残るバッククォートは
+# インラインとみなしてよい。
+_INLINE_CODE_RE = re.compile(r"(`+)[^\n]*?\1")
 
 # クロージングキーワード (GitHub がサポートするもの一式)。
 _KEYWORDS = (
@@ -63,6 +76,10 @@ def _strip_code_blocks(text: str) -> str:
     return text
 
 
+def _strip_inline_code(text: str) -> str:
+    return _INLINE_CODE_RE.sub(" ", text)
+
+
 def _strip_quoted_lines(text: str) -> str:
     kept = []
     for line in text.splitlines():
@@ -75,14 +92,15 @@ def _strip_quoted_lines(text: str) -> str:
 def extract_closing_issues(pr_body: str | None) -> list[int]:
     """PR 本文からクロージングキーワードが付いた Issue 番号を抽出する。
 
-    コードブロック・引用行を除去したうえでキーワードを走査し、登場順を
-    保ちつつ重複を除いた Issue 番号のリストを返す。キーワードが 1 つも
-    見つからなければ空リストを返す。
+    コードブロック・インラインコード・引用行を除去したうえでキーワードを
+    走査し、登場順を保ちつつ重複を除いた Issue 番号のリストを返す。
+    キーワードが 1 つも見つからなければ空リストを返す。
     """
     if not pr_body:
         return []
 
     text = _strip_code_blocks(pr_body)
+    text = _strip_inline_code(text)
     text = _strip_quoted_lines(text)
 
     seen: dict[int, None] = {}

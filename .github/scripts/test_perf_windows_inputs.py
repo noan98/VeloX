@@ -226,5 +226,69 @@ class PerfWindowsInputsTest(unittest.TestCase):
         self.assertEqual([], uncovered)
 
 
+
+class BeaconWiringTest(unittest.TestCase):
+    """`beacon` 入力が **実計測のステップまで** 届いていることの検査。
+
+    Issue #247 の最初の計測は、ここが繋がっていないまま回った。
+    `beacon` 入力は `bench_url` の `url` 出力にだけクエリを付けており、
+    実計測ループは `pages` 出力からページ名を取って **素の URL を組み直して
+    いた**。`pages` は固定ページ配信時に必ず非空なので、beacon 付きの
+    分岐には一度も入らない。
+
+    結果として数えられたのは、`url` 出力を使う唯一の場所 —
+    **velox を 8 秒だけ起動する診断ステップ** — の分だけだった。
+    それを `background_cpu` 8 トライアルの結果として読み、
+    §41 / D125 に書いてしまった (撤回済み)。
+
+    **run を 1 回使い切っても気づけない種類の失敗である。** 数字は出るし、
+    ステップも緑になる。出てきた数字が別のものの数字であることは、
+    workflow を読まないと分からない。
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.doc = yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+        cls.steps = cls.doc["jobs"]["perf-windows"]["steps"]
+
+    def _step(self, name_fragment: str) -> dict:
+        for step in self.steps:
+            if name_fragment in (step.get("name") or ""):
+                return step
+        raise AssertionError(f"ステップが見つからない: {name_fragment}")
+
+    def test_the_bench_step_receives_the_beacon_input(self) -> None:
+        """実計測ステップが `beacon` を見られなければ、URL に付けようがない。"""
+        step = self._step("Run velox-bench")
+        self.assertIn("INPUT_BEACON", step.get("env") or {})
+
+    def test_the_bench_step_builds_the_url_with_the_beacon_query(self) -> None:
+        """ページ名から URL を組み直す分岐にも beacon クエリが要る。"""
+        run = self._step("Run velox-bench")["run"]
+        self.assertIn("$beaconQuery", run)
+        self.assertIn('"http://127.0.0.1:8731/$pg$beaconQuery"', run)
+
+    def test_the_diagnose_step_does_not_send_beacons(self) -> None:
+        """診断は 8 秒の単独起動で、計測の自動操作とは無関係。
+
+        beacon 付きの URL を渡すと、その 8 秒分が計測と同じカウンタに
+        混ざる。最初の計測で数えていたのは、まさにこの混入分だった。
+        """
+        run = self._step("Diagnose VeloX launch")["run"]
+        self.assertIn("steps.bench_url.outputs.url_plain", run)
+        self.assertNotIn("steps.bench_url.outputs.url }}", run)
+
+    def test_url_plain_is_emitted_on_both_branches(self) -> None:
+        """外部 URL を渡した場合も診断ステップは URL を必要とする。"""
+        run = self._step("Determine benchmark URL")["run"]
+        self.assertEqual(2, run.count("url_plain="))
+
+    def test_every_step_reading_the_beacon_input_does_so_via_env(self) -> None:
+        """入力をシェルへ直接展開しない (script injection 対策)。"""
+        for step in self.steps:
+            with self.subTest(step=step.get("name")):
+                self.assertNotIn("inputs.beacon }}", step.get("run") or "")
+
+
 if __name__ == "__main__":
     unittest.main()

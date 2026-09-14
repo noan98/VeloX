@@ -4,7 +4,7 @@ OS 固有実装、CI、配布、アプリ構成に関する Decision の入口�
 
 ## 対象
 
-主担当は **D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108** の 16 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126** の 17 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D50–D55** — CI / Windows release / icon / download-context fix / WebProcess sharing / auto-merge
 - **D68** — multiple windows
@@ -19,7 +19,7 @@ OS 固有実装、CI、配布、アプリ構成に関する Decision の入口�
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108** (16 件)
+**このカテゴリが主担当の Decision: D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126** (17 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -45,6 +45,7 @@ OS 固有実装、CI、配布、アプリ構成に関する Decision の入口�
 - [D103](./archive.md#d103-猶予期間の満了はイベントを生まない-issue-219--待つのをやめるのではなくauto-merge-が自分で待ち直す) — 猶予期間の満了はイベントを生まない (Issue #219) — 待つのをやめるのではなく、auto-merge が自分で待ち直す
 - [D107](./archive.md#d107-auto-merge-の-workflow_run-監視対象をpr-の-check-run-に現れうる-workflow-全部に揃え列挙漏れをテストで固定する-issue-225) — auto-merge の `workflow_run` 監視対象を「PR の check-run に現れうる workflow 全部」に揃え、列挙漏れをテストで固定する (Issue #225)
 - [D108](./archive.md#d108-scripts-と-githubscripts-の-python-テストを-ciyml-で回す-issue-224--テスト-0-件で緑を明示的に失敗させる) — `scripts/` と `.github/scripts/` の Python テストを `ci.yml` で回す (Issue #224) — 「テスト 0 件で緑」を明示的に失敗させる
+- [D126](./archive.md#d126-自動クローズの代行はインラインコード内のキーワードを拾ってはならない-issue-252--閉じませんと書いた-pr-が-issue-を閉じた) — 自動クローズの代行はインラインコード内のキーワードを拾ってはならない (Issue #252) — 「閉じません」と書いた PR が Issue を閉じた
 
 ---
 
