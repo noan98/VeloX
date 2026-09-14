@@ -253,15 +253,15 @@ graphs」に対応する代表メトリクスを、シナリオに存在する�
 
 ## 9. 既知の制約・Revisit condition
 
-- **CI (`perf-gate.yml`/`perf-windows.yml`) からの自動記録は未実装** (§4)。
-  手動 (または将来のワークフロー変更) で `record.py` を呼ぶ運用を前提に
-  している。自動化する場合は「誰が `results/history/` への commit を
-  作るか」の運用設計が追加で必要 — 単純にワークフローに追記させると、
-  PR の fork/権限によっては push できないケースがある。**Issue #211 項目4
-  で `perf-windows.yml` にスケジュール実行を足した時点でもこれは未解決の
-  まま** — スケジュール実行は結果 JSON を artifact として残すのみで、
-  `results/history/windows/` への取り込みは依然として手動 (`record.py`)
-  を要する。
+- **`perf-windows.yml` の週次計測からの自動記録は実装済み**
+  (`docs/decisions.md` D132 / `ingest-history` ジョブ)。取り込みは
+  `main` への直接 push ではなく **PR 経由**で行われる — `main` の ruleset が
+  `pull_request` を必須にしており、`GITHUB_TOKEN` には bypass 権限が無いため。
+  PR は `AUTO_MERGE_TOKEN` (PAT) で作る (`GITHUB_TOKEN` で作った PR は
+  `on: pull_request` を発火させず、CI も auto-merge も動かない)。
+  系列の分け方は D132 決定3 を参照。
+- **`perf-gate.yml` (Linux) からの自動記録は依然として未実装** (§4)。
+  こちらは手動で `record.py` を呼ぶ運用のままである。
 - **「機種」を比較のもう一段の単位にした** (§2.1、Issue #211 項目2 /
   `docs/decisions.md` D106)。`session_id` が同じでも機種が違えば連結・
   差分計算をしない。機種不明の既存エントリは安全側に倒し孤立点として
@@ -271,11 +271,10 @@ graphs」に対応する代表メトリクスを、シナリオに存在する�
   実機 (Issue #136) でノイズの小さい継続計測ができるようになれば、
   「セッションを跨いでも許容誤差内なら緩やかにつなぐ」といった拡張は
   再検討の余地がある。
-- **Windows/macOS のデータは現時点で 0 件**。`results/history/` は OS
-  ディレクトリが無ければ単にそのセクションが空で表示される (エラーには
-  ならないことを `--os macos` フィルタで確認済み)。Issue #136 (Windows
-  手動計測ワークフロー) の成果が `record.py` に渡ればそのまま
-  `results/history/windows/` に載る — ダッシュボード側の変更は不要。
+- **Windows のデータは週次で貯まり始める** (D132)。それまでは 0 件であり、
+  `results/history/` は OS ディレクトリが無ければ単にそのセクションが空で
+  表示される (エラーにならないことを `--os macos` フィルタで確認済み)。
+  **macOS は引き続き 0 件** — 計測ワークフロー自体が無い。
 - **セッション境界をまたぐ「見た目のグラフ上の連続性」の欠如は仕様**であり
   バグではない — §2 を参照。
 - `report.py` の HTML はテーマ (ダーク/ライトモード) に追随する最小限の
