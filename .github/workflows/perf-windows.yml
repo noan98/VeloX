@@ -709,6 +709,33 @@ jobs:
             return "$sc@$slug"
           }
 
+          # Issue #247。腕ごとに beacon の集計を読んで空にするヘルパ。
+          # `/beacon-reset` は「返してから空にする」ので、返ってきた値が
+          # ちょうどその腕の分になる。
+          #
+          # **beacon が無効なときは何もしない。** 既定の計測では serve.py
+          # 自体が動いておらず、叩けば必ず失敗するため。
+          #
+          # 失敗してもジョブは落とさない。これは診断であって計測結果
+          # そのものではない (このステップが落ちると 16 分のベンチが
+          # 丸ごと無駄になる)。
+          function Reset-Beacons() {
+            if ($env:INPUT_BEACON -ne "true") { return $null }
+            try {
+              return (Invoke-WebRequest -Uri "http://127.0.0.1:8731/beacon-reset" `
+                -UseBasicParsing -TimeoutSec 5 -ErrorAction Stop).Content
+            } catch {
+              Write-Host "::warning::beacon の区切りに失敗しました: $_"
+              return $null
+            }
+          }
+
+          function Write-BeaconArm([string] $label) {
+            $body = Reset-Beacons
+            if ($null -eq $body) { return }
+            Write-Host "  beacon [$label] $body"
+          }
+
           # Issue #247。`bench_url` の `url` 出力には beacon クエリが
           # 付いているが、**固定ページを配信するときこの分岐は使われない**
           # — `$pg` が常に非空になるため、素の URL がここで組み直される。
@@ -729,11 +756,18 @@ jobs:
                 Invoke-Bench $sc $url "results\$prefix-windows.json" "[$tag] A (既定)"
               } else {
                 Write-Host "[$tag] A/B 比較: B 条件 = '$compareEnv' / ペア数 = $repeats"
+                # Issue #247。腕の切り替えで beacon の集計を区切る。
+                # **区切らないと A と B の beacon が同じバケットに
+                # 積み上がり、low と normal を分離できない** (§42.5)。
+                # 直前の残り (診断ステップの分など) もここで捨てる。
+                Reset-Beacons | Out-Null
                 for ($r = 1; $r -le $repeats; $r++) {
                   Invoke-Bench $sc $url "results\$prefix-windows-baseline-$r.json" "[$tag] A (既定) #$r"
+                  Write-BeaconArm "[$tag] A (既定) #$r"
                   $names = Set-EnvFromSpec $compareEnv
                   try {
                     Invoke-Bench $sc $url "results\$prefix-windows-compare-$r.json" "[$tag] B ($compareEnv) #$r"
+                    Write-BeaconArm "[$tag] B ($compareEnv) #$r"
                   } finally {
                     foreach ($name in $names) {
                       Remove-Item -Path "Env:$name" -ErrorAction SilentlyContinue
@@ -748,11 +782,18 @@ jobs:
       # 経路。`busy.html` は report() のたびに `beacon?state=..&f=..&t=..`
       # を投げ、`serve.py` がそれを state ごとに数えている。
       #
-      # 見るのは `advanced_frames` / `advanced_ticks` — **最後に見た値と
-      # 最初に見た値の差**である。`state=hidden` の側でこれが 0 なら、
-      # 隠れているタブで rAF / setInterval が一度も進まなかったことに
-      # なる。`count` も一緒に出しているのは、beacon が 1 件しか来て
-      # いない (差が 0 になるのは当然) 場合と区別するため。
+      # 見るのは `advanced_frames` / `advanced_ticks` — **ページ実体
+      # (`id=`) ごとの「最後 − 最初」の合計**である。`state=hidden` の側で
+      # これが 0 なら、隠れているタブで rAF / setInterval が一度も進まな
+      # かったことになる。`count` も一緒に出しているのは、beacon が 1 件
+      # しか来ていない (差が 0 になるのは当然) 場合と区別するため。
+      # `instances` は実体の数で、背景タブが 12 個あるのに 1 なら
+      # **`id=` が届いていない**ことを疑う。
+      #
+      # ⚠️ **A/B 比較のときこのステップは空を返す。** 腕ごとに
+      # `/beacon-reset` で区切っており (§42.5)、**読むべき数字は上の
+      # ベンチステップに出ている `beacon [...] {...}` の行**である。
+      # ここに出るのは最後の腕より後に届いた分だけになる。
       #
       # 集計の取得に失敗してもジョブは落とさない。これは診断であって
       # 計測結果そのものではない。

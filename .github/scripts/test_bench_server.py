@@ -73,5 +73,108 @@ class BeaconCountsTest(unittest.TestCase):
         self.assertEqual(summary["unknown"]["advanced_frames"], 3)
 
 
+class PerInstanceTest(unittest.TestCase):
+    """§42.4 が壊れていた理由を、そのまま回帰テストにする。
+
+    初版は state ごとに first/last だけを持っていた。`background_cpu` は
+    12 個の背景タブを開き、velox は 1 run で 8 回起動し直す — どれも
+    カウンタを 0 から数え直すので、**別々の実体の値を引き算していた。**
+    実測で `advanced_frames` が -5 になった。
+    """
+
+    def test_two_tabs_in_the_same_state_do_not_subtract_across_each_other(self):
+        counts = BeaconCounts()
+        # A は 10 -> 20 (+10)、B は 100 -> 140 (+40)。合計 50。
+        counts.record("state=hidden&f=10&t=5&id=A")
+        counts.record("state=hidden&f=100&t=50&id=B")
+        counts.record("state=hidden&f=20&t=9&id=A")
+        counts.record("state=hidden&f=140&t=70&id=B")
+
+        summary = counts.summary()
+        self.assertEqual(summary["hidden"]["count"], 4)
+        self.assertEqual(summary["hidden"]["instances"], 2)
+        self.assertEqual(summary["hidden"]["advanced_frames"], 50)
+        self.assertEqual(summary["hidden"]["advanced_ticks"], 24)
+
+    def test_a_reloaded_page_never_makes_the_advance_negative(self):
+        """velox の再起動でカウンタが 0 に戻っても負にならない。
+
+        **これが §42.4 で実際に出た -5 の正体である。**
+        """
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=100&t=156&id=first")
+        # 起動し直し。新しいページ実体なので id が変わり、値は小さい。
+        counts.record("state=hidden&f=3&t=4&id=second")
+        counts.record("state=hidden&f=95&t=162&id=second")
+
+        summary = counts.summary()
+        self.assertEqual(summary["hidden"]["instances"], 2)
+        self.assertGreaterEqual(summary["hidden"]["advanced_frames"], 0)
+        # first は 1 件だけなので 0、second が 3 -> 95 で +92。
+        self.assertEqual(summary["hidden"]["advanced_frames"], 92)
+
+    def test_a_counter_going_backwards_within_one_instance_is_clamped(self):
+        # 同じ id でカウンタが戻ることは無いはずだが、戻っても
+        # 進んだ量を負にしない。壊れた入力で指標を壊すより安全側。
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=50&t=50&id=A")
+        counts.record("state=hidden&f=10&t=10&id=A")
+        summary = counts.summary()
+        self.assertEqual(summary["hidden"]["advanced_frames"], 0)
+        self.assertEqual(summary["hidden"]["advanced_ticks"], 0)
+
+    def test_beacons_without_an_id_collapse_into_one_instance(self):
+        """`id=` を送らない古いページは 1 実体として扱う。
+
+        初版と同じ壊れ方をするが、**`instances` が 1 であることから
+        混ざっていると分かる**ので、黙って誤らせない。
+        """
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=10&t=1")
+        counts.record("state=hidden&f=20&t=2")
+        summary = counts.summary()
+        self.assertEqual(summary["hidden"]["instances"], 1)
+
+    def test_instances_is_reported_so_a_missing_id_is_visible(self):
+        # 背景タブが 12 個あるのに instances が 1 なら、id= が
+        # 届いていないということ。読み手がそれに気づけるようにする。
+        counts = BeaconCounts()
+        for tab in range(12):
+            counts.record(f"state=hidden&f=1&t=1&id=tab{tab}")
+        self.assertEqual(counts.summary()["hidden"]["instances"], 12)
+
+
+class ResetTest(unittest.TestCase):
+    """A/B の腕を分ける仕掛け (§42.5 / D127 決定5)。"""
+
+    def test_reset_returns_what_it_clears(self):
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=1&t=1&id=A")
+        counts.record("state=hidden&f=9&t=5&id=A")
+
+        cleared = counts.reset()
+        self.assertEqual(cleared["hidden"]["count"], 2)
+        self.assertEqual(cleared["hidden"]["advanced_frames"], 8)
+        # 返した分は消えている。次の腕の beacon と混ざらない。
+        self.assertEqual(counts.summary(), {})
+
+    def test_the_second_arm_starts_from_zero(self):
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=100&t=100&id=lowarm")
+        counts.reset()
+
+        counts.record("state=hidden&f=5&t=5&id=normalarm")
+        counts.record("state=hidden&f=8&t=7&id=normalarm")
+        summary = counts.summary()
+        self.assertEqual(summary["hidden"]["count"], 2)
+        self.assertEqual(summary["hidden"]["instances"], 1)
+        # 前の腕の 100 を引きずらない。
+        self.assertEqual(summary["hidden"]["advanced_frames"], 3)
+
+    def test_reset_on_an_empty_server_is_not_an_error(self):
+        # 腕の切り替えは beacon が 1 本も来ていなくても起きうる。
+        self.assertEqual(BeaconCounts().reset(), {})
+
+
 if __name__ == "__main__":
     unittest.main()
