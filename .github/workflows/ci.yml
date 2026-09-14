@@ -13,7 +13,14 @@ jobs:
     name: Build, lint & test (Linux)
     runs-on: ubuntu-latest
     steps:
+      # `fetch-depth: 0` は「クロージングキーワードの意図確認」(Issue #253)
+      # のため。**既定の shallow clone では `base..head` が引けない** —
+      # `pull_request` の checkout は `refs/pull/N/merge` を深さ 1 で取るので、
+      # base も head も履歴に無い。このリポジトリは 200 コミット程度なので
+      # 全履歴を取る費用は無視できる。
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
 
       # Issue #224 / docs/decisions D108: リポジトリ内の Python テストを
       # ここでまとめて回す。これを足すまで `scripts/dashboard/test_*.py` は
@@ -50,6 +57,36 @@ jobs:
             python3 -m unittest discover -s "$dir" -p "test_*.py" -v
             echo "::endgroup::"
           done
+
+      # Issue #253 / docs/decisions D128。**Issue #247 は同じ日に 2 度、
+      # 別の経路で誤クローズされた。** 2 度目はコミットメッセージ経由で、
+      # PR 本文のほうは対策していたのに盲点だった。
+      #
+      # **「気をつけて書く」では防げないことが実証されている** — 1 度目の
+      # 対策を入れたコミット自身が 2 度目の経路を踏んだ。バグの説明に
+      # キーワードを書くのは自然な行為で、丁寧に書くほど踏む罠になっている。
+      #
+      # GitHub 本体の解析は止められないので、**閉じる前に気づく**ほうに倒す。
+      # 落とさず警告だけにするのは、意図した close が本文に書き忘れられて
+      # いるだけの場合もあり、**この検査でマージが止まると調査コストのほうが
+      # 事故の修復コスト (再オープン) を上回る**ため。
+      #
+      # `pull_request` のときだけ走る (push では PR 本文が存在しない)。
+      - name: クロージングキーワードの意図確認 (Issue #253)
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # 本文は環境変数で渡す (シェルへ直接展開しない — script injection 対策)。
+          printf '%s' "$PR_BODY" > /tmp/pr-body.txt
+          # `%B%x00` で NUL 区切り。コミットメッセージ自体が改行を含むので、
+          # 行区切りでは割れない。
+          git log --format='%B%x00' "$BASE_SHA..$HEAD_SHA" > /tmp/commit-messages.txt
+          python3 .github/scripts/check_closing_keywords.py \
+            /tmp/pr-body.txt /tmp/commit-messages.txt
 
       - name: Install WebKitGTK + Xvfb
         run: |
