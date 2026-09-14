@@ -283,6 +283,27 @@ class BeaconWiringTest(unittest.TestCase):
         run = self._step("Determine benchmark URL")["run"]
         self.assertEqual(2, run.count("url_plain="))
 
+    def test_the_ab_loop_separates_the_arms(self) -> None:
+        """腕ごとに区切らないと low と normal が同じバケットに積み上がる。
+
+        §42.5 / D127 決定5。再計測できたのに `low`/`normal` を分離
+        できなかったのは、これが無かったためである。
+        """
+        run = self._step("Run velox-bench")["run"]
+        self.assertIn("beacon-reset", run)
+        # A 側・B 側の両方で腕の集計を読み出していること。
+        self.assertEqual(2, run.count("Write-BeaconArm "))
+
+    def test_the_reset_helper_is_inert_when_beacon_is_off(self) -> None:
+        """既定の計測では serve.py が動いていないので、叩けば必ず失敗する。"""
+        run = self._step("Run velox-bench")["run"]
+        self.assertIn('if ($env:INPUT_BEACON -ne "true") { return $null }', run)
+
+    def test_the_reset_helper_never_fails_the_job(self) -> None:
+        """診断のために 16 分のベンチを捨てない (§42.7)。"""
+        run = self._step("Run velox-bench")["run"]
+        self.assertIn("::warning::beacon の区切りに失敗しました", run)
+
     def test_every_step_reading_the_beacon_input_does_so_via_env(self) -> None:
         """入力をシェルへ直接展開しない (script injection 対策)。"""
         for step in self.steps:

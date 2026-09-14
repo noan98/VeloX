@@ -54,24 +54,54 @@ BEACON_PATH = "/beacon"
 REQUEST_QUEUE_SIZE = 128
 #: 集計結果を JSON で返すパス。ワークフローが計測後に 1 回だけ叩く。
 SUMMARY_PATH = "/beacon-summary"
+#: 集計を返したうえで空にするパス (Issue #247)。**A/B の腕の切り替え時に
+#: これを叩かないと、両腕の beacon が同じバケットに積み上がる。**
+#: §42.5 はそれで `low` と `normal` を分離できなかった。
+RESET_PATH = "/beacon-reset"
 
 
 class BeaconCounts:
     """`state` (`visibilityState`) ごとの beacon の集計。
 
     数えたいのは**回数だけではない**。「隠れているタブでカウンタが進んだか」
-    が問いなので、`f=` (rAF の回数) と `t=` (`setInterval` の発火回数) の
-    **最初と最後**を覚えておく。進んでいなければ最初と最後が同じになる。
+    が問いなので、`f=` (rAF の回数) と `t=` (`setInterval` の発火回数) が
+    どれだけ進んだかを数える。
+
+    ## なぜページ「インスタンス」ごとに持つのか (Issue #247)
+
+    初版は state ごとに「最初の値」と「最後の値」だけを持ち、その差を
+    進んだ量としていた。**それは壊れていた。**
+
+    1. **1 つの state に複数のタブが入る。** `background_cpu` は 12 個の
+       背景タブを開き、全部が `state=hidden` で報告する。別々のタブの
+       `f=` を並べて引き算しても意味がない。
+    2. **velox は 1 run で何度も起動し直す。** そのたびにページは
+       読み込み直され、カウンタは 0 から始まる。
+
+    結果、`advanced_frames` が **-5** のような負の値になった
+    (`docs/performance-targets.md` §42.4)。負の「進んだ量」は、指標が
+    壊れている合図である。
+
+    そこで `id=` (ページが読み込みごとに作る乱数) ごとに最初と最後を
+    持ち、**その差を合計する。** インスタンスをまたいで引き算しない。
+
+    `id=` が無い beacon (古い `busy.html` など) は、すべて同じ
+    `"-"` インスタンスとして扱う。初版と同じ壊れ方をするが、**混ざって
+    いることが `instances` の数から見える**ので、黙って誤らせない。
 
     ソケットを持たない純粋なデータなので、単体テストから直接叩ける。
     """
 
+    #: `id=` を持たない beacon をまとめる先。
+    UNKNOWN_INSTANCE = "-"
+
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._states: dict[str, dict[str, int]] = {}
+        # state -> instance id -> {count, first_frames, last_frames, ...}
+        self._states: dict[str, dict[str, dict[str, int]]] = {}
 
     def record(self, query: str) -> None:
-        """`state=hidden&f=12&t=34` の形のクエリを 1 件取り込む。
+        """`state=hidden&f=12&t=34&id=abc` の形のクエリを 1 件取り込む。
 
         壊れた値は黙って捨てる。**ここで例外を投げると計測そのものが
         落ちる**ので、集計の欠落より継続を優先する。
@@ -82,10 +112,12 @@ class BeaconCounts:
         ticks = _first_int(params.get("t"))
         if frames is None or ticks is None:
             return
+        instance = (params.get("id") or [self.UNKNOWN_INSTANCE])[0]
         with self._lock:
-            entry = self._states.get(state)
+            instances = self._states.setdefault(state, {})
+            entry = instances.get(instance)
             if entry is None:
-                self._states[state] = {
+                instances[instance] = {
                     "count": 1,
                     "first_frames": frames,
                     "first_ticks": ticks,
@@ -94,22 +126,67 @@ class BeaconCounts:
                 }
                 return
             entry["count"] += 1
-            entry["last_frames"] = frames
-            entry["last_ticks"] = ticks
+            # **同一インスタンスでカウンタが減ることは原理的に無い。**
+            # `frames` / `ticks` は単調増加しかしないので、小さい値が
+            # 後から届いたら「カウンタが戻った」のではなく
+            # **beacon の到着順が入れ替わった**ということである
+            # (ページは `fetch` を投げっぱなしにし、応答も順序も待たない)。
+            #
+            # そこで min/max で範囲を取る。先に届いたほうを first と
+            # 決め打つと、順序が入れ替わっただけで進んだ量が縮む。
+            # この形なら **進んだ量は構造的に負にならない。**
+            entry["first_frames"] = min(entry["first_frames"], frames)
+            entry["first_ticks"] = min(entry["first_ticks"], ticks)
+            entry["last_frames"] = max(entry["last_frames"], frames)
+            entry["last_ticks"] = max(entry["last_ticks"], ticks)
 
     def summary(self) -> dict[str, dict[str, int]]:
         """集計を JSON にできる形で返す。
 
-        `advanced_*` は「最後 − 最初」で、**これが 0 なら、その状態の
-        タブではカウンタが一度も進まなかった**ことを意味する。
+        `advanced_*` は**インスタンスごとの「最後 − 最初」の合計**で、
+        **これが 0 なら、その状態のタブではカウンタが一度も進まなかった**
+        ことを意味する。インスタンスをまたいで引き算しないので、
+        負にはならない。
+
+        `instances` はその state に何個のページ実体が居たか。
+        `background_cpu` なら背景タブの数 × 起動回数に近い値になるはずで、
+        **1 なら `id=` が届いていない**ことを疑う。
         """
         with self._lock:
-            out: dict[str, dict[str, int]] = {}
-            for state, entry in sorted(self._states.items()):
-                out[state] = dict(entry)
-                out[state]["advanced_frames"] = entry["last_frames"] - entry["first_frames"]
-                out[state]["advanced_ticks"] = entry["last_ticks"] - entry["first_ticks"]
+            return self._summary_locked()
+
+    def reset(self) -> dict[str, dict[str, int]]:
+        """集計を返したうえで空にする (Issue #247)。
+
+        **A/B の腕の切り替え時に呼ぶ。** 呼ばないと両腕の beacon が同じ
+        バケットに積み上がり、`low` と `normal` を分離できない (§42.5)。
+
+        返すのは「これから捨てる分」なので、呼び出し側はそれを腕の
+        結果として記録できる。取得と初期化が 1 回のロックの中で起きる
+        ので、その間に来た beacon が**どちらにも入らない / 両方に入る**
+        ということはない。
+        """
+        with self._lock:
+            out = self._summary_locked()
+            self._states.clear()
             return out
+
+    def _summary_locked(self) -> dict[str, dict[str, int]]:
+        """`summary()` の中身。**呼び出し側がロックを持っていること。**"""
+        out: dict[str, dict[str, int]] = {}
+        for state, instances in sorted(self._states.items()):
+            total = {
+                "count": 0,
+                "instances": len(instances),
+                "advanced_frames": 0,
+                "advanced_ticks": 0,
+            }
+            for entry in instances.values():
+                total["count"] += entry["count"]
+                total["advanced_frames"] += entry["last_frames"] - entry["first_frames"]
+                total["advanced_ticks"] += entry["last_ticks"] - entry["first_ticks"]
+            out[state] = total
+        return out
 
 
 def _first_int(values: list[str] | None) -> int | None:
@@ -157,8 +234,11 @@ class BenchHandler(SimpleHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if path == SUMMARY_PATH:
-            body = json.dumps(self._counts.summary()).encode("utf-8")
+        if path in (SUMMARY_PATH, RESET_PATH):
+            # reset は「返してから空にする」。返す中身は summary と同じなので、
+            # 呼び出し側は腕ごとの結果としてそのまま記録できる。
+            counts = self._counts.reset() if path == RESET_PATH else self._counts.summary()
+            body = json.dumps(counts).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
