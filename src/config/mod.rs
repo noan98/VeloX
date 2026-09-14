@@ -210,18 +210,17 @@ pub struct Config {
     /// every tab that is merely off screen, and with the memory budget off it
     /// is the *only* thing acting on them.
     ///
-    /// Defaults to `Normal` (say nothing), which is what VeloX did before
-    /// #242. `VELOX_BACKGROUND_MEMORY_TARGET=low` switches to
-    /// `ICoreWebView2_19::SetMemoryUsageTargetLevel(LOW)` on Windows.
+    /// **Defaults to `Low` since docs/decisions.md D123**; set
+    /// `VELOX_BACKGROUND_MEMORY_TARGET=normal` to opt out. On Windows this
+    /// becomes `ICoreWebView2_19::SetMemoryUsageTargetLevel(LOW)` for every
+    /// tab that leaves the screen; elsewhere it is inert.
     ///
-    /// **Measured, and unlike `SuspendMechanism::Freeze` it works**: at 20
-    /// tabs with suspension off, `low` cut the footprint to 0.439× with no
-    /// measurable cost in `tab_switch_ms` or `cpu_percent`
-    /// (docs/decisions.md D122, `docs/performance-targets.md` §38).
-    ///
-    /// It is still not the default, because §38 was measured with the memory
-    /// budget off in order to isolate it — not the configuration users run.
-    /// D122 決定3 names the two same-run follow-ups that decide that.
+    /// Measured with the budget *on* — the configuration users actually run
+    /// — it lands at 0.814× / 0.647× of the old default at 20 tabs
+    /// (`docs/performance-targets.md` §39), and the footprint stays so far
+    /// under `suspension`'s budget that **nothing is ever suspended**
+    /// (§39.1). Suspension is now the safety net for workloads the hint
+    /// cannot carry rather than the everyday mechanism (D123 決定2).
     pub background_memory_target: BackgroundMemoryTarget,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
@@ -336,12 +335,13 @@ impl Config {
     ///   freeze path, and for any tab the engine refuses to freeze, VeloX
     ///   falls back to `discard` for that tab so it is still suspended.
     /// - `VELOX_BACKGROUND_MEMORY_TARGET` — what a background but still
-    ///   awake tab is told about memory (Issue #242): `normal` says nothing
-    ///   (the default, and everything VeloX did before #242), `low` asks the
-    ///   engine to economize (`ICoreWebView2_19::SetMemoryUsageTargetLevel`,
-    ///   Windows only). A different axis from `VELOX_SUSPEND_MECHANISM`:
-    ///   this applies to tabs that are merely off screen, suspended or not.
-    ///   Unset or an unrecognized spelling keeps `normal`.
+    ///   awake tab is told about memory (Issue #242): `low` asks the engine
+    ///   to economize (`ICoreWebView2_19::SetMemoryUsageTargetLevel`, Windows
+    ///   only) and is **the default since D123**; `normal` says nothing,
+    ///   which is what VeloX did before #242. A different axis from
+    ///   `VELOX_SUSPEND_MECHANISM`: this applies to tabs that are merely off
+    ///   screen, suspended or not. Unset or an unrecognized spelling keeps
+    ///   the default (`low`).
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
     ///   `browser::suspension`). Off by default; unset or not a number
@@ -1810,13 +1810,13 @@ mod tests {
     // -- suspend_mechanism (Issue #243) -----------------------------------
 
     #[test]
-    fn background_memory_target_defaults_to_the_pre_242_behavior() {
-        // #242 is a measurement knob like #243's: nothing had measured what
-        // `Low` returns when it was added, so an unset
-        // `VELOX_BACKGROUND_MEMORY_TARGET` must keep saying nothing.
+    fn background_memory_target_defaults_to_low_since_d123() {
+        // Unlike `suspend_mechanism` below, this default *did* move: §39
+        // measured it with the budget on and it beat the old default on
+        // every axis, so D123 flipped it. `normal` is the opt-out.
         assert_eq!(
             Config::default().background_memory_target,
-            BackgroundMemoryTarget::Normal
+            BackgroundMemoryTarget::Low
         );
     }
 

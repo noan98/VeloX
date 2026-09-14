@@ -396,9 +396,9 @@ pub enum BackgroundMemoryTarget {
     /// Say nothing to the engine — background tabs are treated exactly like
     /// foreground ones, which is everything VeloX did before Issue #242.
     ///
-    /// The default, and it stays that way until a measurement says
-    /// otherwise (D46).
-    #[default]
+    /// **No longer the default** (docs/decisions.md D123): the measurement
+    /// D46 asked for came back decisively for [`Self::Low`]. This is now the
+    /// opt-out, reachable with `VELOX_BACKGROUND_MEMORY_TARGET=normal`.
     Normal,
     /// Tell the engine a background tab may economize.
     ///
@@ -415,10 +415,23 @@ pub enum BackgroundMemoryTarget {
     /// `TrySuspend` says stop, this says shrink, and the engine only obeys
     /// the second.
     ///
-    /// **Not the default yet.** §38 was measured with the memory budget off,
-    /// to isolate this knob from suspension — which is not the configuration
-    /// users run. D122 決定3 names the two same-run follow-ups that have to
-    /// come first.
+    /// **The default on Windows since D123**, after the two same-run
+    /// follow-ups D122 決定3 demanded (§39). Measured with the budget *on* —
+    /// the configuration users actually run — it lands at 0.814× / 0.647×
+    /// of the old default at 20 tabs.
+    ///
+    /// The result that settled it was not the ratio but what happened to
+    /// suspension: with the hint on, the footprint stays so far under the
+    /// memory budget that **the policy never suspends anything at all**
+    /// (§39.1). So the old default's 12 suspended tabs, their lost page
+    /// state (D105) and their ~100 ms returns (D112) are simply not paid at
+    /// this tab count. Suspension is still there — it has become the safety
+    /// net for workloads the hint cannot carry, not the everyday mechanism
+    /// (D123 決定2).
+    ///
+    /// Off Windows this is inert; macOS and Linux keep suspending exactly as
+    /// before (D123 決定4).
+    #[default]
     Low,
 }
 
@@ -1306,10 +1319,13 @@ mod tests {
     // -- BackgroundMemoryTarget (Issue #242) ------------------------------
 
     #[test]
-    fn background_memory_target_defaults_to_saying_nothing_to_the_engine() {
+    fn background_memory_target_defaults_to_asking_the_engine_to_economize() {
+        // Flipped by D123 on the strength of §38/§39: with the hint on, 20
+        // tabs land so far under the memory budget that suspension never
+        // fires. `Normal` is now the opt-out.
         assert_eq!(
             BackgroundMemoryTarget::default(),
-            BackgroundMemoryTarget::Normal
+            BackgroundMemoryTarget::Low
         );
     }
 
