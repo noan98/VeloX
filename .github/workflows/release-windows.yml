@@ -109,7 +109,7 @@ jobs:
 
       - name: Sign Windows binaries
         if: steps.signing.outputs.enabled == 'true'
-        uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82
         with:
           endpoint: ${{ vars.WINDOWS_CODESIGN_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.WINDOWS_CODESIGN_ACCOUNT_NAME }}
@@ -159,7 +159,7 @@ jobs:
       # 配布物そのものにも署名する。バイナリ署名が有効な場合のみ実行。
       - name: Sign Windows installer
         if: steps.signing.outputs.enabled == 'true'
-        uses: azure/artifact-signing-action@c0ae2c1d0c1847ab81ac0ab8521bee597cfedd30
+        uses: azure/artifact-signing-action@c7ab2a863ab5f9a846ddb8265964877ef296ee82
         with:
           endpoint: ${{ vars.WINDOWS_CODESIGN_ENDPOINT }}
           trusted-signing-account-name: ${{ vars.WINDOWS_CODESIGN_ACCOUNT_NAME }}
