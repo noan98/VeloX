@@ -3534,6 +3534,15 @@ fn handle_context_menu_action(
         context_menu::MenuAction::OpenImageInNewTab(url) => {
             open_new_tab(window, window_id, state, &url)
         }
+        // Issue #161: the same helpers Ctrl/Cmd+S and Ctrl/Cmd+P go through
+        // (`ToolbarCommand::SavePage`/`Print` and their `ContentShortcut`
+        // twins), not a second implementation — so the context menu cannot
+        // drift away from the shortcut in format, destination or error
+        // handling. Both act on the active tab, which is the tab the menu
+        // was opened on: a background tab's webview is hidden, so it never
+        // receives the right-click that opens one.
+        context_menu::MenuAction::SavePage => request_save_page(window, window_id, state, config),
+        context_menu::MenuAction::Print => print_active_tab(window, window_id, state),
         context_menu::MenuAction::Inspect => window.open_devtools(),
         // See this function's doc comment.
         context_menu::MenuAction::OpenLinkInNewWindow(_) => {}
