@@ -1124,6 +1124,9 @@ def main(argv: list[str]) -> int:
     フォールバックは常に不成立)。`prTitle` は `@claude` への依頼コメント
     に含める PR タイトル (省略可)。`codexUsageLimitLookbackHours` は Codex の
     利用上限を「今も続いている」とみなす時間 (省略時 6 時間、`0` で無効化)。
+    `codexResponseTimeoutMinutes` は `@codex review` の依頼から応答を待つ
+    時間 (省略時 60 分、`0` で無効化)。これを過ぎたら Claude フォールバック
+    へ回す (Issue #207)。
     """
     if len(argv) > 1:
         with open(argv[1], "r", encoding="utf-8") as f:

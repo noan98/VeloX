@@ -2196,6 +2196,29 @@ class CodexResponseTimeoutTest(unittest.TestCase):
         self.assertTrue(result["codex_review_request_needed"])
         self.assertFalse(result["claude_review_request_needed"])
 
+    def test_the_boundary_is_inclusive_to_the_second(self) -> None:
+        """判定は `>=` である — 「ちょうど経過した瞬間」に発火する。
+
+        レビュー指摘 (PR #261)。91 分 / 31 分の 2 点だけでは `>` と `>=` の
+        どちらでも通ってしまい、**境界の向きが固定されない。** 1 秒差で
+        挟んで、どちら側に倒れるかを明示する。
+
+        `>=` を選んだのは、待ち時間の上限として自然な読み方 (「60 分待つ」
+        = 60 分経ったら次へ) だからである。
+        """
+        # _NOW = 2026-09-07T16:31:14Z。timeout=60 分に対して:
+        cases = [
+            ("2026-09-07T15:31:13Z", True, "60 分 1 秒経過 → 発火"),
+            ("2026-09-07T15:31:14Z", True, "ちょうど 60 分 → 発火 (>= の側)"),
+            ("2026-09-07T15:31:15Z", False, "59 分 59 秒 → まだ待つ"),
+        ]
+        for created_at, should_fire, label in cases:
+            with self.subTest(label):
+                result = self._run([self._marker(created_at)], timeout=60)
+                self.assertEqual(
+                    result["claude_review_request_needed"], should_fire, label
+                )
+
 
 if __name__ == "__main__":
     unittest.main()
