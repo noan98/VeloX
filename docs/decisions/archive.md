@@ -16577,3 +16577,89 @@ run が複数集まった時点で分散を採り、ゲート化の閾値を決�
 Windows のビルドを回すのが見合わないと判断したら、`paths` による絞り込みを
 検討する — ただし**「CI が走らない PR を auto-merge が扱えるか」は未確認**
 なので、外すなら先にそこを確かめること。
+
+## D134: 最優先 OS のコードが lint の網から外れていた (Issue #158) — `#[cfg(windows)]` は Linux の clippy から見えない
+
+**対象**: Issue #158。実装は `src/ui/webview2_blocking.rs` と
+`.github/workflows/ci.yml`。
+
+### 事象
+
+`main` で Windows ターゲットの clippy を回すと、**既存の警告で落ちる。**
+
+```
+$ cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings
+error: this function has too many arguments (8/7)
+   --> src/ui/webview2_blocking.rs:158:1
+```
+
+起票 (2026-09-06) から 8 日後の `main` でも同じ状態だった。
+
+### なぜ誰も気付かなかったか
+
+CI は 2 つのジョブで役割が分かれていた:
+
+| ジョブ | fmt | clippy | build | test |
+| --- | :---: | :---: | :---: | :---: |
+| Linux | ✅ | ✅ `-D warnings` | ✅ | ✅ |
+| Windows (D61) | — | **なし** | ✅ | ✅ `--lib` |
+
+そして **`#[cfg(windows)]` のコードは Linux の clippy から一切見えない。**
+つまり `src/ui/webview2_blocking.rs` (D59) と `webview2_print.rs` (D75) は、
+**どちらのジョブからも lint されていなかった。**
+
+CLAUDE.md は「compiler warning ゼロを維持」を求めているが、**その網が
+最優先 OS のコードにだけ掛かっていない**という状態だった。これは
+「素通りして緑」(Issue #34 が防ごうとした形) の一種である — CI は緑で、
+規律は文書に書かれていて、実態だけが伴っていない。
+
+### 決定1: 警告は `#[allow]` ではなく構造で消す
+
+`handle_request` の 8 引数のうち 5 つ (`blocklist` / `exceptions` /
+`own_id` / `id` / `proxy`) を `TabBlockingContext` にまとめた。
+
+**これは lint を黙らせるための恣意的な束ねではない。** その 5 つは
+`WebResourceRequested` のクロージャが捕捉する集合そのもので、**タブの
+生存期間を通じて不変**という性質を共有している。残る 3 つ (`args` /
+`core` / `env`) はリクエストごとの COM 参照であり、性質が違う。
+**引数の並びが隠していた構造が、型に出ただけである。**
+
+先例は PR #144 の `SitePolicies` — `BrowserWindow::new` で同じ
+`too_many_arguments (8/7)` が出たとき、`#[allow]` ではなく構造体に
+まとめた。同じ答えを採る。
+
+### 決定2: CI の Windows ジョブで clippy を回す
+
+`ci.yml` の `check-windows` に Linux と同じ `-D warnings` の clippy を
+足した。**決定1 を先に入れないと、この追加と同時に CI が赤くなる**ので
+同じ PR で行う (Issue #158 が明示していた順序)。
+
+これで `#[cfg(windows)]` のコードにも網が掛かる。今後 Windows 固有
+モジュールが増えても (現在 2 つ、増える見込み) 同じ穴は開かない。
+
+### 決定3: 手元での回し方を CLAUDE.md に書く
+
+CLAUDE.md には既に `cargo check --target x86_64-pc-windows-msvc` があった
+が、**clippy は書かれていなかった。** それが「手元で確認する手段はある
+のに誰もやらない」状態を作っていた。同じ節に clippy を並べ、
+**`#[cfg(windows)]` は Linux の clippy から見えない**ことを明記した。
+
+MSVC ツールチェーンは不要 (型チェックのみ) なので、Linux 開発機からでも
+そのまま回せる。
+
+### 検証
+
+- 修正前: 手元で `error: this function has too many arguments (8/7)` を再現
+- 修正後: `cargo clippy --target x86_64-pc-windows-msvc --all-targets --
+  -D warnings` が exit 0
+- Linux 側の `cargo fmt` / `clippy` / `test --lib` 1052 passed も維持
+
+### Revisit condition
+
+(1) Windows ジョブの clippy は**キャッシュが効かない初回だけ遅い**。
+体感できるほど CI 時間が伸びたら、`--lib` に絞るなどの調整を検討する
+(ただし `--all-targets` を外すとテストコードが対象から落ちる)。
+(2) macOS (`#[cfg(target_os = "macos")]`) のコードには**依然として網が
+無い。** macOS ジョブは方針上まだ追加していない (CLAUDE.md「対応 OS の
+優先度」) ため、同じ穴が macOS 側には残っている。本格対応の際に
+`cargo clippy --target aarch64-apple-darwin` を同じ要領で足すこと。

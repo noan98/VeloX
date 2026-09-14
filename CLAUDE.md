@@ -132,14 +132,22 @@ macOS (WKWebView) / Windows (WebView2) は追加のシステム依存なしで�
 CI を一往復させる前に手元で確認してください:
 
 ```sh
-rustup target add x86_64-pc-windows-msvc          # 初回のみ
-cargo check --target x86_64-pc-windows-msvc --all-targets
+rustup target add x86_64-pc-windows-msvc                              # 初回のみ
+cargo check --target x86_64-pc-windows-msvc --all-targets             # 型チェック
+cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings  # lint
 ```
 
 リンクを伴わない型チェックのみなので MSVC ツールチェーンは不要です
 (`webview2-com` / `tao` の Windows 版まで検査されます)。ただしリンクと実行は
 しないため、これが通っても Windows で `cargo build` / `cargo test` が通る
 保証にはなりません (docs/decisions.md D61)。
+
+**⚠️ clippy も忘れずに回してください。** `#[cfg(windows)]` のコードは
+**Linux の clippy からは一切見えません。** 実際に
+`src/ui/webview2_blocking.rs` の `too_many_arguments` が誰にも気付かれない
+まま `main` に残っていました — CI は緑のままです (Issue #158 / D134)。
+現在は CI の Windows ジョブでも clippy を回しているので、手元で確認せずに
+push すると**そこで初めて赤になります。**
 
 CI は `.github/workflows/ci.yml` が PR と `main` push で
 fmt → clippy → test → build を Linux 上で実行します。加えて Windows
