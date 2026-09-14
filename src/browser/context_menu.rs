@@ -152,6 +152,18 @@ pub enum MenuAction {
     OpenLinkInNewTab(String),
     OpenLinkInNewWindow(String),
     OpenImageInNewTab(String),
+    /// Save the page the menu was opened on, the same way Ctrl/Cmd+S does
+    /// (Issue #161, the #39 leftover that had to wait for #46 to land).
+    ///
+    /// **Page-level, not click-level** — it carries no URL because it does
+    /// not save *what was clicked*, it saves the tab. `app.rs` routes it to
+    /// the very same `request_save_page` the shortcut and the toolbar
+    /// button use, so all three produce byte-identical results.
+    SavePage,
+    /// Print the page the menu was opened on, the same way Ctrl/Cmd+P does
+    /// (Issue #161, waiting on #40 the same way [`Self::SavePage`] waited
+    /// on #46). Page-level for the same reason.
+    Print,
     /// Open DevTools for the tab the menu was opened on (Issue #39's
     /// "DevTools導線と統合できる" acceptance condition) — reuses the exact
     /// same `BrowserWindow::open_devtools` path F12 already uses (D18).
@@ -191,6 +203,8 @@ impl MenuAction {
             MenuAction::OpenLinkInNewTab(_) => "リンクを新しいタブで開く".to_owned(),
             MenuAction::OpenLinkInNewWindow(_) => "リンクを新しいウィンドウで開く".to_owned(),
             MenuAction::OpenImageInNewTab(_) => "画像を新しいタブで開く".to_owned(),
+            MenuAction::SavePage => "名前を付けて保存…".to_owned(),
+            MenuAction::Print => "印刷…".to_owned(),
             MenuAction::Inspect => "検証".to_owned(),
         }
     }
@@ -234,6 +248,21 @@ pub fn build_menu(context: &MenuContext) -> Vec<MenuEntry> {
         },
         MenuEntry {
             action: MenuAction::Reload,
+            enabled: true,
+        },
+        // Issue #161. **Page-level actions, so they sit with the navigation
+        // group and appear for every click** — including a click on a link
+        // or an image, where they still mean "this page", exactly as they
+        // do in mainstream browsers. Always enabled: both are about the tab
+        // the menu was opened on, which by construction has a live webview
+        // (a background tab's is hidden and cannot be right-clicked), and
+        // neither depends on the click landing on anything in particular.
+        MenuEntry {
+            action: MenuAction::SavePage,
+            enabled: true,
+        },
+        MenuEntry {
+            action: MenuAction::Print,
             enabled: true,
         },
     ];
@@ -676,6 +705,80 @@ mod tests {
                 "https://example.com/".to_owned()
             ))
         );
+    }
+
+    // --- Issue #161: ページ全体に効く「保存」「印刷」 ---
+
+    #[test]
+    fn save_and_print_appear_on_every_click_and_are_enabled() {
+        // どのクリックでも出ること。リンクの上でも画像の上でも、
+        // これらは「このページ」を指すので消えてはいけない。
+        let contexts = [
+            MenuContext::default(),
+            MenuContext {
+                link_url: Some("https://example.com/a".to_owned()),
+                ..MenuContext::default()
+            },
+            MenuContext {
+                image_url: Some("https://example.com/a.png".to_owned()),
+                ..MenuContext::default()
+            },
+            MenuContext {
+                selection_text: Some("選択".to_owned()),
+                is_editable: true,
+                ..MenuContext::default()
+            },
+        ];
+        for context in contexts {
+            let entries = build_menu(&context);
+            for action in [MenuAction::SavePage, MenuAction::Print] {
+                let entry = entries
+                    .iter()
+                    .find(|e| e.action == action)
+                    .unwrap_or_else(|| panic!("{action:?} が出ていない: {context:?}"));
+                assert!(entry.enabled, "{action:?} が無効になっている: {context:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn save_and_print_sit_with_the_navigation_group() {
+        // 並び順の固定。再読み込みの直後、リンク/画像の項目より前。
+        // 実ブラウザと同じ「移動 → ページ操作 → クリック対象の操作」の順。
+        let entries = build_menu(&MenuContext {
+            link_url: Some("https://example.com/a".to_owned()),
+            ..MenuContext::default()
+        });
+        let at = |action: &MenuAction| entries.iter().position(|e| &e.action == action).unwrap();
+        let reload = at(&MenuAction::Reload);
+        let save = at(&MenuAction::SavePage);
+        let print = at(&MenuAction::Print);
+        let link = entries
+            .iter()
+            .position(|e| matches!(e.action, MenuAction::OpenLinkInNewTab(_)))
+            .unwrap();
+        assert_eq!(save, reload + 1, "{entries:?}");
+        assert_eq!(print, save + 1, "{entries:?}");
+        assert!(print < link, "{entries:?}");
+    }
+
+    #[test]
+    fn save_and_print_are_resolvable_through_an_open_menu() {
+        // ページ由来の index からこの 2 つを実際に引けること。
+        // `resolve` は無効な行と範囲外を弾くので、そこを通り抜けられるかが
+        // 「クリックして動く」の単体テスト水準での確認になる。
+        let entries = build_menu(&MenuContext::default());
+        for action in [MenuAction::SavePage, MenuAction::Print] {
+            let index = entries.iter().position(|e| e.action == action).unwrap();
+            let menu = OpenContextMenu::new(TabId::from(0), entries.clone());
+            assert_eq!(menu.resolve(index), Some(action));
+        }
+    }
+
+    #[test]
+    fn save_and_print_labels_are_fixed_japanese_strings() {
+        assert_eq!(MenuAction::SavePage.label(), "名前を付けて保存…");
+        assert_eq!(MenuAction::Print.label(), "印刷…");
     }
 
     #[test]

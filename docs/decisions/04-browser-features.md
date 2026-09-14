@@ -4,7 +4,7 @@
 
 ## 対象
 
-主担当は **D17–D18, D59–D60, D64, D66, D69, D71–D72, D75–D78** の 13 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D17–D18, D59–D60, D64, D66, D69, D71–D72, D75–D78, D139** の 14 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D17–D18** — content blocking / DevTools / IPC boundary
 - **D23–D28** — keyboard shortcuts / closed tabs / new-window handling / omnibox foundation / history favicon / downloads
@@ -16,7 +16,7 @@
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D17–D18, D59–D60, D64, D66, D69, D71–D72, D75–D78** (13 件)
+**このカテゴリが主担当の Decision: D17–D18, D59–D60, D64, D66, D69, D71–D72, D75–D78, D139** (14 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -39,6 +39,7 @@
 - [D76](./archive.md#d76-名前を付けて保存-46--windows-は-webview2-の-calldevtoolsprotocolmethod-で-mhtml-保存--ネイティブ-save-as-ダイアログmacoslinux-は-outerhtml-の素の保存に留める) — 名前を付けて保存 (#46) — Windows は WebView2 の `CallDevToolsProtocolMethod` で MHTML 保存 + ネイティブ Save-As ダイアログ、macOS/Linux は outerHTML の素の保存に留める
 - [D77](./archive.md#d77-キーボードショートカット管理-38--既存ショートカットの棚卸しと-browsershortcutsshortcut_table-への集約衝突検出信頼境界は不変) — キーボードショートカット管理 (#38) — 既存ショートカットの棚卸しと `browser::shortcuts::SHORTCUT_TABLE` への集約、衝突検出、信頼境界は不変
 - [D78](./archive.md#d78-コンテキストメニュー-39--ネイティブ-api-ではなく-js-描画を採用content-webview-からの入力は専用の境界付き第-3-チャネルとして扱う) — コンテキストメニュー (#39) — ネイティブ API ではなく JS 描画を採用、content webview からの入力は専用の境界付き第 3 チャネルとして扱う
+- [D139](./archive.md#d139-コンテキストメニューに載せたのは印刷とページを保存だけ-issue-161--リンク画像の保存は-46-の関数では作れない) — コンテキストメニューに載せたのは「印刷」と「ページを保存」だけ (Issue #161) — リンク/画像の保存は #46 の関数では作れない
 
 ---
 
