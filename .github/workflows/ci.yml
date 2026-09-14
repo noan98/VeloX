@@ -147,6 +147,22 @@ jobs:
       - name: Build
         run: cargo build
 
+      # Issue #158。**`#[cfg(windows)]` のコードは Linux の clippy から
+      # 一切見えない。** `src/ui/webview2_blocking.rs` (D59) と
+      # `webview2_print.rs` (D75) がそれに当たり、実際に
+      # `too_many_arguments` の警告が誰にも気付かれないまま `main` に
+      # 残っていた (CI は緑のまま)。CLAUDE.md の「compiler warning ゼロを
+      # 維持」に、Windows 固有コードだけ網がかかっていない状態だった。
+      #
+      # Linux 側と同じ `-D warnings` で回す。`--all-targets` なのでテスト
+      # コードも対象に含む。
+      #
+      # ⚠️ 手元でも `cargo clippy --target x86_64-pc-windows-msvc
+      # --all-targets -- -D warnings` で同じ検査ができる (MSVC ツール
+      # チェーン不要、型チェックのみ)。CLAUDE.md「コマンド」節を参照。
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
       # `cargo test` (引数なし) は `tests/integration.rs` も含めて実行し、
       # 実際に `velox` バイナリを起動する。Linux 版の
       # skip_without_gui!() は DISPLAY/DBUS が無ければ自動でスキップするが、

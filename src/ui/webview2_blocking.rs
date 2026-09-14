@@ -57,6 +57,36 @@ use crate::browser::{
 /// purpose", as opposed to e.g. 404 "not found").
 const BLOCKED_STATUS: i32 = 403;
 
+/// What [`handle_request`] needs beyond the per-request COM references:
+/// the rules to match against, and where to report a block to.
+///
+/// Every field here is fixed for the tab's whole life — it is exactly the
+/// set the `WebResourceRequested` closure captures — so bundling them is
+/// not an arbitrary grouping to satisfy a lint but the shape the data
+/// already had. Issue #158: passing them separately made `handle_request`
+/// take eight arguments, one over `clippy::too_many_arguments`' threshold.
+/// `BrowserWindow::new` answered the identical lint the same way with
+/// `SitePolicies` (PR #144) instead of `#[allow]`.
+///
+/// ⚠️ This module is `#[cfg(windows)]`, so **the Linux clippy run never
+/// looks at it.** The warning sat here undetected until someone ran
+/// `cargo clippy --target x86_64-pc-windows-msvc` by hand (D61 explains why
+/// the Windows CI job was build+test only).
+struct TabBlockingContext {
+    /// Ad/tracker filter rules subresource blocking matches against (D17).
+    blocklist: Arc<FilterList>,
+    /// Per-site content-blocking exceptions (Issue #22, D59).
+    exceptions: Arc<SiteExceptions>,
+    /// The window this tab belongs to — carried so the blocked-count badge
+    /// updates the right window (Issue #29, D68).
+    own_id: WindowId,
+    /// The tab whose requests this listener answers.
+    id: TabId,
+    /// How a block is reported back to the event loop. Every state change
+    /// goes through `UserEvent` on the main thread (`app.rs`), never a lock.
+    proxy: EventLoopProxy<UserEvent>,
+}
+
 /// Attach WebView2's `WebResourceRequested` listener to `webview` so every
 /// subresource request it makes is matched against `blocklist`/`exceptions`
 /// (`browser::subresource::is_blocked_resource`) and answered with an empty
@@ -118,6 +148,22 @@ pub fn attach(
         return;
     }
 
+    // Everything the request handler needs that does not change for the
+    // rest of this tab's life, bundled so `handle_request` takes the
+    // per-request COM references and this one context instead of eight
+    // separate arguments (Issue #158 — `clippy::too_many_arguments` fires
+    // at 8, and the Windows-target clippy run is the only one that sees
+    // this `#[cfg(windows)]` module at all). Same structural answer
+    // `SitePolicies` gave the identical lint in `BrowserWindow::new`
+    // (PR #144) rather than reaching for `#[allow]`.
+    let context = TabBlockingContext {
+        blocklist,
+        exceptions,
+        own_id,
+        id,
+        proxy,
+    };
+
     let mut token: i64 = 0;
     // SAFETY: same COM-call reasoning as above. The handler closure itself
     // only touches `args` (an event-args object WebView2 hands us for the
@@ -131,16 +177,7 @@ pub fn attach(
                 let Some(args) = args else {
                     return Ok(());
                 };
-                handle_request(
-                    &args,
-                    &core_for_source,
-                    &env,
-                    &blocklist,
-                    &exceptions,
-                    own_id,
-                    id,
-                    &proxy,
-                )
+                handle_request(&args, &core_for_source, &env, &context)
             })),
             &mut token,
         )
@@ -159,11 +196,7 @@ fn handle_request(
     args: &ICoreWebView2WebResourceRequestedEventArgs,
     core: &ICoreWebView2,
     env: &ICoreWebView2Environment,
-    blocklist: &FilterList,
-    exceptions: &SiteExceptions,
-    own_id: WindowId,
-    id: TabId,
-    proxy: &EventLoopProxy<UserEvent>,
+    context: &TabBlockingContext,
 ) -> windows::core::Result<()> {
     // SAFETY: `args`/`core`/`env` are live COM references for the duration
     // of this call (see `attach`'s doc comment); every call below is a
@@ -184,8 +217,8 @@ fn handle_request(
     let page_host = unsafe { current_page_host(core) };
 
     if !is_blocked_resource(
-        blocklist,
-        exceptions,
+        &context.blocklist,
+        &context.exceptions,
         page_host.as_deref(),
         resource_type,
         &url,
@@ -204,7 +237,11 @@ fn handle_request(
         )?;
         args.SetResponse(&response)?;
     }
-    let _ = proxy.send_event(UserEvent::SubresourceBlocked(own_id, id, url));
+    let _ = context.proxy.send_event(UserEvent::SubresourceBlocked(
+        context.own_id,
+        context.id,
+        url,
+    ));
     Ok(())
 }
 
