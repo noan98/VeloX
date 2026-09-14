@@ -89,14 +89,27 @@ def _split_messages(raw: str) -> list[str]:
 def main(argv: list[str]) -> int:
     """CLI: `check_closing_keywords.py <pr-body-file> <commit-messages-file>`
 
-    警告を出すだけで**失敗させない** (終了コードは常に 0)。閉じる意図が
+    **見つけた対象については警告を出すだけで失敗させない。** 閉じる意図が
     無いキーワードは書き手の判断で残ることもありうるし、**この検査が理由で
     マージが止まると、止まった理由の調査コストのほうが事故の修復コストを
     上回る** — 誤クローズは再オープンで戻せる。
+
+    **ただし配線が壊れているときは落とす。** 引数の数が合わないのは PR の
+    内容の問題ではなく、**この検査が動いていない**という意味である。黙って
+    緑を返すと、**検知器が死んだまま誰も気づかない** — それはこの検査が
+    防ごうとしている「静かに歯止めが外れる」形そのものになる。
+
+    `ci.yml` の Python テスト探索 (「テストが 1 件も見つからない」で
+    `::error::` + `exit 1`) と同じ規律である。**素通りして緑を作らない。**
     """
     if len(argv) != 3:
-        print("usage: check_closing_keywords.py <pr-body-file> <commit-messages-file>")
-        return 0
+        print(
+            "::error::check_closing_keywords.py の引数が合いません "
+            f"(期待 2 個、実際 {len(argv) - 1} 個)。"
+            "workflow 側の配線が壊れており、誤クローズの検知が動いていません。"
+            "usage: check_closing_keywords.py <pr-body-file> <commit-messages-file>"
+        )
+        return 1
 
     with open(argv[1], "r", encoding="utf-8") as f:
         body = f.read()

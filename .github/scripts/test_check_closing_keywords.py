@@ -12,7 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from check_closing_keywords import _split_messages, unintended_closes  # noqa: E402
+from check_closing_keywords import _split_messages, main, unintended_closes  # noqa: E402
 
 
 class UnintendedClosesTest(unittest.TestCase):
@@ -100,6 +100,26 @@ class SplitMessagesTest(unittest.TestCase):
     def test_a_message_containing_newlines_survives_intact(self):
         raw = "subject\n\nbody line 1\nbody line 2\0"
         self.assertEqual(_split_messages(raw), ["subject\n\nbody line 1\nbody line 2"])
+
+
+class BrokenWiringTest(unittest.TestCase):
+    """配線が壊れているときは落とす (PR #257 のレビュー指摘)。
+
+    **黙って緑を返すと、検知器が死んだまま誰も気づかない。** それは
+    この検査が防ごうとしている「静かに歯止めが外れる」形そのものである。
+
+    `ci.yml` の Python テスト探索 (「テストが 1 件も見つからない」で
+    `::error::` + `exit 1`) と同じ規律。
+    """
+
+    def test_missing_arguments_fail_instead_of_passing_quietly(self):
+        self.assertEqual(main(["check_closing_keywords.py"]), 1)
+
+    def test_one_argument_fails(self):
+        self.assertEqual(main(["check_closing_keywords.py", "body.txt"]), 1)
+
+    def test_too_many_arguments_fail(self):
+        self.assertEqual(main(["x", "a", "b", "c"]), 1)
 
 
 if __name__ == "__main__":
