@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::browser::metrics::PerfFormat;
 use crate::browser::navigation;
-use crate::browser::suspension::{SuspendMechanism, SuspensionPolicy};
+use crate::browser::suspension::{BackgroundMemoryTarget, SuspendMechanism, SuspensionPolicy};
 
 /// Default interval between process-tree RSS samples when performance
 /// metrics are enabled but no explicit interval was requested.
@@ -204,6 +204,24 @@ pub struct Config {
     /// 117.5 to 6.25 ms, which is why the knob still exists (D121 決定2),
     /// but the default must stay `Discard`.
     pub suspend_mechanism: SuspendMechanism,
+    /// What a **background but still awake** tab is told about memory
+    /// (Issue #242) — a different axis from `suspend_mechanism` above, which
+    /// only concerns tabs the policy picked for reclaim. This hint applies to
+    /// every tab that is merely off screen, and with the memory budget off it
+    /// is the *only* thing acting on them.
+    ///
+    /// **Defaults to `Low` since docs/decisions.md D123**; set
+    /// `VELOX_BACKGROUND_MEMORY_TARGET=normal` to opt out. On Windows this
+    /// becomes `ICoreWebView2_19::SetMemoryUsageTargetLevel(LOW)` for every
+    /// tab that leaves the screen; elsewhere it is inert.
+    ///
+    /// Measured with the budget *on* — the configuration users actually run
+    /// — it lands at 0.814× / 0.647× of the old default at 20 tabs
+    /// (`docs/performance-targets.md` §39), and the footprint stays so far
+    /// under `suspension`'s budget that **nothing is ever suspended**
+    /// (§39.1). Suspension is now the safety net for workloads the hint
+    /// cannot carry rather than the everyday mechanism (D123 決定2).
+    pub background_memory_target: BackgroundMemoryTarget,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
     /// data store and page visits are not recorded to `HistoryStore`.
@@ -265,6 +283,7 @@ impl Default for Config {
             max_tabs_per_web_process: DEFAULT_MAX_TABS_PER_WEB_PROCESS,
             suspension: SuspensionPolicy::default(),
             suspend_mechanism: SuspendMechanism::default(),
+            background_memory_target: BackgroundMemoryTarget::default(),
             private: false,
             search_engine: SearchEngine::default(),
             perf_metrics: false,
@@ -315,6 +334,14 @@ impl Config {
     ///   unrecognized spelling keeps `discard`. On a platform without a
     ///   freeze path, and for any tab the engine refuses to freeze, VeloX
     ///   falls back to `discard` for that tab so it is still suspended.
+    /// - `VELOX_BACKGROUND_MEMORY_TARGET` — what a background but still
+    ///   awake tab is told about memory (Issue #242): `low` asks the engine
+    ///   to economize (`ICoreWebView2_19::SetMemoryUsageTargetLevel`, Windows
+    ///   only) and is **the default since D123**; `normal` says nothing,
+    ///   which is what VeloX did before #242. A different axis from
+    ///   `VELOX_SUSPEND_MECHANISM`: this applies to tabs that are merely off
+    ///   screen, suspended or not. Unset or an unrecognized spelling keeps
+    ///   the default (`low`).
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
     ///   `browser::suspension`). Off by default; unset or not a number
@@ -416,6 +443,13 @@ impl Config {
             .as_deref()
             .and_then(SuspendMechanism::parse)
             .unwrap_or_default();
+        // Issue #242. Same conservative rule as `suspend_mechanism` above:
+        // an unrecognized spelling keeps the default rather than erroring.
+        let background_memory_target = std::env::var("VELOX_BACKGROUND_MEMORY_TARGET")
+            .ok()
+            .as_deref()
+            .and_then(BackgroundMemoryTarget::parse)
+            .unwrap_or_default();
         let restore_previous_session = std::env::var_os("VELOX_RESTORE_SESSION").is_some();
         Self {
             homepage,
@@ -424,6 +458,7 @@ impl Config {
             max_tabs_per_web_process,
             suspension,
             suspend_mechanism,
+            background_memory_target,
             perf_metrics,
             perf_rss_interval,
             perf_format,
@@ -1773,6 +1808,17 @@ mod tests {
     }
 
     // -- suspend_mechanism (Issue #243) -----------------------------------
+
+    #[test]
+    fn background_memory_target_defaults_to_low_since_d123() {
+        // Unlike `suspend_mechanism` below, this default *did* move: §39
+        // measured it with the budget on and it beat the old default on
+        // every axis, so D123 flipped it. `normal` is the opt-out.
+        assert_eq!(
+            Config::default().background_memory_target,
+            BackgroundMemoryTarget::Low
+        );
+    }
 
     #[test]
     fn suspend_mechanism_defaults_to_the_pre_243_behavior() {

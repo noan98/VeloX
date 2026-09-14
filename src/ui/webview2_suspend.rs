@@ -49,12 +49,16 @@
 //! インターフェースへ降りる。
 
 use tao::event_loop::EventLoopProxy;
-use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2_19, ICoreWebView2_3};
+use webview2_com::Microsoft::Web::WebView2::Win32::{
+    ICoreWebView2_19, ICoreWebView2_3, COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+    COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+};
 use webview2_com::TrySuspendCompletedHandler;
 use windows::core::Interface;
 use wry::{WebView, WebViewExtWindows};
 
 use crate::app::UserEvent;
+use crate::browser::suspension::BackgroundMemoryTarget;
 use crate::browser::{TabId, WindowId};
 
 /// この実行環境の WebView2 Runtime が持っている休止関連 API。
@@ -219,6 +223,36 @@ pub fn is_suspended(webview: &WebView) -> windows::core::Result<bool> {
             .IsSuspended(&mut suspended)?
     };
     Ok(suspended.as_bool())
+}
+
+/// Tell the engine how much memory `webview` may use (Issue #242).
+///
+/// `ICoreWebView2_19::SetMemoryUsageTargetLevel` is a plain synchronous
+/// property setter — unlike [`try_suspend`] there is no completion handler
+/// and nothing to wait for, and unlike suspension it does not change what
+/// the page *is*: the webview stays live, scriptable and ready to show.
+/// It only states an intent the engine may act on.
+///
+/// `Err` is almost always a runtime too old for `ICoreWebView2_19`
+/// (`QueryInterface` → `E_NOINTERFACE`). The caller logs and carries on;
+/// there is nothing to fall back to, because "say nothing" *is* the
+/// pre-#242 behavior.
+pub fn set_memory_usage_target(
+    webview: &WebView,
+    target: BackgroundMemoryTarget,
+) -> windows::core::Result<()> {
+    let level = match target {
+        BackgroundMemoryTarget::Normal => COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL,
+        BackgroundMemoryTarget::Low => COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW,
+    };
+    let core = webview.webview();
+    // SAFETY: [`try_suspend`] と同じ COM 参照の議論。`SetMemoryUsageTargetLevel`
+    // は値渡しの enum を 1 つ取るだけのプロパティ setter で、ポインタを
+    // 渡さない。
+    unsafe {
+        core.cast::<ICoreWebView2_19>()?
+            .SetMemoryUsageTargetLevel(level)
+    }
 }
 
 #[cfg(test)]

@@ -54,7 +54,7 @@ use crate::browser::metrics::{self, IpcDirection};
 use crate::browser::perf_log::IpcLog;
 use crate::browser::save_page;
 use crate::browser::site_permissions::{self, PermissionKind, Resolution, SitePermissionStore};
-use crate::browser::suspension::SuspendMechanism;
+use crate::browser::suspension::{BackgroundMemoryTarget, SuspendMechanism};
 use crate::browser::{
     group_by_date, parse_sentinel, Candidate, DownloadEntry, FilterList, HistoryEntry, ShortcutId,
     SiteExceptions, TabId, WindowId, SHORTCUT_TABLE,
@@ -782,6 +782,29 @@ fn webview_is_playing_audio(_webview: &WebView) -> bool {
     false
 }
 
+/// Tell the engine what `webview` may use, now that it has moved on or off
+/// screen (Issue #242).
+///
+/// Never fails the activation: a runtime too old for `ICoreWebView2_19`
+/// simply means the hint is not available, and the tab behaves exactly as it
+/// did before #242. Logged rather than propagated, the `log_failure` posture
+/// of `app.rs`.
+#[cfg(windows)]
+fn apply_memory_target(webview: &WebView, target: BackgroundMemoryTarget) {
+    if let Err(err) = crate::ui::webview2_suspend::set_memory_usage_target(webview, target) {
+        eprintln!(
+            "velox: メモリ目標 ({}) を設定できませんでした (#242): {err}",
+            target.as_str()
+        );
+    }
+}
+
+/// No engine-level memory hint exists off Windows, so this is inert
+/// (Issue #242) — the same position Linux is in for freezing
+/// (docs/decisions.md D120 決定5, Issue #240).
+#[cfg(not(windows))]
+fn apply_memory_target(_webview: &WebView, _target: BackgroundMemoryTarget) {}
+
 /// Ask the engine to freeze `webview` in place (Issue #243), returning
 /// whether the request was *dispatched*. `false` means the caller must fall
 /// back to discarding the webview; `true` means the answer will arrive as
@@ -1010,6 +1033,10 @@ pub struct BrowserWindow {
     /// `Config::suspend_mechanism` as of window creation. See
     /// [`Self::suspend_tab`].
     suspend_mechanism: SuspendMechanism,
+    /// What background-but-awake tabs are told about memory (Issue #242) —
+    /// `Config::background_memory_target` as of window creation. Applied by
+    /// [`Self::activate_tab`] as tabs move on and off screen.
+    background_memory_target: BackgroundMemoryTarget,
     /// The `WebContext` shared by the toolbar and every tab's content
     /// webview (see docs/decisions.md D49). `Some` only in non-private mode:
     /// `wry`'s WebKitGTK backend ignores any custom context passed via
@@ -1359,6 +1386,7 @@ impl BrowserWindow {
             next_process_group: 1,
             max_tabs_per_web_process: config.max_tabs_per_web_process,
             suspend_mechanism: config.suspend_mechanism,
+            background_memory_target: config.background_memory_target,
             context,
             private,
             blocklist,
@@ -1552,6 +1580,9 @@ impl BrowserWindow {
         if let Some(previous) = self.active.and_then(|prev| self.contents.get(&prev)) {
             if let Some(webview) = &previous.webview {
                 webview.set_visible(false)?;
+                // Issue #242: the tab just left the screen, so it may
+                // economize. A no-op at the default `Normal`.
+                apply_memory_target(webview, self.background_memory_target);
             }
         }
         match self.contents.get(&id) {
@@ -1560,6 +1591,14 @@ impl BrowserWindow {
                     let (_, content_rect) = self.layout();
                     webview.set_bounds(to_bounds(content_rect))?;
                     webview.set_visible(true)?;
+                    // Issue #242: and the tab arriving on screen must be
+                    // taken back off the hint, or it would keep economizing
+                    // while the user is looking at it. Unconditional rather
+                    // than paired with the knob: a tab can have been put at
+                    // `Low` by an earlier activation even if the knob were
+                    // somehow read differently later, and `Normal` is the
+                    // engine's own default, so saying it is always safe.
+                    apply_memory_target(webview, BackgroundMemoryTarget::Normal);
                 }
                 self.active = Some(id);
                 Ok(())
