@@ -118,17 +118,30 @@ def slug(heading_text: str) -> str:
     return "".join(out).replace(" ", "-")
 
 
+def decision_heading_number(line: str) -> int | None:
+    """`## Dxx: ...` 見出しなら番号を、そうでなければ `None` を返す。
+
+    **判定をここに集約しておく。** `## D` で始まるだけでは足りない
+    (`## Design memo` のような見出しが増えれば一致してしまう) ので、
+    `D` + 数字 + 語境界まで確かめる。同じ判定を必要とする側
+    (`test_decision_index.py` の折り返し検査など) は、条件を書き写さずに
+    これを呼ぶこと — 書き写すと片方だけ厳しい/緩いという食い違いが
+    静かに生まれる。
+    """
+    if not line.startswith("## D"):
+        return None
+    match = re.match(r"^D(\d+)\b", line[3:])
+    return int(match.group(1)) if match else None
+
+
 def decisions(archive: Path = ARCHIVE) -> dict[int, tuple[str, str]]:
     """`archive.md` の `## Dxx: ...` 見出しを {番号: (見出し, アンカー)} で返す。"""
     found: dict[int, tuple[str, str]] = {}
     for line in archive.read_text(encoding="utf-8").split("\n"):
-        if not line.startswith("## D"):
+        number = decision_heading_number(line)
+        if number is None:
             continue
         text = line[3:]
-        match = re.match(r"^D(\d+)\b", text)
-        if not match:
-            continue
-        number = int(match.group(1))
         if number in found:  # pragma: no cover - 開発時の取り違え検知
             raise AssertionError(f"D{number} の見出しが複数ある")
         found[number] = (text, slug(text))

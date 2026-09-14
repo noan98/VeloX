@@ -33,6 +33,7 @@ from decision_index import (
     CATEGORY_FILES,
     DECISIONS_DIR,
     category_of,
+    decision_heading_number,
     decisions,
     slug,
 )
@@ -203,7 +204,9 @@ class HeadingIsOneLineTest(unittest.TestCase):
         offenders = [
             (i + 1, line, lines[i + 1])
             for i, line in enumerate(lines)
-            if line.startswith("## D") and i + 1 < len(lines) and lines[i + 1].strip()
+            if decision_heading_number(line) is not None
+            and i + 1 < len(lines)
+            and lines[i + 1].strip()
         ]
         self.assertEqual(
             [],
@@ -220,9 +223,22 @@ class HeadingIsOneLineTest(unittest.TestCase):
         offenders = [
             i
             for i, line in enumerate(sample)
-            if line.startswith("## D") and i + 1 < len(sample) and sample[i + 1].strip()
+            if decision_heading_number(line) is not None
+            and i + 1 < len(sample)
+            and sample[i + 1].strip()
         ]
         self.assertEqual([0], offenders)
+
+    def test_a_non_decision_heading_is_not_flagged(self) -> None:
+        """判定は `## D` の前方一致ではなく `D` + 数字である (レビュー指摘)。
+
+        テスト名が「Decision の見出し」と言っている以上、実装もそれを見て
+        いなければならない。`## Design memo` のような見出しが増えたときに
+        誤検知すると、**折り返していない見出しで CI が落ちる**ことになる。
+        """
+        sample = ["## Design memo", "続きのように見える行", "", "本文"]
+        offenders = [i for i, line in enumerate(sample) if decision_heading_number(line) is not None]
+        self.assertEqual([], offenders)
 
 
 if __name__ == "__main__":
