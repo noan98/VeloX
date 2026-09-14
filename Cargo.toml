@@ -31,7 +31,7 @@ png = "0.18"
 # - everywhere else: no such constraint, so `devtools` is enabled
 #   unconditionally (debug and release both get it).
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-wry = { version = "0.56", features = ["devtools"] }
+wry = { version = "0.57", features = ["devtools"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wry = "0.56"
