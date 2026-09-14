@@ -345,8 +345,21 @@ impl DownloadStore {
 /// the expected length (wry exposes no progress callback at all, Issue
 /// #103), so there is nothing to compare against. Presence is the only
 /// signal available, and the measurement says it is the right one.
-pub fn completion_succeeded(reported_success: bool, destination_exists: bool) -> bool {
-    reported_success || destination_exists
+///
+/// **`flag_is_shared` is what keeps this off the backends that do not have
+/// the bug** (`ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED`). WebView2 reads
+/// each download operation's own state and WKWebView answers per download,
+/// so a `false` from either is the engine's real verdict and must stand —
+/// overruling it there would turn a genuine failure into a reported success
+/// on the strength of a partial file whose survival **has not been
+/// measured on those platforms**, Windows being the priority OS (D140
+/// 決定5). When this is `false` the destination is not even consulted.
+pub fn completion_succeeded(
+    reported_success: bool,
+    destination_exists: bool,
+    flag_is_shared: bool,
+) -> bool {
+    reported_success || (flag_is_shared && destination_exists)
 }
 
 // --- Filename sanitization (security-critical: see docs/decisions.md D28
@@ -666,22 +679,35 @@ mod tests {
     fn a_reported_success_is_taken_at_face_value() {
         // 成功と言われたものを疑う理由は無い。フラグが誤る向きは
         // 「成功を失敗と言う」の一方向だけである (D140)。
-        assert!(completion_succeeded(true, true));
-        assert!(completion_succeeded(true, false));
+        for shared in [true, false] {
+            assert!(completion_succeeded(true, true, shared));
+            assert!(completion_succeeded(true, false, shared));
+        }
     }
 
     #[test]
     fn a_reported_failure_with_the_file_present_is_the_poisoned_flag() {
         // これが Issue #128 の本体。1 件失敗した後の成功が
         // `success = false` で届くが、ファイルは正しく置かれている。
-        assert!(completion_succeeded(false, true));
+        assert!(completion_succeeded(false, true, true));
     }
 
     #[test]
     fn a_reported_failure_with_no_file_is_a_real_failure() {
         // 止めすぎていないことの確認。本当に失敗したときは
         // WebKitGTK が部分ファイルを消すので、ここに来る。
-        assert!(!completion_succeeded(false, false));
+        assert!(!completion_succeeded(false, false, true));
+    }
+
+    #[test]
+    fn a_backend_without_the_shared_flag_is_believed_even_with_a_file_present() {
+        // **これが無いと、Linux 固有の不具合への緩和が Windows / macOS
+        // にも効いてしまう** (D140 決定5)。WebView2 と WKWebView は
+        // ダウンロードごとに成否を出すので、その `false` はエンジンの
+        // 本当の判定であり、部分ファイルが残っていても覆してはならない。
+        // 残るかどうかはそもそもそれらの OS で測っていない。
+        assert!(!completion_succeeded(false, true, false));
+        assert!(!completion_succeeded(false, false, false));
     }
 
     // --- DownloadState / DownloadEntry transitions ---

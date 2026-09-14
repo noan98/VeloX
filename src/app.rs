@@ -2093,16 +2093,30 @@ fn handle_user_event(
             // `downloads::completion_succeeded` for the truth table and why
             // presence — not size — is the signal.
             //
+            // **Gated to the backend that actually has the bug**
+            // (`DOWNLOAD_SUCCESS_FLAG_IS_SHARED`, D140 決定5). WebView2 and
+            // WKWebView answer per download, so their `false` is real and
+            // overruling it would misreport a genuine failure as a success
+            // — on Windows, the priority OS, on the strength of behavior
+            // nobody has measured there.
+            //
             // Reading the filesystem is why this lives here and not in
             // `browser::downloads`, which stays pure (D20): that module
             // gets the two booleans and decides.
             let resolved = state.downloads.resolve_completion(&url, path.as_deref());
             let succeeded = resolved.is_some_and(|id| {
-                let exists = state
-                    .downloads
-                    .get(id)
-                    .is_some_and(|entry| entry.destination.exists());
-                downloads::completion_succeeded(success, exists)
+                // Only the poisoned backend gets its verdict second-guessed,
+                // and only then is the filesystem touched at all.
+                let exists = crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED
+                    && state
+                        .downloads
+                        .get(id)
+                        .is_some_and(|entry| entry.destination.exists());
+                downloads::completion_succeeded(
+                    success,
+                    exists,
+                    crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED,
+                )
             });
             if std::env::var_os("VELOX_DEBUG").is_some() {
                 eprintln!(
