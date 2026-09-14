@@ -82,7 +82,12 @@
     document.getElementById("out").textContent = document.title;
     if (BEACON) {
       /* 到達したことだけが分かればよいので、応答は読まないし失敗も無視する。 */
-      fetch(`beacon?state=${state}&f=${frames}&t=${ticks}&id=${INSTANCE}`, { cache: "no-store" })
+      /* JS ヒープ (Issue #247)。`MemoryUsageTargetLevel(LOW)` を受けた
+         エンジンが何を縮めたのか — JS ヒープか、描画バッファか、
+         キャッシュか — のうち、**ページから見えるのはこれだけ**
+         (D129 決定6)。Chromium 系にしか無いので、無ければ送らない。 */
+      const heap = performance.memory ? `&h=${performance.memory.usedJSHeapSize}` : "";
+      fetch(`beacon?state=${state}&f=${frames}&t=${ticks}&id=${INSTANCE}${heap}`, { cache: "no-store" })
         .catch(() => {});
     }
   }

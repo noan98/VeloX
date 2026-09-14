@@ -171,6 +171,67 @@ class PerInstanceTest(unittest.TestCase):
         self.assertEqual(counts.summary()["hidden"]["instances"], 12)
 
 
+class JsHeapTest(unittest.TestCase):
+    """JS ヒープ (Issue #247 / D129 決定6)。
+
+    `MemoryUsageTargetLevel(LOW)` が何を縮めたのか — JS ヒープか、
+    描画バッファか、キャッシュか — の 3 候補のうち、**ページから
+    見えるのはこれだけ**である。残り 2 つは D118 決定2 の壁。
+    """
+
+    def test_heap_is_summed_and_averaged_over_the_beacons_that_carried_it(self):
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=1&t=1&id=A&h=1000")
+        counts.record("state=hidden&f=5&t=5&id=A&h=3000")
+        counts.record("state=hidden&f=1&t=1&id=B&h=2000")
+
+        summary = counts.summary()["hidden"]
+        self.assertEqual(summary["heap_count"], 3)
+        self.assertEqual(summary["heap_sum"], 6000)
+        self.assertEqual(summary["heap_max"], 3000)
+        self.assertEqual(summary["heap_mean"], 2000)
+
+    def test_the_heap_columns_disappear_when_nothing_reported_one(self):
+        """**0 を「ヒープが 0」と読ませない。**
+
+        `performance.memory` は Chromium 系にしか無い。届かなかった
+        ことと「0 だった」ことは別なので、列ごと落とす。
+        """
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=1&t=1&id=A")
+        summary = counts.summary()["hidden"]
+        for key in ("heap_count", "heap_sum", "heap_max", "heap_mean"):
+            self.assertNotIn(key, summary)
+
+    def test_the_average_divides_by_the_beacons_that_carried_a_heap(self):
+        """`count` で割ると、値を送らない beacon が混ざったとき薄まる。"""
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=1&t=1&id=A&h=4000")
+        counts.record("state=hidden&f=2&t=2&id=A")  # ヒープ無し
+        summary = counts.summary()["hidden"]
+        self.assertEqual(summary["count"], 2)
+        self.assertEqual(summary["heap_count"], 1)
+        # 4000 / 1 であって 4000 / 2 ではない。
+        self.assertEqual(summary["heap_mean"], 4000)
+
+    def test_a_malformed_heap_is_dropped_but_the_beacon_still_counts(self):
+        # ヒープが読めなくても f/t は使える。beacon ごと捨てない。
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=1&t=1&id=A&h=x")
+        summary = counts.summary()["hidden"]
+        self.assertEqual(summary["count"], 1)
+        self.assertNotIn("heap_mean", summary)
+
+    def test_heap_survives_a_reset_boundary_as_its_own_arm(self):
+        counts = BeaconCounts()
+        counts.record("state=hidden&f=1&t=1&id=low&h=9000")
+        cleared = counts.reset()
+        self.assertEqual(cleared["hidden"]["heap_mean"], 9000)
+
+        counts.record("state=hidden&f=1&t=1&id=normal&h=1000")
+        self.assertEqual(counts.summary()["hidden"]["heap_mean"], 1000)
+
+
 class ResetTest(unittest.TestCase):
     """A/B の腕を分ける仕掛け (§42.5 / D127 決定5)。"""
 
