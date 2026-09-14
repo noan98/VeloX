@@ -16761,3 +16761,139 @@ D119 決定3 のとおり「何秒で Recent → Background → Dormant か」�
 意味が出る。
 (3) 利用者が付いて「戻る間隔」が実測できるようになったら決定5 を見直す。
 それまでは数字を置かない (D46)。
+
+## D136: プライベートウィンドウの Omnibox は履歴・入力履歴を読まない (Issue #157) — ブックマークは残す。パネルは変えない
+
+**対象**: Issue #157。Omnibox 候補生成の**読み出し側**のみ。記録
+(書き込み) 側は #27 / D74 で既にウィンドウ単位になっており、本決定は
+触らない。
+
+### D39 の Revisit condition がそのまま発火した
+
+D39 は「プライベートモードでも既存の履歴は読む。記録はしない」と決めた。
+その根拠は「**launching VeloX with `--private`** ということは、履歴パネルも
+同じデータを出し続けるということだ。Omnibox はその 2 本目の読み出し経路に
+すぎず、新しいプライバシー面ではない」だった。**この根拠は当時は正しい。**
+当時のプライベートブラウジングはアプリ全体の起動オプションで (D14)、
+**漏れる相手の通常ウィンドウがそもそも存在しなかった。**
+
+D39 自身が Revisit condition にこう書いている:
+
+> **Revisit if**: VeloX ever gains true per-window (not whole-app, see D14)
+> private browsing — at that point "does an omnibox opened in a private
+> window suggest from the *other*, non-private window's very-recent history"
+> becomes a real question this decision does not answer.
+
+#27 / D74 がまさにその per-window 化を入れた。よって D39 の
+「reference (read) yes」は、**プライベート**ウィンドウについてだけ本決定で
+上書きされる。通常ウィンドウの挙動は D39 のままである。
+
+### 実際に漏れることをコードで確認した
+
+ラベルは benefit:3 だが、プライバシーの問題なので着手前に「本当に漏れるか」
+を確かめた。`OmniboxInput` のハンドラは `HistoryBookmarkSource` と
+`InputHistorySource` を `state.history` / `state.bookmarks` /
+`state.input_history` からその場で組み立てており、**`window_id` を一切見て
+いなかった。** 3 つのストアは `AppState` にひとつだけで全ウィンドウ共有
+(D68) なので、通常ウィンドウが数秒前に記録した訪問先・検索語が、プライベート
+ウィンドウで打鍵するたびに候補として出る。Issue の記述どおりである。
+
+### 決定1: プライベートウィンドウでは履歴・入力履歴を出さない (Issue の案 1)
+
+Issue が挙げた 2 案のうち **案 1 (一切出さない)** を採る。案 2
+(プライベートウィンドウ専用の一時履歴を持つ) は、そのウィンドウのタブが
+閉じるまでの寿命を持つ第 4 のストアと、ウィンドウ ID をまたぐ所有権の
+管理が要る。**本 Issue が実害として挙げているのは「同席者に画面を見られて
+いる状況」であり、案 1 で完全に解消する。** 案 2 の追加価値は「自分が
+今開いたページに戻りやすい」という利便性だけで、コストに見合わない。
+必要になったら別 Issue で足せる (案 1 の上に載る形で、やり直しにならない)。
+
+### 決定2: `bool` ではなく `Option<&HistoryStore>` で表す
+
+`HistoryBookmarkSource` のフィールドを `&HistoryStore` から
+`Option<&HistoryStore>` に変えた。**`&HistoryStore` の隣に
+`include_history: bool` を足す形は採らない。**
+
+| 形 | 呼び出し側が間違えたとき |
+| --- | --- |
+| `history: &HistoryStore` + `bool` | ストアは渡ったまま。**フラグを立て忘れると漏れる** |
+| `history: Option<&HistoryStore>` | 渡さない以外に「履歴なし」と言う方法が無い。**忘れようがない** |
+
+プライバシーの境界は「気をつける」で守るものではない。**型で表せるなら
+型で表す。** 同じ理由で `CandidateSource` 側には privacy の概念を入れて
+いない — ソースは「渡されたものから候補を作る」だけで、何を渡すかは
+呼び出し側 (`app.rs`) の判断である。
+
+### 決定3: `InputHistorySource` は空にするのではなく、ソースごと外す
+
+履歴のほうは `Option` で「ブックマークだけ出す」状態を作る必要があったが、
+入力履歴のほうには**残すべき半分が無い。** そこで `sources` の配列自体を
+分岐させ、プライベートウィンドウでは `InputHistorySource` を渡さない。
+
+### 決定4: 未知のウィンドウは read 側でも private 扱い (fail-closed)
+
+`window_is_private` は `state.windows.is_private(window_id).unwrap_or(true)`
+で、これまでは記録側だけが使っていた。read 側でも**同じ向きが安全側**で
+ある: 知らないウィンドウは候補が 1 件少なくなるだけで、多くなることは
+決してない。倒す向きが安全性そのものなので、`unwrap_or(false)` にすると
+落ちるテストを app.rs に足した (`an_unknown_window_is_treated_as_private`)。
+
+### 決定5: ブックマークはプライベートウィンドウでも出す
+
+実ブラウザ (Chrome Incognito / Firefox Private Browsing) はいずれも
+incognito のアドレスバーでブックマークを候補に出す。そして**ブックマークは
+利用者が意図して保存したものであり、どこを見ていたかの痕跡ではない。**
+D39 も D14 も、ブックマークだけは「常に明示的な操作」として一貫して
+ゲートの対象外にしてきた。ここでも揃える。
+
+### 決定6: 履歴パネル・ブックマークパネル・ダウンロードパネルは変えない
+
+Issue の「Omnibox 以外の読み出し側も洗い出せ」に対する回答。
+`refresh_history_panel` / `search_history_panel` /
+`refresh_bookmarks_panel` / `refresh_downloads_panel` はいずれも共有ストアを
+無条件に読んでおり、プライベートウィンドウでも通常ウィンドウの内容が出る。
+**これは意図どおりのまま残す。**
+
+境界は「どちらのデータか」ではなく、**利用者が求めたかどうか**に引く。
+
+| 経路 | 出てくる状況 | 扱い |
+| --- | --- | --- |
+| **Omnibox 候補** | **URL を打っている最中に、頼んでいないのに出る** | 止める (決定1) |
+| 履歴 / ブックマーク / ダウンロードパネル | 利用者がそのパネルを自分で開いたときだけ出る | そのまま |
+
+Issue が実害として挙げた「同席者に画面を見られている状況」が成立するのは
+前者である。後者は利用者が自分で開いた画面であり、実ブラウザも incognito
+ウィンドウから履歴・ブックマークを閲覧できる。プライベートウィンドウで
+履歴パネルを閉じさせるのは、実ブラウザより厳しく、かつ利用者の明示的な
+操作を拒む挙動になる。
+
+`DownloadStore` / `SitePermissionStore` / `FilterList` の全ウィンドウ共有は
+Issue 本文が明示的にスコープ外としている (D74 / D68 に記録済み)。
+
+読み出し側でもうひとつ見つかった `known_title_for(&state.history, &url)`
+(ブックマーク追加時のタイトル補完) も変えない。これは**今まさに利用者が
+ブックマークしようとしている URL 自身**のタイトルを引くだけで、他の
+ウィンドウの訪問先を画面に出す経路ではない。
+
+### 検証
+
+- `src/browser/omnibox_candidates.rs` に `mod private_window` (4 件)。
+  履歴が出ないこと・**ブックマークは出ること**・通常ウィンドウでは履歴が
+  出ること・「訪問済みかつブックマーク済み」の URL が `merge_entries` の
+  畳み込みごと消えないこと、を固定した
+- `src/app.rs` に `an_unknown_window_is_treated_as_private`。
+  `unwrap_or(false)` に書き換えると落ちることを確認済み
+- `cargo fmt --check` / `cargo clippy --all-targets -- -D warnings` /
+  `cargo test` / `cargo clippy --target x86_64-pc-windows-msvc --all-targets
+  -- -D warnings` がすべて通ること
+
+### Revisit condition
+
+(1) **プライベートウィンドウ内で開いたページに戻りづらい**という不便が
+実際に問題になったら、決定1 を Issue の案 2 (ウィンドウ寿命の一時履歴) へ
+広げる。案 1 の上に足す形になるのでやり直しにはならない。
+(2) 実ブラウザがパネル側の扱いを変えたら決定6 を見直す。今は
+「自分で開いた画面は出す」で揃っている。
+(3) 共有ストアに新しい**読み出し**経路を足すときは、決定6 の表で
+どちら側かを判定すること。「打鍵中に頼んでいないのに出る」側なら、
+決定1 と同じゲートが要る。
