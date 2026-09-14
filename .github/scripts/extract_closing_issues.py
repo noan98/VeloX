@@ -89,19 +89,36 @@ def _strip_quoted_lines(text: str) -> str:
     return "\n".join(kept)
 
 
-def extract_closing_issues(pr_body: str | None) -> list[int]:
-    """PR 本文からクロージングキーワードが付いた Issue 番号を抽出する。
+def extract_closing_issues(pr_body: str | None, *, markdown: bool = True) -> list[int]:
+    """クロージングキーワードが付いた Issue 番号を抽出する。
 
     コードブロック・インラインコード・引用行を除去したうえでキーワードを
     走査し、登場順を保ちつつ重複を除いた Issue 番号のリストを返す。
     キーワードが 1 つも見つからなければ空リストを返す。
+
+    ## `markdown=False` — コミットメッセージを読むとき
+
+    **GitHub はコミットメッセージを Markdown として解釈しない。**
+    PR 本文では効く逃げ道 (バッククォートで囲む・引用行に入れる) が、
+    コミットメッセージでは**一切効かない** (Issue #253 / D128 決定4)。
+
+    したがってコミットメッセージを読むときは `markdown=False` を渡し、
+    **除去を一切しない。** ここを間違えると、**本体が閉じるものを
+    検査が見落とす。**
+
+    実際に Issue #247 を閉じたコミット `d189b19` のメッセージは、
+    キーワードがバッククォートに囲まれている。既定 (`markdown=True`) で
+    読むと `[]` が返り、**事故そのものを検出できない。**
     """
     if not pr_body:
         return []
 
-    text = _strip_code_blocks(pr_body)
-    text = _strip_inline_code(text)
-    text = _strip_quoted_lines(text)
+    if markdown:
+        text = _strip_code_blocks(pr_body)
+        text = _strip_inline_code(text)
+        text = _strip_quoted_lines(text)
+    else:
+        text = pr_body
 
     seen: dict[int, None] = {}
     for match in _CLOSES_RE.finditer(text):

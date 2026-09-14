@@ -204,5 +204,44 @@ class ExtractClosingIssuesTest(unittest.TestCase):
         self.assertEqual(extract_closing_issues(body), [115, 116, 154])
 
 
+class CommitMessageModeTest(unittest.TestCase):
+    """`markdown=False` — コミットメッセージを読むとき (Issue #253 / D128)。
+
+    **GitHub はコミットメッセージを Markdown として解釈しない。**
+    PR 本文で効く逃げ道が、ここでは一切効かない。除去をしてしまうと
+    **本体が閉じるものを検査が見落とす。**
+    """
+
+    def test_inline_code_does_not_protect_a_commit_message(self):
+        # **これが Issue #247 を 2 度目に閉じた実際の形。**
+        body = "そのため PR #249 の「この PR に `Closes #247` は入れていません」という"
+        self.assertEqual(extract_closing_issues(body, markdown=False), [247])
+        # 既定 (PR 本文として読む) では守られる — 両方正しい。
+        self.assertEqual(extract_closing_issues(body), [])
+
+    def test_a_quoted_line_does_not_protect_a_commit_message(self):
+        self.assertEqual(extract_closing_issues("> Closes #1", markdown=False), [1])
+        self.assertEqual(extract_closing_issues("> Closes #1"), [])
+
+    def test_a_fenced_block_does_not_protect_a_commit_message(self):
+        body = "例:\n```\nCloses #2\n```\n"
+        self.assertEqual(extract_closing_issues(body, markdown=False), [2])
+        self.assertEqual(extract_closing_issues(body), [])
+
+    def test_a_plain_keyword_is_found_in_both_modes(self):
+        self.assertEqual(extract_closing_issues("Closes #3", markdown=False), [3])
+        self.assertEqual(extract_closing_issues("Closes #3"), [3])
+
+    def test_the_existing_exclusions_that_are_not_markdown_still_apply(self):
+        # 単語境界や `owner/repo#N` の除外は Markdown とは無関係なので、
+        # `markdown=False` でも効く。
+        self.assertEqual(extract_closing_issues("prefixes #4", markdown=False), [])
+        self.assertEqual(extract_closing_issues("Closes owner/repo#5", markdown=False), [])
+
+    def test_an_empty_body_is_empty_in_both_modes(self):
+        self.assertEqual(extract_closing_issues("", markdown=False), [])
+        self.assertEqual(extract_closing_issues(None, markdown=False), [])
+
+
 if __name__ == "__main__":
     unittest.main()
