@@ -166,9 +166,10 @@ impl Windows {
 
     /// Open a new, non-private window whose tabs are restored from a
     /// previous session's snapshot (Issue #25's `Tabs::restore`, reused as
-    /// is). Only ever used for the *first* window at startup in #29's scope
-    /// — see docs/decisions.md D68 for why multi-window session restore is a
-    /// follow-up. Always non-private: `app::run` only ever takes this path
+    /// is). Used for *every* restored window since Issue #149/D141: the
+    /// first one at startup, and each of the rest as `app::restore_window`
+    /// reopens them on the event loop's first pass. Always non-private:
+    /// `app::run` only ever takes this path
     /// when `config.restore_previous_session && !config.private` already
     /// held (D14/D65 — a private launch restores nothing), so there is no
     /// `private` parameter to get wrong here.

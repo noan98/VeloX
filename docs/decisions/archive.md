@@ -6362,6 +6362,11 @@ webview 発の固定センチネル文字列、D18/D23 の trust boundary) の 2
    複数ウィンドウのセッション復元は `SessionSnapshot` のスキーマ自体を
    「ウィンドウの配列」に変える必要があり、D65 の設計を拡張する形の
    別 Issue が必要と判断した。
+   **⚠️ この制約は現在失効しています (Issue #149 / D141 を参照)。**
+   ここで予告したとおり `SessionSnapshot` は「ウィンドウの配列」
+   (`windows: Vec<SavedWindow>`) に変わり、`persist_session` は非
+   プライベートな全ウィンドウを書き出し、2 枚目以降も次回起動時に復元
+   されます。`AppState::primary_window` もその際に不要になり削除済みです。
 2. **タブ自動休止ポリシー (#63) はウィンドウごとに独立して評価する**。
    `app::sweep_tabs` は `state.windows.ids()` の各ウィンドウに対して
    個別に `suspension::plan` を呼ぶ — `max_live_tabs`/メモリ予算は

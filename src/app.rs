@@ -715,9 +715,9 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     };
     // Issue #29 (D68): `Windows` starts with exactly one window — restored
     // from the previous session's snapshot when one applies, a fresh single
-    // tab at the homepage otherwise. Every window opened later (Ctrl/Cmd+N)
-    // always starts fresh at the homepage; multi-window session restore is
-    // out of this issue's scope (see D68).
+    // tab at the homepage otherwise. A window the user opens later
+    // (Ctrl/Cmd+N) always starts fresh at the homepage; only the ones the
+    // snapshot carries are restored (Issue #149/D141 — see just below).
     let mut windows = Windows::new_with_privacy(config.homepage.clone(), config.private);
     // Issue #149: the windows after the first cannot be built here — a
     // `BrowserWindow` needs an `EventLoopWindowTarget`, which only exists
