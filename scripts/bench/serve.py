@@ -40,12 +40,18 @@ import json
 import os
 import threading
 from functools import partial
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 #: beacon を受け取るパス。`busy.html` の `fetch("beacon?...")` は
 #: ページと同じディレクトリからの相対なので `/beacon` に来る。
 BEACON_PATH = "/beacon"
+#: 待ち行列を深めに取る。`busy.html` は 500ms ごとに beacon を投げ、
+#: `background_cpu` は 2 タブ分がそれをやる。**ページ側は
+#: `.catch(() => {})` で失敗を握り潰すので、接続が拒否されても
+#: 何も言わずに消える** — つまり取りこぼしは「タイマーが止まった」
+#: ように見える。既定の 5 では足りうるので広げておく。
+REQUEST_QUEUE_SIZE = 128
 #: 集計結果を JSON で返すパス。ワークフローが計測後に 1 回だけ叩く。
 SUMMARY_PATH = "/beacon-summary"
 
@@ -117,6 +123,23 @@ def _first_int(values: list[str] | None) -> int | None:
     return parsed if parsed >= 0 else None
 
 
+class BenchServer(ThreadingHTTPServer):
+    """スレッド化した HTTP サーバ。
+
+    **1 リクエストずつ捌く `HTTPServer` だと beacon を取りこぼしうる。**
+    ページ側は `fetch` の失敗を握り潰すので、取りこぼしは
+    「beacon が来ていない」= 「タイマーが止まっている」と**区別が
+    つかない見え方**をする。計測の結論を左右する取り違えなので、
+    サーバ側で起こりにくくしておく。
+
+    §26.4 が記録した「I/O が応答をブロックして page_load_ms が 38 倍」
+    という失敗とは逆方向の変更である (捌く側を増やしている)。
+    """
+
+    daemon_threads = True
+    request_queue_size = REQUEST_QUEUE_SIZE
+
+
 class BenchHandler(SimpleHTTPRequestHandler):
     """固定ページの配信 + beacon の集計。"""
 
@@ -159,7 +182,8 @@ def main() -> None:
 
     counts = BeaconCounts()
     handler = partial(BenchHandler, counts=counts, directory=args.directory)
-    HTTPServer(("127.0.0.1", args.port), handler).serve_forever()
+    server = BenchServer(("127.0.0.1", args.port), handler)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
