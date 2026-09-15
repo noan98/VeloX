@@ -25,8 +25,9 @@ use crate::browser::{
     context_menu, find, input_history, metrics, navigation, omnibox, persistence, print,
     shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
     DownloadEntry, DownloadId, DownloadStore, Favicon, FilterList, HistoryBookmarkSource,
-    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SessionSnapshot, Settings,
-    SiteExceptions, SitePermissionStore, Tab, TabId, Tabs, WindowId, Windows,
+    HistoryEntry, HistoryStore, InputHistorySource, InputHistoryStore, SavedWindow,
+    SessionSnapshot, Settings, SiteExceptions, SitePermissionStore, Tab, TabId, Tabs, WindowId,
+    Windows,
 };
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
@@ -45,6 +46,22 @@ use crate::ui::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};
 /// per-tab events with a `TabId`.
 #[derive(Debug, Clone)]
 pub enum UserEvent {
+    /// Reopen the windows a restored session had beyond its first (Issue
+    /// #149). Sent once, by `run`, *before* `event_loop.run` — the proxy
+    /// queues it, so it is delivered on the loop's first pass.
+    ///
+    /// **Why not just build them in `run` like the primary window**: a
+    /// `BrowserWindow` needs an `EventLoopWindowTarget`, which does not
+    /// exist until the loop is running. Going through the loop also means
+    /// these windows are opened by the exact same `open_new_window` path
+    /// Ctrl/Cmd+N uses, rather than a second construction site that could
+    /// drift from it.
+    ///
+    /// Keeping them out of `run` has a second, deliberate effect: startup's
+    /// `process_start` → `window_created` decomposition (#182) still
+    /// measures **one** window, which is what every §21–§26 number was
+    /// taken against.
+    RestoreWindows(Vec<SavedWindow>),
     /// Raw IPC message from window `.0`'s toolbar webview (JSON, see
     /// [`toolbar::parse_command`]).
     ToolbarMessage(WindowId, String),
@@ -325,14 +342,6 @@ pub enum UserEvent {
 /// `history_enabled` bool once two windows could disagree on privacy).
 struct AppState {
     windows: Windows,
-    /// The first window opened at startup (Issue #29/D68). Session
-    /// persistence (`persist_session`) only ever saves *this* window's tabs
-    /// — multi-window session restore is out of this issue's scope, see the
-    /// PR description — and it is also the window `AutomationCommand`s
-    /// target by default (`app::run`'s `automation_window`, mutable and
-    /// separate from this field since a script can point itself at a
-    /// different window with `new_window`).
-    primary_window: WindowId,
     /// What a newly opened window (Ctrl/Cmd+N, `ToolbarCommand::NewWindow`/
     /// `ContentShortcut::NewWindow`/`AutomationCommand::NewWindow`) is built
     /// with: the same site-scoped policies every other window shares
@@ -706,10 +715,17 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     };
     // Issue #29 (D68): `Windows` starts with exactly one window — restored
     // from the previous session's snapshot when one applies, a fresh single
-    // tab at the homepage otherwise. Every window opened later (Ctrl/Cmd+N)
-    // always starts fresh at the homepage; multi-window session restore is
-    // out of this issue's scope (see D68).
+    // tab at the homepage otherwise. A window the user opens later
+    // (Ctrl/Cmd+N) always starts fresh at the homepage; only the ones the
+    // snapshot carries are restored (Issue #149/D141 — see just below).
     let mut windows = Windows::new_with_privacy(config.homepage.clone(), config.private);
+    // Issue #149: the windows after the first cannot be built here — a
+    // `BrowserWindow` needs an `EventLoopWindowTarget`, which only exists
+    // once `event_loop.run` is going. They are carried into the loop and
+    // opened on its first pass (`UserEvent::RestoreWindows`), so startup's
+    // `process_start` → `window_created` decomposition (#182) still measures
+    // exactly one window, as every §21-§26 number was taken against.
+    let mut restored_secondary: Vec<SavedWindow> = Vec::new();
     let primary_id = match restored_session {
         Some(snapshot) => {
             // Replace the placeholder window `Windows::new` just made above
@@ -717,7 +733,11 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
             // window (never zero, never two) at this point.
             let placeholder = windows.ids().next().expect("Windows::new opens one window");
             windows.close_window(placeholder);
-            windows.open_restored_window(&snapshot.tabs, snapshot.active_index)
+            restored_secondary = snapshot.secondary().to_vec();
+            let primary = snapshot
+                .primary()
+                .expect("sanitize returns None rather than an empty window list");
+            windows.open_restored_window(&primary.tabs, primary.active_index)
         }
         None => windows.ids().next().expect("Windows::new opens one window"),
     };
@@ -860,7 +880,6 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
 
     let mut state = AppState {
         windows,
-        primary_window: primary_id,
         site_policies,
         history,
         bookmarks,
@@ -905,6 +924,22 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 eprintln!("velox: VELOX_AUTOMATION_SCRIPT {script_path:?} を読み込めません: {err}")
             }
         }
+    }
+
+    // Issue #149: hand the previous session's extra windows to the loop.
+    // The proxy queues this, so it arrives on the loop's first pass — the
+    // earliest point at which an `EventLoopWindowTarget` exists to build a
+    // `BrowserWindow` against. Sending nothing when there is nothing to
+    // restore keeps the common path (no session, or one window) byte for
+    // byte what it was.
+    if !restored_secondary.is_empty()
+        && window_event_proxy
+            .send_event(UserEvent::RestoreWindows(restored_secondary))
+            .is_err()
+    {
+        // The loop is already gone, so there is nothing to restore into.
+        // Never fatal — the primary window is up either way.
+        eprintln!("velox: 前回のセッションの 2 枚目以降のウィンドウを復元できませんでした");
     }
 
     event_loop.run(move |event, target, control_flow| {
@@ -1303,7 +1338,12 @@ fn record_perf_event(
         // Issue #39's context menu is not a perf-tracked operation either.
         | UserEvent::ContextMenuRequested { .. }
         | UserEvent::ContextMenuActionSelected { .. }
-        | UserEvent::ContextMenuClosed(..) => {}
+        | UserEvent::ContextMenuClosed(..)
+        // Issue #149: reopening the previous session's extra windows is not
+        // a perf-tracked operation. `process_start` → `window_created`
+        // (#182) is about the *first* window only, and these deliberately
+        // sit outside it (see `UserEvent::RestoreWindows`).
+        | UserEvent::RestoreWindows(..) => {}
     }
 }
 
@@ -2073,6 +2113,18 @@ fn handle_user_event(
                 refresh_downloads_panel(window, state);
             }
         }
+        UserEvent::RestoreWindows(saved) => {
+            for window in saved {
+                restore_window(
+                    target,
+                    window_event_proxy,
+                    ui_windows,
+                    state,
+                    config,
+                    &window,
+                );
+            }
+        }
         UserEvent::DownloadCompleted {
             window_id,
             url,
@@ -2526,11 +2578,75 @@ fn open_new_window(
     let window_id = state
         .windows
         .open_window_with_privacy(url.to_owned(), private);
-    let tab_id = state
+    attach_browser_window(
+        target,
+        window_event_proxy,
+        ui_windows,
+        state,
+        config,
+        window_id,
+        private,
+    )
+}
+
+/// Reopen one window from a restored session (Issue #149), tabs and all.
+///
+/// The only difference from [`open_new_window`] is *which* `Windows` call
+/// creates the logical window — `open_restored_window` (the same one
+/// `app::run` uses for the primary window) instead of a fresh single tab.
+/// Everything after that is shared, so a restored window cannot drift from
+/// a Ctrl/Cmd+N one in theme, bookmark-bar state or failure handling.
+///
+/// **Always non-private.** A private window's tabs never reach
+/// `session.json` in the first place (`persist_session` filters them out),
+/// so nothing here can have come from one — and restoring *into* a private
+/// window would be the same D14 violation from the other direction.
+fn restore_window(
+    target: &EventLoopWindowTarget<UserEvent>,
+    window_event_proxy: &EventLoopProxy<UserEvent>,
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    config: &Config,
+    saved: &SavedWindow,
+) -> Option<WindowId> {
+    let window_id = state
+        .windows
+        .open_restored_window(&saved.tabs, saved.active_index);
+    attach_browser_window(
+        target,
+        window_event_proxy,
+        ui_windows,
+        state,
+        config,
+        window_id,
+        false,
+    )
+}
+
+/// Build the `BrowserWindow` for a logical window that `Windows` has just
+/// created, and register it. Shared by [`open_new_window`] and
+/// [`restore_window`] so the two cannot diverge.
+///
+/// The window is loaded at its *active tab's* current URL, which is what
+/// makes this work for both callers: a fresh window's single tab is at the
+/// requested URL, and a restored window's active tab is at whatever it was
+/// showing last.
+fn attach_browser_window(
+    target: &EventLoopWindowTarget<UserEvent>,
+    window_event_proxy: &EventLoopProxy<UserEvent>,
+    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    config: &Config,
+    window_id: WindowId,
+    private: bool,
+) -> Option<WindowId> {
+    let tabs = state
         .windows
         .tabs(window_id)
-        .expect("just opened above")
-        .active_id();
+        .expect("the caller just opened this window");
+    let tab_id = tabs.active_id();
+    let url = tabs.active().current_url().to_owned();
+    let url = url.as_str();
     match BrowserWindow::new(
         target,
         window_id,
@@ -4267,15 +4383,22 @@ fn clear_all_site_data(window: &BrowserWindow) {
 /// recent session to restore from. A missing `data_dir` is a silent no-op,
 /// like every other `persist_*` function here.
 ///
-/// **Multi-window (Issue #29/D68)**: only ever writes `window_id ==
-/// state.primary_window`'s tabs — a window opened later (Ctrl/Cmd+N or
-/// Ctrl/Cmd+Shift+N) is never part of what the next launch restores. See
-/// docs/decisions.md D68/D74 for why multi-window session persistence/
-/// restore is a follow-up, not part of either issue. In practice this means
-/// the `window_is_private` check below only ever matters when the *primary*
-/// window itself is private (`--private`/`VELOX_PRIVATE` at launch, D74) —
-/// a private window opened later already never reaches here at all, since
-/// it is never `state.primary_window`.
+/// **Multi-window (Issue #149, was the D68/D74 follow-up)**: every open
+/// window is written, in `Windows`' own order, so the next launch restores
+/// all of them. `window_id` is now only "which window's change triggered
+/// this" — the snapshot is built from all of them either way, because a
+/// change in one window (a tab closed) does not make the others' tabs any
+/// less current.
+///
+/// **Private windows are left out entirely**, not written as empty ones: a
+/// private window's tabs must not reach disk (D14/D74), and an empty
+/// placeholder would restore as a window the user never gets their tabs
+/// back in. The filter lives here rather than in `browser::session`, which
+/// never learns what privacy is (D20).
+///
+/// A launch that is private as a whole (`--private`/`VELOX_PRIVATE`, D74)
+/// therefore has no non-private window at all and writes nothing, exactly
+/// as before.
 ///
 /// **Redundant-write skip (Issue #67, D86)**: `sync_tab_strip` — the only
 /// caller — runs this after nearly every tab-affecting event, but
@@ -4288,17 +4411,20 @@ fn clear_all_site_data(window: &BrowserWindow) {
 /// entirely when nothing changed, exactly like `app::
 /// refresh_history_panel_if_open` (Issue #66) skipped a redundant
 /// `set_history` push — same shape, different layer (disk I/O, not IPC).
-fn persist_session(state: &mut AppState, window_id: WindowId) {
-    if window_id != state.primary_window || window_is_private(state, window_id) {
-        return;
-    }
+fn persist_session(state: &mut AppState, _window_id: WindowId) {
     let Some(dir) = state.data_dir.clone() else {
         return;
     };
-    let Some(tabs) = state.windows.tabs(window_id) else {
+    let restorable: Vec<&Tabs> = state
+        .windows
+        .ids()
+        .filter(|id| !state.windows.is_private(*id).unwrap_or(true))
+        .filter_map(|id| state.windows.tabs(id))
+        .collect();
+    if restorable.is_empty() {
         return;
-    };
-    let snapshot = SessionSnapshot::from_tabs(tabs);
+    }
+    let snapshot = SessionSnapshot::from_windows(restorable);
     if state.last_persisted_session.as_ref() == Some(&snapshot) {
         return;
     }
@@ -4520,10 +4646,8 @@ mod tests {
     /// working unchanged).
     fn state_with_history_enabled(history_enabled: bool) -> AppState {
         let windows = Windows::new_with_privacy("https://example.com/", !history_enabled);
-        let primary_window = windows.ids().next().expect("Windows::new opens one window");
         AppState {
             windows,
-            primary_window,
             site_policies: SitePolicies {
                 blocklist: Arc::new(FilterList::built_in()),
                 site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
@@ -4614,7 +4738,6 @@ mod tests {
 
         let mut state = AppState {
             windows,
-            primary_window: normal_window,
             site_policies: SitePolicies {
                 blocklist: Arc::new(FilterList::built_in()),
                 site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
@@ -4711,23 +4834,24 @@ mod tests {
     }
 
     #[test]
-    fn persist_session_skips_a_private_primary_window_but_writes_a_normal_one() {
+    fn persist_session_skips_an_all_private_process_but_writes_a_normal_one() {
         // Issue #27/D74's other acceptance criterion for session
-        // persistence: a process launched with `--private` (so its one and
-        // only, therefore primary, window is private — D68 already
-        // restricts session persistence to the primary window regardless)
-        // must never write `session.json`, exactly like `record_visit_if_enabled`
-        // must never write to `state.history`.
+        // persistence: a process launched with `--private` (so its only
+        // window is private) must never write `session.json`, exactly like
+        // `record_visit_if_enabled` must never write to `state.history`.
+        //
+        // Since Issue #149 this no longer rides on "only the primary window
+        // is saved" — every non-private window is saved, and the guarantee
+        // is that a private one is not among them.
         let dir = unique_temp_dir("private-session");
         let mut state = state_with_history_enabled(false); // private == true
         state.data_dir = Some(dir.clone());
         let window_id = state.windows.ids().next().unwrap();
-        assert_eq!(window_id, state.primary_window);
 
         persist_session(&mut state, window_id);
         assert!(
             !dir.join("session.json").exists(),
-            "a private primary window must never write session.json"
+            "an all-private process must never write session.json"
         );
 
         // Flipping the same window to non-private (a fresh, non-private
@@ -4738,7 +4862,45 @@ mod tests {
         persist_session(&mut normal_state, normal_window_id);
         assert!(
             dir.join("session.json").exists(),
-            "a normal primary window must still write session.json"
+            "a normal window must still write session.json"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn persist_session_saves_every_window_and_leaves_private_ones_out() {
+        // Issue #149's core: a second window's tabs must reach disk too —
+        // and a private one's must not, even when a normal window in the
+        // same process is being saved alongside it.
+        let dir = unique_temp_dir("multi-window-session");
+        let mut state = state_with_history_enabled(true);
+        state.data_dir = Some(dir.clone());
+        let first = state.windows.ids().next().unwrap();
+        state
+            .windows
+            .open_window_with_privacy("https://second.example/".to_owned(), false);
+        let private = state
+            .windows
+            .open_window_with_privacy("https://secret.example/".to_owned(), true);
+        assert!(state.windows.is_private(private).unwrap());
+
+        persist_session(&mut state, first);
+
+        let saved = persistence::load_session(&dir)
+            .expect("session.json")
+            .sanitize()
+            .expect("a usable snapshot");
+        assert_eq!(saved.windows.len(), 2, "{saved:?}");
+        let urls: Vec<&str> = saved
+            .windows
+            .iter()
+            .map(|window| window.tabs[0].url.as_str())
+            .collect();
+        assert!(urls.contains(&"https://second.example/"), "{urls:?}");
+        assert!(
+            !urls.iter().any(|url| url.contains("secret")),
+            "プライベートウィンドウのタブがディスクに出ている: {urls:?}"
         );
 
         std::fs::remove_dir_all(&dir).ok();

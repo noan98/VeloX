@@ -181,7 +181,7 @@ fn write_json<T: Serialize>(dir: &Path, path: &Path, value: &T) -> std::io::Resu
 
 #[cfg(test)]
 mod tests {
-    use super::super::session::SavedTab;
+    use super::super::session::{SavedTab, SavedWindow};
     use super::*;
 
     #[test]
@@ -443,19 +443,22 @@ mod tests {
     fn session_round_trips_through_disk() {
         let dir = unique_temp_dir("velox-persist-session");
         let snapshot = SessionSnapshot {
-            tabs: vec![
-                SavedTab {
-                    url: "https://a.example/".to_owned(),
-                    title: Some("A".to_owned()),
-                    favicon: None,
-                },
-                SavedTab {
-                    url: "https://b.example/".to_owned(),
-                    title: None,
-                    favicon: Some("https://b.example/favicon.ico".to_owned()),
-                },
-            ],
-            active_index: 1,
+            windows: vec![SavedWindow {
+                tabs: vec![
+                    SavedTab {
+                        url: "https://a.example/".to_owned(),
+                        title: Some("A".to_owned()),
+                        favicon: None,
+                    },
+                    SavedTab {
+                        url: "https://b.example/".to_owned(),
+                        title: None,
+                        favicon: Some("https://b.example/favicon.ico".to_owned()),
+                    },
+                ],
+                active_index: 1,
+            }],
+            ..SessionSnapshot::default()
         };
 
         save_session(&dir, &snapshot).expect("save_session should succeed");
@@ -482,12 +485,15 @@ mod tests {
         // A well-formed session, chopped off mid-object — simulates a write
         // interrupted by a crash or power loss.
         let full = serde_json::to_string(&SessionSnapshot {
-            tabs: vec![SavedTab {
-                url: "https://a.example/".to_owned(),
-                title: Some("A very very very long title indeed".to_owned()),
-                favicon: None,
+            windows: vec![SavedWindow {
+                tabs: vec![SavedTab {
+                    url: "https://a.example/".to_owned(),
+                    title: Some("A very very very long title indeed".to_owned()),
+                    favicon: None,
+                }],
+                active_index: 0,
             }],
-            active_index: 0,
+            ..SessionSnapshot::default()
         })
         .unwrap();
         let truncated = &full[..full.len() / 2];
@@ -543,14 +549,17 @@ mod tests {
             })
             .collect();
         let snapshot = SessionSnapshot {
-            tabs,
-            active_index: 10_000,
+            windows: vec![SavedWindow {
+                tabs,
+                active_index: 10_000,
+            }],
+            ..SessionSnapshot::default()
         };
 
         save_session(&dir, &snapshot).expect("save_session should succeed");
         let loaded = load_session(&dir).expect("a large well-formed file should still load");
-        assert_eq!(loaded.tabs.len(), 20_000);
-        assert_eq!(loaded.active_index, 10_000);
+        assert_eq!(loaded.windows[0].tabs.len(), 20_000);
+        assert_eq!(loaded.windows[0].active_index, 10_000);
 
         fs::remove_dir_all(&dir).ok();
     }

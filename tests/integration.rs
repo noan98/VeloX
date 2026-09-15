@@ -1744,6 +1744,109 @@ fn memory_budget_signal_never_suspends_more_than_one_windows_tabs_per_sample() {
 //    suspended (rebuilds its webview through the ordinary resume path).
 // ---------------------------------------------------------------------
 
+/// Guarantees Issue #149's headline: **a second window's tabs survive a
+/// restart too.**
+///
+/// Before #149 `persist_session` wrote only the primary window, so the
+/// second window's tabs were simply gone next launch. This drives the real
+/// binary twice and checks both halves:
+///
+/// 1. **Saving** — after launch 1, `session.json` lists *two* windows, the
+///    second with the tab that was opened in it.
+/// 2. **Restoring** — launch 2 (restore on) writes `session.json` again
+///    from its own live `Windows`, and it still has two windows with the
+///    same tabs. That second write is the actual proof: a window that
+///    failed to reopen would not be in `state.windows` to be saved, so the
+///    file would come back with one.
+#[test]
+fn restoring_the_previous_session_reopens_every_window() {
+    skip_without_gui!("restoring_the_previous_session_reopens_every_window");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("session-restore-windows");
+    let data_dir = dir.join("data");
+    let home = fixture_url("minimal.html");
+    let page_a = fixture_url("text.html");
+
+    // --- Launch 1: window 1 at `home`, then a second window that also
+    //     opens `page_a` as its own second tab. ---
+    let script_1 = format!(
+        "wait_load\n\
+         new_window\n\
+         wait_load\n\
+         open {page_a}\n\
+         wait_load\n\
+         quit\n"
+    );
+    let script_path_1 = write_script(&dir, &script_1);
+    let launch_1 = launch_and_wait(
+        &dir.join("perf1.jsonl"),
+        &data_dir,
+        &home,
+        &script_path_1,
+        Duration::from_secs(30),
+    );
+    let Some(status_1) = launch_1.exit_status else {
+        panic!("velox (launch 1) did not exit on its own within 30s");
+    };
+    assert!(
+        status_1.success(),
+        "launch 1 exited abnormally: {status_1:?}"
+    );
+
+    let after_first = persistence::load_session(&data_dir)
+        .expect("session.json should have been written and parse after launch 1");
+    fn urls_of(snapshot: &velox::browser::SessionSnapshot) -> Vec<Vec<String>> {
+        snapshot
+            .windows
+            .iter()
+            .map(|window| window.tabs.iter().map(|t| t.url.clone()).collect())
+            .collect()
+    }
+    assert_eq!(
+        urls_of(&after_first),
+        vec![vec![home.clone()], vec![home.clone(), page_a.clone()],],
+        "both windows should be saved, in the order they were opened"
+    );
+
+    // --- Launch 2: restore on. Do nothing but let both windows come up,
+    //     then quit — the write on the way through is what proves the
+    //     second window actually exists. ---
+    // A homepage that is in neither saved window: if restore silently fell
+    // back to it, the saved windows below would not match.
+    let unused_homepage = fixture_url("dom_heavy.html");
+    let second_dir = dir.join("second");
+    fs::create_dir_all(&second_dir).expect("create the launch-2 script dir");
+    let script_path_2 = write_script(&second_dir, "wait_load\nwait 3000\nquit\n");
+    let launch_2 = launch_and_wait_with(
+        &dir.join("perf2.jsonl"),
+        &data_dir,
+        &unused_homepage,
+        &script_path_2,
+        Duration::from_secs(40),
+        &[("VELOX_RESTORE_SESSION", Path::new("1"))],
+        None,
+    );
+    let Some(status_2) = launch_2.exit_status else {
+        panic!("velox (launch 2) did not exit on its own within 40s");
+    };
+    assert!(
+        status_2.success(),
+        "launch 2 exited abnormally: {status_2:?}"
+    );
+
+    let after_second = persistence::load_session(&data_dir)
+        .expect("session.json should still parse after launch 2");
+    assert_eq!(
+        urls_of(&after_second),
+        urls_of(&after_first),
+        "launch 2 must have reopened both windows — one window here means the \
+         second never came back (Issue #149)"
+    );
+}
+
 /// Guarantees, across two real, separate launches of `velox` sharing the
 /// same `VELOX_DATA_DIR`:
 ///
@@ -1805,8 +1908,13 @@ fn restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch() {
 
     let snapshot = persistence::load_session(&data_dir)
         .expect("session.json should have been written and parse after launch 1");
+    // Issue #149: one window, but written under `windows` now. The
+    // single-window path is exactly what this test has always covered, so
+    // it keeps covering it — through the new shape.
+    assert_eq!(snapshot.windows.len(), 1, "{snapshot:?}");
+    let saved_window = &snapshot.windows[0];
     assert_eq!(
-        snapshot
+        saved_window
             .tabs
             .iter()
             .map(|t| t.url.as_str())
@@ -1815,7 +1923,7 @@ fn restoring_the_previous_session_reopens_its_tabs_across_a_real_relaunch() {
         "the saved session should list both tabs in the order they were opened"
     );
     assert_eq!(
-        snapshot.active_index, 1,
+        saved_window.active_index, 1,
         "`page_a` (opened last) should be the active tab in the saved session"
     );
 
