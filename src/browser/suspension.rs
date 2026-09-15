@@ -549,6 +549,17 @@ pub struct Candidate {
     /// Whether the caller wants this tab kept alive regardless of the
     /// signals (today: it is playing audio). Never suspended.
     pub protected: bool,
+    /// Whether this tab's page has reported form input since it last
+    /// navigated (Issue #272, D142, `Tab::has_form_input`). Never
+    /// suspended: throwing the webview away destroys what the user typed
+    /// (D105), and no amount of memory saved is worth that.
+    ///
+    /// **Kept separate from `protected` rather than folded into it.** The
+    /// two say different things — `protected` is "the caller decided",
+    /// this is "the page reported" — and `app.rs` only ever sets this when
+    /// the protection is enabled, so the A/B arms of #272's measurement
+    /// differ in the flag rather than in whether the script runs.
+    pub has_form_input: bool,
     /// Which web process this tab's webview lives in (D54's process group
     /// id, `BrowserWindow::process_group_of`). `None` when the caller does
     /// not know (a platform without process groups, or a tab the window
@@ -560,7 +571,7 @@ pub struct Candidate {
 impl Candidate {
     /// Whether the policy may suspend this tab at all.
     fn eligible(&self) -> bool {
-        !self.active && !self.loading && !self.protected
+        !self.active && !self.loading && !self.protected && !self.has_form_input
     }
 }
 
@@ -766,6 +777,7 @@ mod tests {
             idle: Duration::from_secs(idle_secs),
             loading: false,
             protected: false,
+            has_form_input: false,
             process_group: Some(id),
         }
     }
@@ -1532,5 +1544,92 @@ mod tests {
         for raw in ["", "  ", "freeze", "discard", "high", "1", "true", "lo"] {
             assert_eq!(BackgroundMemoryTarget::parse(raw), None, "raw = {raw:?}");
         }
+    }
+
+    // -- Issue #272 (D142): a tab with form input is never suspended ----
+
+    /// The same tab, with the page having reported form input.
+    fn typing(id: u64, idle_secs: u64) -> Candidate {
+        Candidate {
+            has_form_input: true,
+            ..tab(id, idle_secs)
+        }
+    }
+
+    #[test]
+    fn a_tab_with_form_input_survives_every_signal() {
+        // One policy with all three signals on at once, each of which
+        // would take this tab on its own: it is the idlest, the count is
+        // over, and the memory sample is far over budget.
+        let policy = SuspensionPolicy {
+            idle_after: Some(Duration::from_secs(60)),
+            max_live_tabs: Some(1),
+            memory_budget_bytes: Some(100 * MIB),
+            ..SuspensionPolicy::default()
+        };
+        let candidates = vec![
+            Candidate {
+                active: true,
+                ..tab(0, 0)
+            },
+            typing(1, 600),
+            tab(2, 300),
+        ];
+        let sample = Some(MemorySample {
+            total_bytes: 4096 * MIB,
+        });
+
+        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Discard);
+        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
+
+        assert!(
+            !taken.contains(&TabId::from(1)),
+            "the tab being typed in must survive all three signals, got {taken:?}"
+        );
+        assert!(
+            taken.contains(&TabId::from(2)),
+            "the other background tab is still fair game, got {taken:?}"
+        );
+    }
+
+    #[test]
+    fn form_input_pins_its_process_group_like_a_protected_tab() {
+        // Both tabs share a group, so the group can only be emptied if
+        // *both* are eligible — the same rule `protected`/`active` follow.
+        // Without the pin, tab 2 would be suspended for nothing: its
+        // process would stay alive for tab 1 anyway.
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(1),
+            ..SuspensionPolicy::default()
+        };
+        let candidates = vec![
+            Candidate {
+                active: true,
+                ..grouped(0, 0, 9)
+            },
+            Candidate {
+                has_form_input: true,
+                ..grouped(1, 600, 7)
+            },
+            grouped(2, 300, 7),
+        ];
+
+        let order = reclaim_order(&candidates);
+        let flattened: Vec<TabId> = order
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(|tab| tab.id))
+            .collect();
+        assert!(
+            !flattened.contains(&TabId::from(1)),
+            "the typed-in tab is never offered for reclaim, got {flattened:?}"
+        );
+        assert!(
+            !order.iter().any(|chunk| chunk.len() > 1),
+            "group 7 must not be offered as an emptyable whole: {order:?}"
+        );
+
+        let planned = plan(&policy, &candidates, None, SuspendMechanism::Discard);
+        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
+        assert!(!taken.contains(&TabId::from(1)), "got {taken:?}");
     }
 }

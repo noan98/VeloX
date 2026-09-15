@@ -127,6 +127,26 @@ const CONTEXT_MENU_ACTION_PREFIX: &str = "velox:context-menu-action:";
 /// The menu was dismissed with no selection (clicked outside it, or Esc).
 const CONTEXT_MENU_CLOSE_MESSAGE: &str = "velox:context-menu-close";
 
+/// The page reported form input (Issue #272, see docs/decisions.md D142).
+/// Sent by [`form_input_script`] over the same untrusted content IPC
+/// channel the three sentinels above use.
+///
+/// **The narrowest message on this channel.** It carries no payload at all
+/// — not a field name, not a value, not even which frame it came from.
+/// The whole message is "somebody typed in this tab", which is all the
+/// suspension policy needs (`browser::suspension::Candidate::has_form_input`).
+/// A page that sends it without the user typing only keeps *itself* alive,
+/// which is a power it already has today by playing silent audio
+/// (`is_playing_audio` feeds `Candidate::protected`).
+const FORM_INPUT_MESSAGE: &str = "velox:form-input";
+
+/// What [`form_input_script`] posts to its parent frame when it is running
+/// in a subframe, for the main frame to relay over
+/// [`FORM_INPUT_MESSAGE`]. A fixed string on a fixed property, checked by
+/// exact match: the relay never forwards anything a page sends that is not
+/// literally this.
+const FORM_INPUT_RELAY_TOKEN: &str = "velox:form-input-relay";
+
 /// Hard cap on a `CONTEXT_MENU_OPEN_PREFIX` message's JSON payload, checked
 /// *before* `serde_json::from_str` ever runs — the same "reject outright,
 /// never even attempt to parse" pattern D62 established for the toolbar's
@@ -446,6 +466,68 @@ fn devtools_shortcut_script() -> String {
       window.ipc.postMessage("{OPEN_DEVTOOLS_MESSAGE}");
     }}
   }}, true);
+}})();"#
+    )
+}
+
+/// Initialization script that reports form input to Rust over
+/// [`FORM_INPUT_MESSAGE`], so the suspension policy can keep a tab the
+/// user is typing in alive (Issue #272, docs/decisions.md D142).
+///
+/// Injected into **every frame**, not just the main one
+/// (`with_initialization_script_for_main_only(.., false)`): a payment or
+/// comment form is very often in a cross-origin iframe, and missing those
+/// would miss exactly the input worth protecting.
+///
+/// ## Why a subframe never calls `window.ipc` itself
+///
+/// It would work on Linux and **fail silently on Windows** — see D142
+/// 決定2. wry injects its `window.ipc` shim into subframes on Windows
+/// (wry's own docs: "scripts are always added to subframes regardless of
+/// the `for_main_frame_only` option"), but registers a
+/// `WebMessageReceived` handler only on the top-level `ICoreWebView2`.
+/// Microsoft's reference is explicit that an iframe's
+/// `chrome.webview.postMessage` raises `CoreWebView2Frame`'s event, not
+/// the top-level one, so the call would succeed, throw nothing, and go
+/// nowhere. On Linux the shim is main-frame-only, so a "try direct, else
+/// relay" version would take the relay and work — which is precisely why
+/// testing only on Linux would not catch it.
+///
+/// So a subframe **always** relays through its parent, and only the main
+/// frame talks to `window.ipc`. One path, both platforms.
+///
+/// The relay accepts a message only when it is exactly
+/// [`FORM_INPUT_RELAY_TOKEN`]; nothing from the page is forwarded. That is
+/// no weaker than reporting the main frame's own input, since a page can
+/// already fire an `input` event on itself.
+fn form_input_script() -> String {
+    format!(
+        r#"(() => {{
+  "use strict";
+  const isMain = window.top === window;
+  const report = () => {{
+    if (isMain) {{
+      if (window.ipc) {{
+        window.ipc.postMessage("{FORM_INPUT_MESSAGE}");
+      }}
+      return;
+    }}
+    // Subframe: never the direct shim — see this script's Rust doc comment.
+    try {{
+      window.parent.postMessage("{FORM_INPUT_RELAY_TOKEN}", "*");
+    }} catch (error) {{
+      // A sandboxed frame can be denied even this; nothing to fall back
+      // on, and a lost signal only means the tab stays suspendable.
+    }}
+  }};
+  document.addEventListener("input", report, true);
+  if (isMain) {{
+    window.addEventListener("message", (event) => {{
+      if (event.data === "{FORM_INPUT_RELAY_TOKEN}") {{
+        report();
+      }}
+    }});
+  }}
 }})();"#
     )
 }
@@ -3312,6 +3394,7 @@ fn content_webview_builder<'a>(
     let devtools_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
     let context_menu_proxy = proxy.clone();
+    let form_input_proxy = proxy.clone();
     // Current origin of this tab, for the permission handler below
     // (docs/decisions.md D60): `with_permission_handler`'s callback
     // receives only a `PermissionKind`, no URL/origin (see the vendored
@@ -3362,7 +3445,15 @@ fn content_webview_builder<'a>(
         // captures the click target and suppresses the engine's native
         // menu (`event.preventDefault()`, honored cross-engine — see the
         // script's own doc comment) so VeloX's own menu can replace it.
-        .with_initialization_script(context_menu_script());
+        .with_initialization_script(context_menu_script())
+        // Form-input detection (Issue #272, see docs/decisions.md D142):
+        // a fourth injected script, same channel and the same fixed
+        // sentinel treatment — but the only one injected into *subframes*
+        // too (`for_main_frame_only = false`), since the forms most worth
+        // protecting are routinely in a cross-origin iframe. See
+        // `form_input_script`'s own doc comment for why a subframe relays
+        // through its parent instead of calling `window.ipc` itself.
+        .with_initialization_script_for_main_only(form_input_script(), false);
     // Defense in depth, Windows only: `with_default_context_menus(false)`
     // is a WebView2-specific setting (`wry::WebViewBuilderExtWindows`, only
     // compiled `#[cfg(windows)]` in wry itself) that disables its native
@@ -3428,6 +3519,8 @@ fn content_webview_builder<'a>(
                     y,
                     raw,
                 });
+            } else if body == FORM_INPUT_MESSAGE {
+                let _ = form_input_proxy.send_event(UserEvent::FormInputDetected(own_id, id));
             } else if body == CONTEXT_MENU_CLOSE_MESSAGE {
                 let _ = context_menu_proxy.send_event(UserEvent::ContextMenuClosed(own_id, id));
             } else if let Some(index) = parse_context_menu_action(body) {
@@ -4421,6 +4514,69 @@ mod tests {
         // to resolve itself).
         assert!(script.contains("el.href"));
         assert!(script.contains("el.src"));
+    }
+
+    #[test]
+    fn form_input_script_reports_input_and_relays_subframes_through_the_parent() {
+        let script = form_input_script();
+        // Capture phase, so a page that swallows `input` on an ancestor
+        // cannot hide the fact that typing happened.
+        assert!(script.contains(r#"addEventListener("input", report, true)"#));
+        assert!(script.contains(FORM_INPUT_MESSAGE));
+        assert!(script.contains(FORM_INPUT_RELAY_TOKEN));
+        // The relay only ever fires on an exact match, never on some
+        // property of whatever the page posted.
+        assert!(script.contains(&format!(r#"event.data === "{FORM_INPUT_RELAY_TOKEN}""#)));
+    }
+
+    /// **The regression this test exists for is Windows-only and silent.**
+    ///
+    /// A subframe on Windows *has* a `window.ipc` (wry injects its shim
+    /// into subframes there) but its messages reach `CoreWebView2Frame`,
+    /// which wry never listens on — so a subframe calling `window.ipc`
+    /// throws nothing, returns nothing, and loses the signal. On Linux the
+    /// shim is main-frame-only, so the natural "try `window.ipc`, else
+    /// relay" shape *works*, and nothing here would go red. See
+    /// docs/decisions.md D142 決定2.
+    ///
+    /// So this asserts on the script's shape rather than its behavior:
+    /// the only `window.ipc` call sits behind the `isMain` branch.
+    #[test]
+    fn form_input_script_never_posts_to_window_ipc_from_a_subframe() {
+        let script = form_input_script();
+        let ipc_calls = script.matches("window.ipc.postMessage").count();
+        assert_eq!(
+            ipc_calls, 1,
+            "exactly one `window.ipc` call, in the main-frame branch: {script}"
+        );
+
+        let guard = script
+            .find("if (isMain)")
+            .expect("the report path must branch on isMain");
+        let ipc = script
+            .find("window.ipc.postMessage")
+            .expect("checked just above");
+        let relay = script
+            .find("window.parent.postMessage")
+            .expect("a subframe must relay through its parent");
+        assert!(
+            guard < ipc,
+            "the `window.ipc` call must sit inside the isMain branch"
+        );
+        assert!(
+            ipc < relay,
+            "the relay must be the else-path of that branch, not a fallback \
+             tried after `window.ipc` (which would be a no-op on Windows)"
+        );
+        // And the subframe path must not consult `window.ipc` at all —
+        // not even to test for it, which is what a fallback would do.
+        // Sliced past the main-frame call itself, which is what `ipc`
+        // points at.
+        let subframe = &script[ipc + "window.ipc.postMessage".len()..];
+        assert!(
+            !subframe.contains("window.ipc"),
+            "the subframe path must not look at `window.ipc`: {subframe}"
+        );
     }
 
     #[test]

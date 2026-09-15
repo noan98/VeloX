@@ -222,6 +222,19 @@ pub struct Tab {
     /// "last active" timestamp a future session restore (#25) would want to
     /// decide which tabs to restore eagerly vs. lazily.
     last_active: Instant,
+    /// Whether this tab's page has reported form input since it last
+    /// navigated (Issue #272, D142). Set by `ui::window`'s injected script
+    /// over the untrusted content IPC channel and never cleared by the
+    /// page: the only thing that clears it is a navigation, below.
+    ///
+    /// **Deliberately one-way while a document lives.** A field the user
+    /// typed into and then emptied still counts as "there was input here",
+    /// because the cost of being wrong is asymmetric — suspending a tab
+    /// the user was typing in destroys what they wrote (D105), while
+    /// keeping one alive too long costs memory that D114/§35 already
+    /// measures. D142 決定3 left the clearing policy to measurement
+    /// (#272); this is the conservative end of it.
+    has_form_input: bool,
 }
 
 impl Tab {
@@ -241,6 +254,7 @@ impl Tab {
             blocked_count: 0,
             state: TabState::Active,
             last_active: Instant::now(),
+            has_form_input: false,
         }
     }
 
@@ -266,6 +280,7 @@ impl Tab {
             blocked_count: 0,
             state: TabState::Suspended,
             last_active: Instant::now(),
+            has_form_input: false,
         }
     }
 
@@ -405,6 +420,24 @@ impl Tab {
         self.loading = true;
         self.title = None;
         self.favicon = Favicon::Unknown;
+        // The document that held the form is being replaced, so whatever
+        // was typed into it is already gone — there is nothing left to
+        // protect (Issue #272, D142). The injected script re-runs on the
+        // new document and will report again if the user types there.
+        self.has_form_input = false;
+    }
+
+    /// The page reported form input (Issue #272, D142). Idempotent — the
+    /// script reports every `input` event, and the flag only ever goes
+    /// from `false` to `true` until the next navigation clears it.
+    pub fn mark_form_input(&mut self) {
+        self.has_form_input = true;
+    }
+
+    /// Whether [`Self::mark_form_input`] has fired since this tab last
+    /// navigated. Read by [`super::tabs::Tabs::suspension_candidates`].
+    pub fn has_form_input(&self) -> bool {
+        self.has_form_input
     }
 
     /// The engine finished loading `url` (the final URL after redirects).
@@ -738,5 +771,31 @@ mod tests {
         tab.resume().unwrap();
         assert_eq!(tab.state(), TabState::Active);
         assert!(tab.is_loading());
+    }
+
+    // -- Issue #272 (D142): form-input flag ----------------------------
+
+    #[test]
+    fn form_input_is_recorded_and_cleared_by_the_next_navigation() {
+        let mut tab = Tab::new(TabId::from(0), "https://form.example/");
+        assert!(!tab.has_form_input(), "a fresh tab has no reported input");
+
+        tab.mark_form_input();
+        assert!(tab.has_form_input());
+        // Idempotent: the script reports every keystroke.
+        tab.mark_form_input();
+        assert!(tab.has_form_input());
+
+        // Finishing the load does not clear it — the document (and what
+        // was typed into it) is still there.
+        tab.on_load_finished("https://form.example/");
+        assert!(tab.has_form_input(), "a finished load keeps the flag");
+
+        // Navigating away does: that document is gone.
+        tab.on_navigation_started("https://other.example/");
+        assert!(
+            !tab.has_form_input(),
+            "the form went away with the document"
+        );
     }
 }

@@ -1097,6 +1097,50 @@ fn spawn_truncating_server() -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// Serve one fixed HTML document over HTTP/1.1 on a fresh loopback port,
+/// returning its base URL (Issue #272).
+///
+/// **The fixtures for this one cannot be `file://` pages like every other
+/// test here, and that is a platform fact rather than a preference.** On
+/// WebKitGTK, wry's `window.ipc` shim never reaches a `file://` document:
+/// measured with a standalone wry program that loaded the same page twice,
+/// once as `file://` and once through a custom protocol — the page loaded
+/// both times, and only the custom-protocol run produced any IPC at all.
+/// Every injected content script (D18's devtools shortcut, D23's tab
+/// shortcuts, D78's context menu, and #272's form input) is therefore inert
+/// on local files there. A real origin is what this test needs, and the
+/// cheapest one is a loopback socket.
+///
+/// `Connection: close` with a correct `Content-Length` here, unlike
+/// `spawn_truncating_server` above where the header made the test vacuous:
+/// that server's whole point was an early close on an *unfinished* body.
+/// This one sends a complete body, so closing afterwards is unambiguous and
+/// saves the server from having to handle keep-alive reuse.
+fn spawn_page_server(body: String) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let port = listener.local_addr().expect("local addr").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let _ = stream.write_all(
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: text/html; charset=utf-8\r\n\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\r\n",
+                    body.len()
+                )
+                .as_bytes(),
+            );
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
 /// Guarantees the Issue #128 / D140 fix end to end: **after a download that
 /// genuinely fails, a later download that genuinely succeeds is still
 /// recorded as a success.**
@@ -1289,6 +1333,122 @@ fn quit_command_exits_the_process_with_code_zero() {
 /// The `suspend <index>` automation command is exercised too: a manual
 /// suspension of an already-suspended or active tab must be a silent
 /// no-op, exactly like the tab strip's button.
+#[test]
+fn a_tab_with_form_input_in_a_cross_origin_iframe_is_not_suspended() {
+    skip_without_gui!("a_tab_with_form_input_in_a_cross_origin_iframe_is_not_suspended");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("form_input");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let stderr_path = dir.join("stderr.log");
+
+    // Two loopback servers on two ports, so the iframe is genuinely
+    // cross-origin — the case worth protecting (a payment or comment form
+    // is routinely in one) and the case a same-origin `srcdoc` would not
+    // prove. **Only the child fires the `input` event.** Its signal can
+    // only reach VeloX through the parent-frame relay, so this test goes
+    // red if that relay breaks (D142 決定2).
+    let child = spawn_page_server(
+        r#"<!doctype html><meta charset="utf-8"><input id="f">
+<script>
+  var f = document.getElementById('f');
+  f.value = 'typed';
+  f.dispatchEvent(new Event('input', { bubbles: true }));
+</script>"#
+            .to_string(),
+    );
+    let top = spawn_page_server(format!(
+        r#"<!doctype html><meta charset="utf-8"><title>form input</title>
+<iframe src="{child}/child.html" width="200" height="60"></iframe>"#
+    ));
+
+    // The homepage is the fixture, so tab 0 — the tab the live-tab cap
+    // would otherwise take first, since it goes idle first — is the one
+    // with form input.
+    let homepage = top.clone();
+    let page_a = fixture_url("text.html");
+    let page_b = fixture_url("dom_heavy.html");
+
+    // `VELOX_MAX_TABS_PER_PROCESS=1` for the same reason as the
+    // live-tab-cap test below: it makes the choice of victim depend on
+    // recency alone rather than on how this machine happened to group the
+    // tabs into processes.
+    //
+    // Tab strip (cap = 2 live tabs):
+    //   [form]                 form active, 1 live
+    //   open a -> [form, a]    a active, 2 live — at the cap
+    //   open b -> [form, a, b] b active, 3 live -> one must go. By
+    //                          recency that is `form`; it is spared
+    //                          because its iframe reported input, so `a`
+    //                          goes instead.
+    let script = format!(
+        "wait_load\n\
+         open {page_a}\n\
+         wait_load\n\
+         open {page_b}\n\
+         wait_load\n\
+         wait 400\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+        &[
+            ("VELOX_MAX_LIVE_TABS", Path::new("2")),
+            ("VELOX_MAX_TABS_PER_PROCESS", Path::new("1")),
+        ],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the form-input test. \
+             Perf records: {:?}\nstderr:\n{stderr}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let records = &launch.perf_records;
+    let created_ids: Vec<u64> = events_named(records, "tab_create")
+        .filter_map(|r| r["tab_id"].as_u64())
+        .collect();
+    assert_eq!(
+        created_ids.len(),
+        2,
+        "2 `open` commands should yield 2 `tab_create` records: {records:?}"
+    );
+
+    let suspends: Vec<_> = events_named(records, "tab_suspend").collect();
+    let suspended_ids: Vec<u64> = suspends
+        .iter()
+        .filter_map(|r| r["tab_id"].as_u64())
+        .collect();
+    let home_id = 0;
+    assert!(
+        !suspended_ids.contains(&home_id),
+        "the tab whose cross-origin iframe reported form input must never be \
+         suspended (Issue #272 / D142): {suspends:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        suspended_ids.contains(&created_ids[0]),
+        "with tab 0 spared, the cap must take the next least recently used tab \
+         instead — without this the test would also pass with suspension \
+         switched off entirely: {suspends:?}\nstderr:\n{stderr}"
+    );
+}
+
 #[test]
 fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     skip_without_gui!("live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them");
