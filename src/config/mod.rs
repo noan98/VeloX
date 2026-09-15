@@ -246,6 +246,19 @@ pub struct Config {
     /// `VELOX_PRIVATE`/`VELOX_PERF_METRICS`) — see
     /// [`Config::from_env_and_args`].
     pub restore_previous_session: bool,
+    /// Whether a tab whose page reported form input is kept out of the
+    /// automatic-suspension candidates (Issue #272, docs/decisions.md
+    /// D142). **Defaults to on**: suspending a tab the user is typing in
+    /// destroys what they wrote (D105), and that is the expensive way to
+    /// be wrong.
+    ///
+    /// `VELOX_PROTECT_FORM_INPUT=0` turns it off. That exists so #272's
+    /// measurement can run both arms — D142 決定3 recorded that how much
+    /// this protection costs in suspensions (and so in the memory effect
+    /// D114/§35 measured) is *not* yet measured. The injected script runs
+    /// in both arms either way, so the arms differ in the policy and not
+    /// in what the page is doing.
+    pub protect_form_input: bool,
     /// Overrides `browser::downloads::resolve_download_dir`'s platform
     /// default for every download this run (Issue #30's settings screen,
     /// Downloads tab — see docs/decisions.md D67). `None` keeps today's
@@ -291,6 +304,7 @@ impl Default for Config {
             perf_format: PerfFormat::Text,
             perf_output_path: None,
             restore_previous_session: false,
+            protect_form_input: true,
             download_dir_override: None,
         }
     }
@@ -384,6 +398,10 @@ impl Config {
     /// - `VELOX_RESTORE_SESSION` — presence (like `VELOX_PRIVATE`) turns on
     ///   restoring the previous session's tabs at startup (Issue #25, see
     ///   docs/decisions.md D65). Unset means off.
+    /// - `VELOX_PROTECT_FORM_INPUT` — `0`/`off`/`false` stops a tab whose
+    ///   page reported form input from being protected from automatic
+    ///   suspension (Issue #272, D142). **Defaults to on**; this exists to
+    ///   run the other arm of #272's measurement.
     ///
     /// No CLI-parsing crate is introduced for this (see docs/decisions.md
     /// D6); `args` is expected to be the process arguments with argv\[0\]
@@ -451,6 +469,8 @@ impl Config {
             .and_then(BackgroundMemoryTarget::parse)
             .unwrap_or_default();
         let restore_previous_session = std::env::var_os("VELOX_RESTORE_SESSION").is_some();
+        let protect_form_input =
+            resolve_protect_form_input(std::env::var("VELOX_PROTECT_FORM_INPUT").ok().as_deref());
         Self {
             homepage,
             private,
@@ -465,6 +485,7 @@ impl Config {
             perf_output_path,
             content_blocking_site_exceptions,
             restore_previous_session,
+            protect_form_input,
             ..defaults
         }
     }
@@ -712,6 +733,23 @@ pub(crate) fn resolve_search_engine(
 /// (environment variable presence, CLI args). Kept separate from
 /// `Config::from_env_and_args` so the decision logic is testable without
 /// touching the real process environment.
+/// Whether form-input protection stays on, from `VELOX_PROTECT_FORM_INPUT`
+/// (Issue #272, docs/decisions.md D142).
+///
+/// **Only an explicit, recognized "off" turns it off.** Unset keeps it on,
+/// and so does an unrecognized spelling — the same conservative rule every
+/// other knob here follows (`VELOX_SUSPEND_MECHANISM`, `VELOX_BACKGROUND_
+/// MEMORY_TARGET`): a typo must never silently pick the arm that can lose
+/// the user's typing. Case and surrounding whitespace are ignored, since
+/// `VELOX_PROTECT_FORM_INPUT=Off` from a shell script is plainly "off" and
+/// treating it as a typo would be the wrong kind of strict.
+fn resolve_protect_form_input(raw: Option<&str>) -> bool {
+    !matches!(
+        raw.map(str::trim).map(str::to_ascii_lowercase).as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+}
+
 fn resolve_private<I: IntoIterator<Item = String>>(env_flag_set: bool, args: I) -> bool {
     env_flag_set || args.into_iter().any(|arg| arg == "--private")
 }
@@ -1829,5 +1867,28 @@ mod tests {
             Config::default().suspend_mechanism,
             SuspendMechanism::Discard
         );
+    }
+
+    // -- Issue #272 (D142): VELOX_PROTECT_FORM_INPUT -------------------
+
+    #[test]
+    fn form_input_protection_is_on_unless_explicitly_turned_off() {
+        // Unset, and every recognized spelling of "off".
+        assert!(resolve_protect_form_input(None));
+        for off in ["0", "off", "false", "no", " Off ", "FALSE"] {
+            assert!(
+                !resolve_protect_form_input(Some(off)),
+                "{off:?} should turn the protection off"
+            );
+        }
+        // Explicit "on" spellings, and — the point of the conservative
+        // rule — anything unrecognized. A typo must not silently pick the
+        // arm that can lose what the user typed.
+        for on in ["1", "on", "true", "yes", "", "offf", "disable", "0 0"] {
+            assert!(
+                resolve_protect_form_input(Some(on)),
+                "{on:?} should leave the protection on"
+            );
+        }
     }
 }

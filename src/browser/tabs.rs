@@ -463,6 +463,7 @@ impl Tabs {
                 idle: tab.idle_for(now),
                 loading: tab.is_loading(),
                 protected: protect(tab.id()),
+                has_form_input: tab.has_form_input(),
                 process_group: process_group(tab.id()),
             })
             .collect()
@@ -1334,5 +1335,24 @@ mod tests {
         assert_eq!(tabs.active_id(), b);
         assert!(!tabs.get(b).unwrap().is_suspended());
         assert!(tabs.get(b).unwrap().is_loading());
+    }
+
+    #[test]
+    fn suspension_candidates_report_the_form_input_flag() {
+        let t0 = Instant::now();
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open_at("https://b.example/", t0);
+        tabs.get_mut(a).unwrap().mark_form_input();
+        let now = t0 + Duration::from_secs(30);
+
+        let candidates = tabs.suspension_candidates(now, |_| false, |_| None);
+        let a_candidate = candidates.iter().find(|c| c.id == a).expect("a is live");
+        let b_candidate = candidates.iter().find(|c| c.id == b).expect("b is live");
+        assert!(a_candidate.has_form_input);
+        assert!(!b_candidate.has_form_input);
+        // The flag is its own field, not folded into `protected` — the
+        // caller's `protect` closure said `false` for both.
+        assert!(!a_candidate.protected);
     }
 }

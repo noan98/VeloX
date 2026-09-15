@@ -328,6 +328,11 @@ pub enum UserEvent {
     /// The context menu was dismissed with no selection (clicked outside
     /// it, or Esc) — see `ui::window::CONTEXT_MENU_CLOSE_MESSAGE`.
     ContextMenuClosed(WindowId, TabId),
+    /// This tab's page reported form input (Issue #272, D142) — see
+    /// `ui::window::FORM_INPUT_MESSAGE`. Fires on every `input` event, so
+    /// the handler must be cheap and idempotent (`Tab::mark_form_input`
+    /// is both).
+    FormInputDetected(WindowId, TabId),
 }
 
 /// All mutable application state, gathered so the event handlers below take
@@ -1321,6 +1326,11 @@ fn record_perf_event(
         // (`record_tab_suspend`); the sample itself is not a perf event
         // (the perf RSS sampler already logs `rss` on its own schedule).
         | UserEvent::MemorySampled(_)
+        // Issue #272: fires on every keystroke in a form, so logging it
+        // would both flood the perf log and measure the user's typing
+        // rate rather than anything VeloX does. `Tab::mark_form_input`
+        // is a bool store; there is no duration worth recording.
+        | UserEvent::FormInputDetected(..)
         // Issue #43's in-page find is not a perf-tracked operation (no
         // `docs/performance-targets.md` budget calls for it) — nothing to
         // log here.
@@ -2526,6 +2536,22 @@ reported_success={success} recorded_as_success={succeeded}"
                     if let Some(window) = ui_windows.get_mut(&window_id) {
                         handle_context_menu_action(window, window_id, state, config, tab_id, other);
                     }
+                }
+            }
+        }
+        UserEvent::FormInputDetected(window_id, tab_id) => {
+            // Issue #272 / D142. The whole policy switch lives here: with
+            // the protection off the flag is simply never set, so the
+            // measurement's two arms differ in `Candidate::has_form_input`
+            // while the injected script keeps running identically in both
+            // (see `Config::protect_form_input`).
+            if config.protect_form_input {
+                if let Some(tab) = state
+                    .windows
+                    .tabs_mut(window_id)
+                    .and_then(|tabs| tabs.get_mut(tab_id))
+                {
+                    tab.mark_form_input();
                 }
             }
         }
