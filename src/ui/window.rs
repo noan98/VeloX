@@ -496,6 +496,17 @@ fn devtools_shortcut_script() -> String {
 /// So a subframe **always** relays through its parent, and only the main
 /// frame talks to `window.ipc`. One path, both platforms.
 ///
+/// ## Why every frame listens, not just the main one
+///
+/// An iframe inside an iframe reaches the top only if the frame between
+/// them passes the token along, so the listener cannot be gated on
+/// `isMain`: a grandchild's input would reach the middle frame and stop
+/// there, silently — this change's own bug, one nesting level down. A
+/// payment widget embedded inside another embed is exactly that shape.
+/// Since `report` already picks the right thing for whichever frame it
+/// runs in, listening everywhere makes intermediate frames re-relay for
+/// free, at any depth.
+///
 /// The relay accepts a message only when it is exactly
 /// [`FORM_INPUT_RELAY_TOKEN`]; nothing from the page is forwarded. That is
 /// no weaker than reporting the main frame's own input, since a page can
@@ -521,13 +532,17 @@ fn form_input_script() -> String {
     }}
   }};
   document.addEventListener("input", report, true);
-  if (isMain) {{
-    window.addEventListener("message", (event) => {{
-      if (event.data === "{FORM_INPUT_RELAY_TOKEN}") {{
-        report();
-      }}
-    }});
-  }}
+  // Every frame listens, not just the main one: an iframe nested inside
+  // another iframe can only reach the top by having the frame between
+  // them pass the token along. `report` already does the right thing for
+  // whichever frame it runs in — relay upward from a subframe, hand it to
+  // the shim at the top — so re-relaying falls out of listening
+  // everywhere, and the chain works at any depth.
+  window.addEventListener("message", (event) => {{
+    if (event.data === "{FORM_INPUT_RELAY_TOKEN}") {{
+      report();
+    }}
+  }});
 }})();"#
     )
 }
@@ -4527,6 +4542,20 @@ mod tests {
         // The relay only ever fires on an exact match, never on some
         // property of whatever the page posted.
         assert!(script.contains(&format!(r#"event.data === "{FORM_INPUT_RELAY_TOKEN}""#)));
+
+        // **Every frame listens for the relay token, not just the main
+        // one.** An iframe inside an iframe reaches the top only if the
+        // frame between them forwards what it received; gating the
+        // listener on `isMain` loses a grandchild's input silently — the
+        // very bug this whole change exists to prevent, reintroduced one
+        // nesting level down. Pinned by counting the guard: the only
+        // `isMain` branch left is the one inside `report` that chooses
+        // between `window.ipc` and relaying upward.
+        assert_eq!(
+            script.matches("if (isMain)").count(),
+            1,
+            "the relay listener must not be gated on isMain: {script}"
+        );
     }
 
     /// **The regression this test exists for is Windows-only and silent.**

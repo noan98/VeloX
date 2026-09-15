@@ -1450,6 +1450,106 @@ fn a_tab_with_form_input_in_a_cross_origin_iframe_is_not_suspended() {
 }
 
 #[test]
+fn a_tab_with_form_input_two_iframes_deep_is_not_suspended() {
+    skip_without_gui!("a_tab_with_form_input_two_iframes_deep_is_not_suspended");
+    let _guard = GUI_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+
+    let dir = unique_dir("form_input_nested");
+    let perf_output = dir.join("perf.jsonl");
+    let data_dir = dir.join("data");
+    let stderr_path = dir.join("stderr.log");
+
+    // Three origins, three levels: top -> middle -> grandchild, and only
+    // the *grandchild* fires the `input` event. Its signal has to be
+    // relayed twice — the middle frame must forward what it receives to
+    // its own parent — so this is the case a relay registered only on the
+    // main frame loses silently. A payment widget embedded inside another
+    // embed is exactly this shape.
+    let grandchild = spawn_page_server(
+        r#"<!doctype html><meta charset="utf-8"><input id="f">
+<script>
+  var f = document.getElementById('f');
+  f.value = 'typed';
+  f.dispatchEvent(new Event('input', { bubbles: true }));
+</script>"#
+            .to_string(),
+    );
+    let middle = spawn_page_server(format!(
+        r#"<!doctype html><meta charset="utf-8">
+<iframe src="{grandchild}/grandchild.html" width="150" height="40"></iframe>"#
+    ));
+    let top = spawn_page_server(format!(
+        r#"<!doctype html><meta charset="utf-8"><title>nested form input</title>
+<iframe src="{middle}/middle.html" width="200" height="60"></iframe>"#
+    ));
+
+    let homepage = top.clone();
+    let page_a = fixture_url("text.html");
+    let page_b = fixture_url("dom_heavy.html");
+
+    let script = format!(
+        "wait_load\n\
+         open {page_a}\n\
+         wait_load\n\
+         open {page_b}\n\
+         wait_load\n\
+         wait 400\n\
+         quit\n"
+    );
+    let script_path = write_script(&dir, &script);
+
+    let launch = launch_and_wait_with(
+        &perf_output,
+        &data_dir,
+        &homepage,
+        &script_path,
+        Duration::from_secs(30),
+        &[
+            ("VELOX_MAX_LIVE_TABS", Path::new("2")),
+            ("VELOX_MAX_TABS_PER_PROCESS", Path::new("1")),
+        ],
+        Some(&stderr_path),
+    );
+    let stderr = fs::read_to_string(&stderr_path).unwrap_or_default();
+    let Some(status) = launch.exit_status else {
+        panic!(
+            "velox did not exit on its own within 30s during the nested form-input \
+             test. Perf records: {:?}\nstderr:\n{stderr}",
+            launch.perf_records
+        );
+    };
+    assert!(
+        status.success(),
+        "velox exited abnormally: {status:?}\nstderr:\n{stderr}"
+    );
+
+    let records = &launch.perf_records;
+    let created_ids: Vec<u64> = events_named(records, "tab_create")
+        .filter_map(|r| r["tab_id"].as_u64())
+        .collect();
+    assert_eq!(created_ids.len(), 2, "2 `open` commands: {records:?}");
+
+    let suspends: Vec<_> = events_named(records, "tab_suspend").collect();
+    let suspended_ids: Vec<u64> = suspends
+        .iter()
+        .filter_map(|r| r["tab_id"].as_u64())
+        .collect();
+    assert!(
+        !suspended_ids.contains(&0),
+        "the signal must survive two relay hops — an intermediate frame has to \
+         forward what its child sent it (Issue #272 / D143): \
+         {suspends:?}\nstderr:\n{stderr}"
+    );
+    assert!(
+        suspended_ids.contains(&created_ids[0]),
+        "with tab 0 spared, the cap must take the next least recently used tab \
+         instead: {suspends:?}\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them() {
     skip_without_gui!("live_tab_cap_suspends_background_tabs_and_switching_back_resumes_them");
     let _guard = GUI_TEST_LOCK
