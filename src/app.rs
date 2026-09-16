@@ -1703,10 +1703,13 @@ fn sweep_tabs(
 /// (`BrowserWindow::suspend_tab`) — without touching the tab strip; the
 /// caller redraws it once it is done (it may be suspending several tabs).
 /// Returns whether the tab was actually suspended: `false` for an unknown
-/// id, the active tab, or an already-suspended tab (`Tabs::suspend`'s
-/// guards), in which case nothing changed. The one implementation behind
-/// the tab strip's suspend button (`ToolbarCommand::SuspendTab`), the
-/// `suspend <index>` automation command, and [`sweep_tabs`].
+/// id, the active tab, an already-suspended tab, or a pinned tab
+/// (`Tabs::suspend`'s guards — Issue #277, D144 added the last one), in
+/// which case nothing changed. The one implementation behind the tab
+/// strip's suspend button (`ToolbarCommand::SuspendTab`), the
+/// `suspend <index>` automation command, and [`sweep_tabs`] — so all three
+/// inherit the pinned guard from `Tabs::suspend` itself rather than each
+/// needing their own check.
 fn suspend_tab(
     window: &mut BrowserWindow,
     window_id: WindowId,

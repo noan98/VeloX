@@ -17896,6 +17896,55 @@ UI 上の配慮であり、`Tabs::close` 自体はピン留めを見ない。キ
 `session.json` でも読み込みが壊れない」パターンをそのまま踏襲する。
 `SavedWindow::from_tabs` が保存し、`Tabs::restore` が復元する。
 
+### レビューで見つかった抜け: 保護の入口が 1 つしか塞がれていなかった
+
+PR #278 の自動レビューで 2 点見つかった。どちらも初版が「片方の入口だけ
+塞いで、もう片方を見落とす」形をしていた点で共通している。
+
+**(1) 手動休止がピン留めを素通りしていた。** `eligible()` を絶対保護に
+したのは*自動*休止 (`suspension::plan` が回すアイドル・タブ数・メモリの
+スイープ) の入口だけで、*手動*休止 (`Tabs::suspend`、ツールバーの ⏾
+ボタンと `AutomationCommand::Suspend` が呼ぶ) はピン留めを一切見ていな
+かった。ピン留めタブでも ⏾ ボタンを押せば、あるいは
+`suspend <index>` を打てば、普通に休止できてしまっていた —
+ピン留めが守ろうとしている状態そのものに、別の入口からなら 1 クリックで
+入れてしまう抜けである。
+
+**直し方は `Tabs::suspend` にも同じガードを足すことだけで済んだ。**
+`tab.suspend()`を呼ぶ前に `tab.is_pinned()` を見て `false` を返す — アクティブ
+タブを弾いているのと同じ関数・同じ形。`suspend_tab` (`app.rs`) はツール
+バー・automation・`sweep_tabs` の 3 経路すべての共通実装なので、ここ 1 箇所
+の修正で 3 経路とも塞がる。ツールバー側も ⏾ ボタンの表示条件に
+`!tab.pinned` を足した — `Tabs::suspend` が拒否するだけでも壊れはしないが、
+押しても何も起きないボタンを見せたままにしないため。
+
+**復元されて「suspended かつ pinned」なタブとの整合性を確認した。**
+セッション復元は非アクティブなタブを `Tab::new_suspended` で直接
+`TabState::Suspended` として組み立てる (`Tabs::suspend`/`Tab::suspend` を
+一切通らない — `restore` の doc comment の説明どおり) ので、今回追加した
+ガードはこの経路に影響しない。ピン留めされたまま復元された suspended
+タブは、これまでどおり `activate` で resume でき、resume はピン留めを
+見ない (`is_pinned()` は変化しない) ことをテストで確認した — 「休止に
+"入れない"」ガードと「休止から"出す"」経路は別物である。
+
+**(2) `Tabs::restore` が「ピン留めタブは先頭に連続」という不変条件を
+検証も修復もしていなかった。** 決定3 はこの不変条件を `toggle_pinned` の
+1 か所だけで保てると書いたが、それは「`Tabs` の中で組み立てられたタブ列
+は常に不変条件を満たしている」という前提あってのことである。`restore`
+は `SessionSnapshot` という**ファイルから読んだ入力**からタブ列を組み立てる
+唯一の場所で、この文書がこれまで `session.rs`/`Tabs::restore` に一貫して
+向けてきた「ファイルの中身は信用しない」規律 (D65/D141/sanitize) が
+ここにも及ぶべきだった。手で編集した `session.json` (あるいは将来の
+書き出し側のバグ) が非連続な `pinned` 列を持ち込めば、`restore` は
+それをそのまま複製していた。
+
+**直し方は、構築後に安定ソート `sort_by_key(|t| !t.is_pinned())` を
+1 回かけるだけ。** 安定ソートなので、ピン留め同士・非ピン留め同士の
+相対順序は保ったまま、ピン留めタブだけが前に集まる。`active` はインデッ
+クスではなくタブの同一性 (id) で追う — `toggle_pinned` がタブの移動で
+`active` を見失わないようにしているのと全く同じやり方 (ソート前に
+active な id を控え、ソート後に `index_of` で引き直す)。
+
 ### テスト
 
 壊して落ちることを確認した:
@@ -17916,6 +17965,24 @@ UI 上の配慮であり、`Tabs::close` 自体はピン留めを見ない。キ
 JSON ラウンドトリップと旧スキーマ (`pinned` キーが無い) の両方のテストを
 足した。`toolbar.rs` には IPC のパーステストと、送信 JSON に
 `"pinned":true/false` が乗ることのテストを足した。
+
+PR #278 のレビュー対応で追加したもの:
+
+- `suspend_refuses_a_pinned_background_tab` — `Tabs::suspend` がピン留め
+  タブに `false` を返し状態を変えないこと、ピン留めを外せば休止できる
+  ことを確認 (`tabs.rs`)。
+- `restore_moves_a_non_contiguous_pinned_tab_to_the_front` — `[unpinned,
+  pinned, unpinned]` かつ非先頭 (末尾) がアクティブという非連続な
+  `SavedTab` 列を `restore` に渡すと、ピン留めタブが先頭に移動しつつ
+  アクティブなタブは (インデックスではなく) 同一性で正しく引き継がれる
+  ことを確認 (`tabs.rs`)。
+- `a_restored_non_active_pinned_tab_starts_suspended_and_still_resumes_normally`
+  — 復元直後の「suspended かつ pinned」なタブに対して `Tabs::suspend`
+  を呼んでも何も壊れないこと、`activate` (resume) はピン留めを外さない
+  ことを確認 (`tabs.rs`)。app.rs 側の `suspend_tab` はツールバー・
+  automation・`sweep_tabs` の共有実装で、`BrowserWindow` (webview) を
+  要求するため純粋な単体テストの対象外 — ガード自体は下の `Tabs::suspend`
+  1 か所にあるので、そこへのテストで 3 経路とも間接的にカバーされる。
 
 ### 見送ったもの・既知の制約
 

@@ -1515,8 +1515,11 @@
       /* Suspending only makes sense for a background tab that is still
          awake; the active tab must stay live and an already-suspended tab
          has nothing left to drop. Clicking the tab itself (above) resumes
-         it, so no separate "resume" button is needed. */
-      if (!tab.active && !tab.suspended) {
+         it, so no separate "resume" button is needed. A pinned tab is
+         also excluded (Issue #277, D144): `Tabs::suspend` refuses it
+         anyway, so showing the button would just be a click that visibly
+         does nothing. */
+      if (!tab.active && !tab.suspended && !tab.pinned) {
         const suspend = document.createElement("button");
         suspend.className = "tab-suspend";
         suspend.title = "Suspend Tab";

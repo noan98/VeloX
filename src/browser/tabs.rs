@@ -156,7 +156,7 @@ impl Tabs {
             0
         };
         let mut next_id = 0;
-        let tabs = saved
+        let mut tabs: Vec<Tab> = saved
             .iter()
             .enumerate()
             .map(|(index, entry)| {
@@ -176,9 +176,27 @@ impl Tabs {
                 tab
             })
             .collect();
+        // Re-establish the "pinned tabs are contiguous at the front"
+        // invariant (Issue #277, D144) rather than trusting `saved` to
+        // already be in that shape. In practice it always is — `saved`
+        // comes from `SavedWindow::from_tabs`, which just reads a live
+        // `Tabs` back out, and that `Tabs` already upholds the invariant —
+        // but `saved` is untrusted input in principle (a hand-edited
+        // `session.json`, same caution `sanitize` already applies to the
+        // rest of this file), so `restore` does not lean on that in
+        // practice holding. A stable sort keeps every tab's relative
+        // order within its own pinned/unpinned group, so this only ever
+        // moves pinned tabs earlier, never reorders two tabs that agree
+        // on pinned-ness.
+        let active_id = tabs[active_index].id();
+        tabs.sort_by_key(|tab| !tab.is_pinned());
+        let active = tabs
+            .iter()
+            .position(|tab| tab.id() == active_id)
+            .unwrap_or(active_index);
         Tabs {
             tabs,
-            active: active_index,
+            active,
             next_id,
             closed: ClosedTabs::default(),
         }
@@ -408,11 +426,21 @@ impl Tabs {
     /// dropped (see `ui::window::BrowserWindow::suspend_tab`). Refuses —
     /// returning `false`, leaving every tab unchanged — for the active tab
     /// (the visible tab always needs a live webview), an already-suspended
-    /// tab, or an unknown id. The first two are enforced by
+    /// tab, a pinned tab, or an unknown id. The first two are enforced by
     /// [`TabState::suspend`]'s transition rules, not by a separate check
     /// here.
+    ///
+    /// **Pinned is checked here too, not only in
+    /// `suspension::Candidate::eligible`** (Issue #277, D144). Those two
+    /// are separate entry points to the same effect: `eligible` guards the
+    /// *automatic* idle/count/memory sweep, while this guards *manual*
+    /// suspension (the tab strip's ⏾ button, `AutomationCommand::Suspend`).
+    /// A pinned tab must survive both, so both have to say so — protecting
+    /// only the automatic path would leave a pinned tab one click away
+    /// from exactly the state pinning it was supposed to prevent.
     pub fn suspend(&mut self, id: TabId) -> bool {
         match self.get_mut(id) {
+            Some(tab) if tab.is_pinned() => false,
             Some(tab) => tab.suspend().is_ok(),
             None => false,
         }
@@ -1423,6 +1451,30 @@ mod tests {
         assert!(!b_candidate.pinned);
     }
 
+    // -- レビュー指摘1 (PR #278): 手動休止もピン留めを見る -----------------
+
+    #[test]
+    fn suspend_refuses_a_pinned_background_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let b = tabs.open("https://b.example/"); // active
+                                                 // Background it so only "pinned" is the reason `suspend` could
+                                                 // refuse — `a` is neither active nor already suspended.
+        let a = tabs.iter().next().unwrap().id();
+        tabs.toggle_pinned(a);
+
+        assert!(!tabs.suspend(a), "a pinned tab must never be suspended");
+        assert!(!tabs.get(a).unwrap().is_suspended());
+
+        // Unpinning lifts the refusal — pinning is the only thing this
+        // test changed.
+        tabs.toggle_pinned(a);
+        assert!(tabs.suspend(a));
+        assert!(tabs.get(a).unwrap().is_suspended());
+
+        // Sanity: `b` (never pinned) never entered into this at all.
+        assert_eq!(tabs.active_id(), b);
+    }
+
     #[test]
     fn toggle_pinned_flips_the_flag_and_returns_the_new_state() {
         let mut tabs = Tabs::new("https://a.example/");
@@ -1539,5 +1591,82 @@ mod tests {
         let b = tabs.iter().nth(1).unwrap().id();
         assert!(tabs.get(a).unwrap().is_pinned());
         assert!(!tabs.get(b).unwrap().is_pinned());
+    }
+
+    // -- レビュー指摘2 (PR #278): restore が不変条件を修復する --------------
+
+    #[test]
+    fn restore_moves_a_non_contiguous_pinned_tab_to_the_front() {
+        // [unpinned A, pinned B, unpinned C] — not in the invariant's
+        // shape (a hand-edited `session.json`, or a future bug elsewhere
+        // that produced this). `restore` must not just copy it as-is.
+        let saved = vec![
+            saved_tab("https://a.example/"),
+            SavedTab {
+                url: "https://b.example/".to_owned(),
+                title: None,
+                favicon: None,
+                pinned: true,
+            },
+            saved_tab("https://c.example/"),
+        ];
+        let tabs = Tabs::restore(&saved, 2); // c.example was active
+
+        let urls: Vec<&str> = tabs.iter().map(Tab::current_url).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://b.example/",
+                "https://a.example/",
+                "https://c.example/"
+            ]
+        );
+        assert!(tabs.get(tabs.active_id()).unwrap().current_url() == "https://c.example/");
+        // The invariant holds: exactly one pinned tab, and it is first.
+        assert!(tabs.iter().next().unwrap().is_pinned());
+        assert!(tabs.iter().skip(1).all(|tab| !tab.is_pinned()));
+    }
+
+    // -- レビュー指摘1 (PR #278):
+    //    復元された「suspended かつ pinned」なタブの確認 ------------------
+
+    #[test]
+    fn a_restored_non_active_pinned_tab_starts_suspended_and_still_resumes_normally() {
+        // Session restore never goes through `Tab::suspend`/`Tabs::suspend`
+        // for a non-active tab — `Tab::new_suspended` builds it directly in
+        // `TabState::Suspended` (see `restore`'s doc comment) — so the new
+        // "`suspend` refuses a pinned tab" guard in this PR has nothing to
+        // do with how a restored pinned tab becomes suspended in the first
+        // place. This just confirms the combination is otherwise inert:
+        // resuming it (activating it) works exactly like any other
+        // suspended tab, pinned or not.
+        let saved = vec![
+            saved_tab("https://a.example/"),
+            SavedTab {
+                url: "https://b.example/".to_owned(),
+                title: None,
+                favicon: None,
+                pinned: true,
+            },
+        ];
+        let mut tabs = Tabs::restore(&saved, 0);
+        let b = tabs
+            .iter()
+            .find(|t| t.current_url() == "https://b.example/")
+            .unwrap()
+            .id();
+        assert!(tabs.get(b).unwrap().is_pinned());
+        assert!(tabs.get(b).unwrap().is_suspended());
+
+        // Calling `suspend` on it directly is also a no-op (it is already
+        // suspended, and pinned besides) — never a panic, never a state
+        // change.
+        assert!(!tabs.suspend(b));
+        assert!(tabs.get(b).unwrap().is_suspended());
+
+        let effect = tabs.activate(b);
+        assert_eq!(effect, Some(ActivationEffect::Resume));
+        assert!(!tabs.get(b).unwrap().is_suspended());
+        assert!(tabs.get(b).unwrap().is_pinned(), "resuming must not unpin");
     }
 }
