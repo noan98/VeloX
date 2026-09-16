@@ -2655,7 +2655,7 @@ pub mod scenario {
         /// simply changed to wait longer instead), and then adds one more
         /// `wait automation::MEMORY_BOUNCE_SETTLE_MS` before `quit` — long
         /// enough for the default-period memory checker to run at least
-        /// twice more and, if it is going to re-suspend anything, do so
+        /// four times more and, if it is going to re-suspend anything, do so
         /// inside the measured window.
         ///
         /// [`super::MetricKey::TabResuspendCount`]/

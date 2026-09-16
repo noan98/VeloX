@@ -59,7 +59,7 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 可 (`--url` 必須) |
 | `tabs_hold_1` / `_5` / `_10` / `_20` / `_50` | 同上だが**落ち着いた後の定常値**を測る (Issue #197 / D97)。タブを間隔を空けて開き、既定のメモリチェック周期でも休止判定が 2 回以上走る長さ (12 秒) 待ってから `mark` する。`tabs_N` は約 6 秒で終わるため回収前の途中の値しか採れない — **両者を並べて比較してはならない** | 可 (`--url` 必須) |
 | `tabs_hold_resume_1` / `_5` / `_10` / `_20` / `_50` | **メモリ予算が休止したタブへ戻るコスト** (Issue #176 Stage 1)。`mark` までは `tabs_hold_N` と完全に同一で、その後に最長未使用のタブから順に 4 回 `switch` して `tab_resume_ms` を採る。⚠️ 予算が 1 つも休止しなかったタブ数 (Windows 実測では 1 / 5 タブ、§31.3) では `tab_resume` イベントが発生せず、このメトリクスは出ない | 可 (`--url` 必須) |
-| `tabs_hold_bounce_1` / `_5` / `_10` / `_20` / `_50` | **戻したタブが再び休止される「揺り戻し」が起きるか** (Issue #279、D110 Revisit condition (3))。最後のラウンドの `wait` まで `tabs_hold_resume_N` と完全に同一のスクリプトで、そのあとに既定のメモリチェック周期 (5 秒) が 2 回以上走る長さ (12 秒) だけ追加で待ってから `quit` する。`tab_resuspend_count` / `tab_resuspend_revisited_count` / `tab_resuspend_delay_ms` を読む場所であり、これらは最後の `measure_start` (= 戻すラウンドの直前) より後だけを見る | 可 (`--url` 必須) |
+| `tabs_hold_bounce_1` / `_5` / `_10` / `_20` / `_50` | **戻したタブが再び休止される「揺り戻し」が起きるか** (Issue #279、D110 Revisit condition (3))。最後のラウンドの `wait` まで `tabs_hold_resume_N` と完全に同一のスクリプトで、そのあとに既定のメモリチェック周期 (5 秒) が 4 回以上走る長さ (22 秒) だけ追加で待ってから `quit` する。`tab_resuspend_count` / `tab_resuspend_revisited_count` / `tab_resuspend_delay_ms` を読む場所であり、これらは最後の `measure_start` (= 戻すラウンドの直前) より後だけを見る | 可 (`--url` 必須) |
 
 「自動実行」列の意味は `src/browser/benchmark.rs` の
 `scenario::Scenario::is_unattended` を参照。**Issue #112 より前は、VeloX に

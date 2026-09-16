@@ -136,7 +136,7 @@ on:
           - tabs_hold_resume_20
           - tabs_hold_resume_50
           # Issue #279 / D110 Revisit condition (3)。tabs_hold_resume_N と
-          # 最後のラウンドの wait まで完全に同一で、そのあとに 12 秒待つ
+          # 最後のラウンドの wait まで完全に同一で、そのあとに 22 秒待つ
           # ("揺り戻し" — 戻したタブが次のメモリ判定で再び休止されるか)。
           - tabs_hold_bounce_1
           - tabs_hold_bounce_5

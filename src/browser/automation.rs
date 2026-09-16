@@ -467,13 +467,21 @@ const _: () = assert!(
 /// (`memory_resume_rounds_lines`) の最後の `wait` の後に**追加で**待つ時間
 /// (Issue #279、D110 Revisit condition (3))。
 ///
-/// **`MEMORY_HOLD_SETTLE_MS` と同じ根拠、同じ値 (12 秒) である。** どちらも
-/// 「既定のメモリチェック周期 5 秒の 2 倍より長く取り、環境変数で周期を
-/// 縮めなくても既定設定のまま判定が 2 回以上走るようにする」という同じ
-/// 目的を持つ — 違うのはこの窓が測る対象で、`MEMORY_HOLD_SETTLE_MS` は
-/// 「開き終えてから落ち着くまで」を集計から**外す**ための待ちだが、この
-/// 定数は「戻したあとに揺り戻しが起きるかどうか」を集計に**含める**ための
-/// 待ちである。
+/// **`MEMORY_HOLD_SETTLE_MS` と根拠は同じ (既定周期 5 秒の倍数より長く
+/// 取る) だが、値も回数も異なる。** `MEMORY_HOLD_SETTLE_MS` (12 秒 = 2 周期)
+/// は「開き終えてから落ち着くまで」を集計から**外す**ための最低限の待ちで
+/// あるのに対し、この定数は「戻したあとに揺り戻しが起きるかどうか」を
+/// 集計に**含める**ための待ちであり、揺り戻しの終わりまでを窓に収める
+/// 必要がある。
+///
+/// **初回の実測 (perf-windows run 35123564647、`tabs_hold_bounce_50`、
+/// Windows、既定設定) で、2 周期 (12 秒) では足りないと分かった。**
+/// `tab_resuspend_delay_ms` (最後の復帰からの経過時間) が 1.7 秒 / 6.7 秒 /
+/// 11.7 秒の 3 つに集中しており (既定周期 5 秒のスイープが 3 回走り、各回
+/// 4 タブが再休止された)、**最後のスイープが 12 秒の窓の端 (11.8 秒) に
+/// 掛かっていた** — つまり 12 秒では揺り戻しの終わりを窓に収めきれない。
+/// そこで既定周期のスイープが**4 回以上**走る長さ (22 秒 = 5 秒 × 4 + 余裕
+/// 2 秒) に伸ばした。
 ///
 /// **なぜ `tabs_hold_resume_N` 自身にこの待ちを足さないのか。**
 /// `docs/performance-targets.md` §32/§33/§39/§40 はすでに
@@ -488,7 +496,7 @@ const _: () = assert!(
 /// (§32/§33/§39/§40) を静かに意味の違うものへ書き換えてしまう。そのため
 /// `tabs_hold_bounce_N` という**別の ID** を新設し、`tabs_hold_resume_N`
 /// はこれまでどおりの意味を保つ。
-const MEMORY_BOUNCE_SETTLE_MS: u64 = 12_000;
+const MEMORY_BOUNCE_SETTLE_MS: u64 = 22_000;
 /// How many RSS/PSS samples [`recommended_rss_interval_ms`] aims to land
 /// inside the fixed [`MEMORY_STABILIZE_MS`] settle window at the end of a
 /// generated `tabs_N` script — see that function's doc comment and
