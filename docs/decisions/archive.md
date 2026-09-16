@@ -17999,3 +17999,159 @@ D119 決定4/Revisit (2) のとおり `pinned` を最優先の入力として組
 こと。(2) タブの並べ替え UI (ドラッグ&ドロップ) を実装するときは、
 「ピン留めタブは先頭に連続する」不変条件をそちらの実装でも保つこと
 (`Tabs` モジュールの doc comment 参照)。
+
+## D145: 揺り戻しは trial の外で起きていた (Issue #279 / #176 Stage 3) — 窓を足すのは新しいシナリオで、集計は最後の `measure_start` を基準に導出する
+
+**対象**: Issue #279。D110 Revisit condition (3) が残していた「揺り戻し
+(戻したタブが次のメモリ判定で再び休止される) を測っていない」を塞ぐ。
+`#176` Stage 3 (優先度の梯子・hysteresis) の検討項目のうち、hysteresis の
+判断材料を作る一手でもある。
+
+### 背景
+
+`tabs_hold_resume_N` (D110) は「休止したタブへ戻るコスト」を測るが、
+戻した*あと*に何が起きるかは見ていない。スクリプトは最後のラウンドの
+`wait` の直後に `quit` するので、戻した webview がメモリを押し上げ、
+次の周期的なメモリ判定 (既定 5 秒周期) がそれを (あるいは別のタブを)
+再び休止させたとしても、その `tab_suspend` は VeloX のプロセスが
+終わった後には起こり得ず、trial の外側の出来事になる。D110 Revisit
+condition (3) はこれを開発環境での動作確認 (`VELOX_MEMORY_BUDGET_MB=300`、
+5 タブ、Linux) で実際に観測しており、「窓をもっと長く取るか、
+`tab_suspend` の時系列を見る別の仕組みが要る」と書いていた。
+
+perf ログ (JSON Lines) には `tab_suspend`/`tab_resume` が `tab_id` と
+`ts_ms` 付きで既に残っている (`metrics::PerfRecord::to_json`)。窓を
+足せば、既存の記録だけで測れる。
+
+### 決定1: 既存の `tabs_hold_resume_N` は変えず、新しい ID `tabs_hold_bounce_N` を作る
+
+`docs/performance-targets.md` §32/§33/§39/§40 はすでに
+`tabs_hold_resume_N` の `rss_total_bytes` を「復帰ラウンド直後の値」として
+読み、その値を基準に #176 の比較 (D96/D111 が求める「A/B は同一条件で」)
+を組み立てている。この待ちを `tabs_hold_resume_N` 自身に足すと、**同じ
+シナリオ ID・同じメトリクス名が指す局面が変わる** — 揺り戻しが起きれば
+値は「戻した直後」ではなく「戻してさらに何秒か経った後」になる。これは
+D96/D111 が禁じる「条件の違う数値を同じ顔で並べる」ことそのものであり、
+記録済みの値を静かに意味の違うものへ書き換えてしまう。
+
+そこで `Scenario::TabCountMemoryBounce` (`tabs_hold_bounce_N`) を新設した。
+スクリプトは `TabCountMemoryResume` と**最後のラウンドの `wait` まで
+完全に同一**で (`memory_hold_setup_lines`/`memory_resume_rounds_lines` の
+2 関数をそのまま共有する)、その後に `MEMORY_BOUNCE_SETTLE_MS` (12 秒 —
+`MEMORY_HOLD_SETTLE_MS` と同じ根拠: 既定 5 秒周期のメモリ判定が 2 回以上
+走る長さ) の `wait` を 1 行足してから `quit` する。`tabs_hold_resume_N`
+はこれまでどおりの意味を保つ。
+
+D110 決定3 と同じ形のテストで両者の一致を固定した
+(`tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait`) —
+「片方だけ変える」ことがまた構造的にできない形にした。
+
+### 決定2: 3 つの導出メトリクスは、最後の `measure_start` を自分で見つけて切る
+
+`MetricKey` に `TabResuspendCount`/`TabResuspendRevisitedCount`/
+`TabResuspendDelayMs` を足した。3 つとも**フィールドを直接読まず**、
+trial 全体を受け取って自分で最後の `measure_start` を探す
+(`after_last_marker`、既存の `measured_phase` は「マーカーが無ければ
+trial 全体を返す」フォールバックを持つため、「マーカーが無い (絶対的な
+欠損)」と「マーカーはあるが何も続かない (実測のゼロ)」を区別できず、
+今回の 3 つには両者の区別が要る)。
+
+| キー | 値 | 欠損/実測ゼロの境界 |
+| --- | --- | --- |
+| `tab_resuspend_count` | 最後の `measure_start` より後の `tab_suspend` の件数 | trial が空、または `measure_start` が無ければ欠損。それ以外は実測の `0.0` を含めて必ず 1 サンプル |
+| `tab_resuspend_revisited_count` | 上記のうち、同じ `tab_id` の `tab_resume` がそれより前 (かつ `measure_start` より後) にある件数 | 同上 |
+| `tab_resuspend_delay_ms` | 各 `tab_suspend` と、それより前の直近の `tab_resume` (`tab_id` は問わない) との `ts_ms` の差 | 該当ペアが 0 件なら欠損 (「0ms 差」と「該当なし」を混ぜない)。件数ベースの 2 つと違う規約 |
+
+前者 2 つの「実測ゼロ」規約は `suspended_tab_count` (D105 決定2) と同じ
+理由に立つ: `tab_suspend` は `app::sweep_tabs` の自動休止だけが書き、
+手動の `suspend` コマンドは書かない。したがって `mark` (= 最後の
+`measure_start`) より後の件数は、その窓の中で自動休止が実際に何回起きた
+かそのものであり、「起きなかった」も観測できた事実の一部である。副産物
+として、`tabs_hold_N`/`tabs_hold_resume_N` (どちらも `mark` の前に休止が
+落ち着く設計、D97/D110 決定3) で `tab_resuspend_count` が 0 になることは
+§27.5 の前提 (`mark` の時点で休止は既に落ち着いている) の検査にもなる —
+0 でなければ、その前提が崩れている合図である。
+
+`tab_resuspend_delay_ms` だけ規約が違うのは、この値の自然な多重度が
+「0 件以上」であって「1 trial 1 サンプル」ではないため — 該当が無いのに
+`0.0` を返すと「揺り戻しが 0ms で起きた」という嘘になる。
+
+既存の `event_name`/`field_name`/`extract`/`counts_whole_trial` は
+`SuspendedTabCount` 1 つの例外を素朴な `if` で持っていたが、4 つ目の例外
+系列を同じ形で増やすと読みにくくなるため、`MetricSource` (`Field` /
+`WholeTrialCount` / `AfterMarker`) を導入して整理した。**既存の挙動は
+1 ミリも変えていない** — `SuspendedTabCount` は今までどおり trial 全体を
+渡され、他の 22 キーは今までどおり `measured_phase` を渡される
+(`cargo test --lib` の既存テスト全部がそのまま通ることで確認)。
+
+### 決定3: hysteresis はまだ実装しない
+
+D46 (「推測で閾値を決めない、測ってから決める」) に従い、本 PR では
+揺り戻しを*測る*ところまでで止める。実際に hysteresis (連続する再休止を
+一定期間抑制する等) が要るかどうかは、この 3 メトリクスの実測値が
+Windows で入ってから判断する。
+
+### なぜこれを Stage 3 の次の一手にしたか
+
+Issue #176 Stage 3 で候補になり得るものは他に 2 つあったが、いずれも
+今は測れないか、測っても perf-windows に新しい数字が出ない。
+
+1. **D137 Revisit (1) の混合方式 (`Freeze`/`Discard` を段ごとに割り当てる)。**
+   D138 決定1 の勘定 (メモリ信号は解放量 0 の休止を命じない) を段ごとに
+   拡張しても、既定設定 (メモリ信号のみ) では `Recent` 段が `freeze`
+   される機会が無い — 効果は結局「最近使った K タブをメモリ回収の対象から
+   外す」という算術に還元される。`freeze` の価値は CPU と復帰速度
+   (D138 決定2) であって、それは D138 Revisit (3) が指す CPU 計測
+   (Issue #64 側) で測るべきものであり、perf-windows のメモリ計測では
+   新しい数字が出ない。
+2. **#272 の残り (フォーム入力の保護がメモリ効果を削る量)。** D143
+   「見送ったもの」(1) が未計測と記録しているが、自動操作
+   (`browser::automation`) にはフォームへ実際に入力するコマンドが無く、
+   ページ側で `input` イベントを合成するフィクスチャで測れるのは
+   「全タブが保護される = 予算 OFF と同じ」という構成上自明な最悪ケース
+   だけである。これは新しい情報を生まない。
+3. **揺り戻し (本決定)。** 既存の perf ログに必要な材料 (`tab_suspend`/
+   `tab_resume` の `tab_id`/`ts_ms`) が既に揃っており、窓を 1 つ足すだけで
+   D110 Revisit condition (3) — Stage 3 の未解決項目 — に直接答えられる。
+
+この 3 つ目だけが「今すぐ測れて、答えが直接 Stage 3 の判断に使える」もの
+だったため、これを選んだ。
+
+### 検証
+
+わざと壊して落ちることを確認した:
+
+| わざと壊した箇所 | 落ちるもの |
+| --- | --- |
+| `tabs_hold_bounce_N` の末尾の `wait {MEMORY_BOUNCE_SETTLE_MS}` を削除 | `tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait` (一致テスト側ではなく、末尾の `wait` の値そのものを検査する assert で落ちる) |
+| `after_last_marker` の境界を `index + 1..` から `index..` に変更 (マーカー自身を phase に含める) | 既存テストは 1 つも落ちない (`measure_start` 自身の内容を読むキーが無いため) — この盲点を塞ぐために `after_last_marker_excludes_the_marker_itself` を新設し、それが確実に落ちることを確認した |
+| `TabResuspendCount` の「実測ゼロ」を「件数 0 なら欠損」に変更 | `tab_resuspend_count_is_a_measured_zero_when_nothing_follows_the_marker` |
+
+2 番目は当初「既存のどれかが落ちるはず」という前提で試したが、実際には
+1 つも落ちなかった — `measure_start` イベント自身にはどのキーの
+フィルタも一致するフィールドが無く、境界を 1 つずらしても既存の抽出結果
+は変わらないためである。**これは想定外の発見であり、放置せず**
+`after_last_marker_excludes_the_marker_itself` を単体テストとして追加し、
+`after_last_marker` の戻り値の長さと内容を直接検査することで、この盲点を
+塞いだ (追加後にわざと境界を戻すと確実に落ちることを再確認済み)。
+
+`cargo fmt` / `cargo clippy --all-targets -- -D warnings` / `cargo test --lib`
+(1121 件) / `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`
+(271 件) / `python3 .github/scripts/test_decision_index.py` はすべて通った。
+
+### 見送ったもの・既知の制約
+
+(1) **Windows での実測は本 PR では未計測。** 数字が入ったら
+`docs/performance-targets.md` に新しい節を足す (別の作業として)。
+(2) hysteresis そのものの実装 (決定3)。
+(3) `docs/performance-targets.md` §32/§33/§39/§40 を遡って
+`tabs_hold_bounce_N` の値で書き換えることはしない — それらの節は
+`tabs_hold_resume_N` の意味(=戻した直後)で書かれており、そのままで正しい。
+
+**Revisit condition**: (1) Windows での実測が入ったら決定3
+(hysteresis を作らない) を見直す。`tab_resuspend_count`/
+`tab_resuspend_revisited_count`/`tab_resuspend_delay_ms` の値を
+`docs/performance-targets.md` に記録し、揺り戻しの頻度・速さが実際に
+問題になる大きさかどうかで判断する。(2) 末尾の 12 秒 (`MEMORY_BOUNCE_SETTLE_MS`)
+で揺り戻しの反応を取り切れていない兆候 (`tab_resuspend_delay_ms` が
+窓の端 (12 秒近く) に張り付く) が実測で出たら、この値を伸ばすこと。

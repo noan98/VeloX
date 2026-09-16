@@ -199,13 +199,93 @@ pub enum MetricKey {
     /// state (scroll position, form input, unsaved JS state) is not
     /// quantified by either metric — see D105's "まだ分からないこと".
     SuspendedTabCount,
+    /// How many `tab_suspend` events fired **after the last `measure_start`
+    /// marker** — the "揺り戻し" (bounce-back) D110 Revisit condition (3)
+    /// flagged and Issue #279 answers: a resumed tab that gets suspended
+    /// again by the next memory check.
+    ///
+    /// Unlike [`MetricKey::SuspendedTabCount`], which deliberately counts
+    /// the **whole trial** (D105) because `tabs_hold_N`'s own marker sits
+    /// *before* the suspensions it wants to count, this key wants the
+    /// opposite: only what happened *after* the marker, because that is
+    /// where [`scenario::Scenario::TabCountMemoryBounce`] (`tabs_hold_bounce_N`)
+    /// puts its "come back, then wait and see if it happens again" window.
+    /// See [`MetricKey::extract`]'s dedicated branch for the full
+    /// absent/measured-zero rule this key follows (same shape as D105
+    /// decision 2, for the same reason: `tab_suspend` is written only by
+    /// `app::sweep_tabs`'s automatic suspension sweep, so a trial that
+    /// measured at all and saw no `tab_suspend` after its marker is a real,
+    /// meaningful `0` — and on `tabs_hold_N`/`tabs_hold_resume_N` (whose
+    /// marker sits *before* any resuming) that `0` is the expected value,
+    /// which doubles as a check on §27.5's own premise that suspension has
+    /// already finished by the time those scenarios mark).
+    TabResuspendCount,
+    /// Like [`MetricKey::TabResuspendCount`], but counting only the
+    /// `tab_suspend` events whose `tab_id` was resumed (`tab_resume`)
+    /// earlier in the same post-marker window — i.e. a tab the user
+    /// actually got back, only to have the memory budget take it away
+    /// again. [`MetricKey::TabResuspendCount`] alone cannot tell that apart
+    /// from the memory budget simply suspending a *different* tab it had
+    /// not touched yet; this key is the one that answers "did the specific
+    /// tab I just switched back to get suspended again" (Issue #279).
+    ///
+    /// Same absent/measured-zero rule as [`MetricKey::TabResuspendCount`].
+    TabResuspendRevisitedCount,
+    /// For each `tab_suspend` after the marker, how many milliseconds
+    /// elapsed since the **most recent preceding** `tab_resume` (any
+    /// `tab_id`, after the marker) — how quickly a resumed state gets
+    /// reclaimed again once the budget notices. One sample per matching
+    /// `tab_suspend`; a `tab_suspend` with no preceding `tab_resume` in the
+    /// window contributes no sample. Because this key's natural
+    /// multiplicity is "0 or more", unlike the two count keys above, a
+    /// trial with no matching pairs is *absent*, not a measured `0` — see
+    /// [`MetricKey::extract`].
+    ///
+    /// This is quantized by the memory-pressure sampler's own check period
+    /// (`SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL`, 5 seconds by
+    /// default): a resumed tab can only be reconsidered the next time the
+    /// sweep runs, so real values cluster near multiples of that period
+    /// rather than forming a smooth distribution. Treat it as a diagnostic
+    /// to read by eye, not a gate input (see
+    /// [`MetricKey::min_significant_delta`]).
+    TabResuspendDelayMs,
+}
+
+/// What shape [`MetricKey::extract`] follows for a given key — factored out
+/// of [`MetricKey::counts_whole_trial`]/[`MetricKey::extract`] once Issue
+/// #279 brought the number of "does not just read a field" exceptions from
+/// one ([`MetricKey::SuspendedTabCount`], D105) to four. Before this, the
+/// exception lived as a bare `if self == MetricKey::SuspendedTabCount`
+/// check duplicated between the two methods; a second case would have meant
+/// duplicating it a second time. This does not change any existing
+/// behavior — [`MetricKey::SuspendedTabCount`] still gets exactly the
+/// treatment D105 gave it, byte for byte.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MetricSource {
+    /// The default shape: one sample per event named `event_name()`, read
+    /// out of its `field_name()`.
+    Field,
+    /// [`MetricKey::SuspendedTabCount`] only (D105): count every matching
+    /// event over the **whole trial** (not the measured phase), folded into
+    /// exactly one sample per trial.
+    WholeTrialCount,
+    /// The three Issue #279 keys (`TabResuspendCount`/
+    /// `TabResuspendRevisitedCount`/`TabResuspendDelayMs`): derived from the
+    /// events strictly after the trial's last `measure_start` marker, found
+    /// by the key itself via [`after_last_marker`] rather than by
+    /// [`aggregate_trials`]'s usual [`measured_phase`] cut — see
+    /// [`MetricKey::extract`]'s `AfterMarker` branch for why each of these
+    /// three needs to tell "no marker at all" apart from "marker, then
+    /// nothing/no match", which [`measured_phase`]'s fallback-to-whole-trial
+    /// behavior cannot distinguish.
+    AfterMarker,
 }
 
 impl MetricKey {
     /// Every metric key, in a stable order — used to build a
     /// [`BenchmarkResult::metrics`] map deterministically and to drive
     /// [`aggregate_trials`].
-    pub const ALL: [MetricKey; 23] = [
+    pub const ALL: [MetricKey; 26] = [
         MetricKey::StartupEventLoopMs,
         MetricKey::StartupPreWindowSetupMs,
         MetricKey::StartupNativeWindowMs,
@@ -229,6 +309,9 @@ impl MetricKey {
         MetricKey::PssProcessCount,
         MetricKey::CpuPercent,
         MetricKey::SuspendedTabCount,
+        MetricKey::TabResuspendCount,
+        MetricKey::TabResuspendRevisitedCount,
+        MetricKey::TabResuspendDelayMs,
     ];
 
     /// The key's name as stored in [`BenchmarkResult::metrics`] and printed
@@ -258,6 +341,9 @@ impl MetricKey {
             MetricKey::PssProcessCount => "pss_process_count",
             MetricKey::CpuPercent => "cpu_percent",
             MetricKey::SuspendedTabCount => "suspended_tab_count",
+            MetricKey::TabResuspendCount => "tab_resuspend_count",
+            MetricKey::TabResuspendRevisitedCount => "tab_resuspend_revisited_count",
+            MetricKey::TabResuspendDelayMs => "tab_resuspend_delay_ms",
         }
     }
 
@@ -327,10 +413,33 @@ impl MetricKey {
             // significant, same reasoning as the process-count keys just
             // above.
             MetricKey::SuspendedTabCount => 1.0,
+            // Same reasoning as `SuspendedTabCount` just above: an exact
+            // integer count of discrete events, not a sampled continuous
+            // quantity, so a change of less than one whole tab can only
+            // come from a hand-edited/foreign result file.
+            MetricKey::TabResuspendCount | MetricKey::TabResuspendRevisitedCount => 1.0,
+            // Nominally a duration metric, so the same 20ms floor every
+            // other `_ms` key uses — but **this value is quantized by the
+            // memory checker's own period (5s by default), not smoothly
+            // distributed measurement noise**, so it should not actually
+            // be read as a gate input the way the other `_ms` keys are (see
+            // `MetricKey::TabResuspendDelayMs`'s doc comment). The floor is
+            // kept here anyway for consistency, not because 20ms is a
+            // meaningful noise estimate for this key.
+            MetricKey::TabResuspendDelayMs => 20.0, // milliseconds
         }
     }
 
     /// The `PerfRecord` `"event"` value this metric is read from.
+    ///
+    /// Never reached for the three Issue #279 derived keys
+    /// (`TabResuspendCount`/`TabResuspendRevisitedCount`/
+    /// `TabResuspendDelayMs`): each reads *two* event kinds
+    /// (`tab_suspend`/`tab_resume`), which does not fit this "one key, one
+    /// event name" shape at all, so [`MetricKey::extract`]'s `AfterMarker`
+    /// branch never calls this for them. Kept as a real (panicking) arm for
+    /// the same reason `field_name` keeps one for `SuspendedTabCount`: it
+    /// stays exhaustive and self-documenting if a future variant is added.
     fn event_name(self) -> &'static str {
         match self {
             MetricKey::StartupEventLoopMs
@@ -356,6 +465,13 @@ impl MetricKey {
             | MetricKey::PssProcessCount => "rss",
             MetricKey::CpuPercent => "cpu",
             MetricKey::SuspendedTabCount => "tab_suspend",
+            MetricKey::TabResuspendCount
+            | MetricKey::TabResuspendRevisitedCount
+            | MetricKey::TabResuspendDelayMs => unreachable!(
+                "the Issue #279 derived keys are handled by MetricKey::extract's \
+                 AfterMarker branch, which reads tab_suspend/tab_resume directly \
+                 rather than through a single event_name()"
+            ),
         }
     }
 
@@ -399,6 +515,49 @@ impl MetricKey {
                 "SuspendedTabCount is counted by MetricKey::extract's own \
                  branch, not read from a field — see MetricKey::extract"
             ),
+            // Same reason as `SuspendedTabCount` just above, and for the
+            // same reason `event_name` panics for these three too: there is
+            // no single field (or even single event kind) to read.
+            MetricKey::TabResuspendCount
+            | MetricKey::TabResuspendRevisitedCount
+            | MetricKey::TabResuspendDelayMs => unreachable!(
+                "the Issue #279 derived keys are handled by MetricKey::extract's \
+                 AfterMarker branch — see MetricKey::extract"
+            ),
+        }
+    }
+
+    /// This key's [`MetricSource`] — see that type's doc comment for why it
+    /// exists. Exhaustive and wildcard-free like `event_name`/`field_name`,
+    /// so a future variant forces a decision here too.
+    fn source(self) -> MetricSource {
+        match self {
+            MetricKey::StartupEventLoopMs
+            | MetricKey::StartupPreWindowSetupMs
+            | MetricKey::StartupNativeWindowMs
+            | MetricKey::StartupToolbarWebviewMs
+            | MetricKey::StartupWindowCreatedMs
+            | MetricKey::StartupRustSetupDoneMs
+            | MetricKey::StartupToolbarScriptStartedMs
+            | MetricKey::StartupToolbarReadyMs
+            | MetricKey::StartupFirstLoadMs
+            | MetricKey::PageLoadMs
+            | MetricKey::PageLoadEngineMs
+            | MetricKey::PageLoadDispatchMs
+            | MetricKey::TabCreateMs
+            | MetricKey::TabSwitchMs
+            | MetricKey::TabResumeMs
+            | MetricKey::RssTotalBytes
+            | MetricKey::RssProcessCount
+            | MetricKey::RssBrowserBytes
+            | MetricKey::RssEngineBytes
+            | MetricKey::PssTotalBytes
+            | MetricKey::PssProcessCount
+            | MetricKey::CpuPercent => MetricSource::Field,
+            MetricKey::SuspendedTabCount => MetricSource::WholeTrialCount,
+            MetricKey::TabResuspendCount
+            | MetricKey::TabResuspendRevisitedCount
+            | MetricKey::TabResuspendDelayMs => MetricSource::AfterMarker,
         }
     }
 
@@ -455,34 +614,158 @@ impl MetricKey {
     ///   not report a fabricated "0 tabs suspended" alongside a result set
     ///   where every other key is correctly missing.
     pub fn extract(self, events: &[Value]) -> Vec<f64> {
-        if self == MetricKey::SuspendedTabCount {
-            if events.is_empty() {
-                return Vec::new();
+        match self.source() {
+            MetricSource::WholeTrialCount => {
+                if events.is_empty() {
+                    return Vec::new();
+                }
+                let suspended = events
+                    .iter()
+                    .filter(|event| {
+                        event.get("event").and_then(Value::as_str) == Some(self.event_name())
+                    })
+                    .count();
+                vec![suspended as f64]
             }
-            let suspended = events
+            MetricSource::AfterMarker => self.extract_after_marker(events),
+            MetricSource::Field => events
                 .iter()
                 .filter(|event| {
                     event.get("event").and_then(Value::as_str) == Some(self.event_name())
                 })
-                .count();
-            return vec![suspended as f64];
+                .filter_map(|event| event.get(self.field_name()).and_then(Value::as_f64))
+                .collect(),
         }
-        events
-            .iter()
-            .filter(|event| event.get("event").and_then(Value::as_str) == Some(self.event_name()))
-            .filter_map(|event| event.get(self.field_name()).and_then(Value::as_f64))
-            .collect()
+    }
+
+    /// [`MetricSource::AfterMarker`] half of [`MetricKey::extract`] — the
+    /// three Issue #279 keys (D110 Revisit condition (3)), each derived from
+    /// the events strictly after the trial's last `measure_start` marker
+    /// (found via [`after_last_marker`], **not** [`measured_phase`]: see the
+    /// difference below).
+    ///
+    /// All three share one absence rule, checked once here: `None` from
+    /// [`after_last_marker`] (no marker at all — including a wholly empty
+    /// trial) means metrics for this key were never taken, so this returns
+    /// no samples, same "absent, not fabricated" rule
+    /// [`MetricKey::PssTotalBytes`] follows. This is *not* the same case as
+    /// "there is a marker but nothing (matching) follows it" — that case
+    /// reaches each key's own match arm below with `phase` simply empty (or
+    /// containing no matching events), and for the two count keys that is a
+    /// real, measured `0`, exactly the D105-decision-2 rule
+    /// [`MetricKey::SuspendedTabCount`] already follows (and for the same
+    /// reason: `tab_suspend` is written only by the automatic suspension
+    /// sweep, never as a no-op zero-valued record, so "measured and saw
+    /// none" is meaningfully different from "never measured"). On
+    /// `tabs_hold_N`/`tabs_hold_resume_N`, whose marker sits *before* any
+    /// resuming happens at all, that `0` is exactly the expected value, and
+    /// doubles as a check on §27.5's premise that those scenarios' `mark`
+    /// only fires once suspension has already settled.
+    ///
+    /// [`MetricKey::TabResuspendDelayMs`] does not follow that "measured
+    /// zero" rule — see its own doc comment and the `TabResuspendDelayMs`
+    /// arm below for why an empty result stays absent for it specifically.
+    fn extract_after_marker(self, events: &[Value]) -> Vec<f64> {
+        let Some(phase) = after_last_marker(events) else {
+            return Vec::new();
+        };
+        match self {
+            MetricKey::TabResuspendCount => {
+                let count = phase
+                    .iter()
+                    .filter(|event| is_event(event, "tab_suspend"))
+                    .count();
+                vec![count as f64]
+            }
+            MetricKey::TabResuspendRevisitedCount => {
+                let count = phase
+                    .iter()
+                    .enumerate()
+                    .filter(|&(index, event)| {
+                        if !is_event(event, "tab_suspend") {
+                            return false;
+                        }
+                        let tab_id = event.get("tab_id");
+                        // "同じ tab_id の tab_resume が (measure_start より
+                        // 後、この tab_suspend より) 前にある" — `phase` は
+                        // 既に marker より後だけなので、位置で「前」を見れば
+                        // measure_start より後という条件は自動的に満たされる。
+                        phase[..index].iter().rev().any(|prior| {
+                            is_event(prior, "tab_resume") && prior.get("tab_id") == tab_id
+                        })
+                    })
+                    .count();
+                vec![count as f64]
+            }
+            MetricKey::TabResuspendDelayMs => {
+                // 各 tab_suspend について、直近の (tab_id を問わない)
+                // 先行 tab_resume との ts_ms の差。どちらの ts_ms も読めない
+                // 行は無視する ("読めない行は無視する" — Issue #279)。
+                // 該当が 1 件も無ければ空 (= 欠損。二つの件数キーと違い
+                // "実測の 0" にできる自然な多重度が無いため — 「0ms 差」と
+                // 「該当なし」は別の事実であり、混ぜると嘘になる)。
+                phase
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, event)| is_event(event, "tab_suspend"))
+                    .filter_map(|(index, event)| {
+                        let suspend_ts = event.get("ts_ms").and_then(Value::as_f64)?;
+                        let resume_ts = phase[..index].iter().rev().find_map(|prior| {
+                            if is_event(prior, "tab_resume") {
+                                prior.get("ts_ms").and_then(Value::as_f64)
+                            } else {
+                                None
+                            }
+                        })?;
+                        Some(suspend_ts - resume_ts)
+                    })
+                    .collect()
+            }
+            MetricKey::StartupEventLoopMs
+            | MetricKey::StartupPreWindowSetupMs
+            | MetricKey::StartupNativeWindowMs
+            | MetricKey::StartupToolbarWebviewMs
+            | MetricKey::StartupWindowCreatedMs
+            | MetricKey::StartupRustSetupDoneMs
+            | MetricKey::StartupToolbarScriptStartedMs
+            | MetricKey::StartupToolbarReadyMs
+            | MetricKey::StartupFirstLoadMs
+            | MetricKey::PageLoadMs
+            | MetricKey::PageLoadEngineMs
+            | MetricKey::PageLoadDispatchMs
+            | MetricKey::TabCreateMs
+            | MetricKey::TabSwitchMs
+            | MetricKey::TabResumeMs
+            | MetricKey::RssTotalBytes
+            | MetricKey::RssProcessCount
+            | MetricKey::RssBrowserBytes
+            | MetricKey::RssEngineBytes
+            | MetricKey::PssTotalBytes
+            | MetricKey::PssProcessCount
+            | MetricKey::CpuPercent
+            | MetricKey::SuspendedTabCount => unreachable!(
+                "extract_after_marker is only reached via extract()'s \
+                 MetricSource::AfterMarker branch, which self.source() \
+                 guarantees only for the three Issue #279 keys"
+            ),
+        }
     }
 
     /// Whether [`MetricKey::extract`] should be given **the whole trial**
     /// rather than only its "measured phase" (the slice after the last
     /// `measure_start` marker that [`measured_phase`] cuts to, and that
-    /// [`aggregate_trials`] passes to every other key). `true` only for
-    /// [`MetricKey::SuspendedTabCount`] (D105).
+    /// [`aggregate_trials`] passes to every other key). `true` for
+    /// [`MetricKey::SuspendedTabCount`] (D105) and for the three Issue #279
+    /// keys ([`MetricSource::AfterMarker`]) — the latter still get the
+    /// *whole* trial passed in here, because each one finds its own cut
+    /// point via [`after_last_marker`] (which, unlike [`measured_phase`],
+    /// can report "no marker at all" instead of silently falling back to
+    /// "the whole trial", a distinction those three keys need — see
+    /// [`MetricKey::extract_after_marker`]).
     ///
-    /// This is not an arbitrary exception: it is forced by how
-    /// `tabs_hold_N` (`Scenario::TabCountMemoryHold`, D97) — the scenario
-    /// this key exists to annotate — is deliberately shaped.
+    /// [`MetricKey::SuspendedTabCount`]'s exception is not arbitrary: it is
+    /// forced by how `tabs_hold_N` (`Scenario::TabCountMemoryHold`, D97) —
+    /// the scenario this key exists to annotate — is deliberately shaped.
     /// `tabs_hold_N` waits `automation::MEMORY_HOLD_SETTLE_MS` (12s, twice
     /// the 5s default memory-check period) **before** marking, precisely so
     /// the memory-pressure sampler's suspension sweep(s) land before the
@@ -501,9 +784,16 @@ impl MetricKey {
     /// plus the measured ones would blur two different tab counts together
     /// (the reason [`measured_phase`] exists at all, Issue #60). This key
     /// is cumulative rather than a settled-state snapshot, so it wants the
-    /// opposite: everything the trial did, not just its final window.
+    /// opposite: everything the trial did, not just its final window. The
+    /// three Issue #279 keys want the opposite for a different reason: they
+    /// exist specifically to look at what happens *after* the marker on
+    /// `tabs_hold_bounce_N`, so being handed only the already-cut measured
+    /// phase would leave them nothing to cut for themselves.
     fn counts_whole_trial(self) -> bool {
-        matches!(self, MetricKey::SuspendedTabCount)
+        matches!(
+            self.source(),
+            MetricSource::WholeTrialCount | MetricSource::AfterMarker
+        )
     }
 }
 
@@ -595,10 +885,12 @@ pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
     let mut out = BTreeMap::new();
     for key in MetricKey::ALL {
         let mut values = Vec::new();
-        // [`MetricKey::counts_whole_trial`] (D105): almost every key wants
-        // the post-warm-up `measured` slice, but a cumulative
-        // whole-trial-count key like `SuspendedTabCount` wants the
-        // unmodified trial instead — see that method's doc comment.
+        // [`MetricKey::counts_whole_trial`] (D105, Issue #279): almost every
+        // key wants the post-warm-up `measured` slice, but a cumulative
+        // whole-trial-count key like `SuspendedTabCount`, or one of the
+        // three Issue #279 keys that finds its own cut point via
+        // [`after_last_marker`], wants the unmodified trial instead — see
+        // that method's doc comment.
         for (trial, trial_measured) in trials.iter().zip(&measured) {
             let source: &[Value] = if key.counts_whole_trial() {
                 trial
@@ -629,14 +921,39 @@ pub fn aggregate_trials(trials: &[Vec<Value>]) -> BTreeMap<String, Stats> {
 /// The *last* marker wins, so a script may mark more than once (each one
 /// discarding what came before) without the aggregate silently keeping the
 /// earliest phase.
+///
+/// [`after_last_marker`] is the same cut with the "no marker" case kept as
+/// `None` instead of falling back to `trial` — the fallback here.
 fn measured_phase(trial: &[Value]) -> &[Value] {
-    match trial
+    after_last_marker(trial).unwrap_or(trial)
+}
+
+/// The part of one trial's events strictly after the **last**
+/// `measure_start` marker, or `None` when the trial has no marker at all
+/// (including a wholly empty trial).
+///
+/// This is [`measured_phase`] with the "no marker" case kept distinct
+/// rather than folded into "keep everything" — needed by the three Issue
+/// #279 keys (`MetricKey::TabResuspendCount` and friends,
+/// [`MetricKey::extract_after_marker`]), for which "no marker at all" means
+/// *absent* (metrics tied to `mark` never ran) while "marker with nothing
+/// — or no match — after it" is a real, measured `0`. [`measured_phase`]'s
+/// `None -> trial` fallback cannot tell those two cases apart, which is
+/// exactly right for every metric that wants it (every key before Issue
+/// #279) and exactly wrong for these three.
+fn after_last_marker(trial: &[Value]) -> Option<&[Value]> {
+    trial
         .iter()
-        .rposition(|event| event.get("event").and_then(Value::as_str) == Some("measure_start"))
-    {
-        Some(index) => &trial[index + 1..],
-        None => trial,
-    }
+        .rposition(|event| is_event(event, "measure_start"))
+        .map(|index| &trial[index + 1..])
+}
+
+/// Whether `event`'s `"event"` field is exactly `name`. A small helper for
+/// the multi-event-kind logic in [`MetricKey::extract_after_marker`], which
+/// (unlike [`MetricKey::extract`]'s other branches) checks more than one
+/// fixed event name in the same pass.
+fn is_event(event: &Value, name: &str) -> bool {
+    event.get("event").and_then(Value::as_str) == Some(name)
 }
 
 // ---------------------------------------------------------------------
@@ -2315,6 +2632,38 @@ pub mod scenario {
         /// the mechanism; this measures the situation the product actually
         /// puts users in.
         TabCountMemoryResume(u32),
+        /// Whether coming back to a memory-suspended tab gets undone by the
+        /// **next** memory check — the "揺り戻し" (bounce-back) D110
+        /// Revisit condition (3) flagged and left unmeasured (Issue #279).
+        ///
+        /// [`Scenario::TabCountMemoryResume`] answers "how long does it
+        /// take to get a suspended tab back"; it says nothing about what
+        /// happens *after* that, because its script `quit`s right after the
+        /// last round's settle wait. If the resumed tab's webview pushed
+        /// memory back over budget, the next periodic memory check
+        /// (`app::spawn_memory_pressure_sampler`, every
+        /// `SuspensionPolicy::DEFAULT_MEMORY_CHECK_INTERVAL` = 5s by
+        /// default) can suspend it — or a different tab — right back, and
+        /// `tabs_hold_resume_N`'s script never runs long enough to see it.
+        ///
+        /// This variant's script is **byte-for-byte identical to
+        /// `tabs_hold_resume_N`'s, up to and including the last round's
+        /// settle wait** (`automation::generate_bench_script`'s
+        /// `TabCountMemoryBounce` branch shares the round-building code
+        /// with `TabCountMemoryResume` for exactly this reason — see D110
+        /// in `docs/decisions.md` for why `tabs_hold_resume_N` itself is not
+        /// simply changed to wait longer instead), and then adds one more
+        /// `wait automation::MEMORY_BOUNCE_SETTLE_MS` before `quit` — long
+        /// enough for the default-period memory checker to run at least
+        /// twice more and, if it is going to re-suspend anything, do so
+        /// inside the measured window.
+        ///
+        /// [`super::MetricKey::TabResuspendCount`]/
+        /// [`super::MetricKey::TabResuspendRevisitedCount`]/
+        /// [`super::MetricKey::TabResuspendDelayMs`] are the metrics this
+        /// scenario exists to feed; `tab_count` is one of
+        /// [`Scenario::TAB_COUNTS`].
+        TabCountMemoryBounce(u32),
     }
 
     impl Scenario {
@@ -2351,6 +2700,11 @@ pub mod scenario {
                     .iter()
                     .map(|&n| Scenario::TabCountMemoryResume(n)),
             );
+            scenarios.extend(
+                Self::TAB_COUNTS
+                    .iter()
+                    .map(|&n| Scenario::TabCountMemoryBounce(n)),
+            );
             scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabCreateAt(n)));
             scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabSwitchAt(n)));
             scenarios
@@ -2373,6 +2727,7 @@ pub mod scenario {
                 Scenario::TabCountMemory(n) => format!("tabs_{n}"),
                 Scenario::TabCountMemoryHold(n) => format!("tabs_hold_{n}"),
                 Scenario::TabCountMemoryResume(n) => format!("tabs_hold_resume_{n}"),
+                Scenario::TabCountMemoryBounce(n) => format!("tabs_hold_bounce_{n}"),
             }
         }
 
@@ -2415,6 +2770,18 @@ pub mod scenario {
                 (
                     "tabs_hold_resume_",
                     Scenario::TabCountMemoryResume as fn(u32) -> Scenario,
+                ),
+                // `tabs_hold_bounce_` も同じ理由で `tabs_hold_` より
+                // **前**。`tabs_hold_resume_` とは接尾辞が違う
+                // (`resume_`/`bounce_`) ので互いを食い合うことはなく、
+                // どちらを先に置いても構わないが、両方とも `tabs_hold_`
+                // より前でなければ "tabs_hold_bounce_20" が `tabs_hold_`
+                // に食われて残り "bounce_20" のパースに失敗し `None` に
+                // なる (`tabs_hold_bounce_is_not_swallowed_by_tabs_hold`
+                // がこれを守っている)。
+                (
+                    "tabs_hold_bounce_",
+                    Scenario::TabCountMemoryBounce as fn(u32) -> Scenario,
                 ),
                 (
                     "tabs_hold_",
@@ -2464,7 +2831,8 @@ pub mod scenario {
                 | Scenario::TabSwitchAt(_)
                 | Scenario::TabCountMemory(_)
                 | Scenario::TabCountMemoryHold(_)
-                | Scenario::TabCountMemoryResume(_) => true,
+                | Scenario::TabCountMemoryResume(_)
+                | Scenario::TabCountMemoryBounce(_) => true,
             }
         }
     }
@@ -2518,6 +2886,28 @@ pub mod scenario {
         }
 
         #[test]
+        fn tabs_hold_bounce_is_not_swallowed_by_tabs_hold() {
+            // `tabs_hold_resume_is_not_swallowed_by_tabs_hold` と同型。
+            // `tabs_hold_` が `tabs_hold_bounce_` より前にあると
+            // "tabs_hold_bounce_20" が None になる (Issue #279)。
+            assert_eq!(
+                Scenario::parse("tabs_hold_bounce_20"),
+                Some(Scenario::TabCountMemoryBounce(20))
+            );
+            assert_eq!(
+                Scenario::parse("tabs_hold_20"),
+                Some(Scenario::TabCountMemoryHold(20))
+            );
+            assert_eq!(
+                Scenario::parse("tabs_hold_resume_20"),
+                Some(Scenario::TabCountMemoryResume(20)),
+                "tabs_hold_bounce_ を足しても tabs_hold_resume_ の解釈は変わらない"
+            );
+            assert_eq!(Scenario::parse("tabs_hold_bounce_7"), None);
+            assert_eq!(Scenario::parse("tabs_hold_bounce_"), None);
+        }
+
+        #[test]
         fn parse_rejects_unknown_tab_counts() {
             assert_eq!(Scenario::parse("tabs_7"), None);
             assert_eq!(Scenario::parse("tabs_"), None);
@@ -2544,12 +2934,13 @@ pub mod scenario {
         }
 
         #[test]
-        fn all_covers_eight_fixed_plus_five_parameterized_families() {
-            // 固定 8 + タブ数でパラメータ化された 5 系統 (`tabs_N` /
-            // `tabs_hold_N` / `tabs_hold_resume_N` / `tab_create_N` /
-            // `tab_switch_N`)。`tabs_hold_N` は Issue #197、
-            // `tabs_hold_resume_N` は Issue #176 で追加。
-            assert_eq!(Scenario::all().len(), 8 + 5 * Scenario::TAB_COUNTS.len());
+        fn all_covers_eight_fixed_plus_six_parameterized_families() {
+            // 固定 8 + タブ数でパラメータ化された 6 系統 (`tabs_N` /
+            // `tabs_hold_N` / `tabs_hold_resume_N` / `tabs_hold_bounce_N` /
+            // `tab_create_N` / `tab_switch_N`)。`tabs_hold_N` は Issue #197、
+            // `tabs_hold_resume_N` は Issue #176、`tabs_hold_bounce_N` は
+            // Issue #279 で追加。
+            assert_eq!(Scenario::all().len(), 8 + 6 * Scenario::TAB_COUNTS.len());
         }
 
         #[test]
@@ -2606,6 +2997,24 @@ mod tests {
     // -- MetricKey::extract -------------------------------------------------
 
     // -- measured_phase / warm-up cut (Issue #60) --------------------------
+
+    #[test]
+    fn after_last_marker_excludes_the_marker_itself() {
+        // Issue #279: the derived keys' correctness depends on `phase`
+        // starting strictly *after* the marker, not *at* it — pinned
+        // directly rather than only through `MetricKey::extract`, since no
+        // existing field-based key reads anything off `measure_start`
+        // itself and so cannot tell the two boundaries apart (see D145's
+        // "検証" section in docs/decisions.md).
+        let trial = vec![
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":1.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":2.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":2,"reason":"memory","ts_ms":3.0}"#),
+        ];
+        let phase = after_last_marker(&trial).unwrap();
+        assert_eq!(phase.len(), 1, "the marker itself must not be in the phase");
+        assert_eq!(phase[0].get("tab_id").and_then(Value::as_i64), Some(2));
+    }
 
     #[test]
     fn aggregate_ignores_events_before_the_last_measure_start() {
@@ -2930,6 +3339,158 @@ mod tests {
         );
     }
 
+    // -- MetricKey::TabResuspendCount / TabResuspendRevisitedCount /
+    //    TabResuspendDelayMs (Issue #279, D110 Revisit condition (3)) -------
+
+    #[test]
+    fn tab_resuspend_count_ignores_suspensions_before_the_marker() {
+        let events = vec![
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":10.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":2,"reason":"memory","ts_ms":110.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":3,"reason":"memory","ts_ms":120.0}"#),
+        ];
+        assert_eq!(MetricKey::TabResuspendCount.extract(&events), vec![2.0]);
+    }
+
+    #[test]
+    fn tab_resuspend_count_is_a_measured_zero_when_nothing_follows_the_marker() {
+        let events = vec![
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":10.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+        ];
+        assert_eq!(MetricKey::TabResuspendCount.extract(&events), vec![0.0]);
+        assert_eq!(
+            MetricKey::TabResuspendRevisitedCount.extract(&events),
+            vec![0.0]
+        );
+    }
+
+    #[test]
+    fn all_three_derived_keys_are_absent_without_a_marker_even_with_suspensions() {
+        let events = vec![event(
+            r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":10.0}"#,
+        )];
+        assert!(MetricKey::TabResuspendCount.extract(&events).is_empty());
+        assert!(MetricKey::TabResuspendRevisitedCount
+            .extract(&events)
+            .is_empty());
+        assert!(MetricKey::TabResuspendDelayMs.extract(&events).is_empty());
+    }
+
+    #[test]
+    fn all_three_derived_keys_are_absent_for_a_wholly_empty_trial() {
+        assert!(MetricKey::TabResuspendCount.extract(&[]).is_empty());
+        assert!(MetricKey::TabResuspendRevisitedCount
+            .extract(&[])
+            .is_empty());
+        assert!(MetricKey::TabResuspendDelayMs.extract(&[]).is_empty());
+    }
+
+    #[test]
+    fn tab_resuspend_revisited_count_requires_the_same_tab_id_to_have_resumed_first() {
+        let revisited = vec![
+            event(r#"{"event":"measure_start","ts_ms":0.0}"#),
+            event(r#"{"event":"tab_resume","tab_id":3,"duration_ms":5.0,"ts_ms":10.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":3,"reason":"memory","ts_ms":20.0}"#),
+        ];
+        assert_eq!(
+            MetricKey::TabResuspendRevisitedCount.extract(&revisited),
+            vec![1.0]
+        );
+
+        let different_tab = vec![
+            event(r#"{"event":"measure_start","ts_ms":0.0}"#),
+            event(r#"{"event":"tab_resume","tab_id":3,"duration_ms":5.0,"ts_ms":10.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":7,"reason":"memory","ts_ms":20.0}"#),
+        ];
+        assert_eq!(
+            MetricKey::TabResuspendRevisitedCount.extract(&different_tab),
+            vec![0.0]
+        );
+
+        let resume_before_marker = vec![
+            event(r#"{"event":"tab_resume","tab_id":3,"duration_ms":5.0,"ts_ms":10.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":15.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":3,"reason":"memory","ts_ms":20.0}"#),
+        ];
+        assert_eq!(
+            MetricKey::TabResuspendRevisitedCount.extract(&resume_before_marker),
+            vec![0.0],
+            "a tab_resume before the marker must not count as a revisit"
+        );
+    }
+
+    #[test]
+    fn tab_resuspend_delay_ms_reads_the_gap_since_the_nearest_preceding_resume() {
+        let events = vec![
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+            event(r#"{"event":"tab_resume","tab_id":3,"duration_ms":5.0,"ts_ms":150.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":3,"reason":"memory","ts_ms":4150.0}"#),
+        ];
+        assert_eq!(
+            MetricKey::TabResuspendDelayMs.extract(&events),
+            vec![4000.0]
+        );
+    }
+
+    #[test]
+    fn tab_resuspend_delay_ms_is_absent_when_no_suspend_has_a_preceding_resume() {
+        let events = vec![
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":3,"reason":"memory","ts_ms":4150.0}"#),
+        ];
+        assert!(MetricKey::TabResuspendDelayMs.extract(&events).is_empty());
+    }
+
+    #[test]
+    fn tab_resuspend_delay_ms_uses_the_most_recent_resume_not_the_first() {
+        let events = vec![
+            event(r#"{"event":"measure_start","ts_ms":0.0}"#),
+            event(r#"{"event":"tab_resume","tab_id":1,"duration_ms":5.0,"ts_ms":100.0}"#),
+            event(r#"{"event":"tab_resume","tab_id":2,"duration_ms":5.0,"ts_ms":200.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":2,"reason":"memory","ts_ms":300.0}"#),
+        ];
+        assert_eq!(MetricKey::TabResuspendDelayMs.extract(&events), vec![100.0]);
+    }
+
+    #[test]
+    fn tab_resuspend_keys_round_trip_through_from_metric_name() {
+        assert_eq!(
+            MetricKey::from_metric_name("tab_resuspend_count"),
+            Some(MetricKey::TabResuspendCount)
+        );
+        assert_eq!(
+            MetricKey::from_metric_name("tab_resuspend_revisited_count"),
+            Some(MetricKey::TabResuspendRevisitedCount)
+        );
+        assert_eq!(
+            MetricKey::from_metric_name("tab_resuspend_delay_ms"),
+            Some(MetricKey::TabResuspendDelayMs)
+        );
+    }
+
+    #[test]
+    fn aggregate_trials_pools_tab_resuspend_count_alongside_suspended_tab_count() {
+        // `suspended_tab_count` (D105) counts the whole trial;
+        // `tab_resuspend_count` (Issue #279) counts only what happened
+        // after `mark`. The same trial must produce both, with different
+        // values, proving the two keys are cut differently even though
+        // both bypass `measured_phase`.
+        let trial = vec![
+            event(r#"{"event":"tab_suspend","tab_id":1,"reason":"memory","ts_ms":10.0}"#),
+            event(r#"{"event":"measure_start","ts_ms":100.0}"#),
+            event(r#"{"event":"tab_suspend","tab_id":2,"reason":"memory","ts_ms":110.0}"#),
+        ];
+        let aggregated = aggregate_trials(&[trial]);
+        assert_eq!(aggregated.get("suspended_tab_count").unwrap().median, 2.0);
+        assert_eq!(
+            aggregated.get("tab_resuspend_count").unwrap().median,
+            1.0,
+            "only the post-mark suspension should count"
+        );
+    }
+
     // -- compute_stats / percentile ------------------------------------
 
     #[test]
@@ -3036,6 +3597,14 @@ mod tests {
         // fired at all), this trial's events are non-empty, so
         // `SuspendedTabCount` reports a real, measured `0` rather than
         // being omitted — see `MetricKey::extract`'s doc comment (D105).
+        //
+        // Still 4, not 7, after Issue #279: this trial has no
+        // `measure_start` marker at all, so the three derived keys
+        // (`tab_resuspend_count`/`tab_resuspend_revisited_count`/
+        // `tab_resuspend_delay_ms`) all take `extract_after_marker`'s
+        // `None` branch and stay absent — same "no marker at all" rule
+        // that keeps them out of `tabs_N`/every pre-Issue #279 scenario's
+        // results.
         assert_eq!(aggregated.len(), 4);
         assert_eq!(aggregated["suspended_tab_count"].median, 0.0);
     }

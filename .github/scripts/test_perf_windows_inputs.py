@@ -44,7 +44,7 @@ PAGES_DIR = ROOT / "scripts" / "bench" / "pages"
 # このテストを直し忘れれば `test_*_is_written_verbatim_in_the_workflow` が
 # 落ち、「正規表現を変えた」ことが必ず目に入る。逆にテストだけ直しても
 # 同じく落ちる。
-SORT_REGEX = r"^tabs_(?:hold_(?:resume_)?)?(\d+)$"
+SORT_REGEX = r"^tabs_(?:hold_(?:resume_|bounce_)?)?(\d+)$"
 SCALING_REGEX = r"^tabs_(?:hold_)?\d+$"
 
 # シナリオ専用のフィクスチャ (汎用の計測対象ページではない)。workflow 側の
@@ -223,6 +223,26 @@ class PerfWindowsInputsTest(unittest.TestCase):
             "`tabs_hold_resume_N` がスケーリング表の対象に入っている。"
             "定常値ではなく復帰後の値なので、`tabs_hold_N` と同じ表に"
             "並べてはならない (D97): " + ", ".join(included),
+        )
+
+    def test_scaling_regex_deliberately_excludes_the_bounce_family(self) -> None:
+        """`tabs_hold_bounce_N` をスケーリング表に入れてはならない。
+
+        `test_scaling_regex_deliberately_excludes_the_resume_family` と同型
+        (Issue #279)。`tabs_hold_bounce_N` の `rss_total_bytes` は
+        `tabs_hold_resume_N` よりさらに後 (揺り戻しの待ちの後) の窓で
+        測った値であり、`tabs_hold_N` の定常値とはやはり別物である。
+        """
+        scaling_re = re.compile(SCALING_REGEX)
+        bounce = [s for s in self.scenario_options if s.startswith("tabs_hold_bounce_")]
+        self.assertGreater(len(bounce), 0, "tabs_hold_bounce_N が 1 つも無い")
+        included = [s for s in bounce if scaling_re.match(s)]
+        self.assertEqual(
+            [],
+            included,
+            "`tabs_hold_bounce_N` がスケーリング表の対象に入っている。"
+            "定常値ではなく揺り戻しの待ちの後の値なので、`tabs_hold_N` と"
+            "同じ表に並べてはならない: " + ", ".join(included),
         )
 
     def test_scaling_regex_covers_the_steady_state_families(self) -> None:
