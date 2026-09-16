@@ -235,6 +235,13 @@ pub struct Tab {
     /// measures. D142 決定3 left the clearing policy to measurement
     /// (#272); this is the conservative end of it.
     has_form_input: bool,
+    /// Whether the user pinned this tab (Issue #277, D144). Unlike
+    /// `has_form_input` this is a property of the *tab*, not of the
+    /// document it currently shows — navigating away does not unpin it,
+    /// so nothing here clears it on `on_navigation_started`. Only
+    /// [`Self::set_pinned`] (driven by `super::tabs::Tabs::toggle_pinned`)
+    /// ever changes it.
+    pinned: bool,
 }
 
 impl Tab {
@@ -255,6 +262,7 @@ impl Tab {
             state: TabState::Active,
             last_active: Instant::now(),
             has_form_input: false,
+            pinned: false,
         }
     }
 
@@ -281,6 +289,7 @@ impl Tab {
             state: TabState::Suspended,
             last_active: Instant::now(),
             has_form_input: false,
+            pinned: false,
         }
     }
 
@@ -438,6 +447,19 @@ impl Tab {
     /// navigated. Read by [`super::tabs::Tabs::suspension_candidates`].
     pub fn has_form_input(&self) -> bool {
         self.has_form_input
+    }
+
+    /// Whether the user pinned this tab (Issue #277, D144).
+    pub fn is_pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Pin or unpin this tab. Only [`super::tabs::Tabs::toggle_pinned`]
+    /// calls this — it also keeps pinned tabs contiguous at the front of
+    /// display order, which is `Tabs`' job, not `Tab`'s (see that method's
+    /// doc comment).
+    pub(super) fn set_pinned(&mut self, pinned: bool) {
+        self.pinned = pinned;
     }
 
     /// The engine finished loading `url` (the final URL after redirects).
@@ -797,5 +819,32 @@ mod tests {
             !tab.has_form_input(),
             "the form went away with the document"
         );
+    }
+
+    // -- Issue #277 (D144): pinned flag ---------------------------------
+
+    #[test]
+    fn new_tabs_are_not_pinned() {
+        assert!(!Tab::new(TabId::from(0), "https://example.com/").is_pinned());
+        assert!(!Tab::new_suspended(TabId::from(0), "https://example.com/").is_pinned());
+    }
+
+    #[test]
+    fn pinned_is_a_tab_property_that_navigation_does_not_clear() {
+        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        tab.set_pinned(true);
+        assert!(tab.is_pinned());
+
+        // Unlike `has_form_input`, this describes the tab itself, not the
+        // document currently loaded in it — a fresh navigation must not
+        // clear it.
+        tab.on_navigation_started("https://other.example/");
+        assert!(tab.is_pinned(), "pinning survives navigation");
+
+        tab.on_load_finished("https://other.example/");
+        assert!(tab.is_pinned(), "pinning survives a finished load");
+
+        tab.set_pinned(false);
+        assert!(!tab.is_pinned());
     }
 }

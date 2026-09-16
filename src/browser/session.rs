@@ -30,6 +30,13 @@ pub struct SavedTab {
     pub title: Option<String>,
     #[serde(default)]
     pub favicon: Option<String>,
+    /// Whether the user had pinned this tab (Issue #277, D144).
+    /// `#[serde(default)]` so a `session.json` written before this field
+    /// existed keeps loading — it just restores every tab unpinned,
+    /// exactly the same backward-compat story D141 already tells for
+    /// `windows` itself.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// One window's persisted tabs, in display order, plus which one was active
@@ -104,6 +111,7 @@ impl SavedWindow {
                         Favicon::Url(url) => Some(url.clone()),
                         Favicon::Unknown => None,
                     },
+                    pinned: tab.is_pinned(),
                 }
             })
             .collect();
@@ -228,6 +236,7 @@ mod tests {
             url: url.to_owned(),
             title: None,
             favicon: None,
+            pinned: false,
         }
     }
 
@@ -537,6 +546,7 @@ mod tests {
                         url: "https://a.example/".to_owned(),
                         title: Some("A".to_owned()),
                         favicon: Some("https://a.example/favicon.ico".to_owned()),
+                        pinned: true,
                     },
                     saved("https://b.example/"),
                 ],
@@ -560,5 +570,47 @@ mod tests {
         assert_eq!(snapshot.windows[0].tabs[0].title, None);
         assert_eq!(snapshot.windows[0].tabs[0].favicon, None);
         assert_eq!(snapshot.windows[0].active_index, 0);
+    }
+
+    // -- Issue #277 (D144): `pinned` --------------------------------------
+
+    #[test]
+    fn a_session_file_written_before_pinned_existed_loads_every_tab_unpinned() {
+        // The exact old-schema shape `missing_optional_fields_deserialize_
+        // as_defaults` already covers above, focused on the new field:
+        // no `pinned` key at all, the same as any `session.json` written
+        // by a VeloX build before Issue #277.
+        let json = r#"{"windows":[{"tabs":[{"url":"https://a.example/"}]}]}"#;
+        let snapshot: SessionSnapshot = serde_json::from_str(json).unwrap();
+        assert!(!snapshot.windows[0].tabs[0].pinned);
+    }
+
+    #[test]
+    fn pinned_round_trips_through_json() {
+        let snapshot = snapshot(vec![window(
+            vec![
+                SavedTab {
+                    url: "https://a.example/".to_owned(),
+                    title: None,
+                    favicon: None,
+                    pinned: true,
+                },
+                saved("https://b.example/"),
+            ],
+            0,
+        )]);
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let back: SessionSnapshot = serde_json::from_str(&json).unwrap();
+        assert!(back.windows[0].tabs[0].pinned);
+        assert!(!back.windows[0].tabs[1].pinned);
+    }
+
+    #[test]
+    fn from_tabs_captures_the_pinned_flag() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        tabs.toggle_pinned(a);
+        let saved = SavedWindow::from_tabs(&tabs);
+        assert!(saved.tabs[0].pinned);
     }
 }

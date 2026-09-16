@@ -14,7 +14,8 @@ speed can be built on top of it rather than bolted on.
 - [x] Browser window (toolbar + content area), multiple windows (`Ctrl`/`Cmd`+`N`)
 - [x] URL navigation (typed input, `example.com` is auto-completed to `https://example.com`)
 - [x] Back / Forward / Reload
-- [x] Tabs (create, switch, close, suspend & resume)
+- [x] Tabs (create, switch, close, suspend & resume, pin/unpin — a pinned
+      tab is never auto-suspended)
 - [x] Omnibox with suggestions ranked from history and bookmarks
 - [x] History UI (search, delete)
 - [x] Bookmarks (bookmark bar, folders, inline editing)

@@ -560,6 +560,18 @@ pub struct Candidate {
     /// the protection is enabled, so the A/B arms of #272's measurement
     /// differ in the flag rather than in whether the script runs.
     pub has_form_input: bool,
+    /// Whether the user pinned this tab (Issue #277, D144, `Tab::is_pinned`).
+    /// Never suspended, and — unlike `has_form_input` — this is kept as its
+    /// own field rather than ever being considered for folding into
+    /// `has_form_input`'s "priority, not protection" treatment (D135
+    /// 決定1/決定2): those decisions distrust `has_form_input` because it is
+    /// the *page* self-reporting through untrusted content IPC, while
+    /// `pinned` only ever changes through the toolbar's own pin button —
+    /// VeloX's trusted UI, not the page. D119 決定4/Revisit (2) names
+    /// `pinned` as the one input that needs no such caution: it is the
+    /// user's explicit "keep this" signal, so it is treated as an absolute
+    /// protection, exactly like `protected`, rather than a mere tiebreaker.
+    pub pinned: bool,
     /// Which web process this tab's webview lives in (D54's process group
     /// id, `BrowserWindow::process_group_of`). `None` when the caller does
     /// not know (a platform without process groups, or a tab the window
@@ -571,7 +583,7 @@ pub struct Candidate {
 impl Candidate {
     /// Whether the policy may suspend this tab at all.
     fn eligible(&self) -> bool {
-        !self.active && !self.loading && !self.protected && !self.has_form_input
+        !self.active && !self.loading && !self.protected && !self.has_form_input && !self.pinned
     }
 }
 
@@ -778,6 +790,7 @@ mod tests {
             loading: false,
             protected: false,
             has_form_input: false,
+            pinned: false,
             process_group: Some(id),
         }
     }
@@ -1622,6 +1635,88 @@ mod tests {
         assert!(
             !flattened.contains(&TabId::from(1)),
             "the typed-in tab is never offered for reclaim, got {flattened:?}"
+        );
+        assert!(
+            !order.iter().any(|chunk| chunk.len() > 1),
+            "group 7 must not be offered as an emptyable whole: {order:?}"
+        );
+
+        let planned = plan(&policy, &candidates, None, SuspendMechanism::Discard);
+        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
+        assert!(!taken.contains(&TabId::from(1)), "got {taken:?}");
+    }
+
+    // -- Issue #277 (D144): a pinned tab is never suspended --------------
+
+    /// The same tab, pinned by the user.
+    fn pinned(id: u64, idle_secs: u64) -> Candidate {
+        Candidate {
+            pinned: true,
+            ..tab(id, idle_secs)
+        }
+    }
+
+    #[test]
+    fn a_pinned_tab_survives_every_signal() {
+        // Same shape as `a_tab_with_form_input_survives_every_signal`: all
+        // three signals would take this tab on their own.
+        let policy = SuspensionPolicy {
+            idle_after: Some(Duration::from_secs(60)),
+            max_live_tabs: Some(1),
+            memory_budget_bytes: Some(100 * MIB),
+            ..SuspensionPolicy::default()
+        };
+        let candidates = vec![
+            Candidate {
+                active: true,
+                ..tab(0, 0)
+            },
+            pinned(1, 600),
+            tab(2, 300),
+        ];
+        let sample = Some(MemorySample {
+            total_bytes: 4096 * MIB,
+        });
+
+        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Discard);
+        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
+
+        assert!(
+            !taken.contains(&TabId::from(1)),
+            "the pinned tab must survive all three signals, got {taken:?}"
+        );
+        assert!(
+            taken.contains(&TabId::from(2)),
+            "the other background tab is still fair game, got {taken:?}"
+        );
+    }
+
+    #[test]
+    fn pinning_pins_its_process_group_like_a_protected_tab() {
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(1),
+            ..SuspensionPolicy::default()
+        };
+        let candidates = vec![
+            Candidate {
+                active: true,
+                ..grouped(0, 0, 9)
+            },
+            Candidate {
+                pinned: true,
+                ..grouped(1, 600, 7)
+            },
+            grouped(2, 300, 7),
+        ];
+
+        let order = reclaim_order(&candidates);
+        let flattened: Vec<TabId> = order
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(|tab| tab.id))
+            .collect();
+        assert!(
+            !flattened.contains(&TabId::from(1)),
+            "the pinned tab is never offered for reclaim, got {flattened:?}"
         );
         assert!(
             !order.iter().any(|chunk| chunk.len() > 1),

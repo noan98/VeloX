@@ -449,11 +449,13 @@ mod tests {
                         url: "https://a.example/".to_owned(),
                         title: Some("A".to_owned()),
                         favicon: None,
+                        pinned: false,
                     },
                     SavedTab {
                         url: "https://b.example/".to_owned(),
                         title: None,
                         favicon: Some("https://b.example/favicon.ico".to_owned()),
+                        pinned: true,
                     },
                 ],
                 active_index: 1,
@@ -490,6 +492,7 @@ mod tests {
                     url: "https://a.example/".to_owned(),
                     title: Some("A very very very long title indeed".to_owned()),
                     favicon: None,
+                    pinned: false,
                 }],
                 active_index: 0,
             }],
@@ -546,6 +549,7 @@ mod tests {
                 url: format!("https://{i}.example/"),
                 title: Some(format!("Tab {i}")),
                 favicon: None,
+                pinned: false,
             })
             .collect();
         let snapshot = SessionSnapshot {
