@@ -2821,6 +2821,15 @@ fn handle_toolbar_command(
             // Otherwise: unknown id, the active tab (never suspended), or
             // already suspended — a no-op, mirroring `CloseTab`'s guards.
         }
+        ToolbarCommand::TogglePinTab { id } => {
+            if tabs_of(state, window_id)
+                .toggle_pinned(TabId::from(id))
+                .is_some()
+            {
+                sync_tab_strip(window, window_id, state);
+            }
+            // Otherwise: unknown id — a no-op, mirroring `SuspendTab`.
+        }
         // A pure startup-timing probe (Issue #59/D43) — `record_perf_event`
         // already consumed it above; nothing to do here.
         ToolbarCommand::ScriptStarted => {}
@@ -4027,6 +4036,7 @@ fn sync_tab_strip(window: &BrowserWindow, window_id: WindowId, state: &mut AppSt
             loading: tab.is_loading(),
             active: tab.id() == active_id,
             suspended: tab.is_suspended(),
+            pinned: tab.is_pinned(),
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));

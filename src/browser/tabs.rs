@@ -12,6 +12,14 @@
 //! type that mutates a `Tab`'s state (its transition methods are
 //! `pub(super)`), and every method below that changes which tab is active
 //! upholds this invariant by construction — see [`Self::resolve_activation`].
+//!
+//! **Invariant** (Issue #277, D144): pinned tabs are always contiguous at
+//! the front of display order, i.e. `self.tabs[..k]` are exactly the
+//! pinned tabs for `k` = how many there are. [`Self::toggle_pinned`] is
+//! the only method that has to actively maintain this — see its doc
+//! comment for why every other tab-ordering method (`open`/`open_at`/
+//! `reopen_closed`, which only ever append at the very end) already
+//! upholds it for free.
 
 use std::time::{Duration, Instant};
 
@@ -164,6 +172,7 @@ impl Tabs {
                 if let Some(favicon) = &entry.favicon {
                     tab.set_favicon_url(favicon.clone());
                 }
+                tab.set_pinned(entry.pinned);
                 tab
             })
             .collect();
@@ -409,6 +418,43 @@ impl Tabs {
         }
     }
 
+    /// Pin or unpin tab `id` (Issue #277, D144): the tab strip's pin
+    /// button. Returns the tab's new pinned state, or `None` for an
+    /// unknown id, leaving every tab unchanged.
+    ///
+    /// **Invariant: pinned tabs are always contiguous at the front of
+    /// display order** (index `0..k`, `k` = number of pinned tabs). This
+    /// is the one method that has to move a tab to keep that true —
+    /// [`Self::open`]/[`Self::open_at`]/[`Self::reopen_closed`] always
+    /// append a brand new (unpinned) tab at the very end, which can never
+    /// land before a pinned one, so they never need to.
+    ///
+    /// Pinning moves the tab to just after the currently-last pinned tab;
+    /// unpinning moves it to the first unpinned position. Both turn out to
+    /// be the same index once the tab being moved is removed from the
+    /// list first: with the invariant already holding *before* this call,
+    /// every pinned tab left in the list is still at the front, so "how
+    /// many of them are there" is exactly the boundary either direction
+    /// wants.
+    pub fn toggle_pinned(&mut self, id: TabId) -> Option<bool> {
+        let index = self.index_of(id)?;
+        let active_id = self.active_id();
+        let pinned = !self.tabs[index].is_pinned();
+        self.tabs[index].set_pinned(pinned);
+        let tab = self.tabs.remove(index);
+        let insert_at = self.tabs.iter().take_while(|t| t.is_pinned()).count();
+        self.tabs.insert(insert_at, tab);
+        // Moving a tab can shift every index, including the active one;
+        // `active` tracks the tab's *identity*, not a slot, so it has to
+        // be re-resolved rather than left as a now-possibly-wrong index.
+        // `active_id` was only ever moved above, never removed, so this
+        // always finds it — the fallback to the untouched index is just
+        // this type's usual "never panic on an inconsistent id" contract
+        // (see `resolve_activation`), not an expected path.
+        self.active = self.index_of(active_id).unwrap_or(self.active);
+        Some(pinned)
+    }
+
     /// Background (non-active) tabs that are not yet suspended and have
     /// been idle for at least `idle_after` as of `now`. The active tab is
     /// never a candidate: suspending the tab the user is looking at would
@@ -464,6 +510,7 @@ impl Tabs {
                 loading: tab.is_loading(),
                 protected: protect(tab.id()),
                 has_form_input: tab.has_form_input(),
+                pinned: tab.is_pinned(),
                 process_group: process_group(tab.id()),
             })
             .collect()
@@ -1243,6 +1290,7 @@ mod tests {
             url: url.to_owned(),
             title: None,
             favicon: None,
+            pinned: false,
         }
     }
 
@@ -1272,6 +1320,7 @@ mod tests {
             url: "https://a.example/".to_owned(),
             title: Some("A".to_owned()),
             favicon: Some("https://a.example/favicon.ico".to_owned()),
+            pinned: false,
         }];
         let tabs = Tabs::restore(&saved, 0);
         let tab = tabs.active();
@@ -1354,5 +1403,141 @@ mod tests {
         // The flag is its own field, not folded into `protected` — the
         // caller's `protect` closure said `false` for both.
         assert!(!a_candidate.protected);
+    }
+
+    // -- Issue #277 (D144): pinned tabs ---------------------------------
+
+    #[test]
+    fn suspension_candidates_report_the_pinned_flag() {
+        let t0 = Instant::now();
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open_at("https://b.example/", t0);
+        assert_eq!(tabs.toggle_pinned(a), Some(true));
+        let now = t0 + Duration::from_secs(30);
+
+        let candidates = tabs.suspension_candidates(now, |_| false, |_| None);
+        let a_candidate = candidates.iter().find(|c| c.id == a).expect("a is live");
+        let b_candidate = candidates.iter().find(|c| c.id == b).expect("b is live");
+        assert!(a_candidate.pinned);
+        assert!(!b_candidate.pinned);
+    }
+
+    #[test]
+    fn toggle_pinned_flips_the_flag_and_returns_the_new_state() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        assert!(!tabs.get(a).unwrap().is_pinned());
+
+        assert_eq!(tabs.toggle_pinned(a), Some(true));
+        assert!(tabs.get(a).unwrap().is_pinned());
+
+        assert_eq!(tabs.toggle_pinned(a), Some(false));
+        assert!(!tabs.get(a).unwrap().is_pinned());
+    }
+
+    #[test]
+    fn toggle_pinned_is_none_for_an_unknown_id() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let stale = tabs.open("https://b.example/");
+        tabs.close(stale);
+        assert_eq!(tabs.toggle_pinned(stale), None);
+    }
+
+    #[test]
+    fn pinning_moves_a_tab_to_just_after_the_last_pinned_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/");
+        // Display order: a, b, c.
+        tabs.toggle_pinned(b);
+        // b jumps to the front (no other pinned tab yet): b, a, c.
+        assert_eq!(ids(&tabs), vec![b, a, c]);
+
+        tabs.toggle_pinned(c);
+        // c is pinned too, so it lands right after b: b, c, a.
+        assert_eq!(ids(&tabs), vec![b, c, a]);
+    }
+
+    #[test]
+    fn unpinning_moves_a_tab_to_the_first_unpinned_position() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/");
+        tabs.toggle_pinned(a);
+        tabs.toggle_pinned(b);
+        tabs.toggle_pinned(c);
+        assert_eq!(ids(&tabs), vec![a, b, c]);
+
+        // Unpinning the first of three pinned tabs drops it right after
+        // the tabs that remain pinned, i.e. to the very end here.
+        tabs.toggle_pinned(a);
+        assert_eq!(ids(&tabs), vec![b, c, a]);
+    }
+
+    #[test]
+    fn toggle_pinned_never_disturbs_which_tab_is_active() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/"); // active
+        assert_eq!(tabs.active_id(), b);
+
+        // Pinning a *different* tab moves it around b without touching
+        // which one is active.
+        tabs.toggle_pinned(a);
+        assert_eq!(tabs.active_id(), b);
+
+        // Pinning the active tab itself must also survive the move.
+        tabs.toggle_pinned(b);
+        assert_eq!(tabs.active_id(), b);
+    }
+
+    #[test]
+    fn a_newly_opened_tab_never_lands_before_a_pinned_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        tabs.toggle_pinned(a);
+
+        let b = tabs.open("https://b.example/");
+        let c = tabs.open("https://c.example/");
+        // The invariant (pinned tabs contiguous at the front) holds
+        // without `open` having to know anything about pinning: it only
+        // ever appends at the very end.
+        assert_eq!(ids(&tabs), vec![a, b, c]);
+        assert!(tabs.get(a).unwrap().is_pinned());
+        assert!(!tabs.get(b).unwrap().is_pinned());
+        assert!(!tabs.get(c).unwrap().is_pinned());
+    }
+
+    #[test]
+    fn reopen_closed_never_lands_before_a_pinned_tab() {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        tabs.toggle_pinned(a);
+        tabs.close(b);
+
+        let reopened = tabs.reopen_closed(Instant::now()).unwrap();
+        assert_eq!(ids(&tabs), vec![a, reopened]);
+    }
+
+    #[test]
+    fn restore_applies_the_pinned_flag_from_the_saved_snapshot() {
+        let saved = vec![
+            SavedTab {
+                url: "https://a.example/".to_owned(),
+                title: None,
+                favicon: None,
+                pinned: true,
+            },
+            saved_tab("https://b.example/"),
+        ];
+        let tabs = Tabs::restore(&saved, 1);
+        let a = tabs.iter().next().unwrap().id();
+        let b = tabs.iter().nth(1).unwrap().id();
+        assert!(tabs.get(a).unwrap().is_pinned());
+        assert!(!tabs.get(b).unwrap().is_pinned());
     }
 }

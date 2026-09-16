@@ -137,6 +137,17 @@
      Dimmed so it reads as dormant, distinct from an ordinary background tab. */
   .tab.suspended { opacity: 0.55; }
   .tab.suspended .tab-label::before { content: "\1F4A4\a0"; } /* 💤 */
+  /* Pinned tabs (Issue #277, D144) render compact: favicon (or the
+     fallback below) and the pin button only, no label/close button — see
+     `veloxSetTabs`. */
+  .tab.pinned {
+    flex: 0 0 auto;
+    width: 44px;
+    max-width: 44px;
+    min-width: 44px;
+    justify-content: center;
+    padding: 0 4px;
+  }
   .tab-favicon {
     flex: none;
     width: 14px;
@@ -146,6 +157,19 @@
        entirely on a load error (e.g. no such favicon.ico), so a failed
        fetch never leaves a broken-image icon in the tab strip. */
   }
+  /* Stand-in for a pinned tab with no favicon yet — an ordinary
+     (unpinned) tab has no equivalent since its label carries the title
+     instead. */
+  .tab-favicon-fallback {
+    flex: none;
+    width: 14px;
+    height: 14px;
+    border-radius: 2px;
+    background: var(--field-bg);
+    font-size: 9px;
+    line-height: 14px;
+    text-align: center;
+  }
   .tab-label {
     flex: 1;
     min-width: 0;
@@ -154,7 +178,7 @@
     white-space: nowrap;
     font-size: 12px;
   }
-  .tab-close, .tab-suspend {
+  .tab-close, .tab-suspend, .tab-pin {
     flex: none;
     width: 18px;
     height: 18px;
@@ -167,8 +191,14 @@
     line-height: 1;
     cursor: pointer;
   }
-  .tab-close:hover, .tab-suspend:hover { background: rgba(128, 128, 128, 0.3); }
+  .tab-close:hover, .tab-suspend:hover, .tab-pin:hover {
+    background: rgba(128, 128, 128, 0.3);
+  }
   .tab-suspend { font-size: 11px; }
+  .tab-pin { font-size: 11px; }
+  /* A pinned tab's own pin button (which unpins it) stays visible instead
+     of only-on-hover, so "this is pinned" is legible at a glance. */
+  .tab.pinned .tab-pin { opacity: 0.85; }
   #new-tab {
     flex: none;
     width: 24px;
@@ -1443,7 +1473,8 @@
       el.className = "tab"
         + (tab.active ? " active" : "")
         + (tab.loading ? " loading" : "")
-        + (tab.suspended ? " suspended" : "");
+        + (tab.suspended ? " suspended" : "")
+        + (tab.pinned ? " pinned" : "");
       const displayName = tab.title || tab.url || "New Tab";
       el.title = displayName + (tab.suspended ? " (suspended)" : "");
       el.addEventListener("click", () => send({ cmd: "activate_tab", id: tab.id }));
@@ -1460,12 +1491,26 @@
         icon.alt = "";
         icon.addEventListener("error", () => icon.remove());
         el.appendChild(icon);
+      } else if (tab.pinned) {
+        // A pinned tab shows no label to fall back on (it renders
+        // compact — see the CSS above), so with no favicon yet it needs
+        // its own stand-in rather than showing nothing at all.
+        const fallback = document.createElement("span");
+        fallback.className = "tab-favicon-fallback";
+        fallback.textContent = (displayName.trim().charAt(0) || "?").toUpperCase();
+        el.appendChild(fallback);
       }
 
-      const label = document.createElement("span");
-      label.className = "tab-label";
-      label.textContent = displayName;
-      el.appendChild(label);
+      /* Pinned tabs (Issue #277, D144) render compact: no label, so a
+         pinned tab is identified by its favicon/fallback and the pin
+         button alone, plus the full `displayName` still in `el.title`
+         above (a native tooltip on hover). */
+      if (!tab.pinned) {
+        const label = document.createElement("span");
+        label.className = "tab-label";
+        label.textContent = displayName;
+        el.appendChild(label);
+      }
 
       /* Suspending only makes sense for a background tab that is still
          awake; the active tab must stay live and an already-suspended tab
@@ -1483,15 +1528,30 @@
         el.appendChild(suspend);
       }
 
-      const close = document.createElement("button");
-      close.className = "tab-close";
-      close.title = "Close Tab";
-      close.textContent = "×";
-      close.addEventListener("click", (e) => {
+      const pin = document.createElement("button");
+      pin.className = "tab-pin";
+      pin.title = tab.pinned ? "ピン留めを解除" : "ピン留め";
+      pin.textContent = "📌";
+      pin.addEventListener("click", (e) => {
         e.stopPropagation();
-        send({ cmd: "close_tab", id: tab.id });
+        send({ cmd: "toggle_pin_tab", id: tab.id });
       });
-      el.appendChild(close);
+      el.appendChild(pin);
+
+      /* A pinned tab has no close button — unpin it first (Issue #277).
+         Ctrl/Cmd+W still closes the active tab even if it is pinned; only
+         the strip's own close button is withheld here. */
+      if (!tab.pinned) {
+        const close = document.createElement("button");
+        close.className = "tab-close";
+        close.title = "Close Tab";
+        close.textContent = "×";
+        close.addEventListener("click", (e) => {
+          e.stopPropagation();
+          send({ cmd: "close_tab", id: tab.id });
+        });
+        el.appendChild(close);
+      }
 
       tabsContainer.appendChild(el);
     }

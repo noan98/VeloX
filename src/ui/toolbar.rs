@@ -80,6 +80,15 @@ pub enum ToolbarCommand {
     SuspendTab {
         id: u64,
     },
+    /// A tab's pin button was clicked: toggle whether it is pinned (Issue
+    /// #277, D144). A pinned tab is excluded from automatic suspension
+    /// (`browser::suspension::Candidate::pinned`) and kept at the front of
+    /// the tab strip (`browser::tabs::Tabs::toggle_pinned`). Unlike
+    /// `SuspendTab`, this never no-ops on id alone — any live or suspended
+    /// tab can be pinned or unpinned.
+    TogglePinTab {
+        id: u64,
+    },
     /// The toolbar document finished loading and wants the current state
     /// (the content page may have started loading before the toolbar was
     /// ready to display it).
@@ -356,6 +365,10 @@ pub struct TabSummary {
     /// to reclaim memory — see docs/decisions.md D9). The tab strip shows
     /// this distinctly so the user can tell a dormant tab from a live one.
     pub suspended: bool,
+    /// Whether the user pinned this tab (Issue #277, D144). The tab strip
+    /// renders a pinned tab compactly (favicon/fallback and the pin button
+    /// only, no close button) and never before an unpinned tab.
+    pub pinned: bool,
 }
 
 /// One folder's worth of bookmarks, as sent to the toolbar JS inside a
@@ -797,6 +810,10 @@ mod tests {
             parse_command(r#"{"cmd":"suspend_tab","id":7}"#).unwrap(),
             ToolbarCommand::SuspendTab { id: 7 }
         );
+        assert_eq!(
+            parse_command(r#"{"cmd":"toggle_pin_tab","id":9}"#).unwrap(),
+            ToolbarCommand::TogglePinTab { id: 9 }
+        );
     }
 
     #[test]
@@ -1113,6 +1130,7 @@ mod tests {
             loading: false,
             active: true,
             suspended: false,
+            pinned: false,
         }];
         let script = set_tabs_script(&tabs);
         assert!(script.contains("\\u2028"), "{script}");
@@ -1165,6 +1183,7 @@ mod tests {
                 loading: false,
                 active: true,
                 suspended: false,
+                pinned: false,
             },
             TabSummary {
                 id: 2,
@@ -1174,6 +1193,7 @@ mod tests {
                 loading: true,
                 active: false,
                 suspended: false,
+                pinned: false,
             },
             TabSummary {
                 id: 3,
@@ -1183,6 +1203,7 @@ mod tests {
                 loading: false,
                 active: false,
                 suspended: true,
+                pinned: false,
             },
         ];
         let script = set_tabs_script(&tabs);
@@ -1197,9 +1218,26 @@ mod tests {
         // No title/favicon yet serializes as JSON null, not an empty string.
         assert!(script.contains(r#""title":null"#));
         assert!(script.contains(r#""favicon":null"#));
+        assert!(script.contains(r#""pinned":false"#));
 
         let empty = set_tabs_script(&[]);
         assert_eq!(empty, "veloxSetTabs([]);");
+    }
+
+    #[test]
+    fn tabs_script_embeds_the_pinned_flag() {
+        let tabs = vec![TabSummary {
+            id: 1,
+            url: "https://a.example/".to_owned(),
+            title: None,
+            favicon: None,
+            loading: false,
+            active: false,
+            suspended: false,
+            pinned: true,
+        }];
+        let script = set_tabs_script(&tabs);
+        assert!(script.contains(r#""pinned":true"#));
     }
 
     #[test]

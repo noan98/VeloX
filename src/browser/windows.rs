@@ -454,11 +454,13 @@ mod tests {
                 url: "https://a.example/".to_owned(),
                 title: None,
                 favicon: None,
+                pinned: false,
             },
             SavedTab {
                 url: "https://b.example/".to_owned(),
                 title: None,
                 favicon: None,
+                pinned: false,
             },
         ];
         let restored = windows.open_restored_window(&saved, 1);
@@ -765,6 +767,7 @@ mod tests {
             url: "https://a.example/".to_owned(),
             title: None,
             favicon: None,
+            pinned: false,
         }];
         let restored = windows.open_restored_window(&saved, 0);
         assert_eq!(windows.is_private(restored), Some(false));
