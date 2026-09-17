@@ -135,6 +135,14 @@ on:
           - tabs_hold_resume_10
           - tabs_hold_resume_20
           - tabs_hold_resume_50
+          # Issue #279 / D110 Revisit condition (3)。tabs_hold_resume_N と
+          # 最後のラウンドの wait まで完全に同一で、そのあとに 22 秒待つ
+          # ("揺り戻し" — 戻したタブが次のメモリ判定で再び休止されるか)。
+          - tabs_hold_bounce_1
+          - tabs_hold_bounce_5
+          - tabs_hold_bounce_10
+          - tabs_hold_bounce_20
+          - tabs_hold_bounce_50
       scenarios:
         description: "複数シナリオを 1 回の run で続けて計測する (カンマ区切り、例: tabs_1,tabs_5,tabs_10,tabs_20)。指定するとシナリオ選択より優先される。D96 の「Windows は run ごとに分ける」に従い、タブ数スケーリングのような複数点の比較はこれで同一 run に収める"
         type: string
@@ -1014,14 +1022,15 @@ jobs:
           # 事故が run 34247895418 で実際に起きている。`tabs_hold_resume_`
           # (Issue #176) でも同じ漏れをやりかけた — `hold_` の直後に数字を
           # 要求する形だと `hold_resume_20` で外れ、`_1, _10, _20, _5, _50`
-          # という文字列順になる。ページ接尾辞 (`@minimal`) を足した
-          # Issue #231 でも同じ罠があるので、**分解してからシナリオ名だけを
-          # 正規表現にかける。**
+          # という文字列順になる。`tabs_hold_bounce_` (Issue #279) も同じ
+          # 形の罠を持つので同じ選択肢グループに入れてある。ページ接尾辞
+          # (`@minimal`) を足した Issue #231 でも同じ罠があるので、
+          # **分解してからシナリオ名だけを正規表現にかける。**
           $scenarioNames = @($scenarioNames | Sort-Object {
             Get-PageRank (Split-GroupName $_).page
           }, {
             $sc = (Split-GroupName $_).scenario
-            if ($sc -match '^tabs_(?:hold_(?:resume_)?)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
+            if ($sc -match '^tabs_(?:hold_(?:resume_|bounce_)?)?(\d+)$') { [int]$Matches[1] } else { [int]::MaxValue }
           }, { $_ })
 
           $compareKeys = @(
@@ -1069,7 +1078,27 @@ jobs:
             # いう意味である。逆に `tabs_hold_resume_N` で行が出ない
             # ときは**予算が 1 つも休止しなかった**ことを意味する
             # (生きているタブへの switch は `tab_switch` になる)。
-            "tab_resume_ms"
+            "tab_resume_ms",
+            # Issue #279 / D110 Revisit condition (3)。**「揺り戻し」— 戻した
+            # タブが次のメモリ判定で再び休止されるか**を見るための鍵。
+            # `tabs_hold_bounce_N` (Scenario::TabCountMemoryBounce) は
+            # `tabs_hold_resume_N` と同じ手順で戻したあと、既定の周期で
+            # 判定が 2 回以上走る長さだけ追加で待つ。
+            #
+            # ⚠️ **`tabs_hold_bounce_N` の `suspended_tab_count` は揺り戻し分
+            # を含む合計である。** 「落ち着くまでの休止数」を読みたいときは
+            # `suspended_tab_count - tab_resuspend_count` を計算すること —
+            # 後者が `mark` (= 戻すラウンドの直前) より後だけの休止件数
+            # なので、差が「戻す前に落ち着いていた休止数」になる。
+            "tab_resuspend_count",
+            # 上記のうち、戻したのと同じタブが再び休止された件数
+            # (`MetricKey::TabResuspendRevisitedCount`) — 「本当に往復した」
+            # ケースだけを数える。
+            "tab_resuspend_revisited_count",
+            # 揺り戻しが起きるまでの速さ。既定のメモリチェック周期 (5 秒)
+            # で量子化されるので、gate の対象としてではなく目安として読む
+            # こと (`MetricKey::TabResuspendDelayMs` の doc comment 参照)。
+            "tab_resuspend_delay_ms"
           )
 
           if ($scenarioNames.Count -gt 0) {
@@ -1138,7 +1167,7 @@ jobs:
               # 0 として引き算すると**休止しなかった条件の方が速いかの
               # ような表**になってしまう。
               if ($a.Count -eq 0 -and $b.Count -eq 0) { continue }
-              $digits = if ($key -eq "rss_total_bytes" -or $key -eq "rss_process_count" -or $key -eq "suspended_tab_count") { 0 } else { 2 }
+              $digits = if ($key -eq "rss_total_bytes" -or $key -eq "rss_process_count" -or $key -eq "suspended_tab_count" -or $key -eq "tab_resuspend_count" -or $key -eq "tab_resuspend_revisited_count") { 0 } else { 2 }
               $aList = if ($a.Count -gt 0) { ($a | ForEach-Object { [math]::Round($_, $digits) }) -join ", " } else { "-" }
               $bList = if ($b.Count -gt 0) { ($b | ForEach-Object { [math]::Round($_, $digits) }) -join ", " } else { "-" }
               $aAvgText = if ($a.Count -gt 0) { [math]::Round(($a | Measure-Object -Average).Average, $digits) } else { "-" }
@@ -1173,6 +1202,13 @@ jobs:
           # とは別物である (実測で 527.9 → 666.4 MiB)。同じスケーリング
           # 表に並べると、`tabs_N` と `tabs_hold_N` を混ぜてはならない
           # (D97) のと同じ誤読を招く。
+          #
+          # ⚠️ `tabs_hold_bounce_N` (Issue #279) も同じ理由で除外**され
+          # ている** — この正規表現を変更したわけではなく、`hold_` の直後に
+          # 数字を要求する形のままなので `tabs_hold_bounce_20` はそもそも
+          # マッチしない。`tabs_hold_bounce_N` の `rss_total_bytes` は
+          # `tabs_hold_resume_N` よりさらに後 (揺り戻しの待ちの後) の窓の
+          # 値で、定常値からより遠いので、この除外は意図の通りである。
           #
           # ⚠️ **ページをまたいだ行を 1 つの表に並べない** (Issue #231)。
           # 同一 run 内ならページ差は機種差を含まないので比較できるが、

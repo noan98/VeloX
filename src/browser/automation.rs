@@ -463,6 +463,40 @@ const _: () = assert!(
     MEMORY_RESUME_ROUNDS * 4 <= 48,
     "MEMORY_RESUME_ROUNDS が 50 タブでの休止数に対して多すぎる"
 );
+/// `tabs_hold_bounce_N` (`Scenario::TabCountMemoryBounce`) が、復帰ラウンド
+/// (`memory_resume_rounds_lines`) の最後の `wait` の後に**追加で**待つ時間
+/// (Issue #279、D110 Revisit condition (3))。
+///
+/// **`MEMORY_HOLD_SETTLE_MS` と根拠は同じ (既定周期 5 秒の倍数より長く
+/// 取る) だが、値も回数も異なる。** `MEMORY_HOLD_SETTLE_MS` (12 秒 = 2 周期)
+/// は「開き終えてから落ち着くまで」を集計から**外す**ための最低限の待ちで
+/// あるのに対し、この定数は「戻したあとに揺り戻しが起きるかどうか」を
+/// 集計に**含める**ための待ちであり、揺り戻しの終わりまでを窓に収める
+/// 必要がある。
+///
+/// **初回の実測 (perf-windows run 35123564647、`tabs_hold_bounce_50`、
+/// Windows、既定設定) で、2 周期 (12 秒) では足りないと分かった。**
+/// `tab_resuspend_delay_ms` (最後の復帰からの経過時間) が 1.7 秒 / 6.7 秒 /
+/// 11.7 秒の 3 つに集中しており (既定周期 5 秒のスイープが 3 回走り、各回
+/// 4 タブが再休止された)、**最後のスイープが 12 秒の窓の端 (11.8 秒) に
+/// 掛かっていた** — つまり 12 秒では揺り戻しの終わりを窓に収めきれない。
+/// そこで既定周期のスイープが**4 回以上**走る長さ (22 秒 = 5 秒 × 4 + 余裕
+/// 2 秒) に伸ばした。
+///
+/// **なぜ `tabs_hold_resume_N` 自身にこの待ちを足さないのか。**
+/// `docs/performance-targets.md` §32/§33/§39/§40 はすでに
+/// `tabs_hold_resume_N` の `rss_total_bytes` を「復帰ラウンド直後の値」
+/// として読んでおり、その値を基準に #176 の各種比較 (D96/D111 が求める
+/// 「A/B は同一条件で」) を組み立てている。この待ちを `tabs_hold_resume_N`
+/// 自身に足すと、**同じシナリオ ID `tabs_hold_resume_N` の
+/// `rss_total_bytes` が指す局面が変わる** — 揺り戻しが起きれば値は
+/// 「戻した直後」ではなく「戻してさらに何秒か経った後」になる。これは
+/// D96/D111 が禁じている「条件の違う数値を同じ顔 (同じシナリオ ID・同じ
+/// メトリクス名) で並べる」ことそのものであり、既存の記録済みの値
+/// (§32/§33/§39/§40) を静かに意味の違うものへ書き換えてしまう。そのため
+/// `tabs_hold_bounce_N` という**別の ID** を新設し、`tabs_hold_resume_N`
+/// はこれまでどおりの意味を保つ。
+const MEMORY_BOUNCE_SETTLE_MS: u64 = 22_000;
 /// How many RSS/PSS samples [`recommended_rss_interval_ms`] aims to land
 /// inside the fixed [`MEMORY_STABILIZE_MS`] settle window at the end of a
 /// generated `tabs_N` script — see that function's doc comment and
@@ -493,6 +527,25 @@ fn memory_hold_setup_lines(tab_count: u32, url: &str) -> Vec<String> {
         .collect();
     lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
     lines.push("mark".to_owned());
+    lines
+}
+
+/// `tabs_hold_resume_N` と `tabs_hold_bounce_N` に共通の「`mark` の後、
+/// 最長未使用のタブから順に戻す」ラウンド部分 (Issue #279)。
+///
+/// `memory_hold_setup_lines` が `mark` **までの**組み立てを共有させている
+/// のと同じやり方で、こちらは `mark` **の後**の組み立てを共有させる —
+/// `tabs_hold_bounce_N` の値が `tabs_hold_resume_N` と地続きに読めるのは、
+/// 「最後のラウンドの `wait` まで完全に同一」であることが構造的に保証
+/// されているからである (`generate_bench_script` の両分岐、および
+/// `tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait` が
+/// これを検査する)。
+fn memory_resume_rounds_lines() -> Vec<String> {
+    let mut lines = Vec::new();
+    for index in 0..MEMORY_RESUME_ROUNDS {
+        lines.push(format!("switch {index}"));
+        lines.push(format!("wait {RESUME_SETTLE_MS}"));
+    }
     lines
 }
 
@@ -633,11 +686,27 @@ pub fn generate_bench_script(
             // 可能性が高い**から。休止は最長未使用から順に行われる
             // (`browser::suspension::reclaim_order`) ので、この順に戻すと
             // 「本当に休止されていたタブ」を測れる確率が最も高い。
+            //
+            // ラウンド部分自体は `memory_resume_rounds_lines` に切り出して
+            // あり、`TabCountMemoryBounce` (`tabs_hold_bounce_N`、Issue
+            // #279) と共有する — 後者が「最後のラウンドの `wait` まで
+            // 完全に同一」であることの構造的な保証はここから来る。
             let mut lines = memory_hold_setup_lines(tab_count, url);
-            for index in 0..MEMORY_RESUME_ROUNDS {
-                lines.push(format!("switch {index}"));
-                lines.push(format!("wait {RESUME_SETTLE_MS}"));
-            }
+            lines.extend(memory_resume_rounds_lines());
+            lines
+        }
+        Scenario::TabCountMemoryBounce(tab_count) => {
+            // `mark` までの準備、および `mark` 後のラウンドは
+            // `TabCountMemoryResume` と**同じ関数呼び出し**で組み立てる。
+            // 違うのはその後に `MEMORY_BOUNCE_SETTLE_MS` の待ちを 1 行
+            // 足すことだけ (Issue #279、D110 決定3)。ここでラウンドの
+            // *後*に何かを足すのが、`memory_hold_setup_lines` が `mark`
+            // の*前*で守っている不変条件と対になる — 「最後のラウンドの
+            // `wait` までは `tabs_hold_resume_N` と完全に同一」という
+            // 前提を、関数呼び出しの並びそのもので保証する。
+            let mut lines = memory_hold_setup_lines(tab_count, url);
+            lines.extend(memory_resume_rounds_lines());
+            lines.push(format!("wait {MEMORY_BOUNCE_SETTLE_MS}"));
             lines
         }
     };
@@ -727,6 +796,14 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             let rounds_ms = MEMORY_RESUME_ROUNDS as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
             open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms
         }
+        Scenario::TabCountMemoryBounce(tab_count) => {
+            // `TabCountMemoryResume` と同じ計算に、末尾の
+            // `MEMORY_BOUNCE_SETTLE_MS` を足すだけ (Issue #279)。
+            let open_ms =
+                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            let rounds_ms = MEMORY_RESUME_ROUNDS as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
+            open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms + MEMORY_BOUNCE_SETTLE_MS
+        }
     };
     script_ms / 1000 + STARTUP_DEFAULT_SECS + TEARDOWN_BUFFER_SECS
 }
@@ -791,6 +868,16 @@ pub fn recommended_rss_interval_ms(
         Scenario::TabCountMemoryResume(_) => {
             Some((MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS) / TARGET_STABILIZED_RSS_SAMPLES)
         }
+        // `tabs_hold_bounce_N` の集計対象窓は `tabs_hold_resume_N` と同じ
+        // ラウンド区間に `MEMORY_BOUNCE_SETTLE_MS` の待ちが続くもの
+        // (Issue #279)。窓の下限は同じ理屈で「ラウンドの `RESUME_SETTLE_MS`
+        // 合計 + `MEMORY_BOUNCE_SETTLE_MS`」とし、これを目標サンプル数で
+        // 割る。実際の窓 (各 `switch` の実処理時間を含む) はこれより長く
+        // なるので、目標サンプル数を下回ることはない (安全側)。
+        Scenario::TabCountMemoryBounce(_) => Some(
+            (MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS + MEMORY_BOUNCE_SETTLE_MS)
+                / TARGET_STABILIZED_RSS_SAMPLES,
+        ),
         // Same reasoning for the CPU window (Issue #64): the default 5000ms
         // would fit at most one sample inside it, and one sample yields no
         // `cpu_percent` at all (a rate needs two).
@@ -1046,6 +1133,9 @@ mod tests {
             // 外に出したうえで、その後の「戻す」操作だけを窓に入れる。**
             // `tabs_hold_N` が定常値を測るのに対し、こちらはその定常状態
             // から復帰するコストを測る。
+            // `tabs_hold_bounce_N` (Issue #279) も同じ `mark` を出す —
+            // `tabs_hold_resume_N` と全く同じ理由で、違いは `mark` の後に
+            // 足す末尾の待ちだけである。
             let expected = matches!(
                 scenario,
                 Scenario::TabCreateAt(_)
@@ -1053,6 +1143,7 @@ mod tests {
                     | Scenario::BackgroundCpu
                     | Scenario::TabCountMemoryHold(_)
                     | Scenario::TabCountMemoryResume(_)
+                    | Scenario::TabCountMemoryBounce(_)
             );
             assert_eq!(has_mark, expected, "{scenario:?}");
         }
@@ -1201,6 +1292,69 @@ mod tests {
             assert!(
                 hold > plain,
                 "tabs_hold_{n} ({hold}s) は tabs_{n} ({plain}s) より長く待つ必要がある"
+            );
+        }
+    }
+
+    // -- tabs_hold_bounce_N (Issue #279, D110 Revisit condition (3)) -------
+
+    #[test]
+    fn tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait() {
+        // D110 決定3 と同じ形の検査。`tabs_hold_bounce_N` のスクリプトから
+        // 末尾の `wait`(MEMORY_BOUNCE_SETTLE_MS) と `quit` を除いたものが、
+        // `tabs_hold_resume_N` のスクリプトから `quit` を除いたものと
+        // 一致しなければならない — 「最後のラウンドの `wait` まで完全に
+        // 同一」であることを字面で固定する。
+        let url = "http://127.0.0.1:8731/minimal.html";
+        let resume =
+            parse_script(&generate_bench_script(Scenario::TabCountMemoryResume(20), url).unwrap())
+                .unwrap();
+        let bounce =
+            parse_script(&generate_bench_script(Scenario::TabCountMemoryBounce(20), url).unwrap())
+                .unwrap();
+
+        assert_eq!(resume.last(), Some(&AutomationCommand::Quit));
+        let resume_without_quit = &resume[..resume.len() - 1];
+
+        assert_eq!(bounce.last(), Some(&AutomationCommand::Quit));
+        let bounce_without_tail = &bounce[..bounce.len() - 2];
+        assert_eq!(
+            bounce[bounce.len() - 2],
+            AutomationCommand::Wait {
+                ms: MEMORY_BOUNCE_SETTLE_MS
+            },
+            "quit の直前は MEMORY_BOUNCE_SETTLE_MS の待ちであるべき: {bounce:?}"
+        );
+
+        assert_eq!(
+            resume_without_quit, bounce_without_tail,
+            "tabs_hold_bounce_N は最後のラウンドの wait まで tabs_hold_resume_N と \
+             完全に同一でなければならない"
+        );
+    }
+
+    #[test]
+    fn tabs_hold_bounce_samples_rss_inside_its_window() {
+        let interval = recommended_rss_interval_ms(Scenario::TabCountMemoryBounce(20))
+            .expect("tabs_hold_bounce must override the RSS interval");
+        assert!(interval > 0);
+        let window_lower_bound =
+            MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS + MEMORY_BOUNCE_SETTLE_MS;
+        assert!(
+            window_lower_bound / interval >= 2,
+            "窓の下限 {window_lower_bound}ms に間隔 {interval}ms では 2 サンプル入らない"
+        );
+    }
+
+    #[test]
+    fn tabs_hold_bounce_gets_a_longer_timeout_than_tabs_hold_resume() {
+        for n in Scenario::TAB_COUNTS {
+            let resume = recommended_timeout_secs(Scenario::TabCountMemoryResume(n));
+            let bounce = recommended_timeout_secs(Scenario::TabCountMemoryBounce(n));
+            assert!(
+                bounce > resume,
+                "tabs_hold_bounce_{n} ({bounce}s) は tabs_hold_resume_{n} \
+                 ({resume}s) より長く待つ必要がある"
             );
         }
     }

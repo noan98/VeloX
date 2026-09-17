@@ -59,6 +59,7 @@ Gate) が呼び出す前提のインターフェースでもある。CI が実�
 | `tabs_1` / `tabs_5` / `tabs_10` / `tabs_20` / `tabs_50` | 1/5/10/20/50 tabs でのメモリ/CPU使用量 | 可 (`--url` 必須) |
 | `tabs_hold_1` / `_5` / `_10` / `_20` / `_50` | 同上だが**落ち着いた後の定常値**を測る (Issue #197 / D97)。タブを間隔を空けて開き、既定のメモリチェック周期でも休止判定が 2 回以上走る長さ (12 秒) 待ってから `mark` する。`tabs_N` は約 6 秒で終わるため回収前の途中の値しか採れない — **両者を並べて比較してはならない** | 可 (`--url` 必須) |
 | `tabs_hold_resume_1` / `_5` / `_10` / `_20` / `_50` | **メモリ予算が休止したタブへ戻るコスト** (Issue #176 Stage 1)。`mark` までは `tabs_hold_N` と完全に同一で、その後に最長未使用のタブから順に 4 回 `switch` して `tab_resume_ms` を採る。⚠️ 予算が 1 つも休止しなかったタブ数 (Windows 実測では 1 / 5 タブ、§31.3) では `tab_resume` イベントが発生せず、このメトリクスは出ない | 可 (`--url` 必須) |
+| `tabs_hold_bounce_1` / `_5` / `_10` / `_20` / `_50` | **戻したタブが再び休止される「揺り戻し」が起きるか** (Issue #279、D110 Revisit condition (3))。最後のラウンドの `wait` まで `tabs_hold_resume_N` と完全に同一のスクリプトで、そのあとに既定のメモリチェック周期 (5 秒) が 4 回以上走る長さ (22 秒) だけ追加で待ってから `quit` する。`tab_resuspend_count` / `tab_resuspend_revisited_count` / `tab_resuspend_delay_ms` を読む場所であり、これらは最後の `measure_start` (= 戻すラウンドの直前) より後だけを見る | 可 (`--url` 必須) |
 
 「自動実行」列の意味は `src/browser/benchmark.rs` の
 `scenario::Scenario::is_unattended` を参照。**Issue #112 より前は、VeloX に
@@ -209,6 +210,9 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 | `rss_engine_bytes` | `rss` | `engine_rss_bytes` |
 | `pss_total_bytes` | `rss` | `total_pss_bytes` |
 | `pss_process_count` | `rss` | `pss_process_count` |
+| `tab_resuspend_count` | `tab_suspend` (`measure_start` からの導出) | フィールド無し。最後の `measure_start` より後の `tab_suspend` の件数 (Issue #279、D110 Revisit condition (3)) |
+| `tab_resuspend_revisited_count` | `tab_suspend` / `tab_resume` (`measure_start` からの導出) | フィールド無し。上記のうち、同じ `tab_id` の `tab_resume` がそれより前 (かつ `measure_start` より後) にある件数 |
+| `tab_resuspend_delay_ms` | `tab_suspend` / `tab_resume` (`measure_start` からの導出) | フィールド無し。各 `tab_suspend` の `ts_ms` と、それより前 (かつ `measure_start` より後) の直近の `tab_resume` の `ts_ms` との差 |
 
 **`startup_*` はすべて「プロセス開始からの累積 ms」であり、区間の長さでは
 ない** (Issue #182 / D92)。ある区間の長さを見たいときは隣り合うチェック
@@ -250,6 +254,21 @@ no such platform gap. `pss_process_count` says how many processes
 contributed to the PSS sum, out of `rss_process_count` total; less than
 `rss_process_count` (but present) means the sum is real but incomplete, not
 wrong.
+
+`tab_resuspend_count` / `tab_resuspend_revisited_count` / `tab_resuspend_delay_ms`
+(Issue #279) はどれもフィールドを直接読むのではなく、**最後の
+`measure_start` より後**のイベントから自分で切り出して算出する導出
+メトリクスである。件数の 2 つ (`tab_resuspend_count`/
+`tab_resuspend_revisited_count`) は `suspended_tab_count` (D105) と同じ
+規約に従う: trial の events が空、または `measure_start` が無ければ欠損、
+それ以外は実測の `0.0` を含めて必ず 1 サンプルを返す。`tab_resuspend_delay_ms`
+はこの規約に従わない — 該当ペアが 1 件も無ければ欠損であり (「0ms 差」と
+「該当なし」を混ぜない)、該当した `tab_suspend` の数だけサンプルを返す。
+`tabs_hold_bounce_N` (`Scenario::TabCountMemoryBounce`) がこれらを読む
+唯一のシナリオだが、`measure_start` を出す他のシナリオ (`tabs_hold_N` /
+`tabs_hold_resume_N` など) でもこの規約どおりに計算される — 詳細は
+`MetricKey::extract`/`MetricKey::extract_after_marker` の doc comment、
+決定の経緯は `docs/decisions.md` D145 を参照。
 
 `cold_startup` / `warm_startup` / `first_page_load` はいずれも同じ `startup`
 イベントの 3 フィールドを見ている。「cold」と「warm」の違いはランナー側の
