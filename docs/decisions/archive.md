@@ -18037,10 +18037,15 @@ D96/D111 が禁じる「条件の違う数値を同じ顔で並べる」こと�
 そこで `Scenario::TabCountMemoryBounce` (`tabs_hold_bounce_N`) を新設した。
 スクリプトは `TabCountMemoryResume` と**最後のラウンドの `wait` まで
 完全に同一**で (`memory_hold_setup_lines`/`memory_resume_rounds_lines` の
-2 関数をそのまま共有する)、その後に `MEMORY_BOUNCE_SETTLE_MS` (12 秒 —
-`MEMORY_HOLD_SETTLE_MS` と同じ根拠: 既定 5 秒周期のメモリ判定が 2 回以上
-走る長さ) の `wait` を 1 行足してから `quit` する。`tabs_hold_resume_N`
-はこれまでどおりの意味を保つ。
+2 関数をそのまま共有する)、その後に `MEMORY_BOUNCE_SETTLE_MS` の `wait` を
+1 行足してから `quit` する。`tabs_hold_resume_N` はこれまでどおりの意味を
+保つ。
+
+`MEMORY_BOUNCE_SETTLE_MS` は当初 12 秒 (`MEMORY_HOLD_SETTLE_MS` と同じ
+根拠: 既定 5 秒周期のメモリ判定が 2 回以上走る長さ) にしたが、**初回の
+実測 (§46、run 1) で 12 秒の窓の端 (11.8 秒) にまだスイープが掛かって
+いた**ため、同じ PR の中で **22 秒** (4 周期以上) に伸ばした。理由は
+定数の doc comment に書いてある。
 
 D110 決定3 と同じ形のテストで両者の一致を固定した
 (`tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait`) —
@@ -18139,19 +18144,53 @@ Issue #176 Stage 3 で候補になり得るものは他に 2 つあったが、�
 (1121 件) / `python3 -m unittest discover -s .github/scripts -p 'test_*.py'`
 (271 件) / `python3 .github/scripts/test_decision_index.py` はすべて通った。
 
+### 実測で分かったこと (Windows、`docs/performance-targets.md` §46)
+
+同じ PR の中で perf-windows を 3 本回した (`tabs_hold_bounce_20/50`、
+22 秒窓への延長 + `VELOX_MAX_TABS_PER_PROCESS=1` の A/B、そして復帰を
+一切しない対照 `tabs_hold_50`)。**答えは 2 つに割れた。**
+
+1. **戻ったタブ自身が再休止されたことは一度も無い。**
+   `tab_resuspend_revisited_count` は全 run・全 trial で 0 (32 回の復帰)。
+   最長未使用から取る `reclaim_order` が、戻ったばかりのタブを最後まで
+   残すからである。**「戻したタブがすぐ消える」という意味の hysteresis は、
+   今の設計では要らない** — 決定3 はこの意味で確定する。
+2. **しかし `mark` 後の休止は復帰への反応ではなかった。** 復帰をしない
+   対照でも `mark` 後 8 秒に 4 件休止しており、`tab_resuspend_delay_ms`
+   の分布は「最後の復帰の 1.7 秒後から 5 秒周期で 4 タブずつ、22 秒経って
+   もまだ続く」— 復帰の回数にも経過時間にも依らず、周期に依っている。
+   **50 タブ + `LOW` では、`mark` の時点で回収が終わっていない。** 決定2
+   が `tab_resuspend_count` に持たせた副次的な役割 (`tabs_hold_N` で 0
+   でなければ §27.5 の前提が崩れている合図) が、最初の実測でそのまま
+   発動した。§31 / §40 の `tabs_hold_50` の値は「定常値」ではなく「開き
+   終えて 20 秒後」の値として読み直す (値は変わらない、説明が過大だった)。
+
+「5 秒に 4 タブ」が疑似プロセスグループ (最大 4) の丸ごと回収による
+ものではないことは B 腕 (`VELOX_MAX_TABS_PER_PROCESS=1` でも同じ) で
+否定できた。残る仮説 (`ESTIMATED_BYTES_PER_TAB` = 64 MiB が Windows +
+`LOW` の実態 29 MiB/タブ (§40.2) より大きく、要求が小さく出る) は
+集計値では確かめられない — **スイープごとの時系列 (perf ログの生の
+JSON Lines) が artifact に残っていない**ためである。
+
 ### 見送ったもの・既知の制約
 
-(1) **Windows での実測は本 PR では未計測。** 数字が入ったら
-`docs/performance-targets.md` に新しい節を足す (別の作業として)。
-(2) hysteresis そのものの実装 (決定3)。
+(1) **復帰が上乗せした休止を分離できていない** (§46.3)。分離するには
+復帰の前に回収が本当に止まった状態が要り、`tabs_hold_N` との地続き性
+(D110 決定3) を壊さずには作れない。別シナリオとして設計し直す話になる。
+(2) hysteresis そのものの実装 (決定3) — 上記 1 のとおり、少なくとも
+「戻ったタブを守る」形のものは要らないと分かった。
 (3) `docs/performance-targets.md` §32/§33/§39/§40 を遡って
 `tabs_hold_bounce_N` の値で書き換えることはしない — それらの節は
 `tabs_hold_resume_N` の意味(=戻した直後)で書かれており、そのままで正しい。
+ただし §31 / §40 の「定常値」という説明は §46.4 のとおり読み直しが要る。
 
-**Revisit condition**: (1) Windows での実測が入ったら決定3
-(hysteresis を作らない) を見直す。`tab_resuspend_count`/
-`tab_resuspend_revisited_count`/`tab_resuspend_delay_ms` の値を
-`docs/performance-targets.md` に記録し、揺り戻しの頻度・速さが実際に
-問題になる大きさかどうかで判断する。(2) 末尾の 12 秒 (`MEMORY_BOUNCE_SETTLE_MS`)
-で揺り戻しの反応を取り切れていない兆候 (`tab_resuspend_delay_ms` が
-窓の端 (12 秒近く) に張り付く) が実測で出たら、この値を伸ばすこと。
+**Revisit condition**: (1) perf-windows の artifact に perf ログの生の
+JSON Lines を残せるようにしたら、「5 秒に 4 タブ」の原因 (§46.5 の仮説 2)
+を時系列で確かめる。それが `ESTIMATED_BYTES_PER_TAB` の Windows 側の
+過大評価なら、D138 の見込み解放量を機構ごとだけでなく OS ごと / hint の
+有無ごとにする話になる。(2) 予算が飽和しない中間のタブ数か重いページ
+(§40.2 の `dom_heavy` × 20 タブ) で「収束済みの状態から戻す」条件を作れた
+ら、復帰が上乗せする休止を分離して測る。(3) `tabs_hold_N` の 12 秒の
+settle は Windows の 50 タブでは足りない (§46.4)。`tabs_hold_N` の値を
+「定常値」として使う場面では、`tab_resuspend_count` が 0 であることを
+確かめること。
