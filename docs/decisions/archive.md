@@ -18194,3 +18194,100 @@ JSON Lines を残せるようにしたら、「5 秒に 4 タブ」の原因 (§
 settle は Windows の 50 タブでは足りない (§46.4)。`tabs_hold_N` の値を
 「定常値」として使う場面では、`tab_resuspend_count` が 0 であることを
 確かめること。
+
+## D146: wry / windows / webview2-com は 3 つ同時にしか上げられない (dependabot PR #259 / #199 / #198) — 個別の bump は `windows-core` の二重化で Windows ビルドが必ず落ちる
+
+**対象**: dependabot が個別に開いた 3 本の PR (#259 wry 0.56.1 → 0.57.0、
+#199 webview2-com 0.38.2 → 0.39.1、#198 windows 0.61.3 → 0.62.2) が、
+3 本とも CI の Windows ジョブ (`Build & test (Windows)`) で落ちていた。
+Linux ジョブは 3 本とも緑で、失敗は Windows にしか現れない。
+
+### 何が起きていたか
+
+Cargo.toml の D59 のコメントが最初から書いていたとおり、`windows` と
+`webview2-com` は **wry が内部で使っているものと同じバージョン**で
+なければならない。`wry::WebViewExtWindows::webview()` が返す
+`ICoreWebView2` は wry 側の `webview2-com-sys` が定義する型であり、
+VeloX が自分の `webview2-com` / `windows` から import する型と**同じ
+クレートの同じバージョン**でないと、Rust にとっては名前が同じだけの
+別の型になる。
+
+wry 0.57.0 は依存を `windows` 0.62 / `webview2-com` 0.39 に上げた
+(tauri-apps/wry#1809)。したがって:
+
+| 上げたもの | 依存グラフに残るもの | 結果 |
+| --- | --- | --- |
+| wry だけ (#259) | wry 経由の `windows-core` 0.62 と VeloX 直接指定の 0.61 | `ICoreWebView2::cast` が「別の `Interface` トレイト」を要求して E0599、計 24 エラー |
+| webview2-com だけ (#199) | webview2-com 経由の `windows-result` 0.4 と wry 経由の 0.3 | `?` の `From` 変換が同名別型で E0277、計 40 エラー |
+| windows だけ (#198) | VeloX 直接指定の 0.62 と wry 経由の 0.61 | 同上、計 38 エラー |
+
+エラーメッセージには毎回 `there are multiple different versions of crate
+windows_core in the dependency graph` が出ており、原因は 3 本とも同じ
+「二重化」である。**個別にマージできる組み合わせは存在しない。**
+
+### 決定1: 3 つを 1 本の PR で同時に上げ、dependabot の個別 PR は閉じる
+
+Cargo.toml 側で `wry` 0.57 / `webview2-com` 0.39 / `windows` 0.62 を
+同時に指定し、`cargo update -p wry -p webview2-com -p windows@0.61.3` で
+ロックファイルを更新した。結果、`windows` / `windows-core` /
+`windows-result` はそれぞれ 1 バージョン (0.62.2 / 0.62.2 / 0.4.1) に
+収束し、`Removing windows v0.61.3` 以下 9 クレートが依存グラフから消えた
+(`main` の時点で `windows` 0.62.2 は tao 経由で既に入っていたので、
+実質的には**古い側が消えた**だけである)。
+
+Linux 上の `cargo check` / `cargo clippy --all-targets -- -D warnings`
+(`--target x86_64-pc-windows-msvc`、CLAUDE.md「コマンド」の手順) は
+どちらも警告 0 で通った。3 本の個別 PR で出ていたエラーは、二重化を
+解消するだけで全部消える — VeloX 側のコード変更は 1 行も要らなかった。
+
+dependabot の 3 本はこの PR で置き換えられるので閉じる。
+`.github/dependabot.yml` (D63) は minor / patch を週次で 1 本にまとめて
+いるが、Cargo の semver では 0.x の minor 上げ (0.56 → 0.57) は
+**breaking = major 扱い**なので、この 3 つは grouping から漏れて個別 PR に
+なった。次も同じことが起きるので、この 3 クレートだけを常に 1 本にまとめる
+専用の group を足す余地がある (Revisit (1))。
+
+### 決定2: MSRV を 1.85 に上げる (`rust-version` / README)
+
+wry 0.57.0 は MSRV を 1.85 に上げている (`Cargo.toml` の `rust-version`)。
+VeloX の `rust-version = "1.77"` はこれと矛盾するので 1.85 に揃えた。
+CI は `dtolnay/rust-toolchain` の stable を使っており、実際に使われる
+toolchain は変わらない。
+
+### 決定3: wry 0.57 の挙動変更 2 点は VeloX に影響しない
+
+wry 0.57.0 の CHANGELOG のうち、依存の更新以外で VeloX に関係し得るのは
+2 点で、どちらも影響が無いことを確認した。
+
+1. **`window.ipc` は `with_ipc_handler` を呼んだ webview にしか注入され
+   なくなった** (tauri-apps/wry#1816)。VeloX が作る webview は toolbar と
+   各タブの content の 2 種類だけで (`src/ui/window.rs` の
+   `new_webview_builder` から生える 2 箇所)、どちらも `with_ipc_handler`
+   を呼んでいる。`window.ipc.postMessage` を使うスクリプト (toolbar HTML、
+   ショートカット、フォーム入力検知 D142、自動操作の beacon) はすべて
+   この 2 種類の上で動くので、注入されなくなる webview は無い。
+2. **Windows 7 のサポート終了** (`windows` 0.62 / microsoft/windows-rs#3808)。
+   VeloX は WebView2 ランタイムを前提としており、Windows 7 は元々
+   サポート対象に入っていない (`docs/architecture.md`、CLAUDE.md
+   「対応 OS の優先度」)。
+
+### 見送ったもの・既知の制約
+
+(1) コード中のコメントに残る「wry 0.56 では〜できない」という記述
+(約 30 箇所: ダウンロードの中断、`prefers-color-scheme`、クラッシュ検知、
+権限フックなど) は**書き換えていない**。これらは「0.56.1 のソースを読んで
+確認した API の欠落」の記録であり、0.57.0 の CHANGELOG にそれらを埋める
+項目は無い (依存更新 / iOS の背景色 / `window.ipc` の注入条件 / MSRV の
+4 点のみ)。したがって記述は事実として今も正しく、バージョン番号だけを
+0.57 に書き換えると「0.57 のソースで確認した」という嘘になる。
+(2) Linux 上では `cargo test` を回せていない (この作業環境に WebKitGTK
+の開発パッケージが無い)。CI の Linux / Windows ジョブが担保する。
+(3) `dirs` 6 → 7 (wry 経由の推移的依存) が同時に上がる。cargo-deny
+(D63) のライセンス / advisory 検査は CI で走る。
+
+**Revisit condition**: (1) dependabot が次にこの 3 つのどれかを個別に
+上げてきたら、`.github/dependabot.yml` に `wry` / `windows` /
+`webview2-com` を `patterns` で束ねる専用の group (major を含む) を足して、
+3 つを常に 1 本にまとめること。(2) wry が `windows` / `webview2-com` の major を
+また上げたら、同じ手順 (3 つ同時、`cargo tree -d` で `windows-core` が
+1 つに収束していることを確認) で追随する。
