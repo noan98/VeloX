@@ -97,7 +97,7 @@ instead of silently skipping.
 
 ## Build
 
-Rust stable (1.77+) is required.
+Rust stable (1.85+) is required.
 
 ### Linux
 

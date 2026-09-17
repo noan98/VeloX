@@ -5,7 +5,7 @@ edition = "2021"
 description = "A fast, lightweight web browser built with Rust."
 license = "MIT"
 repository = "https://github.com/noan98/VeloX"
-rust-version = "1.77"
+rust-version = "1.85"
 
 [dependencies]
 # Window creation and event loop (cross-platform: macOS / Linux / Windows).
@@ -31,10 +31,10 @@ png = "0.18"
 # - everywhere else: no such constraint, so `devtools` is enabled
 #   unconditionally (debug and release both get it).
 [target.'cfg(not(target_os = "macos"))'.dependencies]
-wry = { version = "0.56", features = ["devtools"] }
+wry = { version = "0.57", features = ["devtools"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-wry = "0.56"
+wry = "0.57"
 
 # wry's gtk backend exposes raw gtk containers; we need the gtk crate to place
 # two webviews (toolbar + content) inside one window on Linux/BSD.
@@ -56,7 +56,8 @@ winresource = "0.1"
 # `windows` for the COM interface types themselves, `webview2-com` for the
 # `WebResourceRequestedEventHandler` helper that implements the COM event
 # handler vtable so we don't have to. Versions are pinned to exactly what
-# wry 0.56.1 depends on (see its Cargo.toml) so the `ICoreWebView2` value
+# wry 0.57.0 depends on (see its Cargo.toml: `windows` 0.62 /
+# `webview2-com` 0.39; docs/decisions.md D146) so the `ICoreWebView2` value
 # `webview()` returns is the *same type* our code imports — a version
 # mismatch here would not fail to compile with a helpful error, it would
 # just mean two distinct `ICoreWebView2` types that cannot be used
@@ -86,8 +87,8 @@ winresource = "0.1"
 # rather than adding `windows-sys` or another crate (CLAUDE.md "依存クレート
 # は必要最小限に保つ").
 [target.'cfg(windows)'.dependencies]
-webview2-com = "0.38"
-windows = { version = "0.61", features = [
+webview2-com = "0.39"
+windows = { version = "0.62", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
