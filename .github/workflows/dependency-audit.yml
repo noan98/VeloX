@@ -62,4 +62,4 @@ jobs:
       # `command` を省略すると advisories/bans/licenses/sources の
       # 4 領域すべてを検査する。
       - name: cargo deny check
-        uses: EmbarkStudios/cargo-deny-action@b66acf5e9fe20f8aba065be86778a8a4c846f902
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25
