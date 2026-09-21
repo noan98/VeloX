@@ -1003,8 +1003,18 @@ pub fn recommended_rss_interval_ms_with(
         // 窓の下限**として間隔を決める。実際の窓はこれより長くなるので、
         // 目標サンプル数を下回ることはない (安全側)。
         Scenario::TabCountMemoryResume(_) => {
-            let window = (overrides.resume_rounds() as u64 * RESUME_SETTLE_MS)
-                .max(MEMORY_HOLD_WINDOW_MS.min(MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS));
+            // ラウンド数 0 のときだけ窓の下限が 0 になるので、そのときに
+            // 限って `tabs_hold_N` の窓を使う (0 で割らない・間隔 0ms を
+            // 返さない)。それ以外は上書き後のラウンド数で決まる下限そのもの
+            // (既定なら従来どおり 4 × 500ms)。PR #287 のレビュー指摘で、
+            // 以前の式は定数同士の `min` になっていて doc comment と食い
+            // 違っていた。
+            let rounds_window = overrides.resume_rounds() as u64 * RESUME_SETTLE_MS;
+            let window = if rounds_window == 0 {
+                MEMORY_HOLD_WINDOW_MS
+            } else {
+                rounds_window
+            };
             Some(window / TARGET_STABILIZED_RSS_SAMPLES)
         }
         // `tabs_hold_bounce_N` の集計対象窓は `tabs_hold_resume_N` と同じ
