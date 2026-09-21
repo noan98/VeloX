@@ -129,6 +129,8 @@ class Timeline:
     mark_ms: float | None
     sweeps: list[Sweep]
     resumes: list[float]
+    # `ts_ms` 昇順の全 `rss` サンプル (`render_rss_track` が使う)。
+    rss: list[RssSample] = field(default_factory=list)
 
     @property
     def suspended_total(self) -> int:
@@ -208,7 +210,7 @@ def build_timeline(path: Path, events: list[dict]) -> Timeline:
         sweep.rss_before = before[-1] if before else None
         sweep.rss_after = after[0] if after else None
 
-    return Timeline(path=path, records=len(events), mark_ms=mark_ms, sweeps=sweeps, resumes=resumes)
+    return Timeline(path=path, records=len(events), mark_ms=mark_ms, sweeps=sweeps, resumes=resumes, rss=rss)
 
 
 def expand_inputs(inputs: list[str]) -> list[Path]:
@@ -338,6 +340,84 @@ def render_markdown(
     return "\n".join(lines)
 
 
+def _sample_at_or_before(rss: list[RssSample], ts_ms: float) -> RssSample | None:
+    """`ts_ms` 以前で最も新しい `rss` サンプル。無ければ `None`。"""
+    candidate = None
+    for sample in rss:
+        if sample.ts_ms <= ts_ms:
+            candidate = sample
+        else:
+            break
+    return candidate
+
+
+def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) -> str:
+    """`mark` を基準に `step_ms` 刻みで `rss` の推移を出す (§47.7)。
+
+    スイープの表は休止が起きた瞬間しか見せないので、**休止が 1 件も
+    無いログ (予算 OFF の腕)** の推移が読めない。「復帰で作り直した
+    webview が 15〜20 秒かけて育つ」(#176) を予算と無関係に確かめるには、
+    予算 OFF の腕で同じ山が出るかを見る必要があり、そのための見方。
+    各刻みの値は「その時刻以前で最も新しいサンプル」で、直前の刻みからの
+    差と、その区間に起きた休止数を併記する。`mark` の無いログは省略する。
+    """
+    lines: list[str] = []
+    step_s = step_ms / 1000
+    if markdown:
+        lines.append(f"### `mark` 基準 {step_s:g} 秒刻みの rss の推移 (D148 / §47.7)")
+        lines.append("")
+        lines.append(
+            "各行はその時刻以前で最も新しい `rss` サンプル。「差」は直前の行からの増減、"
+            "「休止」はその区間に起きた `tab_suspend` の件数。休止が無い腕 (予算 OFF) でも読めるのがスイープの表との違い。"
+        )
+        lines.append("")
+    skipped = 0
+    for tl in timelines:
+        if tl.mark_ms is None:
+            skipped += 1
+            continue
+        if markdown:
+            lines.append(f"#### `{tl.path.name}`")
+            lines.append("")
+            lines.append("| t (s) | rss (MiB) | 差 (MiB) | 休止 | プロセス | engine (MiB) | browser (MiB) |")
+            lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+        else:
+            lines.append(f"{tl.path.name}: mark={tl.mark_ms / 1000:.1f}s")
+        last_ts = tl.rss[-1].ts_ms if tl.rss else tl.mark_ms
+        previous: RssSample | None = None
+        tick = 0
+        # 最後のサンプルを含む窓まで出す (刻みの時刻そのものを超えていても、
+        # その直前の窓にサンプルがあれば行にする)。
+        while tl.mark_ms + (tick - 1) * step_ms < last_ts:
+            at = tl.mark_ms + tick * step_ms
+            sample = _sample_at_or_before(tl.rss, at)
+            if sample is not None:
+                # 直前の刻みからこの刻みまで (前開区間) に起きた休止。
+                suspended = sum(s.count for s in tl.sweeps if at - step_ms < s.start_ms <= at) if tick > 0 else 0
+                delta = "-" if previous is None else f"{(sample.total_rss_bytes - previous.total_rss_bytes) / MIB:+.1f}"
+                cells = [
+                    f"+{tick * step_s:g}",
+                    _mib(sample.total_rss_bytes),
+                    delta,
+                    str(suspended),
+                    "-" if sample.process_count is None else str(sample.process_count),
+                    _mib(sample.engine_rss_bytes),
+                    _mib(sample.browser_rss_bytes),
+                ]
+                if markdown:
+                    lines.append("| " + " | ".join(cells) + " |")
+                else:
+                    lines.append("  " + " ".join(cells))
+                previous = sample
+            tick += 1
+        if markdown:
+            lines.append("")
+    if skipped and markdown:
+        lines.append(f"(`mark` の無いログ {skipped} 本は省略)")
+        lines.append("")
+    return "\n".join(lines)
+
+
 def render_plain(timelines: list[Timeline], budget: int | None, per_tab: int, only_with_suspends: bool) -> str:
     lines: list[str] = []
     for tl in timelines:
@@ -380,6 +460,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--markdown", action="store_true", help="Job Summary 向けの Markdown で出す")
     parser.add_argument(
+        "--rss-track",
+        action="store_true",
+        help="スイープの表の代わりに、mark 基準 --track-step-ms 刻みの rss の推移を出す (休止の無い腕でも読める)",
+    )
+    parser.add_argument("--track-step-ms", type=float, default=5000.0, help="--rss-track の刻み (ms、既定 5000)")
+    parser.add_argument(
         "--only-with-suspends",
         action="store_true",
         help="tab_suspend が 1 件も無いログは省略する (cold_startup などで表が空にならないように)",
@@ -418,7 +504,9 @@ def main(argv: list[str] | None = None) -> int:
         print("perf_log_timeline: 読めた perf ログがありません", file=sys.stderr)
         return 1
 
-    if args.markdown:
+    if args.rss_track:
+        print(render_rss_track(timelines, args.track_step_ms, args.markdown))
+    elif args.markdown:
         print(render_markdown(timelines, budget, args.per_tab_bytes, args.only_with_suspends))
     else:
         print(render_plain(timelines, budget, args.per_tab_bytes, args.only_with_suspends))

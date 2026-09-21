@@ -941,6 +941,21 @@ jobs:
           Write-Host $text
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $text
 
+          # §47.7。スイープの表は休止の瞬間しか見せないので、予算 OFF の腕
+          # (休止ゼロ) の rss の推移が読めない。「復帰で作り直した webview
+          # が 15〜20 秒かけて育つ」を予算と無関係に確かめるため、mark 基準
+          # 5 秒刻みの rss / プロセス数の推移も出す。mark の無いログ
+          # (cold_startup など) は省略される。
+          $track = python .github/scripts/perf_log_timeline.py results\perf-logs `
+            --rss-track --markdown
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::rss の推移を作れませんでした (exit code $LASTEXITCODE)"
+            exit 0
+          }
+          $trackText = $track -join "`n"
+          Write-Host $trackText
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $trackText
+
       - name: Show result summary
         if: always()
         shell: pwsh
