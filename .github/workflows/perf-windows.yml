@@ -183,6 +183,10 @@ on:
         description: "計測対象ページの URL。空欄なら scripts/bench/pages/ の固定ページ (上の page / pages) を loopback 配信して使う。指定すると page / pages は無視される"
         type: string
         default: ""
+      rss_interval_ms:
+        description: "perf の RSS サンプル間隔 (ms、velox-bench run --rss-interval-ms)。空欄なら velox-bench の自動調整 (D50: tabs_N 系はスクリプト長から逆算、他は既定 5000ms)。§47.5 / D148: 休止スイープの時系列で「直前の rss」を判定に近づけたい・スイープ間の増え方の形を見たいときに 1000 などを指定する。短くするほどサンプラ自身の負荷が測定に乗るので、page_load_ms などを他 run と比べる用途では空欄のまま"
+        type: string
+        default: ""
   # この workflow 自身を変更する PR でのみ実行して検証する (docs/
   # decisions.md D88、release-windows.yml と同じパターン)。それ以外の PR
   # では走らない。workflow_dispatch の入力は使えないため、既定値
@@ -603,10 +607,27 @@ jobs:
           BENCH_URL: ${{ steps.bench_url.outputs.url }}
           BENCH_PAGES: ${{ steps.bench_url.outputs.pages }}
           INPUT_BEACON: ${{ inputs.beacon }}
+          INPUT_RSS_INTERVAL_MS: ${{ inputs.rss_interval_ms }}
         run: |
           $ErrorActionPreference = "Stop"
           $scenario = $env:INPUT_SCENARIO
           if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = "cold_startup" }
+
+          # §47.5 / D148。perf の RSS サンプル間隔。空欄なら velox-bench の
+          # 自動調整 (D50) に任せる。指定があれば `--rss-interval-ms` で
+          # 渡す — こちらは明示なので自動調整に勝つ (`cmd_run` の規則)。
+          # `common_env` で `VELOX_PERF_RSS_INTERVAL_MS` を渡しても
+          # velox-bench が自動調整値で上書きするため、入力はこれしか無い。
+          $rssIntervalMs = $env:INPUT_RSS_INTERVAL_MS
+          $rssIntervalArgs = @()
+          if (-not [string]::IsNullOrWhiteSpace($rssIntervalMs)) {
+            $parsedInterval = 0
+            if (-not [int]::TryParse($rssIntervalMs.Trim(), [ref]$parsedInterval) -or $parsedInterval -lt 100) {
+              throw "rss_interval_ms は 100 以上の整数で指定してください (受け取った値: '$rssIntervalMs')"
+            }
+            $rssIntervalArgs = @("--rss-interval-ms", "$parsedInterval")
+            Write-Host "perf の RSS サンプル間隔: ${parsedInterval}ms (自動調整を上書き)"
+          }
 
           # Issue #197 / D93 子 Issue 案 A。タブ数スケーリングのように
           # **複数の点を突き合わせたい計測は、同じ run の中で採らなければ
@@ -703,7 +724,8 @@ jobs:
               --trials $trials `
               --url "$url" `
               --output $outfile `
-              --keep-logs results\perf-logs
+              --keep-logs results\perf-logs `
+              @rssIntervalArgs
             if ($LASTEXITCODE -ne 0) {
               throw "velox-bench run が失敗しました (条件: $label, exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
             }

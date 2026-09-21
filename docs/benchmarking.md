@@ -599,6 +599,7 @@ Windows では不要になる (Windows には Xvfb/D-Bus セッションバス�
 | `page` | loopback で配信する `scripts/bench/pages/` の固定ページ | `minimal.html` |
 | `pages` | 複数ページを 1 run で続けて計測する (カンマ区切り)。指定すると `page` より優先される | (空) |
 | `url` | 計測対象ページの URL。空欄なら `scripts/bench/pages/` の固定ページ (`page` / `pages`) を loopback 配信して使う (Linux の `perf-gate.yml` と同じ「ネットワーク非依存の固定ページで測る」方針)。指定すると `page` / `pages` は無視される | (空、固定ページを使用) |
+| `rss_interval_ms` | perf の RSS サンプル間隔 (ms)。`velox-bench run --rss-interval-ms` にそのまま渡り、明示なので D50 の自動調整に勝つ。「休止スイープの時系列」(D148) で直前の `rss` を判定に近づけたい・スイープ間の増え方の形を見たいときに `1000` などを指定する (§47.5)。短いほどサンプラ自身の負荷が乗るので、他 run と比べる計測では空欄のまま | (空、自動調整) |
 
 **`scenarios` と `pages` は同じ問題への同じ答えである** (Issue #197 /
 Issue #231、D96 決定 3)。`windows-latest` は run ごとに別スペックのマシンを

@@ -18500,9 +18500,11 @@ Job Summary であり、Windows ランナーでは `python` が既に固定ペ�
 位相が揃い、判定の直前に採れている行は試行ごとに 1 行だけだった。
 Revisit (2) の perf レコードが要る。あわせて、`rss` レコードに既にある
 `process_count` と browser / engine の内訳をスイープ直前→直後の形で表に
-足した (同じ PR #283 の中で)。戻りが engine 側か・`Discard` で実際に
-プロセスが減っているかを、新しい記録なしに次の run で切り分けるため
-(§47.4)。
+足した (PR #284)。その run (§47.5) で、`Discard` は 1 タブ 1 プロセス
+を確実に終わらせ、browser 側は動かず、**戻っているのは残った engine 側の
+プロセス** (4 プロセス消えながら engine が +15〜+70 MiB) だと分かった。
+どのプロセスがなぜ膨らむかは総量では決められず、次は perf の RSS
+サンプル間隔を 1 秒に詰めて増え方の形 (段か漸増か) を読む。
 
 **Revisit condition**: (1) Rust 側の `ESTIMATED_BYTES_PER_TAB` /
 `memory_budget_for_ram` を変えるとき、または複製の維持が負担になったら、
