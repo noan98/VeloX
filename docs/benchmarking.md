@@ -234,6 +234,13 @@ VELOX_PERF_METRICS=1 VELOX_PERF_FORMAT=json VELOX_PERF_OUTPUT=/tmp/out.jsonl \
 `rss_engine_bytes` が動き、`rss_browser_bytes` はほぼ動かないはず**です。
 そうなっていない A/B は、予算とは別の何かが動いていることを意味します。
 
+`rss` レコードには、この表に無い `total_private_bytes` /
+`private_process_count` / `browser_private_bytes` / `engine_private_bytes`
+(私的コミット、Windows の `PagefileUsage`。Issue #176 Stage 3 / D150) も
+入っていますが、`velox-bench` はまだ集計しません。読むのは
+`.github/scripts/perf_log_timeline.py` (perf-windows の Job Summary) で、
+Windows 以外では `null` です。
+
 ⚠️ `rss_browser_bytes` は「Rust が確保した量」ではありません。root プロセスの
 RSS には `tao` のウィンドウやエンジンがプロセス内に置くものも含まれます
 (D118 決定3)。ロール別 (WebProcess / NetworkProcess / GPU) の細分は

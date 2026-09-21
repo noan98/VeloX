@@ -1162,7 +1162,7 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     | `tab_suspend`| `tab_id` (uint), `reason` (string: `idle` / `tab_count` / `memory`) — an automatic suspension (Issue #63); no duration, dropping a webview is synchronous |
     | `measure_start` | *(none)* — the `mark` automation command (Issue #60). Everything logged before the last one is warm-up: `benchmark::aggregate_trials` pools only what follows it, which is what lets a scenario open N tabs before measuring an operation *at* N tabs |
     | `cpu`        | `percent` (float) — CPU used by the whole process tree between the two most recent `rss` samples, as a percentage of one core (Issue #64). A rate, so the first sample of a run emits none |
-    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint), `total_cpu_seconds` (float or `null`) |
+    | `rss`        | `pid` (uint), `process_count` (uint), `total_rss_bytes` (uint), `total_pss_bytes` (uint or `null`), `pss_process_count` (uint), `total_cpu_seconds` (float or `null`), `browser_rss_bytes` (uint), `engine_rss_bytes` (uint), `total_private_bytes` (uint or `null`), `private_process_count` (uint), `browser_private_bytes` (uint or `null`), `engine_private_bytes` (uint or `null`) |
     | `ipc`        | `direction` (string: `in` / `out`), `name` (string — a `ToolbarCommand`'s `cmd` tag for `in`, an `eval_toolbar` call-site label like `set_tabs` for `out`), `bytes` (uint — raw JSON payload size), `duration_ms` (float ms — Rust-side `parse_command`/`evaluate_script` cost only, never JS execution; Issue #66) |
 
     `event_loop_ms`/`pre_window_setup_ms`/`native_window_ms`/
@@ -1185,6 +1185,16 @@ below). `PerfRecord::event_name()` returns one of `startup`, `page_load`,
     `process_count` processes it *was* read for, so a partial sum (some
     processes' PSS missing, not zeroed) is distinguishable from a complete
     one even when `total_pss_bytes` is non-null.
+
+    `browser_rss_bytes`/`engine_rss_bytes` (Issue #176 Stage 1, D118) split
+    `total_rss_bytes` into the root process and everything below it.
+    `total_private_bytes`/`private_process_count`/`browser_private_bytes`/
+    `engine_private_bytes` (Issue #176 Stage 3, D150) are the same split
+    for **private commit** — on Windows `PROCESS_MEMORY_COUNTERS::
+    PagefileUsage`, read from the same `GetProcessMemoryInfo` call as the
+    working set. They follow the `total_pss_bytes` rule: present, `null`
+    when no process reported it (every non-Windows platform today), and
+    `private_process_count` says how many of `process_count` did.
 
     Example lines:
     ```json
