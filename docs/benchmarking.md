@@ -630,7 +630,19 @@ Issue #231、D96 決定 3)。`windows-latest` は run ごとに別スペック�
 5 秒ごとに 4 タブずつ休止が続く」のスイープごとの内訳) を読むにはこちらを
 使う。Job Summary と `results/history/` への取り込みは `results` 直下の
 `*-windows*.json` しか読まないため、このディレクトリが集計に混ざることは
-ない。
+ない。この生ログは同じ run の Job Summary にも**「休止スイープの時系列」**
+として要約される (`.github/scripts/perf_log_timeline.py`、D148): メモリ
+判定 1 回ごとに、休止したタブ数・直前の `rss`・予算超過量・その超過量から
+`tabs_to_free` と同じ式で求めた要求タブ数を 1 行に並べる。予算は perf
+ログに無いので、ランナーの RAM から Rust 側と同じ式で再現している
+(`--ram-bytes`)。手元で読むときは
+
+```sh
+python3 .github/scripts/perf_log_timeline.py results/perf-logs \
+  --budget-bytes $((1023 * 1024 * 1024)) --markdown --only-with-suspends
+```
+
+のように予算を直接与えてもよい。
 
 **⚠️ この workflow は `windows-latest` ランナー上で VeloX (WebView2)
 のウィンドウが実際に起動できるかどうかが最大の未知数である。** Linux は
