@@ -304,8 +304,11 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         })?;
     }
     // `results/tabs_hold_50-windows-baseline-1.json` ->
-    // `tabs_hold_50-windows-baseline-1`. Falls back to the scenario ID for
-    // an `--output` with no usable stem (e.g. `.json`).
+    // `tabs_hold_50-windows-baseline-1`. Falls back to the scenario ID only
+    // when `--output` has no file-name component at all (`file_stem` is
+    // `None`, e.g. `..`) — note that `.json` is *not* such a case:
+    // `Path::file_stem` treats a leading-dot-only name as the stem itself,
+    // so it yields `.json-trial-1.jsonl`, which is odd but unambiguous.
     let output_stem: String = Path::new(output_path)
         .file_stem()
         .and_then(|stem| stem.to_str())
