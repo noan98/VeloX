@@ -680,13 +680,26 @@ jobs:
             return $names
           }
 
+          # Issue #176 Stage 3 / D145 Revisit condition (1) / D147。
+          # `--keep-logs` で**各試行の perf ログ (JSON Lines) を捨てずに残す**。
+          # 結果 JSON は中央値などの集計値しか持たないため、§46 の
+          # 「`mark` の後に 5 秒ごとに 4 タブずつ休止が続く」は遅延の分布
+          # としてしか見えず、1 回のスイープが何タブを要求したのか (= 仮説
+          # 「`ESTIMATED_BYTES_PER_TAB` が Windows では過大で、要求が小さく
+          # 出て収束に回数が要る」の検証材料) は時系列でしか確かめられない。
+          # 置き場は `results\perf-logs\` — 後段のサマリと ingest は
+          # `results` 直下の `*-windows*.json` しか読まないので
+          # (`Get-ChildItem -Filter`、`perf_history_plan.py` の `glob`)、
+          # サブディレクトリの `.jsonl` が集計に混ざることはない。artifact
+          # には `results/` ごと入る。
           function Invoke-Bench([string] $sc, [string] $url, [string] $outfile, [string] $label) {
             Write-Host "=== $label -> $outfile ==="
             & target\release\velox-bench.exe run `
               --scenario $sc `
               --trials $trials `
               --url "$url" `
-              --output $outfile
+              --output $outfile `
+              --keep-logs results\perf-logs
             if ($LASTEXITCODE -ne 0) {
               throw "velox-bench run が失敗しました (条件: $label, exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
             }

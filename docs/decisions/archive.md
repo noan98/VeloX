@@ -18291,3 +18291,110 @@ wry 0.57.0 の CHANGELOG のうち、依存の更新以外で VeloX に関係し
 3 つを常に 1 本にまとめること。(2) wry が `windows` / `webview2-com` の major を
 また上げたら、同じ手順 (3 つ同時、`cargo tree -d` で `windows-core` が
 1 つに収束していることを確認) で追随する。
+
+## D147: 試行ごとの perf ログ (生の JSON Lines) を perf-windows の artifact に残す (Issue #176 Stage 3 / D145 Revisit condition (1)) — `velox-bench run --keep-logs` で結果ファイル名に揃えて残し、集計は 1 バイトも変えない
+
+**対象**: D145 Revisit condition (1) と `docs/performance-targets.md` §46.5
+が「次の計測基盤の一手」と書いた、**perf ログの生の時系列を artifact に
+残す**こと。Issue #176 Stage 3 の hysteresis 計測 (D145) で残った
+「50 タブ + `LOW` では `mark` の後も 5 秒ごとに 4 タブずつ休止が続く」の
+原因 (§46.5 仮説 2: `ESTIMATED_BYTES_PER_TAB` = 64 MiB が Windows + `LOW`
+の実態 29 MiB/タブより大きく、1 回の要求が小さく出て収束に回数が要る) を
+確かめる材料を作る。
+
+### 背景
+
+`velox-bench run` は試行ごとに `VELOX_PERF_OUTPUT` を temp dir の一時
+ファイルに向け、`benchmark::parse_jsonl` で読んだ**直後に削除**していた。
+残るのは `--output` の集計結果 (`BenchmarkResult`、メトリクスごとの
+中央値・サンプル一覧) だけである。これは中央値の比較には十分だが、
+**時系列は消えている**:
+
+- `tab_suspend` レコードは `sweep_tabs` が 1 タブ休止するたびに 1 行書く
+  (`record_tab_suspend`)。1 回のスイープが何タブを要求したか
+  (`suspension::tabs_to_free` の結果) は、**`ts_ms` がほぼ同じ
+  `tab_suspend` が何行連続しているか**としてしか残っていない。
+- その直前の `rss` サンプル (予算をどれだけ超えていたか) と並べて初めて、
+  「超過量に対して要求が小さく出ていた」かどうかが読める。
+
+D145 の `tab_resuspend_delay_ms` はこの時系列を**遅延の分布**に潰した
+ものであり、「5 秒周期・4 タブずつ」という形までは復元できたが、
+「なぜ 4 か」は分布からは決められなかった (§46.5)。perf-windows の
+artifact には集計後の JSON しか無かったので、run を回し直しても同じ
+ところで止まる。
+
+### 決定1: 残す仕組みは workflow ではなく `velox-bench run` に持たせる (`--keep-logs <dir>`)
+
+候補は 2 つあった。(a) workflow 側で `VELOX_PERF_OUTPUT` を自分で指定して
+`velox-bench` を迂回する、(b) `velox-bench run` に「試行ログを残す」
+オプションを足す。**(b) にした。**
+
+(a) は `run` が持つ試行ごとの `VELOX_PERF_OUTPUT` の付け替え・
+`VELOX_PERF_RSS_INTERVAL_MS` の自動調整 (D50)・自動操作スクリプトの生成
+(D44) を PowerShell に複製することになり、Linux (`perf-gate.yml`) や
+手元実行と挙動が分かれる。(b) なら**どの OS のどの呼び出しでも同じ 1 つの
+実装**で残せる。
+
+`--keep-logs <dir>` を付けると、各試行のログを temp dir ではなく `<dir>`
+の下に**`--output` のファイル名の stem + `-trial-<n>.jsonl`** で書き、
+削除しない。stem を使うのは perf-windows の A/B 腕
+(`<prefix>-windows-baseline-<r>.json` / `-compare-<r>.json`) と複数ページ
+(`tabs_hold_20@dom_heavy-…`) を**結果ファイルと同じ規則で区別する**ため
+で、ログ側に独自の命名を導入すると、どのログがどの結果に対応するかを
+別表で持つことになる。同じ名前で再実行すると上書きされる (`--output` と
+同じ挙動)。
+
+### 決定2: 置き場は `results\perf-logs\`、後段の集計とは構造的に混ざらない
+
+perf-windows.yml の `Invoke-Bench` に `--keep-logs results\perf-logs` を
+足した。`results/` は既に artifact に丸ごと入る (`Upload results`) ので、
+upload 側の変更は要らない。
+
+後段が読む範囲を確認した上でこの場所にしている:
+
+| 読み手 | 読む範囲 | `results/perf-logs/*.jsonl` は |
+| --- | --- | --- |
+| Job Summary (A/B 表・タブ数スケーリング表) | `Get-ChildItem -Path results -Filter "*-windows*.json"` (非再帰) | 読まない |
+| `ingest-history` (`perf_history_plan.py`) | `results_dir.glob("*.json")` (非再帰) | 読まない → `results/history/` にも入らない |
+
+つまり**生ログが集計や履歴に紛れ込む経路は無い**。`results/history/` は
+集計値だけの追記専用 (D132) のままである。
+
+### 決定3: 集計結果は変えない — 同じファイルを同じように読む
+
+`--keep-logs` の有無で変わるのはログファイルの**場所と寿命**だけで、
+`parse_jsonl` → `aggregate_trials` に渡る内容は同一である。したがって
+perf-windows の結果 JSON・Job Summary・`results/history/` の値は、この
+変更の前後で 1 バイトも変わらない。Linux 上で `cargo check` /
+`cargo clippy --target x86_64-pc-windows-msvc --all-targets -- -D warnings`
+(CLAUDE.md「コマンド」の手順) は警告 0 で通っている。
+
+### 見送ったもの・既知の制約
+
+(1) **`perf-gate.yml` (Linux の回帰ゲート) には足していない。** 時系列が
+要るのは Windows の 50 タブの収束の問題であり、CLAUDE.md「対応 OS の
+優先度」のとおり Windows を先に整える。フラグ自体は OS を問わないので、
+必要になったら同じ 1 行を足すだけでよい。
+(2) **`compare-windows.yml` にも足していない。** あちらは 2 つの ref の
+比較 (D97) で、時系列を読む問いをまだ持っていない。
+(3) **生ログを読む解析ツール (スイープごとの要求タブ数と直前の `rss` を
+並べる表など) はまだ作っていない。** どの形が要るかは最初の実測を見て
+から決める — 先に作ると、§46.5 の仮説 2 に都合のよい切り方だけを用意
+することになりかねない (D46)。手元では `jq` や `velox-bench aggregate
+--input` で読める形式である。
+(4) **artifact の容量。** `tabs_hold_bounce_50` は 1 試行あたり
+50 タブ分の `rss` サンプル (500ms 周期、D50) と `tab_suspend` /
+`tab_resume` が入るので数百 KB 規模になる見込みだが、実測はしていない。
+retention は既存の 30 日のまま。問題になったら `perf-logs` だけ別 artifact
+にして retention を短くする。
+(5) 本作業環境には WebKitGTK が無く、`velox-bench run` を実際に動かして
+`--keep-logs` の出力を確認することはできていない (D146 (2) と同じ制約)。
+CI の Windows ジョブと、次回の perf-windows 実行で確認する。
+
+**Revisit condition**: (1) 次回の `tabs_hold_bounce_50` の run で
+`results/perf-logs/` の時系列を読み、§46.5 仮説 2 (要求が小さく出ている)
+を確かめる。確かめられたら D138 の見込み解放量を OS ごと / hint の有無
+ごとに分ける話 (D145 Revisit (1) の後半) に進む。(2) 生ログの読み方が
+定まったら、(3) の解析を `velox-bench` のサブコマンドか
+`.github/scripts/` に固定し、Job Summary に載せる。(3) artifact の容量が
+問題になったら (4) のとおり分離する。
