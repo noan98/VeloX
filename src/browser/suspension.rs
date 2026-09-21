@@ -502,6 +502,78 @@ impl BackgroundMemoryTarget {
     }
 }
 
+/// Which of the process tree's memory figures the memory-budget signal
+/// compares against [`SuspensionPolicy::memory_budget_bytes`] (Issue #176
+/// Stage 3, docs/decisions.md D151).
+///
+/// Every sample (`metrics::RssSample`) carries up to three totals, and
+/// which ones exist depends on the platform: PSS (Linux only), private
+/// commit (Windows only, `PagefileUsage`, D150) and RSS (everywhere, on
+/// Windows the working set). Until D151 the choice was fixed — PSS where
+/// it exists, else RSS — which on Windows meant the **working set**.
+/// `docs/performance-targets.md` §47.9 measured that the working set of a
+/// freshly created renderer keeps growing for ~75 s by about +470 MiB per
+/// 50 tabs **without the process allocating anything** (private commit
+/// stayed flat, even fell): pages that were already committed, or shared,
+/// were merely touched into residency. A budget compared against that
+/// keeps discarding background tabs to pay for residency, not for
+/// allocation — the "5 秒に 4 タブ" / "揺り戻し" §46〜§47 chased.
+///
+/// This knob exists to measure the alternative on the same binary
+/// (`VELOX_MEMORY_BUDGET_INPUT`). **The default is unchanged behavior**
+/// ([`Self::Resident`]) until the A/B is in — the same rule
+/// [`SuspendMechanism`] followed (D121): a knob first, the default only
+/// after the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryBudgetInput {
+    /// PSS where the platform reads it (Linux), otherwise RSS — on Windows
+    /// the working set. Everything VeloX did before D151.
+    #[default]
+    Resident,
+    /// Private commit where the platform reads it (Windows,
+    /// `metrics::RssSample::total_private_bytes`), otherwise exactly
+    /// [`Self::Resident`] — so on Linux the two spellings are identical
+    /// today (PSS), and only Windows changes.
+    PrivateCommit,
+}
+
+impl MemoryBudgetInput {
+    /// Stable lowercase name, for logs and settings round-trips.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemoryBudgetInput::Resident => "resident",
+            MemoryBudgetInput::PrivateCommit => "private",
+        }
+    }
+
+    /// Parse the `VELOX_MEMORY_BUDGET_INPUT` spelling. `None` for anything
+    /// unrecognized, so the caller falls back to the default rather than
+    /// letting a typo pick behavior the measurements never covered — the
+    /// same rule [`SuspendMechanism::parse`] follows.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "resident" => Some(MemoryBudgetInput::Resident),
+            "private" => Some(MemoryBudgetInput::PrivateCommit),
+            _ => None,
+        }
+    }
+
+    /// The number the memory signal hands to [`plan`] as
+    /// [`MemorySample::total_bytes`], chosen from one sample's three totals.
+    /// Pure so the fallback order is unit-tested without a real process
+    /// tree; `app::spawn_memory_pressure_sampler` feeds it the fields of
+    /// `metrics::RssSample`.
+    ///
+    /// `None` inputs mean "this platform could not read that figure", never
+    /// zero (the `RssSample` rule), so the fallback steps over them.
+    pub fn pick(self, private_bytes: Option<u64>, pss_bytes: Option<u64>, rss_bytes: u64) -> u64 {
+        match self {
+            MemoryBudgetInput::Resident => pss_bytes.unwrap_or(rss_bytes),
+            MemoryBudgetInput::PrivateCommit => private_bytes.or(pss_bytes).unwrap_or(rss_bytes),
+        }
+    }
+}
+
 /// Whether a **late** "the engine could not freeze this tab" answer may
 /// still throw that tab's webview away (Issue #243).
 ///
@@ -1557,6 +1629,56 @@ mod tests {
         for raw in ["", "  ", "freeze", "discard", "high", "1", "true", "lo"] {
             assert_eq!(BackgroundMemoryTarget::parse(raw), None, "raw = {raw:?}");
         }
+    }
+
+    // -- Issue #176 Stage 3 (D151): VELOX_MEMORY_BUDGET_INPUT -------------
+
+    #[test]
+    fn memory_budget_input_defaults_to_the_pre_d151_behavior() {
+        // A knob to *measure* private commit against the working set, not
+        // to ship it: the default stays what every recorded number (§46〜
+        // §47) was taken with, until the A/B says otherwise.
+        assert_eq!(MemoryBudgetInput::default(), MemoryBudgetInput::Resident);
+    }
+
+    #[test]
+    fn memory_budget_input_parses_its_own_names_and_rejects_everything_else() {
+        for input in [
+            MemoryBudgetInput::Resident,
+            MemoryBudgetInput::PrivateCommit,
+        ] {
+            assert_eq!(MemoryBudgetInput::parse(input.as_str()), Some(input));
+        }
+        assert_eq!(
+            MemoryBudgetInput::parse(" Private "),
+            Some(MemoryBudgetInput::PrivateCommit)
+        );
+        for raw in ["", "  ", "rss", "pss", "commit", "working_set", "low", "1"] {
+            assert_eq!(MemoryBudgetInput::parse(raw), None, "raw = {raw:?}");
+        }
+    }
+
+    #[test]
+    fn memory_budget_input_pick_follows_the_documented_fallback_order() {
+        // Linux today: PSS + RSS, no private commit. Both spellings read PSS.
+        assert_eq!(MemoryBudgetInput::Resident.pick(None, Some(500), 900), 500);
+        assert_eq!(
+            MemoryBudgetInput::PrivateCommit.pick(None, Some(500), 900),
+            500
+        );
+        // Windows today: private commit + RSS (working set), no PSS. This is
+        // the one platform where the knob changes anything.
+        assert_eq!(
+            MemoryBudgetInput::Resident.pick(Some(1500), None, 1200),
+            1200
+        );
+        assert_eq!(
+            MemoryBudgetInput::PrivateCommit.pick(Some(1500), None, 1200),
+            1500
+        );
+        // Neither extra figure (other Unix): RSS for both.
+        assert_eq!(MemoryBudgetInput::Resident.pick(None, None, 900), 900);
+        assert_eq!(MemoryBudgetInput::PrivateCommit.pick(None, None, 900), 900);
     }
 
     // -- Issue #272 (D142): a tab with form input is never suspended ----

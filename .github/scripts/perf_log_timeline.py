@@ -34,14 +34,18 @@ trial ごとに次を表にする:
   メモリ判定は別のサンプラ (`VELOX_MEMORY_CHECK_INTERVAL_MS`、既定 5 秒)
   が採るので、「直前の `rss`」は判定が見た値そのものではなく、その近似
   である。表には `rss` の古さ (スイープまでの経過 ms) を出す。
-- Windows では PSS が採れないため、判定は `total_rss_bytes` を使う
-  (`app.rs` の `total_pss_bytes.unwrap_or(total_rss_bytes)`)。Linux では
-  判定は PSS を見るので、この表の「超過量」は Linux では過大になる。
+- 判定が見る量は `VELOX_MEMORY_BUDGET_INPUT` (D151) で決まる。既定の
+  `resident` は Windows では `total_rss_bytes` (ワーキングセット)、
+  `private` は `total_private_bytes` (私的コミット、D150。無ければ
+  `resident` と同じ)。このスクリプトは `--budget-input` で同じ選択を
+  真似る (既定 `resident`)。Linux では判定は PSS を見るので、この表の
+  「超過量」は Linux では過大になる。
 
 使い方:
 
     perf_log_timeline.py <file.jsonl | dir> [...] [--ram-bytes N | --budget-bytes N]
-        [--per-tab-bytes N] [--markdown] [--only-with-suspends]
+        [--per-tab-bytes N] [--budget-input resident|private] [--markdown]
+        [--only-with-suspends]
 
 ディレクトリを渡すとその直下の `*.jsonl` を名前順に読む。終了コードは
 読めたファイルが 1 つも無いときだけ 1、それ以外は 0 (診断ツールなので
@@ -77,6 +81,22 @@ def memory_budget_for_ram(ram_bytes: int | None) -> int:
     if ram_bytes is None:
         return MIN_MEMORY_BUDGET_BYTES
     return min(max(ram_bytes // MEMORY_BUDGET_RAM_DIVISOR, MIN_MEMORY_BUDGET_BYTES), MAX_MEMORY_BUDGET_BYTES)
+
+
+# `suspension::MemoryBudgetInput` の綴り (D151)。判定が予算と比べる量。
+BUDGET_INPUTS = ("resident", "private")
+
+
+def judged_bytes(sample: "RssSample", budget_input: str) -> int:
+    """判定が `budget_input` で見る量 (`MemoryBudgetInput::pick` と同じ順)。
+
+    perf ログの `rss` レコードには PSS は Windows では無い (null) ので、
+    ここでは `private` なら `total_private_bytes`、無ければ
+    `total_rss_bytes`。Linux のログ (PSS あり) は今のところ対象外。
+    """
+    if budget_input == "private" and sample.total_private_bytes is not None:
+        return sample.total_private_bytes
+    return sample.total_rss_bytes
 
 
 def tabs_to_free(total: int, budget: int, per_tab: int) -> int:
@@ -265,6 +285,7 @@ def render_markdown(
     budget: int | None,
     per_tab: int,
     only_with_suspends: bool,
+    budget_input: str = "resident",
 ) -> str:
     lines: list[str] = []
     lines.append("### 休止スイープの時系列 (D147 / D148、§46.5 の検証用)")
@@ -276,7 +297,8 @@ def render_markdown(
         )
     else:
         lines.append(
-            f"予算 **{budget / MIB:.0f} MiB**、見込み解放量 **{per_tab / MIB:.0f} MiB/タブ** として、"
+            f"予算 **{budget / MIB:.0f} MiB**、見込み解放量 **{per_tab / MIB:.0f} MiB/タブ**、"
+            f"判定の入力 **`{budget_input}`** (D151) として、"
             "各スイープの直前の `rss` から `tabs_to_free` と同じ式で「要求タブ数」を求めている。"
             "**要求 = 実際なら、判定は要求どおりに取れていて、収束が遅いのは要求が小さく出ているから** "
             "(§46.5 仮説 2)。実際 > 要求なら疑似プロセスグループの丸ごと回収 (仮説 1) の寄与がある。"
@@ -337,8 +359,9 @@ def render_markdown(
                 if before is None:
                     cells.extend(["-", "-"])
                 else:
-                    over = max(before.total_rss_bytes - budget, 0)
-                    demand = tabs_to_free(before.total_rss_bytes, budget, per_tab)
+                    judged = judged_bytes(before, budget_input)
+                    over = max(judged - budget, 0)
+                    demand = tabs_to_free(judged, budget, per_tab)
                     marker = "" if demand == sweep.count else (" ⚠️" if sweep.count > demand else " ↓")
                     cells.extend([f"{over / MIB:.1f}", f"{demand}{marker}"])
             cells.append(_mib(after_rss.total_rss_bytes if after_rss else None))
@@ -452,7 +475,13 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
     return "\n".join(lines)
 
 
-def render_plain(timelines: list[Timeline], budget: int | None, per_tab: int, only_with_suspends: bool) -> str:
+def render_plain(
+    timelines: list[Timeline],
+    budget: int | None,
+    per_tab: int,
+    only_with_suspends: bool,
+    budget_input: str = "resident",
+) -> str:
     lines: list[str] = []
     for tl in timelines:
         if only_with_suspends and not tl.sweeps:
@@ -469,8 +498,9 @@ def render_plain(timelines: list[Timeline], budget: int | None, per_tab: int, on
                 f"rss_before={_mib(before.total_rss_bytes if before else None)}MiB",
             ]
             if budget is not None and before is not None:
-                parts.append(f"over={max(before.total_rss_bytes - budget, 0) / MIB:.1f}MiB")
-                parts.append(f"demand={tabs_to_free(before.total_rss_bytes, budget, per_tab)}")
+                judged = judged_bytes(before, budget_input)
+                parts.append(f"over={max(judged - budget, 0) / MIB:.1f}MiB")
+                parts.append(f"demand={tabs_to_free(judged, budget, per_tab)}")
             parts.append(f"rss_after={_mib(sweep.rss_after.total_rss_bytes if sweep.rss_after else None)}MiB")
             parts.append(f"procs={_pair(before, sweep.rss_after, lambda s: s.process_count, as_mib=False)}")
             parts.append(f"engine={_pair(before, sweep.rss_after, lambda s: s.engine_rss_bytes, as_mib=True)}MiB")
@@ -507,6 +537,16 @@ def main(argv: list[str] | None = None) -> int:
         type=int,
         default=ESTIMATED_BYTES_PER_TAB,
         help=f"1 タブあたりの見込み解放量 (bytes、既定 {ESTIMATED_BYTES_PER_TAB})",
+    )
+    parser.add_argument(
+        "--budget-input",
+        choices=BUDGET_INPUTS,
+        default="resident",
+        help=(
+            "判定が予算と比べる量 (VELOX_MEMORY_BUDGET_INPUT、D151)。resident = total_rss_bytes "
+            "(Windows ではワーキングセット)、private = total_private_bytes (無ければ resident と同じ)。"
+            "超過量と要求タブ数の計算に使う (既定 resident)"
+        ),
     )
     parser.add_argument("--markdown", action="store_true", help="Job Summary 向けの Markdown で出す")
     parser.add_argument(
@@ -565,9 +605,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.rss_track:
         print(render_rss_track(timelines, args.track_step_ms, args.markdown))
     elif args.markdown:
-        print(render_markdown(timelines, budget, args.per_tab_bytes, args.only_with_suspends))
+        print(render_markdown(timelines, budget, args.per_tab_bytes, args.only_with_suspends, args.budget_input))
     else:
-        print(render_plain(timelines, budget, args.per_tab_bytes, args.only_with_suspends))
+        print(render_plain(timelines, budget, args.per_tab_bytes, args.only_with_suspends, args.budget_input))
     return 0
 
 

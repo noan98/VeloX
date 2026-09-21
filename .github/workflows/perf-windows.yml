@@ -953,6 +953,10 @@ jobs:
           # 使い、日本語の表を書けずに落ちる (run 35561470137)。スクリプト
           # 側でも UTF-8 に固定しているが、こちらは二重の保険。
           PYTHONUTF8: "1"
+          # D151。判定が予算と比べる量 (`VELOX_MEMORY_BUDGET_INPUT`) は腕ごとに
+          # 違いうるので、表の「超過 / 要求」も腕ごとに同じ選択で出す。
+          COMPARE_ENV: ${{ steps.bench_run.outputs.compare_env }}
+          COMMON_ENV: ${{ inputs.common_env }}
         run: |
           if (-not (Test-Path "results\perf-logs")) {
             Write-Host "results\perf-logs がありません (velox-bench run が 1 度も走っていない可能性)"
@@ -962,15 +966,41 @@ jobs:
           # これが OEM コードページのままだと、python 側を直しても
           # `$timeline` の中で日本語が化ける。
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-          $timeline = python .github/scripts/perf_log_timeline.py results\perf-logs `
-            --ram-bytes $env:RAM_BYTES --markdown --only-with-suspends
-          if ($LASTEXITCODE -ne 0) {
-            Write-Host "::warning::休止スイープの時系列を作れませんでした (exit code $LASTEXITCODE)"
-            exit 0
+
+          # 腕ごとの判定の入力 (D151)。`common_env` は両腕に、`compare_env`
+          # は B にだけ効く。どちらにも無ければ Rust 側の既定 (`resident`)。
+          function Get-BudgetInput([string] $envList, [string] $fallback) {
+            if ($envList -match 'VELOX_MEMORY_BUDGET_INPUT\s*=\s*([A-Za-z]+)') {
+              return $Matches[1].ToLowerInvariant()
+            }
+            return $fallback
           }
-          $text = $timeline -join "`n"
-          Write-Host $text
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $text
+          $baselineInput = Get-BudgetInput $env:COMMON_ENV "resident"
+          $compareInput = Get-BudgetInput $env:COMPARE_ENV $baselineInput
+
+          # 腕ごとに入力が違うときだけ、ファイルを A / B に分けて 2 回呼ぶ
+          # (結果ファイル名の `-baseline-` / `-compare-` で分ける)。同じなら
+          # ディレクトリごと 1 回。
+          $groups = @()
+          if ($baselineInput -eq $compareInput) {
+            $groups += @{ input = $baselineInput; paths = @("results\perf-logs") }
+          } else {
+            $a = @(Get-ChildItem results\perf-logs -Filter "*-baseline-*.jsonl" | ForEach-Object { $_.FullName })
+            $b = @(Get-ChildItem results\perf-logs -Filter "*-compare-*.jsonl" | ForEach-Object { $_.FullName })
+            if ($a.Count -gt 0) { $groups += @{ input = $baselineInput; paths = $a } }
+            if ($b.Count -gt 0) { $groups += @{ input = $compareInput; paths = $b } }
+          }
+          foreach ($group in $groups) {
+            $timeline = python .github/scripts/perf_log_timeline.py @($group.paths) `
+              --ram-bytes $env:RAM_BYTES --budget-input $group.input --markdown --only-with-suspends
+            if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::休止スイープの時系列を作れませんでした (exit code $LASTEXITCODE)"
+              exit 0
+            }
+            $text = $timeline -join "`n"
+            Write-Host $text
+            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $text
+          }
 
           # §47.7。スイープの表は休止の瞬間しか見せないので、予算 OFF の腕
           # (休止ゼロ) の rss の推移が読めない。「復帰で作り直した webview
