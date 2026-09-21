@@ -1,0 +1,219 @@
+"""`perf_log_timeline.py` の単体テスト。
+
+**なぜこのテストが要るか** (D148)
+
+このスクリプトが出す「要求タブ数」は、`browser::suspension` の
+`memory_budget_for_ram` / `tabs_to_free` の**複製**である。Rust 側と
+ずれると、§46.5 の仮説 2 (要求が小さく出ている) を「確かめた」つもりで
+別の式を見ていることになる。ここでは §46 で実測した機械
+(15.99 GiB → 予算 1023 MiB) と、`tabs_to_free` のテストが固定している
+性質 (切り上げ・超過があれば必ず 1 以上・見込み解放量 0 なら 0) を
+そのまま固定する。
+
+スイープのまとめ方も固定する: 1 回の判定で休止された 4 タブ (数 ms 差)
+は 1 行に、5 秒後の次の判定は別の行になること。ここが崩れると
+「5 秒に 4 タブ」が「5 秒に 1 タブ × 4 行」に見えて、問いそのものが
+消える。
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from perf_log_timeline import (  # noqa: E402
+    ESTIMATED_BYTES_PER_TAB,
+    MIB,
+    build_timeline,
+    expand_inputs,
+    main,
+    memory_budget_for_ram,
+    parse_jsonl,
+    render_markdown,
+    tabs_to_free,
+)
+
+SCRIPT = Path(__file__).resolve().parent / "perf_log_timeline.py"
+
+
+def _rss(ts_ms: float, mib: float, processes: int = 10) -> dict:
+    return {
+        "event": "rss",
+        "ts_ms": ts_ms,
+        "total_rss_bytes": int(mib * MIB),
+        "total_pss_bytes": None,
+        "process_count": processes,
+    }
+
+
+def _suspend(ts_ms: float, tab_id: int, reason: str = "memory") -> dict:
+    return {"event": "tab_suspend", "ts_ms": ts_ms, "tab_id": tab_id, "reason": reason}
+
+
+def _lines(events: list[dict]) -> str:
+    return "\n".join(json.dumps(e) for e in events) + "\n"
+
+
+# §46 の run 2 と同じ形: mark の 1.7 秒後から 5 秒周期で 4 タブずつ。
+SAMPLE_EVENTS = [
+    {"event": "startup", "ts_ms": 1.0},
+    _rss(9_000.0, 1200.0),
+    {"event": "measure_start", "ts_ms": 10_000.0},
+    _rss(11_000.0, 1150.0),
+    _suspend(11_700.0, 5),
+    _suspend(11_705.0, 6),
+    _suspend(11_712.0, 7),
+    _suspend(11_720.0, 8),
+    _rss(12_000.0, 1090.0),
+    {"event": "tab_resume", "ts_ms": 13_000.0, "tab_id": 3},
+    _rss(16_500.0, 1100.0),
+    _suspend(16_700.0, 9),
+    _suspend(16_704.0, 10),
+    _suspend(16_709.0, 11),
+    _suspend(16_715.0, 12),
+    _rss(17_000.0, 1040.0),
+]
+
+
+class BudgetFormulaTest(unittest.TestCase):
+    def test_matches_section_46_machine(self) -> None:
+        # 15.99 GiB (§46 のランナー) → 1023 MiB。Rust 側の
+        # `memory_budget_for_ram` と同じ答えでなければならない。
+        ram = int(15.99 * 1024 * MIB)
+        self.assertEqual(memory_budget_for_ram(ram) // MIB, 1023)
+
+    def test_clamps_to_min_and_max(self) -> None:
+        self.assertEqual(memory_budget_for_ram(4 * 1024 * MIB), 700 * MIB)
+        self.assertEqual(memory_budget_for_ram(64 * 1024 * MIB), 2048 * MIB)
+        self.assertEqual(memory_budget_for_ram(None), 700 * MIB)
+
+
+class TabsToFreeTest(unittest.TestCase):
+    def test_rounds_up_and_never_returns_zero_when_over(self) -> None:
+        per_tab = ESTIMATED_BYTES_PER_TAB
+        budget = 1023 * MIB
+        self.assertEqual(tabs_to_free(budget, budget, per_tab), 0)
+        self.assertEqual(tabs_to_free(budget + 1, budget, per_tab), 1)
+        self.assertEqual(tabs_to_free(budget + per_tab, budget, per_tab), 1)
+        self.assertEqual(tabs_to_free(budget + per_tab + 1, budget, per_tab), 2)
+        self.assertEqual(tabs_to_free(budget + 200 * MIB, budget, per_tab), 4)
+
+    def test_zero_per_tab_means_zero_tabs(self) -> None:
+        self.assertEqual(tabs_to_free(10_000 * MIB, 700 * MIB, 0), 0)
+
+
+class TimelineTest(unittest.TestCase):
+    def test_groups_one_sweep_per_decision(self) -> None:
+        tl = build_timeline(Path("x-trial-1.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        self.assertEqual(tl.mark_ms, 10_000.0)
+        self.assertEqual(len(tl.sweeps), 2)
+        self.assertEqual([s.count for s in tl.sweeps], [4, 4])
+        self.assertEqual(tl.suspended_total, 8)
+        self.assertEqual(len(tl.sweeps_after_mark()), 2)
+        self.assertEqual(len(tl.resumes), 1)
+
+    def test_picks_the_rss_sample_just_before_and_after(self) -> None:
+        tl = build_timeline(Path("x.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        first, second = tl.sweeps
+        self.assertEqual(first.rss_before.total_rss_bytes, 1150 * MIB)
+        self.assertEqual(first.rss_after.total_rss_bytes, 1090 * MIB)
+        self.assertEqual(second.rss_before.total_rss_bytes, 1100 * MIB)
+        self.assertEqual(second.rss_after.total_rss_bytes, 1040 * MIB)
+
+    def test_uses_the_last_measure_start(self) -> None:
+        events = [
+            {"event": "measure_start", "ts_ms": 1_000.0},
+            _suspend(2_000.0, 1),
+            {"event": "measure_start", "ts_ms": 3_000.0},
+            _suspend(4_000.0, 2),
+        ]
+        tl = build_timeline(Path("x.jsonl"), parse_jsonl(_lines(events)))
+        self.assertEqual(tl.mark_ms, 3_000.0)
+        self.assertEqual(len(tl.sweeps), 2)
+        self.assertEqual(len(tl.sweeps_after_mark()), 1)
+
+    def test_skips_broken_lines_and_records_without_ts(self) -> None:
+        text = 'not json\n{"event":"rss"}\n' + _lines([_suspend(5.0, 1)])
+        events = parse_jsonl(text)
+        self.assertEqual(len(events), 1)
+
+
+class RenderTest(unittest.TestCase):
+    def test_markdown_shows_demand_next_to_actual(self) -> None:
+        tl = build_timeline(Path("tabs_hold_bounce_50-windows-baseline-1-trial-1.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        budget = 1023 * MIB
+        text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, only_with_suspends=True)
+        # 1150 MiB - 1023 MiB = 127 MiB 超過 → ceil(127 / 64) = 2 要求に対して 4 休止。
+        self.assertIn("| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 127.0 | 2 ⚠️ | 1090.0 |", text)
+        # 1100 - 1023 = 77 MiB → 2 要求、4 休止。
+        self.assertIn("| 2 | +6.7 | 4 | memory×4 | 1100.0 | 200 | 77.0 | 2 ⚠️ | 1040.0 |", text)
+        self.assertIn("予算 **1023 MiB**", text)
+
+    def test_markdown_omits_empty_logs_when_asked(self) -> None:
+        empty = build_timeline(Path("cold_startup-trial-1.jsonl"), parse_jsonl(_lines([_rss(100.0, 300.0)])))
+        text = render_markdown([empty], None, ESTIMATED_BYTES_PER_TAB, only_with_suspends=True)
+        self.assertNotIn("cold_startup-trial-1.jsonl", text)
+        self.assertIn("1 本は省略", text)
+        text = render_markdown([empty], None, ESTIMATED_BYTES_PER_TAB, only_with_suspends=False)
+        self.assertIn("(休止なし)", text)
+
+
+class CliTest(unittest.TestCase):
+    def test_reads_a_directory_and_computes_budget_from_ram(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "b-trial-1.jsonl").write_text(_lines(SAMPLE_EVENTS), encoding="utf-8")
+            (root / "a-trial-1.jsonl").write_text(_lines([_rss(1.0, 100.0)]), encoding="utf-8")
+            (root / "ignored.json").write_text("{}", encoding="utf-8")
+            self.assertEqual([p.name for p in expand_inputs([tmp])], ["a-trial-1.jsonl", "b-trial-1.jsonl"])
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main([tmp, "--ram-bytes", str(int(15.99 * 1024 * MIB)), "--markdown", "--only-with-suspends"])
+            self.assertEqual(code, 0)
+            self.assertIn("予算 **1023 MiB**", out.getvalue())
+            self.assertIn("b-trial-1.jsonl", out.getvalue())
+            self.assertNotIn("#### `a-trial-1.jsonl`", out.getvalue())
+
+    def test_writes_utf8_even_when_stdout_is_a_legacy_code_page(self) -> None:
+        # perf-windows の初回 (run 35561470137) は、Windows の Python が
+        # stdout を cp1252 で開いたために表の日本語で `UnicodeEncodeError`
+        # になった。`PYTHONIOENCODING=cp1252` で同じ状況を作り、それでも
+        # UTF-8 で書けることを固定する。
+        import os
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "b-trial-1.jsonl"
+            log.write_text(_lines(SAMPLE_EVENTS), encoding="utf-8")
+            env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+            env.pop("PYTHONUTF8", None)
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), str(log), "--budget-bytes", str(1023 * MIB), "--markdown"],
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            self.assertIn("休止スイープの時系列", proc.stdout.decode("utf-8"))
+
+    def test_returns_1_when_nothing_could_be_read(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            err = io.StringIO()
+            with redirect_stdout(io.StringIO()):
+                sys.stderr, saved = err, sys.stderr
+                try:
+                    code = main([str(Path(tmp) / "missing.jsonl")])
+                finally:
+                    sys.stderr = saved
+            self.assertEqual(code, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

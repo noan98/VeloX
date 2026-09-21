@@ -298,6 +298,10 @@ jobs:
           "cpu=$($cpu.Name)" >> $env:GITHUB_OUTPUT
           "cores=$($cpu.NumberOfLogicalProcessors)" >> $env:GITHUB_OUTPUT
           "ram_gib=$mem" >> $env:GITHUB_OUTPUT
+          # D148。休止スイープの時系列 (下の「Show suspend sweep timeline」)
+          # が RAM 相対の予算 (D114、`memory_budget_for_ram`) を再現する
+          # ための生の値。丸めた `ram_gib` からでは 1 MiB 単位で合わない。
+          "ram_bytes=$([int64]$os.TotalVisibleMemorySize * 1KB)" >> $env:GITHUB_OUTPUT
 
       - name: Build (release)
         run: cargo build --release
@@ -869,6 +873,51 @@ jobs:
           } catch {
             Write-Host "beacon 集計を取得できませんでした: $_"
           }
+
+      # Issue #176 Stage 3 / D145 Revisit condition (1) / D147 / D148。
+      # `--keep-logs` で残した試行ごとの生ログから、**メモリ判定 1 回ごとに
+      # 何タブ休止し、その直前の rss が予算をどれだけ超えていたか**を表に
+      # して Job Summary に出す。§46.5 の仮説 2 (「`ESTIMATED_BYTES_PER_TAB`
+      # = 64 MiB が Windows の実態より大きく、1 回の要求が小さく出て収束に
+      # 回数が要る」) は、この「要求タブ数 vs 実際の休止数」の並びでしか
+      # 確かめられない。
+      #
+      # artifact に入る生ログをダウンロードして手元で読むのが本来の経路
+      # だが、**Job Summary に出しておけば run ページを開くだけで読める。**
+      # 予算は perf ログに書かれていないので、`env_info` の RAM から
+      # Rust 側と同じ式で求める (`perf_log_timeline.py` の docstring)。
+      #
+      # 診断であって計測結果そのものではないので、失敗してもジョブは
+      # 落とさない。`--only-with-suspends` で、休止が起きないシナリオ
+      # (`cold_startup` など) では表が空で膨らまないようにしている。
+      - name: Show suspend sweep timeline (D148)
+        if: always()
+        shell: pwsh
+        continue-on-error: true
+        env:
+          RAM_BYTES: ${{ steps.env_info.outputs.ram_bytes }}
+          # Windows の Python は既定でコンソールのコードページ (cp1252) を
+          # 使い、日本語の表を書けずに落ちる (run 35561470137)。スクリプト
+          # 側でも UTF-8 に固定しているが、こちらは二重の保険。
+          PYTHONUTF8: "1"
+        run: |
+          if (-not (Test-Path "results\perf-logs")) {
+            Write-Host "results\perf-logs がありません (velox-bench run が 1 度も走っていない可能性)"
+            exit 0
+          }
+          # python の出力を pwsh が受け取るときの復号も UTF-8 に揃える。
+          # これが OEM コードページのままだと、python 側を直しても
+          # `$timeline` の中で日本語が化ける。
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          $timeline = python .github/scripts/perf_log_timeline.py results\perf-logs `
+            --ram-bytes $env:RAM_BYTES --markdown --only-with-suspends
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::休止スイープの時系列を作れませんでした (exit code $LASTEXITCODE)"
+            exit 0
+          }
+          $text = $timeline -join "`n"
+          Write-Host $text
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $text
 
       - name: Show result summary
         if: always()
