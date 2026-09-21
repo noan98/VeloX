@@ -5753,6 +5753,10 @@ B = `VELOX_MEMORY_BUDGET_MB=0`、`rss_interval_ms=1000`、
 は B の 10 試行目の途中でジョブの 30 分制限に掛かって cancelled に
 なっているが、A 10 試行・B 9 試行の `--rss-track` の表は Job ログに
 残っており (B の 9 試行は小数点まで揃う)、読み取りはそこから。
+同条件を `trials=4` × repeats 2 で取り直した
+[run 35614426718](https://github.com/noan98/VeloX/actions/runs/35614426718)
+(success、機種は Intel Xeon Platinum 8573C) でも、下の表の値は B の
+8 試行すべてで ±3 MiB 以内に揃った — **機種が違っても同じ**。
 
 B (予算 OFF、休止ゼロ、プロセス 57 のまま) の 5 秒窓ごとの差。左が
 ワーキングセット (rss、判定が見ている量)、右が私的コミット (MiB、
