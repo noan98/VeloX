@@ -4,7 +4,7 @@
 
 ## 対象
 
-主担当は **D61–D63, D65, D67, D102, D116** の 7 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D61–D63, D65, D67, D102, D116, D146** の 8 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D61–D63** — CI 実行環境 / input robustness / dependency & security audit
 - **D65** — tab session restore
@@ -14,7 +14,7 @@
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D61–D63, D65, D67, D102, D116** (7 件)
+**このカテゴリが主担当の Decision: D61–D63, D65, D67, D102, D116, D146** (8 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -31,6 +31,7 @@
 - [D67](./archive.md#d67-設定画面と永続設定基盤-30--browsersettings-に一元化しconfigapply_settingsto_settings-で相互変換appearance-のみ即時反映他は次回起動反映) — 設定画面と永続設定基盤 (#30) — `browser::settings` に一元化し、`Config::apply_settings`/`to_settings` で相互変換、Appearance のみ即時反映・他は次回起動反映
 - [D102](./archive.md#d102-リポジトリの-public-化-2026-09-09-で失効した前提を洗い出しコメント起動-workflow-に投稿者の絞り込みを入れる) — リポジトリの public 化 (2026-09-09) で失効した前提を洗い出し、コメント起動 workflow に投稿者の絞り込みを入れる
 - [D116](./archive.md#d116-設計判断の索引は手で書かずarchivemd-から生成して-ci-で検査する-issue-227) — 設計判断の索引は手で書かず、`archive.md` から生成して CI で検査する (Issue #227)
+- [D146](./archive.md#d146-wry--windows--webview2-com-は-3-つ同時にしか上げられない-dependabot-pr-259--199--198--個別の-bump-は-windows-core-の二重化で-windows-ビルドが必ず落ちる) — wry / windows / webview2-com は 3 つ同時にしか上げられない (dependabot PR #259 / #199 / #198) — 個別の bump は `windows-core` の二重化で Windows ビルドが必ず落ちる
 
 ---
 

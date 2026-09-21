@@ -19,7 +19,7 @@ VeloX の設計判断は、実装の経緯・代替案・トレードオフま�
 | [03-performance.md](./03-performance.md) | メトリクス、ベンチマーク、メモリ、プロファイリング、回帰検知 | D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118, D120–D125, D127, D129–D130, D132, D135, D137–D138, D142–D145 |
 | [04-browser-features.md](./04-browser-features.md) | コンテンツブロック、DevTools、ダウンロード、権限、サイトデータ、検索 | D17–D18, D59–D60, D64, D66, D69, D71–D72, D75–D78, D139–D140 |
 | [05-platform-release.md](./05-platform-release.md) | Windows、アイコン、CI、リリース、マルチウィンドウ | D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126, D128, D131, D133–D134 |
-| [06-security-maintenance.md](./06-security-maintenance.md) | 入力値堅牢性、依存監査、セッション復元、設定 | D61–D63, D65, D67, D102, D116 |
+| [06-security-maintenance.md](./06-security-maintenance.md) | 入力値堅牢性、依存監査、セッション復元、設定 | D61–D63, D65, D67, D102, D116, D146 |
 
 ## 重要なルール
 
