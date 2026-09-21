@@ -384,17 +384,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="tab_suspend が 1 件も無いログは省略する (cold_startup などで表が空にならないように)",
     )
-    args = parser.parse_args(argv)
-
     # Windows の Python は stdout をコンソールのコードページ (cp1252 など)
     # で開くので、表の日本語見出しがそのままでは `UnicodeEncodeError` に
     # なる — perf-windows の初回 (run 35561470137) で実際に落ちた。呼び出し
     # 側の `PYTHONUTF8` に頼らず、ここで UTF-8 に固定する (テストが
     # `PYTHONIOENCODING=cp1252` で再現している)。`StringIO` に差し替え
     # られている場合 (単体テスト) は `reconfigure` が無いので触らない。
+    # `parse_args` より前に置くのは、`--help` や引数エラーの日本語も同じ
+    # 経路で落ちるため (PR #283 のレビュー指摘)。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
+
+    args = parser.parse_args(argv)
 
     budget: int | None
     if args.budget_bytes is not None:
