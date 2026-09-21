@@ -896,11 +896,19 @@ jobs:
         continue-on-error: true
         env:
           RAM_BYTES: ${{ steps.env_info.outputs.ram_bytes }}
+          # Windows の Python は既定でコンソールのコードページ (cp1252) を
+          # 使い、日本語の表を書けずに落ちる (run 35561470137)。スクリプト
+          # 側でも UTF-8 に固定しているが、こちらは二重の保険。
+          PYTHONUTF8: "1"
         run: |
           if (-not (Test-Path "results\perf-logs")) {
             Write-Host "results\perf-logs がありません (velox-bench run が 1 度も走っていない可能性)"
             exit 0
           }
+          # python の出力を pwsh が受け取るときの復号も UTF-8 に揃える。
+          # これが OEM コードページのままだと、python 側を直しても
+          # `$timeline` の中で日本語が化ける。
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $timeline = python .github/scripts/perf_log_timeline.py results\perf-logs `
             --ram-bytes $env:RAM_BYTES --markdown --only-with-suspends
           if ($LASTEXITCODE -ne 0) {

@@ -40,6 +40,8 @@ from perf_log_timeline import (  # noqa: E402
     tabs_to_free,
 )
 
+SCRIPT = Path(__file__).resolve().parent / "perf_log_timeline.py"
+
 
 def _rss(ts_ms: float, mib: float, processes: int = 10) -> dict:
     return {
@@ -178,6 +180,28 @@ class CliTest(unittest.TestCase):
             self.assertIn("予算 **1023 MiB**", out.getvalue())
             self.assertIn("b-trial-1.jsonl", out.getvalue())
             self.assertNotIn("#### `a-trial-1.jsonl`", out.getvalue())
+
+    def test_writes_utf8_even_when_stdout_is_a_legacy_code_page(self) -> None:
+        # perf-windows の初回 (run 35561470137) は、Windows の Python が
+        # stdout を cp1252 で開いたために表の日本語で `UnicodeEncodeError`
+        # になった。`PYTHONIOENCODING=cp1252` で同じ状況を作り、それでも
+        # UTF-8 で書けることを固定する。
+        import os
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "b-trial-1.jsonl"
+            log.write_text(_lines(SAMPLE_EVENTS), encoding="utf-8")
+            env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+            env.pop("PYTHONUTF8", None)
+            proc = subprocess.run(
+                [sys.executable, str(SCRIPT), str(log), "--budget-bytes", str(1023 * MIB), "--markdown"],
+                capture_output=True,
+                env=env,
+                check=False,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr.decode("utf-8", "replace"))
+            self.assertIn("休止スイープの時系列", proc.stdout.decode("utf-8"))
 
     def test_returns_1_when_nothing_could_be_read(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
