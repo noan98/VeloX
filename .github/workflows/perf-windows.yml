@@ -183,6 +183,14 @@ on:
         description: "計測対象ページの URL。空欄なら scripts/bench/pages/ の固定ページ (上の page / pages) を loopback 配信して使う。指定すると page / pages は無視される"
         type: string
         default: ""
+      resume_rounds:
+        description: "tabs_hold_resume_N / tabs_hold_bounce_N の復帰ラウンド数 (velox-bench run --resume-rounds、0〜12)。空欄なら既定の 4。§47.7 / D149: タブ切り替え後の engine の増分が切り替え回数に比例するかを見るときに 0 / 1 / 2 で振る。0 は「切り替えなしの長い保持」という対照。上書きした結果は結果 JSON の script_overrides に残り、既定の結果と同じ顔で並べてはならない"
+        type: string
+        default: ""
+      bounce_settle_ms:
+        description: "tabs_hold_bounce_N がラウンドの後に待つ時間 (ms、velox-bench run --bounce-settle-ms)。空欄なら既定の 22000 (D145)。§47.7 / D149: 切り替え後の増分が止まるのか・戻るのかを見るときに 60000 などに伸ばす。ジョブの timeout-minutes (30) と trials × repeats の積に注意。上書きした結果は結果 JSON の script_overrides に残る"
+        type: string
+        default: ""
       rss_interval_ms:
         description: "perf の RSS サンプル間隔 (ms、velox-bench run --rss-interval-ms)。空欄なら velox-bench の自動調整 (D50: tabs_N 系はスクリプト長から逆算、他は既定 5000ms)。§47.5 / D148: 休止スイープの時系列で「直前の rss」を判定に近づけたい・スイープ間の増え方の形を見たいときに 1000 などを指定する。短くするほどサンプラ自身の負荷が測定に乗るので、page_load_ms などを他 run と比べる用途では空欄のまま"
         type: string
@@ -608,10 +616,32 @@ jobs:
           BENCH_PAGES: ${{ steps.bench_url.outputs.pages }}
           INPUT_BEACON: ${{ inputs.beacon }}
           INPUT_RSS_INTERVAL_MS: ${{ inputs.rss_interval_ms }}
+          INPUT_RESUME_ROUNDS: ${{ inputs.resume_rounds }}
+          INPUT_BOUNCE_SETTLE_MS: ${{ inputs.bounce_settle_ms }}
         run: |
           $ErrorActionPreference = "Stop"
           $scenario = $env:INPUT_SCENARIO
           if ([string]::IsNullOrWhiteSpace($scenario)) { $scenario = "cold_startup" }
+
+          # §47.7 / D149。スクリプトの形の計測用の上書き。値の妥当性
+          # (効くシナリオか、上限か) は velox-bench 側 (`validate_for`) が
+          # 検査して、効かない組み合わせなら run を失敗させる — 黙って既定
+          # のまま測らない。ここでは整数であることだけ見る。
+          $scriptOverrideArgs = @()
+          foreach ($pair in @(
+              @{ name = "resume_rounds"; env = $env:INPUT_RESUME_ROUNDS; flag = "--resume-rounds" },
+              @{ name = "bounce_settle_ms"; env = $env:INPUT_BOUNCE_SETTLE_MS; flag = "--bounce-settle-ms" })) {
+            if (-not [string]::IsNullOrWhiteSpace($pair.env)) {
+              $parsed = 0
+              if (-not [int]::TryParse($pair.env.Trim(), [ref]$parsed) -or $parsed -lt 0) {
+                throw "$($pair.name) は 0 以上の整数で指定してください (受け取った値: '$($pair.env)')"
+              }
+              $scriptOverrideArgs += @($pair.flag, "$parsed")
+            }
+          }
+          if ($scriptOverrideArgs.Count -gt 0) {
+            Write-Host "スクリプトの計測用の上書き: $($scriptOverrideArgs -join ' ') (結果 JSON の script_overrides に残る。既定の結果と同じ顔で並べないこと)"
+          }
 
           # §47.5 / D148。perf の RSS サンプル間隔。空欄なら velox-bench の
           # 自動調整 (D50) に任せる。指定があれば `--rss-interval-ms` で
@@ -725,7 +755,8 @@ jobs:
               --url "$url" `
               --output $outfile `
               --keep-logs results\perf-logs `
-              @rssIntervalArgs
+              @rssIntervalArgs `
+              @scriptOverrideArgs
             if ($LASTEXITCODE -ne 0) {
               throw "velox-bench run が失敗しました (条件: $label, exit code $LASTEXITCODE) — 上の診断ステップのログを確認してください"
             }

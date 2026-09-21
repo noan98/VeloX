@@ -504,6 +504,95 @@ const MEMORY_BOUNCE_SETTLE_MS: u64 = 22_000;
 /// duration, is what the interval is derived from.
 const TARGET_STABILIZED_RSS_SAMPLES: u64 = 4;
 
+/// 復帰ラウンド数の上限。上の `const _: () = assert!(MEMORY_RESUME_ROUNDS * 4
+/// <= 48)` と同じ根拠 (50 タブで 48 休止のうち 1/4 以下しか戻さない) を、
+/// 実行時の上書き ([`BenchScriptOverrides`]) にも同じ数で課す。
+pub const MAX_RESUME_ROUNDS: usize = 48 / 4;
+const _: () = assert!(MEMORY_RESUME_ROUNDS <= MAX_RESUME_ROUNDS);
+
+/// `tabs_hold_resume_N` / `tabs_hold_bounce_N` の**計測用の上書き**
+/// (Issue #176 Stage 3、docs/decisions.md D149)。
+///
+/// §47.7 で「タブを表示 (アクティブ化) した 5〜20 秒後に engine 側が約
+/// 300 MiB 増え、22 秒の窓の端でまだ増え続けている」ことが分かった。
+/// これが止まるのか・切り替え回数に比例するのかを見るには、復帰ラウンド数
+/// (`MEMORY_RESUME_ROUNDS`) と揺り戻しの待ち (`MEMORY_BOUNCE_SETTLE_MS`) を
+/// **1 回の計測のためだけに**振る必要がある。定数そのものを変えると、
+/// 同じシナリオ ID の記録済みの値 (§46 / §47) が指す局面が変わってしまう
+/// (D96 / D111 が禁じる「条件の違う数値を同じ顔で並べる」)。そこで定数は
+/// そのままに、`velox-bench run --resume-rounds` / `--bounce-settle-ms` から
+/// ここを通して渡し、結果 JSON (`BenchmarkResult::script_overrides`) に
+/// 何を上書きしたかを残す。
+///
+/// `None` は「定数どおり」で、その場合の挙動はこの型が無かった頃と 1 バイト
+/// も変わらない ([`generate_bench_script`] などの引数なし版はこれを渡す)。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BenchScriptOverrides {
+    /// `mark` の後に戻す (= `switch` する) ラウンド数。0 なら `mark` の後に
+    /// 何もせず待つだけになり、「切り替えなしの長い保持」という対照が作れる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_rounds: Option<usize>,
+    /// `tabs_hold_bounce_N` がラウンドの後に待つ時間 (ms)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounce_settle_ms: Option<u64>,
+}
+
+impl BenchScriptOverrides {
+    /// 何も上書きしていないか。結果 JSON に書くかどうかの判断に使う。
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn resume_rounds(&self) -> usize {
+        self.resume_rounds.unwrap_or(MEMORY_RESUME_ROUNDS)
+    }
+
+    fn bounce_settle_ms(&self) -> u64 {
+        self.bounce_settle_ms.unwrap_or(MEMORY_BOUNCE_SETTLE_MS)
+    }
+
+    /// `scenario` に対してこの上書きが意味を持つかを検査する。**効かない
+    /// シナリオに指定されたら黙って無視せず `Err`** — 「上書きしたつもりで
+    /// 既定のまま測った」結果が同じ顔で残るのを防ぐため。
+    pub fn validate_for(
+        &self,
+        scenario: crate::browser::benchmark::scenario::Scenario,
+    ) -> Result<(), String> {
+        use crate::browser::benchmark::scenario::Scenario;
+        let has_rounds = matches!(
+            scenario,
+            Scenario::TabCountMemoryResume(_) | Scenario::TabCountMemoryBounce(_)
+        );
+        let has_bounce = matches!(scenario, Scenario::TabCountMemoryBounce(_));
+        if let Some(rounds) = self.resume_rounds {
+            if !has_rounds {
+                return Err(format!(
+                    "--resume-rounds は tabs_hold_resume_N / tabs_hold_bounce_N にしか効きません ({})",
+                    scenario.id()
+                ));
+            }
+            if rounds > MAX_RESUME_ROUNDS {
+                return Err(format!(
+                    "--resume-rounds は {MAX_RESUME_ROUNDS} 以下で指定してください (受け取った値: {rounds})。\
+                     50 タブで 48 休止のうち 1/4 以下しか戻さない、という前提を守るためです"
+                ));
+            }
+        }
+        if let Some(settle) = self.bounce_settle_ms {
+            if !has_bounce {
+                return Err(format!(
+                    "--bounce-settle-ms は tabs_hold_bounce_N にしか効きません ({})",
+                    scenario.id()
+                ));
+            }
+            if settle == 0 {
+                return Err("--bounce-settle-ms は 1 以上で指定してください".to_owned());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// `tabs_hold_N` と `tabs_hold_resume_N` に共通の準備 — タブを間隔を空けて
 /// 開き、休止が落ち着くまで待ち、`mark` を打つところまでを返す。
 ///
@@ -540,9 +629,9 @@ fn memory_hold_setup_lines(tab_count: u32, url: &str) -> Vec<String> {
 /// されているからである (`generate_bench_script` の両分岐、および
 /// `tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait` が
 /// これを検査する)。
-fn memory_resume_rounds_lines() -> Vec<String> {
+fn memory_resume_rounds_lines(rounds: usize) -> Vec<String> {
     let mut lines = Vec::new();
-    for index in 0..MEMORY_RESUME_ROUNDS {
+    for index in 0..rounds {
         lines.push(format!("switch {index}"));
         lines.push(format!("wait {RESUME_SETTLE_MS}"));
     }
@@ -563,6 +652,16 @@ fn memory_resume_rounds_lines() -> Vec<String> {
 pub fn generate_bench_script(
     scenario: crate::browser::benchmark::scenario::Scenario,
     url: &str,
+) -> Option<String> {
+    generate_bench_script_with(scenario, url, BenchScriptOverrides::default())
+}
+
+/// [`generate_bench_script`] に計測用の上書き ([`BenchScriptOverrides`]) を
+/// 渡す版。既定値を渡せば引数なし版と同じ文字列になる。
+pub fn generate_bench_script_with(
+    scenario: crate::browser::benchmark::scenario::Scenario,
+    url: &str,
+    overrides: BenchScriptOverrides,
 ) -> Option<String> {
     use crate::browser::benchmark::scenario::Scenario;
 
@@ -692,7 +791,7 @@ pub fn generate_bench_script(
             // #279) と共有する — 後者が「最後のラウンドの `wait` まで
             // 完全に同一」であることの構造的な保証はここから来る。
             let mut lines = memory_hold_setup_lines(tab_count, url);
-            lines.extend(memory_resume_rounds_lines());
+            lines.extend(memory_resume_rounds_lines(overrides.resume_rounds()));
             lines
         }
         Scenario::TabCountMemoryBounce(tab_count) => {
@@ -705,8 +804,8 @@ pub fn generate_bench_script(
             // `wait` までは `tabs_hold_resume_N` と完全に同一」という
             // 前提を、関数呼び出しの並びそのもので保証する。
             let mut lines = memory_hold_setup_lines(tab_count, url);
-            lines.extend(memory_resume_rounds_lines());
-            lines.push(format!("wait {MEMORY_BOUNCE_SETTLE_MS}"));
+            lines.extend(memory_resume_rounds_lines(overrides.resume_rounds()));
+            lines.push(format!("wait {}", overrides.bounce_settle_ms()));
             lines
         }
     };
@@ -742,6 +841,15 @@ pub fn needs_automation_script(scenario: crate::browser::benchmark::scenario::Sc
 /// steps and waits to comfortably finish (and hit `quit`) before
 /// `velox-bench run` would otherwise kill the process.
 pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::Scenario) -> u64 {
+    recommended_timeout_secs_with(scenario, BenchScriptOverrides::default())
+}
+
+/// [`recommended_timeout_secs`] に計測用の上書きを渡す版 — ラウンド数や
+/// 揺り戻しの待ちを伸ばしたら、待ち切る前に殺されないよう上限も伸びる。
+pub fn recommended_timeout_secs_with(
+    scenario: crate::browser::benchmark::scenario::Scenario,
+    overrides: BenchScriptOverrides,
+) -> u64 {
     use crate::browser::benchmark::scenario::Scenario;
 
     /// Rough wall-clock cost of one `open`/`switch`/`close`/`navigate`
@@ -793,7 +901,8 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             // 固定の待ち時間ではなくラウンドの合計になること。
             let open_ms =
                 u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
-            let rounds_ms = MEMORY_RESUME_ROUNDS as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
+            let rounds_ms =
+                overrides.resume_rounds() as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
             open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms
         }
         Scenario::TabCountMemoryBounce(tab_count) => {
@@ -801,8 +910,9 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
             // `MEMORY_BOUNCE_SETTLE_MS` を足すだけ (Issue #279)。
             let open_ms =
                 u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
-            let rounds_ms = MEMORY_RESUME_ROUNDS as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
-            open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms + MEMORY_BOUNCE_SETTLE_MS
+            let rounds_ms =
+                overrides.resume_rounds() as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
+            open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms + overrides.bounce_settle_ms()
         }
     };
     script_ms / 1000 + STARTUP_DEFAULT_SECS + TEARDOWN_BUFFER_SECS
@@ -847,6 +957,18 @@ pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::S
 pub fn recommended_rss_interval_ms(
     scenario: crate::browser::benchmark::scenario::Scenario,
 ) -> Option<u64> {
+    recommended_rss_interval_ms_with(scenario, BenchScriptOverrides::default())
+}
+
+/// [`recommended_rss_interval_ms`] に計測用の上書きを渡す版。窓の下限が
+/// ラウンド数と揺り戻しの待ちで決まるシナリオでは、上書き後の窓で計算する。
+/// ラウンド数 0 では `RESUME_SETTLE_MS` の合計が 0 になるので、窓の下限は
+/// `tabs_hold_N` と同じ `MEMORY_HOLD_WINDOW_MS` を最低値にする (0 で割らない・
+/// 間隔 0ms を返さない)。
+pub fn recommended_rss_interval_ms_with(
+    scenario: crate::browser::benchmark::scenario::Scenario,
+    overrides: BenchScriptOverrides,
+) -> Option<u64> {
     use crate::browser::benchmark::scenario::Scenario;
     match scenario {
         Scenario::TabCountMemory(_) => Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES),
@@ -866,7 +988,9 @@ pub fn recommended_rss_interval_ms(
         // 窓の下限**として間隔を決める。実際の窓はこれより長くなるので、
         // 目標サンプル数を下回ることはない (安全側)。
         Scenario::TabCountMemoryResume(_) => {
-            Some((MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS) / TARGET_STABILIZED_RSS_SAMPLES)
+            let window = (overrides.resume_rounds() as u64 * RESUME_SETTLE_MS)
+                .max(MEMORY_HOLD_WINDOW_MS.min(MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS));
+            Some(window / TARGET_STABILIZED_RSS_SAMPLES)
         }
         // `tabs_hold_bounce_N` の集計対象窓は `tabs_hold_resume_N` と同じ
         // ラウンド区間に `MEMORY_BOUNCE_SETTLE_MS` の待ちが続くもの
@@ -875,7 +999,7 @@ pub fn recommended_rss_interval_ms(
         // 割る。実際の窓 (各 `switch` の実処理時間を含む) はこれより長く
         // なるので、目標サンプル数を下回ることはない (安全側)。
         Scenario::TabCountMemoryBounce(_) => Some(
-            (MEMORY_RESUME_ROUNDS as u64 * RESUME_SETTLE_MS + MEMORY_BOUNCE_SETTLE_MS)
+            (overrides.resume_rounds() as u64 * RESUME_SETTLE_MS + overrides.bounce_settle_ms())
                 / TARGET_STABILIZED_RSS_SAMPLES,
         ),
         // Same reasoning for the CPU window (Issue #64): the default 5000ms
@@ -1344,6 +1468,153 @@ mod tests {
             window_lower_bound / interval >= 2,
             "窓の下限 {window_lower_bound}ms に間隔 {interval}ms では 2 サンプル入らない"
         );
+    }
+
+    // -- 計測用の上書き (Issue #176 Stage 3 / D149) --------------------------
+
+    #[test]
+    fn default_overrides_reproduce_the_plain_functions_byte_for_byte() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        for scenario in Scenario::all() {
+            assert_eq!(
+                generate_bench_script(scenario, url),
+                generate_bench_script_with(scenario, url, BenchScriptOverrides::default()),
+                "{}",
+                scenario.id()
+            );
+            assert_eq!(
+                recommended_timeout_secs(scenario),
+                recommended_timeout_secs_with(scenario, BenchScriptOverrides::default())
+            );
+            assert_eq!(
+                recommended_rss_interval_ms(scenario),
+                recommended_rss_interval_ms_with(scenario, BenchScriptOverrides::default())
+            );
+        }
+        assert!(BenchScriptOverrides::default().is_default());
+    }
+
+    #[test]
+    fn overridden_rounds_and_settle_change_only_the_tail_of_the_bounce_script() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        let overrides = BenchScriptOverrides {
+            resume_rounds: Some(2),
+            bounce_settle_ms: Some(60_000),
+        };
+        let script = parse_script(
+            &generate_bench_script_with(Scenario::TabCountMemoryBounce(20), url, overrides)
+                .unwrap(),
+        )
+        .unwrap();
+        let switches: Vec<usize> = script
+            .iter()
+            .filter_map(|c| match c {
+                AutomationCommand::Switch { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            switches,
+            vec![0, 1],
+            "ラウンド数の上書きが switch の数に効く"
+        );
+        assert_eq!(
+            script[script.len() - 2],
+            AutomationCommand::Wait { ms: 60_000 },
+            "揺り戻しの待ちの上書きが quit 直前の wait に効く"
+        );
+        // mark までは何も変わらない (D110 決定3 の不変条件は上書きでも保つ)。
+        let plain =
+            parse_script(&generate_bench_script(Scenario::TabCountMemoryBounce(20), url).unwrap())
+                .unwrap();
+        let mark_at = |cmds: &[AutomationCommand]| {
+            cmds.iter()
+                .position(|c| matches!(c, AutomationCommand::Mark))
+                .unwrap()
+        };
+        assert_eq!(script[..=mark_at(&script)], plain[..=mark_at(&plain)]);
+    }
+
+    #[test]
+    fn zero_rounds_is_a_hold_with_no_switch_at_all() {
+        let url = "http://127.0.0.1:8731/minimal.html";
+        let overrides = BenchScriptOverrides {
+            resume_rounds: Some(0),
+            bounce_settle_ms: None,
+        };
+        let script = parse_script(
+            &generate_bench_script_with(Scenario::TabCountMemoryBounce(20), url, overrides)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !script
+                .iter()
+                .any(|c| matches!(c, AutomationCommand::Switch { .. })),
+            "0 ラウンドなら switch は 1 つも無い: {script:?}"
+        );
+        // 間隔は 0 にならず、tabs_hold_N と同じ窓で計算される。
+        let interval =
+            recommended_rss_interval_ms_with(Scenario::TabCountMemoryResume(20), overrides)
+                .unwrap();
+        assert!(interval > 0);
+    }
+
+    #[test]
+    fn overrides_are_rejected_where_they_would_be_silently_ignored() {
+        let rounds = BenchScriptOverrides {
+            resume_rounds: Some(2),
+            bounce_settle_ms: None,
+        };
+        assert!(rounds
+            .validate_for(Scenario::TabCountMemoryResume(20))
+            .is_ok());
+        assert!(rounds
+            .validate_for(Scenario::TabCountMemoryBounce(20))
+            .is_ok());
+        assert!(rounds
+            .validate_for(Scenario::TabCountMemoryHold(20))
+            .is_err());
+        assert!(rounds.validate_for(Scenario::ColdStartup).is_err());
+
+        let settle = BenchScriptOverrides {
+            resume_rounds: None,
+            bounce_settle_ms: Some(60_000),
+        };
+        assert!(settle
+            .validate_for(Scenario::TabCountMemoryBounce(20))
+            .is_ok());
+        assert!(settle
+            .validate_for(Scenario::TabCountMemoryResume(20))
+            .is_err());
+
+        let too_many = BenchScriptOverrides {
+            resume_rounds: Some(MAX_RESUME_ROUNDS + 1),
+            bounce_settle_ms: None,
+        };
+        assert!(too_many
+            .validate_for(Scenario::TabCountMemoryBounce(50))
+            .is_err());
+        let zero_settle = BenchScriptOverrides {
+            resume_rounds: None,
+            bounce_settle_ms: Some(0),
+        };
+        assert!(zero_settle
+            .validate_for(Scenario::TabCountMemoryBounce(50))
+            .is_err());
+    }
+
+    #[test]
+    fn a_longer_settle_lengthens_the_timeout() {
+        let plain = recommended_timeout_secs(Scenario::TabCountMemoryBounce(50));
+        let longer = recommended_timeout_secs_with(
+            Scenario::TabCountMemoryBounce(50),
+            BenchScriptOverrides {
+                resume_rounds: None,
+                bounce_settle_ms: Some(MEMORY_BOUNCE_SETTLE_MS + 40_000),
+            },
+        );
+        assert_eq!(longer, plain + 40);
     }
 
     #[test]

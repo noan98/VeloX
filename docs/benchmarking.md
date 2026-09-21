@@ -373,6 +373,15 @@ cargo run --release --bin velox-bench -- run \
   上書きされる。集計結果は指定の有無で変わらない (同じファイルを同じ
   ように読む)。残したログは `aggregate --input` / `ipc-summary --input`
   にそのまま渡せる。
+- `--resume-rounds <n>` / `--bounce-settle-ms <ms>`: `tabs_hold_resume_N` /
+  `tabs_hold_bounce_N` の**計測用の上書き** (Issue #176 Stage 3、D149)。
+  前者は `mark` の後に戻すラウンド数 (既定 4、0〜12。0 なら切り替えなしの
+  長い保持という対照になる)、後者は `tabs_hold_bounce_N` がラウンドの後に
+  待つ時間 (既定 22000)。効かないシナリオに指定するとエラーで止まる
+  (黙って既定のまま測らない)。上書きした事実は結果 JSON の
+  `script_overrides` に残るので、**既定のスクリプトの結果と同じ顔で並べない
+  こと** (D96 / D111)。`--warmup-secs` の既定値と RSS サンプル間隔の自動
+  調整も上書き後の形で計算される。
 
 ### 3. 手動収集したログを集計する (`aggregate`)
 
@@ -599,6 +608,8 @@ Windows では不要になる (Windows には Xvfb/D-Bus セッションバス�
 | `page` | loopback で配信する `scripts/bench/pages/` の固定ページ | `minimal.html` |
 | `pages` | 複数ページを 1 run で続けて計測する (カンマ区切り)。指定すると `page` より優先される | (空) |
 | `url` | 計測対象ページの URL。空欄なら `scripts/bench/pages/` の固定ページ (`page` / `pages`) を loopback 配信して使う (Linux の `perf-gate.yml` と同じ「ネットワーク非依存の固定ページで測る」方針)。指定すると `page` / `pages` は無視される | (空、固定ページを使用) |
+| `resume_rounds` | `tabs_hold_resume_N` / `tabs_hold_bounce_N` の復帰ラウンド数 (`--resume-rounds`、0〜12)。空欄なら既定の 4。0 は「切り替えなしの長い保持」という対照 (§47.7 / D149)。結果 JSON の `script_overrides` に残る | (空、既定) |
+| `bounce_settle_ms` | `tabs_hold_bounce_N` がラウンドの後に待つ時間 (`--bounce-settle-ms`)。空欄なら既定の 22000 (D145)。切り替え後の増分が止まるかを見るときに伸ばす。`timeout-minutes` (30) と trials × repeats に注意 | (空、既定) |
 | `rss_interval_ms` | perf の RSS サンプル間隔 (ms)。`velox-bench run --rss-interval-ms` にそのまま渡り、明示なので D50 の自動調整に勝つ。「休止スイープの時系列」(D148) で直前の `rss` を判定に近づけたい・スイープ間の増え方の形を見たいときに `1000` などを指定する (§47.5)。短いほどサンプラ自身の負荷が乗るので、他 run と比べる計測では空欄のまま | (空、自動調整) |
 
 **`scenarios` と `pages` は同じ問題への同じ答えである** (Issue #197 /

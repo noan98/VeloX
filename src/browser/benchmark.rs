@@ -1215,6 +1215,17 @@ pub struct BenchmarkResult {
     #[serde(default)]
     pub url: Option<String>,
     pub environment: RunEnvironment,
+    /// 計測用にスクリプトの形を上書きしていたら、その内容
+    /// (`velox-bench run --resume-rounds` / `--bounce-settle-ms`、Issue #176
+    /// Stage 3 / D149)。`None` (キー自体が無い) は定数どおりの既定の
+    /// スクリプトで、このフィールドが無かった頃の結果と同じ意味である。
+    ///
+    /// **なぜ必要か**: `url` と同じ形の問題。シナリオ ID は「どの形の
+    /// スクリプトで測ったか」を表さないので、ラウンド数や待ちを変えた
+    /// 結果が既定の結果と同じ顔で並ぶと、比較してはいけないものを比較する
+    /// ことになる (D96 / D111)。上書きした事実を結果自身に持たせる。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_overrides: Option<crate::browser::automation::BenchScriptOverrides>,
     /// One entry per [`MetricKey`] that had at least one sample, keyed by
     /// [`MetricKey::as_str`].
     pub metrics: BTreeMap<String, Stats>,
@@ -1954,6 +1965,7 @@ mod gate_tests {
         BenchmarkResult {
             scenario: scenario.to_owned(),
             url: None,
+            script_overrides: None,
             environment: RunEnvironment {
                 os: "linux".to_owned(),
                 cpu_count: 4,
@@ -3919,6 +3931,7 @@ mod tests {
         BenchmarkResult {
             scenario: scenario.to_owned(),
             url: None,
+            script_overrides: None,
             environment: RunEnvironment {
                 os: "linux".to_owned(),
                 cpu_count: 8,
