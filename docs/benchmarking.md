@@ -362,6 +362,17 @@ cargo run --release --bin velox-bench -- run \
 - `--rss-interval-ms <ms>`: `VELOX_PERF_RSS_INTERVAL_MS` を子プロセスに渡す。
 - `--git-commit <sha>`: 保存する `environment.git_commit` を明示的に指定
   (省略時はカレントディレクトリで `git rev-parse HEAD` を試みる)。
+- `--keep-logs <dir>`: **各試行の perf ログ (生の JSON Lines) を `<dir>` に
+  残す** (Issue #176 Stage 3、D147)。既定では試行ごとの
+  `VELOX_PERF_OUTPUT` は temp dir に書かれ、集計した直後に削除される —
+  `--output` の集計値 (中央値・サンプル一覧) には `tab_suspend` と `rss` の
+  **時系列**が残らないため、「1 回のメモリ判定が何タブを休止させたか」の
+  ような問いには答えられない。指定すると `<dir>/<--output の stem>-trial-<n>.jsonl`
+  に残り (`results/tabs_hold_50-windows-baseline-1.json` なら
+  `tabs_hold_50-windows-baseline-1-trial-1.jsonl`)、同名で再実行すると
+  上書きされる。集計結果は指定の有無で変わらない (同じファイルを同じ
+  ように読む)。残したログは `aggregate --input` / `ipc-summary --input`
+  にそのまま渡せる。
 
 ### 3. 手動収集したログを集計する (`aggregate`)
 
@@ -612,7 +623,14 @@ Issue #231、D96 決定 3)。`windows-latest` は run ごとに別スペック�
 実行が終わると、結果 JSON (`velox-bench run --output` の出力そのもの、
 `aggregate`/`compare`/`gate` にそのままかけられる形式) と実行環境の情報
 (OS ビルド番号・CPU・メモリ・WebView2 Runtime バージョン) を記録した
-テキストが Actions の Artifact として残る。
+テキストが Actions の Artifact として残る。加えて **`results/perf-logs/`
+に試行ごとの perf ログ (生の JSON Lines) が残る** (`velox-bench run
+--keep-logs`、D147)。結果 JSON は集計値だけなので、`tab_suspend` と `rss`
+の時系列 (例: `docs/performance-targets.md` §46.5 の「`mark` の後に
+5 秒ごとに 4 タブずつ休止が続く」のスイープごとの内訳) を読むにはこちらを
+使う。Job Summary と `results/history/` への取り込みは `results` 直下の
+`*-windows*.json` しか読まないため、このディレクトリが集計に混ざることは
+ない。
 
 **⚠️ この workflow は `windows-latest` ランナー上で VeloX (WebView2)
 のウィンドウが実際に起動できるかどうかが最大の未知数である。** Linux は

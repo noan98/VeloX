@@ -84,7 +84,7 @@ fn main() {
 
 const USAGE: &str = "使い方:\n\
   velox-bench list-scenarios\n\
-  velox-bench run --scenario <id> --trials <N> --output <path> [--url <URL>] [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>]\n\
+  velox-bench run --scenario <id> --trials <N> --output <path> [--url <URL>] [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>] [--keep-logs <dir>]\n\
   velox-bench aggregate --scenario <id> --output <path> --input <path> [--input <path> ...] [--git-commit <sha>]\n\
   velox-bench compare --baseline <path> --candidate <path> [--threshold-pct <pct>] [--output <path>]\n\
   velox-bench gate --baseline <path> --candidate <path> [--candidate <path> ...] \\\n\
@@ -280,6 +280,39 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         }
     }
 
+    // Issue #176 Stage 3 / D145 Revisit condition (1) / D147. By default
+    // each trial's `VELOX_PERF_OUTPUT` JSON Lines file lives in the temp
+    // dir and is deleted as soon as it has been parsed — the aggregated
+    // `--output` is all that survives. That is enough for medians, but it
+    // throws away the *time series*: §46 could show "4 tabs every 5 seconds
+    // after `mark`" only as a delay histogram, and could not tell whether a
+    // sweep asked for 1 tab or 4 (`app::sweep_tabs`'s per-sweep decision is
+    // only visible as consecutive `tab_suspend` records with near-identical
+    // `ts_ms`). `--keep-logs <dir>` writes every trial's log into `<dir>`
+    // instead, named after the result file so a multi-arm run
+    // (`<prefix>-windows-baseline-1.json`, …) keeps them apart, and never
+    // deletes them. The aggregated result is unchanged either way — the
+    // same bytes are parsed from the same file, only its location and
+    // lifetime differ.
+    let keep_logs_dir: Option<PathBuf> = flags.one("keep-logs").map(PathBuf::from);
+    if let Some(dir) = &keep_logs_dir {
+        fs::create_dir_all(dir).map_err(|err| {
+            format!(
+                "--keep-logs のディレクトリを作成できません ({}): {err}",
+                dir.display()
+            )
+        })?;
+    }
+    // `results/tabs_hold_50-windows-baseline-1.json` ->
+    // `tabs_hold_50-windows-baseline-1`. Falls back to the scenario ID for
+    // an `--output` with no usable stem (e.g. `.json`).
+    let output_stem: String = Path::new(output_path)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or(scenario_id)
+        .to_owned();
+
     // Written once (its content only depends on `scenario`/`url`, not on
     // the trial number) and removed again once every trial has run.
     let script_path = match &automation_script {
@@ -298,14 +331,23 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     let mut trial_events = Vec::with_capacity(trials as usize);
     let mut spawn_failures = 0u32;
     for trial in 1..=trials {
-        let log_path = env::temp_dir().join(format!(
-            "velox-bench-{}-{scenario_id}-{trial}-{}.jsonl",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let log_path = match &keep_logs_dir {
+            // Deterministic name: re-running into the same directory
+            // overwrites the previous run's log of the same trial, which is
+            // what a caller re-measuring the same condition wants (and what
+            // `--output` already does for the aggregated result).
+            Some(dir) => dir.join(format!("{output_stem}-trial-{trial}.jsonl")),
+            None => env::temp_dir().join(format!(
+                "velox-bench-{}-{scenario_id}-{trial}-{}.jsonl",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            )),
+        };
+        // `PerfLog` appends; start from an empty file either way so a
+        // leftover from an earlier run can never be counted twice.
         let _ = fs::remove_file(&log_path);
 
         let mut command = Command::new(&velox_bin);
@@ -345,11 +387,20 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
             events.len()
         );
         trial_events.push(events);
-        let _ = fs::remove_file(&log_path);
+        if keep_logs_dir.is_none() {
+            let _ = fs::remove_file(&log_path);
+        }
     }
 
     if let Some(script_path) = &script_path {
         let _ = fs::remove_file(script_path);
+    }
+    if let Some(dir) = &keep_logs_dir {
+        println!(
+            "velox-bench: 各試行の perf ログ (JSON Lines) を {} に残しました \
+             ({output_stem}-trial-<n>.jsonl)",
+            dir.display()
+        );
     }
 
     let metrics = benchmark::aggregate_trials(&trial_events);
