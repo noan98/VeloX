@@ -18509,10 +18509,15 @@ Revisit (2) の perf レコードが要る。あわせて、`rss` レコード�
 (休止ゼロ、webview の作り直しも無し) でも同じ山が**より大きく** (+300 MiB
 / 15 秒) 出た (§47.7)。したがって原因は休止でも作り直しでもなく、
 **タブを表示 (アクティブ化) したこと**で、上の「定常状態」という読みは
-言い過ぎだった — 正しくは「タブを切り替えたことによる engine 側の増分を、
-予算が背景タブから徴収し続けている」。予算の動きとしては筋が通っており、
-`ESTIMATED_BYTES_PER_TAB` の OS 別化を見送る判断は変わらない。増分が
-止まるのか・切り替え回数に比例するのかは窓 (22 秒) の外で未確認。
+言い過ぎだった。さらに D149 の上書きで 60 秒窓と「切り替えなし」の対照を
+取ると (§47.8)、**切り替えを一切しなくても同じ時刻に同じ 2 段の山**が
+出た。増分はタブ操作と無関係で、レンダラが作られてから約 30 秒後と約
+65 秒後にワーキングセットが段階的に増える engine 側の動きであり、予算 ON
+の腕はそれを背景タブの `Discard` で徴収していた — これが §46 以来の
+「揺り戻し」の正体。予算の動きとしては筋が通っており、
+`ESTIMATED_BYTES_PER_TAB` の OS 別化を見送る判断は変わらない。次は判定が
+見ている `WorkingSetSize` が私的コミットの増加かどうかを `PagefileUsage`
+を並べて確かめる。
 
 **Revisit condition**: (1) Rust 側の `ESTIMATED_BYTES_PER_TAB` /
 `memory_budget_for_ram` を変えるとき、または複製の維持が負担になったら、
@@ -18520,3 +18525,88 @@ Revisit (2) の perf レコードが要る。あわせて、`rss` レコード�
 run の表で「直前の `rss`」の古さが判定周期に対して大きすぎて読めなければ、
 (2) の perf レコードを足す。(3) 表が §46.5 の仮説 2 を支持したら、D138 の
 見込み解放量を OS ごと / hint の有無ごとに分ける (D145 Revisit (1) の後半)。
+
+## D149: スクリプトの形は定数のまま、計測用の上書きを `velox-bench run` の引数で通し、結果 JSON に残す (Issue #176 Stage 3 / §47.7) — 効かないシナリオへの指定はエラー、ラウンド数の上限はコンパイル時の前提と同じ 12
+
+**対象**: §47.7 が残した 2 つの問い — タブを表示 (アクティブ化) した後の
+engine 側の増分 (約 +300 MiB / 15 秒) は**止まるのか・戻るのか**、
+**切り替え回数に比例するのか**。どちらも `tabs_hold_bounce_N` の形
+(復帰ラウンド 4 回、揺り戻しの待ち 22 秒) の外にあり、ラウンド数と待ちを
+振らないと答えられない。
+
+### 決定1: 定数は変えず、上書きを引数で通す
+
+`MEMORY_RESUME_ROUNDS` (D110) と `MEMORY_BOUNCE_SETTLE_MS` (D145) を変える
+と、同じシナリオ ID の記録済みの値 (§46 / §47) が指す局面が変わる。D145
+が `tabs_hold_resume_N` に待ちを足さず別 ID を新設したのと同じ理由 (D96 /
+D111: 条件の違う数値を同じ顔で並べない) で、定数はそのままにする。
+
+代わりに `browser::automation::BenchScriptOverrides` (`resume_rounds` /
+`bounce_settle_ms`、どちらも `Option`) を足し、`generate_bench_script` /
+`recommended_timeout_secs` / `recommended_rss_interval_ms` に `_with` 版を
+用意して通す。引数なし版は既定値を渡す薄い包みで、**既定値なら出力は
+1 バイトも変わらない** (テスト
+`default_overrides_reproduce_the_plain_functions_byte_for_byte`)。`mark`
+までの組み立て (`memory_hold_setup_lines`) には触れないので、D110 決定3 の
+不変条件 (bounce は resume と最後の `wait` まで同一) は上書きしても保たれる。
+
+入り口は `velox-bench run --resume-rounds <n>` / `--bounce-settle-ms <ms>`
+と、perf-windows.yml の入力 `resume_rounds` / `bounce_settle_ms`。**環境
+変数にはしない** — 環境を読むのは `config` の役目 (D20) で、`browser::
+automation` は純粋ロジックのまま保つ。`velox-bench` は既に引数を読む IO
+層なので、そこで読んで値として渡す。
+
+### 決定2: 上書きした事実を結果 JSON に持たせる
+
+`BenchmarkResult::script_overrides` (`Option`、既定なら書かない) を足した。
+`url` (Issue #176) と同じ形の問題で、シナリオ ID は「どの形のスクリプトで
+測ったか」を表さない。上書きした結果が既定の結果と同じ顔で並ぶと比較して
+はいけないものを比較する。`aggregate` はログから形を知れないので `None`
+のまま (推測で埋めない、`url` と同じ)。結果ファイル名は変えない — Job
+Summary と ingest の名前規則を動かさないため。週次の ingest は schedule
+実行 (既定入力) しか取り込まないので、上書きした run が `results/history/`
+に紛れることはない。
+
+### 決定3: 効かないシナリオへの指定はエラー、上限はコンパイル時の前提と同じ
+
+`BenchScriptOverrides::validate_for` が、`--resume-rounds` を
+`tabs_hold_resume_N` / `tabs_hold_bounce_N` 以外に、`--bounce-settle-ms` を
+`tabs_hold_bounce_N` 以外に指定したら `Err` にする。黙って無視すると
+「上書きしたつもりで既定のまま測った」結果が同じ顔で残る。ラウンド数の
+上限 `MAX_RESUME_ROUNDS` = 12 は D110 の `const assert` (50 タブで 48 休止
+のうち 1/4 以下しか戻さない) と同じ数で、定数側にも同じ assert を足して
+片方だけ動かないようにした。ラウンド数 0 は **`tabs_hold_bounce_N` でだけ**
+許す — そこではラウンドの後に必ず待ちが続くので「切り替えなしの長い保持」
+という対照になる (§47.7 の (a) と (a') を分ける)。`tabs_hold_resume_N` で
+0 にすると `mark` の直後に `quit` する空のスクリプトになり、「有効な run」
+の顔をして何も測らないので拒む (PR #287 のレビュー指摘)。待ち 0 も拒む。
+
+ラウンド数 0 のとき RSS サンプル間隔の自動調整は窓の下限が 0 になるので、
+`tabs_hold_N` と同じ `MEMORY_HOLD_WINDOW_MS` を最低値にする (0 で割らない、
+間隔 0ms を返さない)。
+
+### 見送ったもの・既知の制約
+
+(1) 上書きした結果を Job Summary の A/B 表で目立たせることはしていない。
+表は結果 JSON の集計値だけを読んでおり、`script_overrides` は「Show result
+summary」の JSON 全文と bench ステップのログに出る。次の計測で読みにくけれ
+ば表の見出しに足す。(2) `tabs_hold_N` (復帰なし) の窓 (`MEMORY_HOLD_WINDOW_MS`
+= 8 秒) は上書き対象にしていない。「切り替えなしの長い保持」は
+`tabs_hold_bounce_N --resume-rounds 0 --bounce-settle-ms <長い値>` で作れる
+ので、入り口を増やさない。(3) 本作業環境では `cargo test` を回せない
+(D146 (2))。CI の Windows / Linux ジョブが担保する。
+
+### 最初の実測 (2026-09-21、§47.8)
+
+`bounce_settle_ms=60000` と `resume_rounds=0` の 2 本で、§47.7 の 2 つの
+問いに答えが出た: 増分は 2 段 (+5〜+20 で約 +320 MiB、+35〜+50 で約
++150 MiB) で止まり、60 秒では戻らず、**切り替え回数とは無関係** (0 回でも
+同じ)。上書きの入り口はこの目的を果たした。`tabs_hold_N` の settle
+(12 秒) が Windows では短すぎる (最後のタブから約 75 秒) ことも分かったが、
+定数は変えず、次の計測 (私的コミットの記録) の結果を見てから決める。
+
+**Revisit condition**: (1) §47.8 の次の計測で「山がコミットの増加か」が
+決まったら、`tabs_hold_N` の settle を伸ばすか・判定の入力を替えるかと
+あわせて、上書きが計測の常用になるか (workflow の既定を変えるか、別
+シナリオ ID にするか) を決める。(2) 上書きした結果を並べて読む機会が増え
+たら、Job Summary の表に `script_overrides` を出す。

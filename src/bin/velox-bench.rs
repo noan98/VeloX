@@ -84,7 +84,7 @@ fn main() {
 
 const USAGE: &str = "使い方:\n\
   velox-bench list-scenarios\n\
-  velox-bench run --scenario <id> --trials <N> --output <path> [--url <URL>] [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>] [--keep-logs <dir>]\n\
+  velox-bench run --scenario <id> --trials <N> --output <path> [--url <URL>] [--velox-bin <path>] [--warmup-secs <secs>] [--rss-interval-ms <ms>] [--git-commit <sha>] [--keep-logs <dir>] [--resume-rounds <n>] [--bounce-settle-ms <ms>]\n\
   velox-bench aggregate --scenario <id> --output <path> --input <path> [--input <path> ...] [--git-commit <sha>]\n\
   velox-bench compare --baseline <path> --candidate <path> [--threshold-pct <pct>] [--output <path>]\n\
   velox-bench gate --baseline <path> --candidate <path> [--candidate <path> ...] \\\n\
@@ -216,10 +216,34 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     // Every other scenario keeps getting `None` here exactly as before, so
     // this cannot change `cold_startup`/`warm_startup`/`first_page_load`'s
     // (or `navigation`/`tab_create`/`tab_switch`'s) behavior.
-    let rss_interval_ms: Option<String> = flags
-        .one("rss-interval-ms")
-        .map(str::to_owned)
-        .or_else(|| automation::recommended_rss_interval_ms(scenario).map(|ms| ms.to_string()));
+    // Issue #176 Stage 3 / D149。`tabs_hold_resume_N` / `tabs_hold_bounce_N`
+    // の復帰ラウンド数と揺り戻しの待ちを、この 1 回の計測のためだけに
+    // 上書きする。効かないシナリオに指定されたら `validate_for` が弾く —
+    // 「上書きしたつもりで既定のまま測った」結果を同じ顔で残さないため。
+    // 何を上書きしたかは結果 JSON (`script_overrides`) に残る。
+    let overrides = automation::BenchScriptOverrides {
+        resume_rounds: flags
+            .one("resume-rounds")
+            .map(|raw| {
+                raw.parse::<usize>()
+                    .map_err(|_| "--resume-rounds は 0 以上の整数で指定してください".to_owned())
+            })
+            .transpose()?,
+        bounce_settle_ms: flags
+            .one("bounce-settle-ms")
+            .map(|raw| {
+                raw.parse::<u64>()
+                    .map_err(|_| "--bounce-settle-ms は正の整数 (ms) で指定してください".to_owned())
+            })
+            .transpose()?,
+    };
+    overrides.validate_for(scenario)?;
+
+    let rss_interval_ms: Option<String> =
+        flags.one("rss-interval-ms").map(str::to_owned).or_else(|| {
+            automation::recommended_rss_interval_ms_with(scenario, overrides)
+                .map(|ms| ms.to_string())
+        });
     // The page every trial loads. Handed to VeloX as `VELOX_HOMEPAGE`
     // (Issue #106): without it every trial would measure whatever the
     // compiled-in default homepage is, which is network-dependent and
@@ -239,13 +263,26 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
              (scripts/bench/pages/ の固定ページを指定してください。docs/benchmarking.md 参照)。"
         ));
     }
-    let automation_script = url.and_then(|url| automation::generate_bench_script(scenario, url));
+    let automation_script =
+        url.and_then(|url| automation::generate_bench_script_with(scenario, url, overrides));
+    if !overrides.is_default() {
+        println!(
+            "velox-bench: 計測用の上書き: resume_rounds={} bounce_settle_ms={} \
+             (結果 JSON の script_overrides に残ります。既定のスクリプトの結果と同じ顔で並べないでください)",
+            overrides
+                .resume_rounds
+                .map_or("(既定)".to_owned(), |n| n.to_string()),
+            overrides
+                .bounce_settle_ms
+                .map_or("(既定)".to_owned(), |ms| ms.to_string()),
+        );
+    }
 
     // A script ends with `quit`, so a trial normally exits on its own well
     // before this — see `wait_for_exit_or_timeout`. `--warmup-secs`
     // overrides the default either way (e.g. to force a longer wait on a
     // slower machine).
-    let default_warmup_secs = automation::recommended_timeout_secs(scenario);
+    let default_warmup_secs = automation::recommended_timeout_secs_with(scenario, overrides);
     let warmup_secs: u64 = flags
         .one("warmup-secs")
         .map(|v| v.parse().unwrap_or(default_warmup_secs))
@@ -417,6 +454,7 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         // `minimal.html` と `dom_heavy.html` の結果が同じ顔で並ぶ。
         url: url.map(str::to_owned),
         environment,
+        script_overrides: (!overrides.is_default()).then_some(overrides),
         metrics,
     };
     write_result(output_path, &result)?;
@@ -567,6 +605,9 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
         // まま残す (Issue #176)。
         url: None,
         environment,
+        // `aggregate` はログを読むだけで、どの形のスクリプトで採られたかを
+        // 知る手段が無い (`url` と同じ)。推測で埋めず `None` のまま。
+        script_overrides: None,
         metrics,
     };
     write_result(output_path, &result)?;
