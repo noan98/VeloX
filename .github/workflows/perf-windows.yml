@@ -1493,10 +1493,19 @@ jobs:
     name: Record results into results/history
     needs: perf-windows
     runs-on: ubuntu-latest
+    # D149 訂正 / D151: `main` 上の手動実行でも取り込むが、**計測用の
+    # 上書き (`resume_rounds` / `bounce_settle_ms` / `rss_interval_ms`) の
+    # ある run は取り込まない。** 同じシナリオ ID でも既定のスクリプトとは
+    # 測っている局面が違うので、週次の系列に同じ顔で並ぶと比較してはいけ
+    # ないものを比較する (run 35618824317 が PR #291 を作ってしまい、
+    # マージ前に閉じた)。`schedule` では inputs はすべて空なので素通り。
     if: >-
       github.repository == 'noan98/VeloX'
       && (github.event_name == 'schedule'
       || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      && inputs.resume_rounds == ''
+      && inputs.bounce_settle_ms == ''
+      && inputs.rss_interval_ms == ''
     # 書き込み権限は**このジョブにだけ**与える。workflow 全体に付けると、
     # `pull_request` でも走る計測ジョブにまで書き込み権限が広がる。
     permissions:

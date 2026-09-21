@@ -18585,6 +18585,19 @@ Summary と ingest の名前規則を動かさないため。週次の ingest �
 `tabs_hold_N` と同じ `MEMORY_HOLD_WINDOW_MS` を最低値にする (0 で割らない、
 間隔 0ms を返さない)。
 
+### 訂正 (2026-09-21): ingest は `main` 上の手動実行でも走る
+
+決定2 の「週次の ingest は schedule 実行 (既定入力) しか取り込まない」は
+誤りだった。`ingest-history` の `if` は `schedule` に加えて **`main` 上の
+`workflow_dispatch`** も通しており、D151 の A/B (run 35618824317、
+`resume_rounds=0` / `bounce_settle_ms=60000`) が
+`results/history/windows/tabs_hold_bounce_50.jsonl` への取り込み PR
+(#291) を作った。マージ前に閉じ、ブランチを削除した。ingest の `if` に
+「上書き入力 (`resume_rounds` / `bounce_settle_ms` / `rss_interval_ms`) が
+すべて空」を足し、`test_perf_windows_inputs.py` で固定した。結果 JSON の
+`script_overrides` を ingest 側で読む案は、入力が空なら上書きも無いので
+不要。
+
 ### 見送ったもの・既知の制約
 
 (1) 上書きした結果を Job Summary の A/B 表で目立たせることはしていない。
@@ -18749,6 +18762,17 @@ perf ログに書く案 (D148 Revisit (2)) はまだ採らない — 入力の�
 として読めるので、そこで決める (D145 Revisit (1) 後半)。(3) 本作業環境
 では `cargo test` を回せない (D146 (2))。`cargo clippy --target
 x86_64-pc-windows-msvc --all-targets` と単体テスト (CI) で担保する。
+
+### 最初の実測 (2026-09-21、§47.10)
+
+A/B (run 35618824317、`tabs_hold_bounce_50`、切り替えなしの 60 秒保持、
+各 8 試行): B (`private`) は**タブを開いている最中の 4 スイープ (20 タブ)
+で予算の下に入り、mark 後 60 秒間の休止はゼロ** (2 試行だけ +3.3 に 1 回)。
+ワーキングセットの 2 段の階段はそのまま出るが休止に変換されず、揺り戻しは
+消えた。A (`resident`) は mark 後も 4〜5 回休止し続け、合計 28 タブ。
+Revisit (1) の条件は満たされたので、Windows の既定を `PrivateCommit` に
+替える (D152)。予算の式と `ESTIMATED_BYTES_PER_TAB` は据え置き (要求 ≤
+実際のまま収束しており、グループ単位の丸めが差を吸収している)。
 
 **Revisit condition**: (1) A/B (`tabs_hold_bounce_50`、A = 既定 / B =
 `VELOX_MEMORY_BUDGET_INPUT=private`、60 秒窓) で B の休止が初回のスイープ
