@@ -1466,21 +1466,23 @@ fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Insta
 /// `Config::suspension.memory_budget_bytes` is set.
 ///
 /// Which of the sample's totals is compared against the budget is
-/// `input`'s call (`MemoryBudgetInput::pick`, Issue #176 Stage 3 / D151).
-/// With the default (`Resident`): PSS is used when the platform can read
-/// it (Linux with `smaps_rollup`), because that is what the budget is
-/// meant to be compared against (`docs/performance-targets.md` §3.1: RSS
+/// `input`'s call (`MemoryBudgetInput::pick`, Issue #176 Stage 3 /
+/// D151 / D152). With the default (`PrivateCommit`, since D152): on
+/// Windows the private commit (`PagefileUsage`, D150) is compared, not
+/// the working set — §47.9/§47.10 found the working set of a young
+/// renderer growing for ~75 s without any allocation, and the budget
+/// discarding tabs to pay for that residency. Elsewhere `PrivateCommit`
+/// and `Resident` read the same figure: PSS when the platform can read it
+/// (Linux with `smaps_rollup`), because that is what the budget is meant
+/// to be compared against (`docs/performance-targets.md` §3.1: RSS
 /// double-counts shared pages once per process and would put a
-/// multi-process browser "over budget" on shared library pages alone).
-/// Where PSS is unavailable the RSS total is used instead — an
-/// over-estimate, so a budget tuned for PSS will suspend slightly earlier
-/// there; documented in D56. This is the normal case on Windows (Issue
-/// #136, D88: RSS is read via `GetProcessMemoryInfo`, but PSS has no
-/// Windows equivalent and is not attempted, so `total_pss_bytes` is always
-/// `None` there — same as the non-Linux Unix `ps` fallback). With
-/// `PrivateCommit` (`VELOX_MEMORY_BUDGET_INPUT=private`), Windows compares
-/// the private commit (`PagefileUsage`, D150) instead of the working set;
-/// other platforms are unchanged. On a platform where RSS itself cannot be
+/// multi-process browser "over budget" on shared library pages alone),
+/// and the RSS total where PSS is unavailable — an over-estimate, so a
+/// budget tuned for PSS will suspend slightly earlier there; documented
+/// in D56 (the non-Linux Unix `ps` fallback; PSS has no Windows
+/// equivalent either, Issue #136 / D88). `VELOX_MEMORY_BUDGET_INPUT=
+/// resident` restores the pre-D151 reading — on Windows the working set
+/// via `GetProcessMemoryInfo`. On a platform where RSS itself cannot be
 /// read either (`RssError::Unsupported` — today, any OS other than Linux,
 /// other Unix, or Windows), the failure is logged once and the thread
 /// exits: the memory signal is simply inert, and the idle/tab-count

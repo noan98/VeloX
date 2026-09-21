@@ -229,13 +229,15 @@ pub struct Config {
     /// than one to choose from today (working set vs. private commit,
     /// D150); elsewhere both spellings read the same PSS/RSS.
     ///
-    /// **Defaults to [`MemoryBudgetInput::Resident`], the pre-D151
-    /// behavior.** `VELOX_MEMORY_BUDGET_INPUT=private` is the measurement
-    /// arm: `docs/performance-targets.md` §47.9 found that the working set
-    /// grows for ~75 s after a renderer starts without the process
-    /// allocating anything, and that the budget was discarding tabs to pay
-    /// for that. Whether private commit is the better input is what this
-    /// knob lets the A/B decide, on one binary.
+    /// **Defaults to [`MemoryBudgetInput::PrivateCommit`] since D152**;
+    /// `VELOX_MEMORY_BUDGET_INPUT=resident` is the opt-out (the pre-D151
+    /// behavior, the working set on Windows). `docs/performance-targets.md`
+    /// §47.9 found that the working set grows for ~75 s after a renderer
+    /// starts without the process allocating anything, and that the budget
+    /// was discarding tabs to pay for that; the A/B in §47.10 then showed
+    /// the private-commit input converging while the tabs were still being
+    /// opened and ordering nothing afterwards (20 tabs suspended instead of
+    /// 28, no "揺り戻し").
     pub memory_budget_input: MemoryBudgetInput,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
@@ -373,12 +375,12 @@ impl Config {
     ///   screen, suspended or not. Unset or an unrecognized spelling keeps
     ///   the default (`low`).
     /// - `VELOX_MEMORY_BUDGET_INPUT` — which memory figure the memory
-    ///   budget below is compared against (Issue #176 Stage 3, D151):
-    ///   `resident` is PSS on Linux and the working set on Windows (the
-    ///   default, and everything VeloX did before D151); `private` is the
-    ///   private commit on Windows (`PagefileUsage`, D150) and identical to
-    ///   `resident` everywhere else. A measurement knob (§47.9): unset or an
-    ///   unrecognized spelling keeps `resident`.
+    ///   budget below is compared against (Issue #176 Stage 3, D151/D152):
+    ///   `private` is the private commit on Windows (`PagefileUsage`, D150)
+    ///   and **the default since D152** (§47.10); `resident` is PSS on
+    ///   Linux and the working set on Windows — everything VeloX did before
+    ///   D151, kept as the opt-out. The two are identical everywhere but
+    ///   Windows. Unset or an unrecognized spelling keeps `private`.
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
     ///   `browser::suspension`). Off by default; unset or not a number
@@ -491,8 +493,8 @@ impl Config {
             .as_deref()
             .and_then(BackgroundMemoryTarget::parse)
             .unwrap_or_default();
-        // Issue #176 Stage 3 (D151). Same conservative rule again: a typo
-        // keeps the budget reading what every recorded number was taken with.
+        // Issue #176 Stage 3 (D151/D152). Same conservative rule again: a
+        // typo keeps the measured default rather than picking an arm.
         let memory_budget_input = std::env::var("VELOX_MEMORY_BUDGET_INPUT")
             .ok()
             .as_deref()
@@ -1903,14 +1905,14 @@ mod tests {
     // -- Issue #176 Stage 3 (D151): VELOX_MEMORY_BUDGET_INPUT ----------
 
     #[test]
-    fn memory_budget_input_defaults_to_resident() {
-        // Same shape as `suspend_mechanism`: the knob exists to measure the
-        // other arm (§47.9), so an unset `VELOX_MEMORY_BUDGET_INPUT` must
-        // keep comparing the budget against what §46〜§47 were measured
-        // with — the working set on Windows.
+    fn memory_budget_input_defaults_to_private_commit_since_d152() {
+        // Same shape as `background_memory_target`: the knob measured the
+        // other arm first (D151), and the A/B (§47.10) moved the default.
+        // `resident` is the opt-out, and the reading §46〜§47.9 were taken
+        // with.
         assert_eq!(
             Config::default().memory_budget_input,
-            MemoryBudgetInput::Resident
+            MemoryBudgetInput::PrivateCommit
         );
     }
 

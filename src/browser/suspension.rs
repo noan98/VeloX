@@ -519,21 +519,26 @@ impl BackgroundMemoryTarget {
 /// keeps discarding background tabs to pay for residency, not for
 /// allocation — the "5 秒に 4 タブ" / "揺り戻し" §46〜§47 chased.
 ///
-/// This knob exists to measure the alternative on the same binary
-/// (`VELOX_MEMORY_BUDGET_INPUT`). **The default is unchanged behavior**
-/// ([`Self::Resident`]) until the A/B is in — the same rule
-/// [`SuspendMechanism`] followed (D121): a knob first, the default only
-/// after the numbers.
+/// The knob (`VELOX_MEMORY_BUDGET_INPUT`) first measured the alternative
+/// on the same binary with the default left at [`Self::Resident`] — the
+/// same rule [`SuspendMechanism`] followed (D121): a knob first, the
+/// default only after the numbers. The numbers came in (§47.10, D152):
+/// against private commit the budget converged **while the tabs were
+/// still being opened** (4 sweeps, 20 tabs) and then ordered nothing for
+/// 60 s, while the working-set arm kept discarding 4 tabs every 5 s after
+/// the mark (28 tabs in total) to pay for residency. **The default is
+/// [`Self::PrivateCommit`] since D152**; `resident` is the opt-out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MemoryBudgetInput {
     /// PSS where the platform reads it (Linux), otherwise RSS — on Windows
-    /// the working set. Everything VeloX did before D151.
-    #[default]
+    /// the working set. Everything VeloX did before D151, and the default
+    /// until D152; reachable with `VELOX_MEMORY_BUDGET_INPUT=resident`.
     Resident,
     /// Private commit where the platform reads it (Windows,
     /// `metrics::RssSample::total_private_bytes`), otherwise exactly
     /// [`Self::Resident`] — so on Linux the two spellings are identical
-    /// today (PSS), and only Windows changes.
+    /// today (PSS), and only Windows changes. **The default since D152.**
+    #[default]
     PrivateCommit,
 }
 
@@ -1634,11 +1639,17 @@ mod tests {
     // -- Issue #176 Stage 3 (D151): VELOX_MEMORY_BUDGET_INPUT -------------
 
     #[test]
-    fn memory_budget_input_defaults_to_the_pre_d151_behavior() {
-        // A knob to *measure* private commit against the working set, not
-        // to ship it: the default stays what every recorded number (§46〜
-        // §47) was taken with, until the A/B says otherwise.
-        assert_eq!(MemoryBudgetInput::default(), MemoryBudgetInput::Resident);
+    fn memory_budget_input_defaults_to_private_commit_since_d152() {
+        // The knob first measured private commit against the working set
+        // with the default left as before (D151); the A/B (§47.10) then
+        // flipped it: converged while opening tabs, nothing suspended for
+        // 60 s after the mark, 20 tabs instead of 28. `resident` stays as
+        // the opt-out and as the reading every number in §46〜§47.9 was
+        // taken with.
+        assert_eq!(
+            MemoryBudgetInput::default(),
+            MemoryBudgetInput::PrivateCommit
+        );
     }
 
     #[test]

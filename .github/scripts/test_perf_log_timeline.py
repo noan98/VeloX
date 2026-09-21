@@ -166,7 +166,10 @@ class RenderTest(unittest.TestCase):
     def test_markdown_shows_demand_next_to_actual(self) -> None:
         tl = build_timeline(Path("tabs_hold_bounce_50-windows-baseline-1-trial-1.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
         budget = 1023 * MIB
-        text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, only_with_suspends=True)
+        # §46 の run 2 は D152 より前 (判定はワーキングセット) なので `resident` で読む。
+        text = render_markdown(
+            [tl], budget, ESTIMATED_BYTES_PER_TAB, only_with_suspends=True, budget_input="resident"
+        )
         # 1150 MiB - 1023 MiB = 127 MiB 超過 → ceil(127 / 64) = 2 要求に対して 4 休止。
         # 末尾はプロセス数 / engine / browser / engine 私的 の直前→直後
         # (§47.4 の切り分け用、私的は D150)。engine 私的 = 0.8 × total − 0.8 × 27。
@@ -194,8 +197,10 @@ class RenderTest(unittest.TestCase):
         text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, False, budget_input="private")
         self.assertIn("判定の入力 **`private`**", text)
         self.assertIn("| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 20.0 | 1 ⚠️ | 1090.0 |", text)
-        # 既定 (resident) は rss で判定: 1150 − 900 = 250 → ceil(250/64) = 4。
-        text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, False)
+        # 既定は D152 から private と同じ。
+        self.assertEqual(text, render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, False))
+        # resident は rss で判定: 1150 − 900 = 250 → ceil(250/64) = 4。
+        text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, False, budget_input="resident")
         self.assertIn("| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 250.0 | 4 | 1090.0 |", text)
         # 私的コミットの無いログ (Linux / 古いログ) では private も rss に落ちる。
         old = tl.rss[0]

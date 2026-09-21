@@ -35,11 +35,12 @@ trial ごとに次を表にする:
   が採るので、「直前の `rss`」は判定が見た値そのものではなく、その近似
   である。表には `rss` の古さ (スイープまでの経過 ms) を出す。
 - 判定が見る量は `VELOX_MEMORY_BUDGET_INPUT` (D151) で決まる。既定の
-  `resident` は Windows では `total_rss_bytes` (ワーキングセット)、
-  `private` は `total_private_bytes` (私的コミット、D150。無ければ
-  `resident` と同じ)。このスクリプトは `--budget-input` で同じ選択を
-  真似る (既定 `resident`)。Linux では判定は PSS を見るので、この表の
-  「超過量」は Linux では過大になる。
+  `private` (D152) は `total_private_bytes` (私的コミット、D150。無ければ
+  `resident` と同じ)、`resident` は Windows では `total_rss_bytes`
+  (ワーキングセット)。このスクリプトは `--budget-input` で同じ選択を
+  真似る (既定 `private`)。**D152 より前の run (§46〜§47.10 の A 腕) を
+  読み直すときは `--budget-input resident` を渡すこと。** Linux では判定は
+  PSS を見るので、この表の「超過量」は Linux では過大になる。
 
 使い方:
 
@@ -285,7 +286,7 @@ def render_markdown(
     budget: int | None,
     per_tab: int,
     only_with_suspends: bool,
-    budget_input: str = "resident",
+    budget_input: str = "private",
 ) -> str:
     lines: list[str] = []
     lines.append("### 休止スイープの時系列 (D147 / D148、§46.5 の検証用)")
@@ -480,7 +481,7 @@ def render_plain(
     budget: int | None,
     per_tab: int,
     only_with_suspends: bool,
-    budget_input: str = "resident",
+    budget_input: str = "private",
 ) -> str:
     lines: list[str] = []
     for tl in timelines:
@@ -541,11 +542,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--budget-input",
         choices=BUDGET_INPUTS,
-        default="resident",
+        default="private",
         help=(
-            "判定が予算と比べる量 (VELOX_MEMORY_BUDGET_INPUT、D151)。resident = total_rss_bytes "
-            "(Windows ではワーキングセット)、private = total_private_bytes (無ければ resident と同じ)。"
-            "超過量と要求タブ数の計算に使う (既定 resident)"
+            "判定が予算と比べる量 (VELOX_MEMORY_BUDGET_INPUT、D151)。private = total_private_bytes "
+            "(無ければ resident と同じ、D152 からの既定)、resident = total_rss_bytes (Windows では"
+            "ワーキングセット、D152 より前の run はこちら)。超過量と要求タブ数の計算に使う (既定 private)"
         ),
     )
     parser.add_argument("--markdown", action="store_true", help="Job Summary 向けの Markdown で出す")
