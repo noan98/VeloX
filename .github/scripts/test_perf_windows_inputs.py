@@ -407,6 +407,19 @@ class IngestHistoryWiringTest(unittest.TestCase):
         self.assertIn("github.ref == 'refs/heads/main'", condition)
         self.assertNotIn("pull_request", condition)
 
+    def test_the_ingest_job_skips_runs_with_script_overrides(self) -> None:
+        """計測用の上書き (D149 / D151) のある run を週次の系列に混ぜない。
+
+        run 35618824317 (`resume_rounds=0` / `bounce_settle_ms=60000`) が
+        `results/history/windows/tabs_hold_bounce_50.jsonl` への取り込み PR
+        (#291) を作ってしまった。上書きは結果 JSON の `script_overrides` に
+        残るが、ingest の判定はそこまで読まないので、入力が空であることを
+        job の `if` で要求する。
+        """
+        condition = self.ingest["if"]
+        for name in ("resume_rounds", "bounce_settle_ms", "rss_interval_ms"):
+            self.assertIn(f"inputs.{name} == ''", condition, name)
+
     def test_only_the_ingest_job_gets_write_permission(self) -> None:
         """計測ジョブ (pull_request でも走る) に書き込み権限を広げない。"""
         self.assertEqual(self.ingest["permissions"], {"contents": "write", "pull-requests": "write"})
