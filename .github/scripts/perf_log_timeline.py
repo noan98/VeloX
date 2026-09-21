@@ -386,9 +386,12 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
         last_ts = tl.rss[-1].ts_ms if tl.rss else tl.mark_ms
         previous: RssSample | None = None
         tick = 0
-        # 最後のサンプルを含む窓まで出す (刻みの時刻そのものを超えていても、
-        # その直前の窓にサンプルがあれば行にする)。
-        while tl.mark_ms + (tick - 1) * step_ms < last_ts:
+        # 刻みの時刻にサンプルが**追いついている**行だけ出す。最後のサンプル
+        # は `quit` の途中 (プロセスが消えていく最中) に採られていることが
+        # あり、run 35601333889 では +25 s の行がプロセス 57→33・rss −430 MiB
+        # と読めてしまった。刻みより後にサンプルがあることを条件にすれば、
+        # 途中経過を定常値のように見せない。
+        while tl.mark_ms + tick * step_ms <= last_ts:
             at = tl.mark_ms + tick * step_ms
             sample = _sample_at_or_before(tl.rss, at)
             if sample is not None:

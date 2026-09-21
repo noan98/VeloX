@@ -194,12 +194,16 @@ class RssTrackTest(unittest.TestCase):
         tl = build_timeline(Path("b-trial-1.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
         text = render_rss_track([tl], 5000.0, markdown=True)
         # mark = 10.0s。+0 は 9.0s のサンプル (1200 MiB)、+5 は 12.0s の
-        # サンプル (1090 MiB、その区間に 4 休止)、+10 は 17.0s の 1040 MiB
-        # (16.7s の 4 休止)。最後のサンプルが 17.0s なので +10 で止まる。
+        # サンプル (1090 MiB、その区間に 4 休止)。最後のサンプルは 17.0s
+        # なので +10 (20.0s) には追いついておらず、行にしない — 最後の
+        # サンプルは quit の途中で採られうるため (run 35601333889)。
         self.assertIn("| +0 | 1200.0 | - | 0 | 10 | 1173.0 | 27.0 |", text)
         self.assertIn("| +5 | 1090.0 | -110.0 | 4 | 9 | 1063.0 | 27.0 |", text)
+        self.assertNotIn("| +10 |", text)
+        # 20.0s 以降にサンプルがあれば +10 の行が出て、16.7s の 4 休止を数える。
+        longer = build_timeline(Path("b.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS + [_rss(20_500.0, 1041.0, 8)])))
+        text = render_rss_track([longer], 5000.0, markdown=True)
         self.assertIn("| +10 | 1040.0 | -50.0 | 4 | 8 | 1013.0 | 27.0 |", text)
-        self.assertNotIn("| +15 |", text)
 
     def test_logs_without_mark_are_skipped_and_counted(self) -> None:
         from perf_log_timeline import render_rss_track
