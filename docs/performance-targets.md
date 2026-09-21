@@ -5452,7 +5452,7 @@ Job Summary の「休止スイープの時系列」) で初めて読んだ。**�
 | シナリオ / ページ | `tabs_hold_bounce_50` / `minimal.html` |
 | A / B | 既定 / `VELOX_MAX_TABS_PER_PROCESS=1` (§46 run 2 と同じ組) |
 | trials × repeats | 2 × 2 (試行ログ 8 本、A 4 本 / B 4 本) |
-| ランナー | AMD EPYC 7763 64-Core Processor                 (4 論理コア) / RAM 15.99 GiB → 予算 1024 MiB (D114、`memory_budget_for_ram`) |
+| ランナー | AMD EPYC 7763 (4 論理コア) / RAM 15.99 GiB → 予算 1023.7 MiB (D114、`memory_budget_for_ram`。§46 の run 1 と同じ機種で、表では 1024 に丸めて表示される) |
 | WebView2 Runtime | 152.0.4191.66 |
 | 休止機構 | 既定の `Discard` (見込み解放量 64 MiB/タブ、D138) |
 
@@ -5534,8 +5534,8 @@ Windows + `LOW` では過大) は成立している** — ただし、それが�
 (`LOW` はヒントであり、エンジンが再び膨らませうる)、(b) プロセス共有に
 より `Discard` してもレンダラプロセスが残って膨らむ、(c) browser / GPU
 プロセス。`rss` レコードには `process_count` と browser / engine の内訳が
-既にあるので、表に列を足せば新しい記録なしに (a)〜(c) をある程度切り
-分けられる。
+既にあるので、表にスイープ直前→直後の列を足した (PR #283)。次の run で
+新しい記録なしに (a)〜(c) をある程度切り分けられる。
 
 ### 47.5 この計測の限界
 

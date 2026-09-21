@@ -43,13 +43,19 @@ from perf_log_timeline import (  # noqa: E402
 SCRIPT = Path(__file__).resolve().parent / "perf_log_timeline.py"
 
 
+BROWSER_MIB = 27.0
+
+
 def _rss(ts_ms: float, mib: float, processes: int = 10) -> dict:
+    # 実際のレコードと同じく browser + engine = total を守る。
     return {
         "event": "rss",
         "ts_ms": ts_ms,
         "total_rss_bytes": int(mib * MIB),
         "total_pss_bytes": None,
         "process_count": processes,
+        "browser_rss_bytes": int(BROWSER_MIB * MIB),
+        "engine_rss_bytes": int((mib - BROWSER_MIB) * MIB),
     }
 
 
@@ -71,14 +77,14 @@ SAMPLE_EVENTS = [
     _suspend(11_705.0, 6),
     _suspend(11_712.0, 7),
     _suspend(11_720.0, 8),
-    _rss(12_000.0, 1090.0),
+    _rss(12_000.0, 1090.0, processes=9),
     {"event": "tab_resume", "ts_ms": 13_000.0, "tab_id": 3},
     _rss(16_500.0, 1100.0),
     _suspend(16_700.0, 9),
     _suspend(16_704.0, 10),
     _suspend(16_709.0, 11),
     _suspend(16_715.0, 12),
-    _rss(17_000.0, 1040.0),
+    _rss(17_000.0, 1040.0, processes=8),
 ]
 
 
@@ -151,10 +157,26 @@ class RenderTest(unittest.TestCase):
         budget = 1023 * MIB
         text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, only_with_suspends=True)
         # 1150 MiB - 1023 MiB = 127 MiB 超過 → ceil(127 / 64) = 2 要求に対して 4 休止。
-        self.assertIn("| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 127.0 | 2 ⚠️ | 1090.0 |", text)
+        # 末尾はプロセス数 / engine / browser の直前→直後 (§47.4 の切り分け用)。
+        self.assertIn(
+            "| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 127.0 | 2 ⚠️ | 1090.0 | 10→9 | 1123.0→1063.0 | 27.0→27.0 |",
+            text,
+        )
         # 1100 - 1023 = 77 MiB → 2 要求、4 休止。
-        self.assertIn("| 2 | +6.7 | 4 | memory×4 | 1100.0 | 200 | 77.0 | 2 ⚠️ | 1040.0 |", text)
+        self.assertIn(
+            "| 2 | +6.7 | 4 | memory×4 | 1100.0 | 200 | 77.0 | 2 ⚠️ | 1040.0 | 10→8 | 1073.0→1013.0 | 27.0→27.0 |",
+            text,
+        )
         self.assertIn("予算 **1023 MiB**", text)
+
+    def test_detail_columns_degrade_to_dash_on_old_logs(self) -> None:
+        # Issue #176 Stage 1 より前のログには browser / engine の内訳が無い。
+        # 列ごと消すのではなく `-` にして、行の形を変えない。
+        old = {"event": "rss", "ts_ms": 500.0, "total_rss_bytes": 1100 * MIB, "process_count": 12}
+        events = [{"event": "measure_start", "ts_ms": 100.0}, old, _suspend(900.0, 1)]
+        tl = build_timeline(Path("old.jsonl"), parse_jsonl(_lines(events)))
+        text = render_markdown([tl], None, ESTIMATED_BYTES_PER_TAB, only_with_suspends=False)
+        self.assertIn("| 1 | +0.8 | 1 | memory | 1100.0 | 400 | - | 12→- | -→- | -→- |", text)
 
     def test_markdown_omits_empty_logs_when_asked(self) -> None:
         empty = build_timeline(Path("cold_startup-trial-1.jsonl"), parse_jsonl(_lines([_rss(100.0, 300.0)])))

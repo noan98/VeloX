@@ -18499,9 +18499,10 @@ Job Summary であり、Windows ランナーでは `python` が既に固定ペ�
 限界 (2) の予想は当たった: perf の RSS サンプラは約 5 秒周期で判定と
 位相が揃い、判定の直前に採れている行は試行ごとに 1 行だけだった。
 Revisit (2) の perf レコードが要る。あわせて、`rss` レコードに既にある
-`process_count` と browser / engine の内訳を表に足せば、戻りが engine 側
-か・`Discard` で実際にプロセスが減っているかを新しい記録なしに切り分け
-られる (§47.4)。
+`process_count` と browser / engine の内訳をスイープ直前→直後の形で表に
+足した (同じ PR #283 の中で)。戻りが engine 側か・`Discard` で実際に
+プロセスが減っているかを、新しい記録なしに次の run で切り分けるため
+(§47.4)。
 
 **Revisit condition**: (1) Rust 側の `ESTIMATED_BYTES_PER_TAB` /
 `memory_budget_for_ram` を変えるとき、または複製の維持が負担になったら、
