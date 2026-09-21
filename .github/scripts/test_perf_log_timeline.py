@@ -46,8 +46,15 @@ SCRIPT = Path(__file__).resolve().parent / "perf_log_timeline.py"
 BROWSER_MIB = 27.0
 
 
+# 私的コミット (D150) はテストでは rss の 8 割とする。ワーキングセットと
+# 別の量として列に出ていることが分かればよい。
+PRIVATE_RATIO = 0.8
+
+
 def _rss(ts_ms: float, mib: float, processes: int = 10) -> dict:
     # 実際のレコードと同じく browser + engine = total を守る。
+    private = int(mib * PRIVATE_RATIO * MIB)
+    browser_private = int(BROWSER_MIB * PRIVATE_RATIO * MIB)
     return {
         "event": "rss",
         "ts_ms": ts_ms,
@@ -56,6 +63,10 @@ def _rss(ts_ms: float, mib: float, processes: int = 10) -> dict:
         "process_count": processes,
         "browser_rss_bytes": int(BROWSER_MIB * MIB),
         "engine_rss_bytes": int((mib - BROWSER_MIB) * MIB),
+        "total_private_bytes": private,
+        "private_process_count": processes,
+        "browser_private_bytes": browser_private,
+        "engine_private_bytes": private - browser_private,
     }
 
 
@@ -157,14 +168,17 @@ class RenderTest(unittest.TestCase):
         budget = 1023 * MIB
         text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, only_with_suspends=True)
         # 1150 MiB - 1023 MiB = 127 MiB 超過 → ceil(127 / 64) = 2 要求に対して 4 休止。
-        # 末尾はプロセス数 / engine / browser の直前→直後 (§47.4 の切り分け用)。
+        # 末尾はプロセス数 / engine / browser / engine 私的 の直前→直後
+        # (§47.4 の切り分け用、私的は D150)。engine 私的 = 0.8 × total − 0.8 × 27。
         self.assertIn(
-            "| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 127.0 | 2 ⚠️ | 1090.0 | 10→9 | 1123.0→1063.0 | 27.0→27.0 |",
+            "| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 127.0 | 2 ⚠️ | 1090.0 | 10→9 | 1123.0→1063.0 | 27.0→27.0 "
+            "| 898.4→850.4 |",
             text,
         )
         # 1100 - 1023 = 77 MiB → 2 要求、4 休止。
         self.assertIn(
-            "| 2 | +6.7 | 4 | memory×4 | 1100.0 | 200 | 77.0 | 2 ⚠️ | 1040.0 | 10→8 | 1073.0→1013.0 | 27.0→27.0 |",
+            "| 2 | +6.7 | 4 | memory×4 | 1100.0 | 200 | 77.0 | 2 ⚠️ | 1040.0 | 10→8 | 1073.0→1013.0 | 27.0→27.0 "
+            "| 858.4→810.4 |",
             text,
         )
         self.assertIn("予算 **1023 MiB**", text)
@@ -176,7 +190,18 @@ class RenderTest(unittest.TestCase):
         events = [{"event": "measure_start", "ts_ms": 100.0}, old, _suspend(900.0, 1)]
         tl = build_timeline(Path("old.jsonl"), parse_jsonl(_lines(events)))
         text = render_markdown([tl], None, ESTIMATED_BYTES_PER_TAB, only_with_suspends=False)
-        self.assertIn("| 1 | +0.8 | 1 | memory | 1100.0 | 400 | - | 12→- | -→- | -→- |", text)
+        self.assertIn("| 1 | +0.8 | 1 | memory | 1100.0 | 400 | - | 12→- | -→- | -→- | -→- |", text)
+
+    def test_private_columns_degrade_to_dash_without_the_field_or_when_null(self) -> None:
+        # Linux / macOS の VeloX は `total_private_bytes: null` を書く (D150)。
+        # 無い (古いログ) のと null なのは同じく `-` になる。
+        linux = {**_rss(500.0, 1100.0), "total_private_bytes": None, "engine_private_bytes": None}
+        events = [{"event": "measure_start", "ts_ms": 100.0}, linux, _suspend(900.0, 1), _rss(1_200.0, 1000.0)]
+        tl = build_timeline(Path("linux.jsonl"), parse_jsonl(_lines(events)))
+        self.assertIsNone(tl.rss[0].total_private_bytes)
+        self.assertIsNone(tl.rss[0].engine_private_bytes)
+        text = render_markdown([tl], None, ESTIMATED_BYTES_PER_TAB, only_with_suspends=False)
+        self.assertIn("| 1073.0→973.0 | 27.0→27.0 | -→778.4 |", text)
 
     def test_markdown_omits_empty_logs_when_asked(self) -> None:
         empty = build_timeline(Path("cold_startup-trial-1.jsonl"), parse_jsonl(_lines([_rss(100.0, 300.0)])))
@@ -197,13 +222,32 @@ class RssTrackTest(unittest.TestCase):
         # サンプル (1090 MiB、その区間に 4 休止)。最後のサンプルは 17.0s
         # なので +10 (20.0s) には追いついておらず、行にしない — 最後の
         # サンプルは quit の途中で採られうるため (run 35601333889)。
-        self.assertIn("| +0 | 1200.0 | - | 0 | 10 | 1173.0 | 27.0 |", text)
-        self.assertIn("| +5 | 1090.0 | -110.0 | 4 | 9 | 1063.0 | 27.0 |", text)
+        # 末尾 3 列は私的コミット (D150): 総量 / 直前の行からの差 / engine 側。
+        self.assertIn("| +0 | 1200.0 | - | 0 | 10 | 1173.0 | 27.0 | 960.0 | - | 938.4 |", text)
+        self.assertIn("| +5 | 1090.0 | -110.0 | 4 | 9 | 1063.0 | 27.0 | 872.0 | -88.0 | 850.4 |", text)
         self.assertNotIn("| +10 |", text)
         # 20.0s 以降にサンプルがあれば +10 の行が出て、16.7s の 4 休止を数える。
         longer = build_timeline(Path("b.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS + [_rss(20_500.0, 1041.0, 8)])))
         text = render_rss_track([longer], 5000.0, markdown=True)
-        self.assertIn("| +10 | 1040.0 | -50.0 | 4 | 8 | 1013.0 | 27.0 |", text)
+        self.assertIn("| +10 | 1040.0 | -50.0 | 4 | 8 | 1013.0 | 27.0 | 832.0 | -40.0 | 810.4 |", text)
+
+    def test_track_private_delta_is_dash_when_either_side_is_missing(self) -> None:
+        from perf_log_timeline import render_rss_track
+
+        # +0 の行は私的コミットあり、+5 の行は無し (null) → 差は `-`、
+        # 次に戻っても直前が無いので `-`。
+        events = [
+            _rss(9_000.0, 1200.0),
+            {"event": "measure_start", "ts_ms": 10_000.0},
+            {**_rss(14_500.0, 1100.0), "total_private_bytes": None, "engine_private_bytes": None},
+            _rss(19_500.0, 1050.0),
+            _rss(21_000.0, 1050.0),
+        ]
+        tl = build_timeline(Path("b.jsonl"), parse_jsonl(_lines(events)))
+        text = render_rss_track([tl], 5000.0, markdown=True)
+        self.assertIn("| +0 | 1200.0 | - | 0 | 10 | 1173.0 | 27.0 | 960.0 | - | 938.4 |", text)
+        self.assertIn("| +5 | 1100.0 | -100.0 | 0 | 10 | 1073.0 | 27.0 | - | - | - |", text)
+        self.assertIn("| +10 | 1050.0 | -50.0 | 0 | 10 | 1023.0 | 27.0 | 840.0 | - | 818.4 |", text)
 
     def test_logs_without_mark_are_skipped_and_counted(self) -> None:
         from perf_log_timeline import render_rss_track

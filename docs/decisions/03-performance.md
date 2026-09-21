@@ -4,7 +4,7 @@
 
 ## 対象
 
-主担当は **D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118, D120–D125, D127, D129–D130, D132, D135, D137–D138, D142–D145, D147–D149** の 66 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118, D120–D125, D127, D129–D130, D132, D135, D137–D138, D142–D145, D147–D150** の 67 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D16** — `/proc` ベースの metrics
 - **D19** — tab latency / structured perf output
@@ -29,7 +29,7 @@
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118, D120–D125, D127, D129–D130, D132, D135, D137–D138, D142–D145, D147–D149** (66 件)
+**このカテゴリが主担当の Decision: D16, D19, D21, D41–D49, D56–D58, D79–D82, D84–D90, D92–D97, D99, D101, D104–D106, D109–D115, D117–D118, D120–D125, D127, D129–D130, D132, D135, D137–D138, D142–D145, D147–D150** (67 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -105,6 +105,7 @@
 - [D147](./archive.md#d147-試行ごとの-perf-ログ-生の-json-lines-を-perf-windows-の-artifact-に残す-issue-176-stage-3--d145-revisit-condition-1--velox-bench-run---keep-logs-で結果ファイル名に揃えて残し集計は-1-バイトも変えない) — 試行ごとの perf ログ (生の JSON Lines) を perf-windows の artifact に残す (Issue #176 Stage 3 / D145 Revisit condition (1)) — `velox-bench run --keep-logs` で結果ファイル名に揃えて残し、集計は 1 バイトも変えない
 - [D148](./archive.md#d148-休止スイープの時系列は-job-summary-に出す-issue-176-stage-3--d147-revisit-condition-2--生ログを読む最初の形は判定ごとの要求タブ数-vs-実際の休止数で予算は-ram-から-rust-と同じ式で再現する) — 休止スイープの時系列は Job Summary に出す (Issue #176 Stage 3 / D147 Revisit condition (2)) — 生ログを読む最初の形は「判定ごとの要求タブ数 vs 実際の休止数」で、予算は RAM から Rust と同じ式で再現する
 - [D149](./archive.md#d149-スクリプトの形は定数のまま計測用の上書きを-velox-bench-run-の引数で通し結果-json-に残す-issue-176-stage-3--477--効かないシナリオへの指定はエラーラウンド数の上限はコンパイル時の前提と同じ-12) — スクリプトの形は定数のまま、計測用の上書きを `velox-bench run` の引数で通し、結果 JSON に残す (Issue #176 Stage 3 / §47.7) — 効かないシナリオへの指定はエラー、ラウンド数の上限はコンパイル時の前提と同じ 12
+- [D150](./archive.md#d150-rss-レコードに私的コミット-windows-の-pagefileusage-を並べる-issue-176-stage-3--478--予算の判定は変えずまず山がコミットの増加かを数字で決める) — `rss` レコードに私的コミット (Windows の `PagefileUsage`) を並べる (Issue #176 Stage 3 / §47.8) — 予算の判定は変えず、まず「山がコミットの増加か」を数字で決める
 
 ---
 

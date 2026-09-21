@@ -18610,3 +18610,88 @@ summary」の JSON 全文と bench ステップのログに出る。次の計測
 あわせて、上書きが計測の常用になるか (workflow の既定を変えるか、別
 シナリオ ID にするか) を決める。(2) 上書きした結果を並べて読む機会が増え
 たら、Job Summary の表に `script_overrides` を出す。
+
+## D150: `rss` レコードに私的コミット (Windows の `PagefileUsage`) を並べる (Issue #176 Stage 3 / §47.8) — 予算の判定は変えず、まず「山がコミットの増加か」を数字で決める
+
+**対象**: §47.8 で、Windows の 50 タブ保持は**タブ操作と無関係に**レンダラ
+が作られてから約 30 秒後と約 65 秒後にワーキングセットが 2 段で増える
+(合計約 +470 MiB / 49 レンダラ) と分かった。予算の判定が見ている量は
+`GetProcessMemoryInfo` の `WorkingSetSize` (ワーキングセット全体、共有
+ページ込み、D88) で、この増分が**実際に確保した量 (コミット) の増加**なのか、
+**既にコミット済み / 共有のページを GC や JIT が触ってワーキングセットに
+乗せただけ**なのかは、この量だけでは決められない。前者なら
+「`tabs_hold_N` の settle を伸ばす」「作成後 75 秒以内のレンダラを別扱い
+する」が候補で、後者なら「判定の入力を私的コミットに替える」が候補になる
+— 打ち手が分かれるので、先に測る (D46)。
+
+### 決定1: 同じ `GetProcessMemoryInfo` の `PagefileUsage` を読み、`rss` レコードに追記する
+
+`PROCESS_MEMORY_COUNTERS::PagefileUsage` は名前に反して「プロセスの私的
+コミット (Commit Charge に数えられる分、タスクマネージャの Commit Size)」
+で、共有ページ・ファイル裏付きの常駐ページを含まない。`WorkingSetSize` と
+**同じ 1 回の呼び出し**から取れるので、追加のカーネル往復は無く、2 つの値は
+必ず同じ瞬間のもの (`QueriedProcess` に両方をまとめて返し、片方だけ取れる
+ことがない)。
+
+`RssSample` に `total_private_bytes` / `private_process_count` /
+`browser_private_bytes` / `engine_private_bytes` を足し、`rss` レコードの
+JSON にも同名で追記する。規則は D42 (PSS) と Stage 1 (内訳) のとおり:
+
+- **既存キーの後ろに足す**。既存の消費者 (`benchmark::extract_*`、
+  `perf_log_timeline.py`、`ingest`) はキーで読むので影響しない。
+- **未計測は `null` で、キーは常に出す**。Linux / macOS は今日は読まない
+  (`None`) ので、古い VeloX (キーが無い) と「この VeloX では読めなかった」
+  を消費者が区別できる。`private_process_count` で部分和と完全な和を区別
+  する (`pss_process_count` と同じ)。
+- **分割は root pid 基準** (D118)。`browser_private_bytes` は root だけ、
+  `engine_private_bytes` は子孫の合計で、両方 `Some` なら合計は
+  `total_private_bytes` に一致する。0 で埋めない — `OpenProcess` に失敗した
+  プロセスは「除外」であって「0」ではない (Windows 実装の失敗時挙動、D88)。
+
+Linux で対応する量 (`/proc/<pid>/status` の `RssAnon:`) は読まない。問いは
+Windows の `WorkingSetSize` についてのもので、Linux の予算は PSS を見て
+おり、比較する相手がいない。必要になったら同じフィールドに `Some` を
+入れるだけで済む形にしてある。
+
+### 決定2: 予算の判定は変えない
+
+`app.rs` の判定 (`total_pss_bytes.unwrap_or(total_rss_bytes)`) はこの PR
+では触らない。**測ってから決める** (D46) — 私的コミットを判定に使うかは、
+山がコミットの増加か否かで答えが逆になる。`velox-bench` の集計にも
+新しいメトリクスは足さない (`results/history/` の列を増やすのは、読む
+形が固まってから)。読むのは `perf_log_timeline.py` の 2 つの表で、
+スイープの表に「engine 私的 (直前→直後)」、`--rss-track` に「私的 / 私的差
+/ engine 私的」を足した。Windows 以外と古いログでは `-` になる。
+
+### 見送ったもの・既知の制約
+
+(1) `PeakWorkingSetSize` / `PeakPagefileUsage` は読まない — 山の高さは
+1 秒サンプルの系列から読めるし、ピークはプロセス起動からの累積で
+「いつ」が分からない。(2) プロセスごとの系列 (どのレンダラが増えたか) は
+まだ出さない。総量の私的コミットが山と同じ形で動くかがまず知りたい
+ことで、答えが「動かない」なら個別に見る必要がない。(3) 本作業環境では
+`cargo test` を回せない (D146 (2))。`cargo check` / `clippy` を
+`x86_64-pc-windows-msvc` で通し、単体テストは CI の Windows / Linux ジョブ
+が担保する。Windows の実機で `PagefileUsage` が期待どおりの値を返すかは
+最初の perf-windows run で確かめる。
+
+### 最初の実測 (2026-09-21、§47.9)
+
+`tabs_hold_bounce_50`、B = 予算 OFF、60 秒窓、切り替えなし (run
+35610806143、A 10 試行 / B 9 試行): **2 段の山はどちらも私的コミットに
+出なかった。** 第 1 の山 (+320 MiB) の 15 秒間にコミットは −50 MiB →
+横ばい、第 2 の山 (+150 MiB) の間は +16 MiB。mark の時点でコミット
+1512 MiB > ワーキングセット 1242 MiB で、増分は確保済み / 共有のページが
+常駐になっただけと読める。A の `Discard` は 4 タブでコミットを約 95〜
+100 MiB (1 タブ約 24 MiB) 確実に返した。`PagefileUsage` は期待どおりの
+値を返し、追加のカーネル往復も無い。Revisit (1) の後半 (判定の入力を
+私的コミットに替える) に進む。
+
+**Revisit condition**: (1) 最初の実測 (`tabs_hold_bounce_50`、予算 OFF、
+60 秒窓) で山が私的コミットにも同じ形で出たら、増分は確保量の増加であり、
+`tabs_hold_N` の settle (D110) を伸ばすか、判定が若いレンダラを別扱いする
+かを D46 に従って決める。出なければ (私的コミットが横ばいでワーキング
+セットだけ増える) 判定の入力を私的コミットに替える検討に進み、その場合は
+Linux の `RssAnon:` も読んで対称にする。(2) 私的コミットを常用の指標に
+するなら、`velox-bench` の集計 (`rss_private_bytes` など) と
+`results/history/` の列に昇格させる。

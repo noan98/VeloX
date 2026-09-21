@@ -161,6 +161,10 @@ mod tests {
                 total_cpu_seconds: None,
                 browser_rss_bytes: 0,
                 engine_rss_bytes: 0,
+                total_private_bytes: None,
+                private_process_count: 0,
+                browser_private_bytes: None,
+                engine_private_bytes: None,
             }),
             Duration::from_millis(10),
         );

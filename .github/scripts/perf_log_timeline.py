@@ -101,6 +101,12 @@ class RssSample:
     # `None` を許す。
     browser_rss_bytes: int | None = None
     engine_rss_bytes: int | None = None
+    # Issue #176 Stage 3 / D150 が足した私的コミット (Windows の
+    # `PagefileUsage`)。§47.8 の 2 段の山が「確保量 (コミット) の増加」なのか
+    # 「既にコミット済み / 共有のページをワーキングセットに乗せただけ」なのかを
+    # 分けるための列。Windows 以外と古いログでは `None` (JSON では null)。
+    total_private_bytes: int | None = None
+    engine_private_bytes: int | None = None
 
 
 @dataclass
@@ -158,6 +164,11 @@ def parse_jsonl(text: str) -> list[dict]:
     return events
 
 
+def _opt_int(value) -> int | None:
+    """数値なら int、それ以外 (無い・null・文字列) は `None`。"""
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
 def build_timeline(path: Path, events: list[dict]) -> Timeline:
     events = sorted(events, key=lambda e: e["ts_ms"])
     rss: list[RssSample] = []
@@ -171,15 +182,15 @@ def build_timeline(path: Path, events: list[dict]) -> Timeline:
             total = event.get("total_rss_bytes")
             if isinstance(total, (int, float)):
                 count = event.get("process_count")
-                browser = event.get("browser_rss_bytes")
-                engine = event.get("engine_rss_bytes")
                 rss.append(
                     RssSample(
                         ts,
                         int(total),
                         int(count) if isinstance(count, int) else None,
-                        int(browser) if isinstance(browser, (int, float)) else None,
-                        int(engine) if isinstance(engine, (int, float)) else None,
+                        _opt_int(event.get("browser_rss_bytes")),
+                        _opt_int(event.get("engine_rss_bytes")),
+                        _opt_int(event.get("total_private_bytes")),
+                        _opt_int(event.get("engine_private_bytes")),
                     )
                 )
         elif kind == "tab_suspend":
@@ -275,6 +286,8 @@ def render_markdown(
         "時刻は最後の `measure_start` (`mark`) からの相対秒 (無ければプロセス開始から)。"
         "`rss` は perf のサンプラの値で、判定が見た値そのものではない (「古さ」列はスイープまでの経過 ms)。"
         "「プロセス」「engine」「browser」はスイープ直前→直後の値 (§47.4: 返した分が戻るのがどちら側かを見る)。"
+        "「engine 私的」は engine 側の私的コミット (Windows の `PagefileUsage`、D150) の直前→直後で、"
+        "ワーキングセットの増減が確保量の増減かを見る (Windows 以外と古いログでは `-`)。"
     )
     lines.append("")
 
@@ -297,8 +310,8 @@ def render_markdown(
             lines.append("(休止なし)")
             lines.append("")
             continue
-        detail_head = " プロセス | engine (MiB) | browser (MiB) |"
-        detail_rule = " --- | --- | --- |"
+        detail_head = " プロセス | engine (MiB) | browser (MiB) | engine 私的 (MiB) |"
+        detail_rule = " --- | --- | --- | --- |"
         if budget is None:
             lines.append("| # | t (s) | 休止 | 理由 | rss 直前 (MiB) | 古さ (ms) | rss 直後 (MiB) |" + detail_head)
             lines.append("| ---: | ---: | ---: | --- | ---: | ---: | ---: |" + detail_rule)
@@ -332,6 +345,7 @@ def render_markdown(
             cells.append(_pair(before, after_rss, lambda s: s.process_count, as_mib=False))
             cells.append(_pair(before, after_rss, lambda s: s.engine_rss_bytes, as_mib=True))
             cells.append(_pair(before, after_rss, lambda s: s.browser_rss_bytes, as_mib=True))
+            cells.append(_pair(before, after_rss, lambda s: s.engine_private_bytes, as_mib=True))
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
     if skipped:
@@ -372,6 +386,9 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
         lines.append(
             "各行はその時刻以前で最も新しい `rss` サンプル。「差」は直前の行からの増減、"
             "「休止」はその区間に起きた `tab_suspend` の件数。休止が無い腕 (予算 OFF) でも読めるのがスイープの表との違い。"
+            "「私的」「engine 私的」は私的コミット (Windows の `PagefileUsage`、D150) の総量と engine 側、"
+            "「私的差」はその総量の直前の行からの増減。rss の「差」と並べて、山がコミットの増加かを読む "
+            "(Windows 以外と古いログでは `-`)。"
         )
         lines.append("")
     skipped = 0
@@ -382,8 +399,11 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
         if markdown:
             lines.append(f"#### `{tl.path.name}`")
             lines.append("")
-            lines.append("| t (s) | rss (MiB) | 差 (MiB) | 休止 | プロセス | engine (MiB) | browser (MiB) |")
-            lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
+            lines.append(
+                "| t (s) | rss (MiB) | 差 (MiB) | 休止 | プロセス | engine (MiB) | browser (MiB) "
+                "| 私的 (MiB) | 私的差 (MiB) | engine 私的 (MiB) |"
+            )
+            lines.append("| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
         else:
             lines.append(f"{tl.path.name}: mark={tl.mark_ms / 1000:.1f}s")
         last_ts = tl.rss[-1].ts_ms if tl.rss else tl.mark_ms
@@ -401,6 +421,11 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
                 # 直前の刻みからこの刻みまで (前開区間) に起きた休止。
                 suspended = sum(s.count for s in tl.sweeps if at - step_ms < s.start_ms <= at) if tick > 0 else 0
                 delta = "-" if previous is None else f"{(sample.total_rss_bytes - previous.total_rss_bytes) / MIB:+.1f}"
+                private_delta = (
+                    "-"
+                    if previous is None or previous.total_private_bytes is None or sample.total_private_bytes is None
+                    else f"{(sample.total_private_bytes - previous.total_private_bytes) / MIB:+.1f}"
+                )
                 cells = [
                     f"+{tick * step_s:g}",
                     _mib(sample.total_rss_bytes),
@@ -409,6 +434,9 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
                     "-" if sample.process_count is None else str(sample.process_count),
                     _mib(sample.engine_rss_bytes),
                     _mib(sample.browser_rss_bytes),
+                    _mib(sample.total_private_bytes),
+                    private_delta,
+                    _mib(sample.engine_private_bytes),
                 ]
                 if markdown:
                     lines.append("| " + " | ".join(cells) + " |")
@@ -446,6 +474,9 @@ def render_plain(timelines: list[Timeline], budget: int | None, per_tab: int, on
             parts.append(f"rss_after={_mib(sweep.rss_after.total_rss_bytes if sweep.rss_after else None)}MiB")
             parts.append(f"procs={_pair(before, sweep.rss_after, lambda s: s.process_count, as_mib=False)}")
             parts.append(f"engine={_pair(before, sweep.rss_after, lambda s: s.engine_rss_bytes, as_mib=True)}MiB")
+            parts.append(
+                f"engine_private={_pair(before, sweep.rss_after, lambda s: s.engine_private_bytes, as_mib=True)}MiB"
+            )
             lines.append(" ".join(parts))
     return "\n".join(lines)
 

@@ -476,6 +476,35 @@ pub struct RssSample {
     /// does not carry. See D118 for why a partial, Linux-only breakdown was
     /// not worth the asymmetry.
     pub engine_rss_bytes: u64,
+    /// Sum of **private commit** over every process in the tree that
+    /// reported it (Issue #176 Stage 3 / §47.8 / D150). On Windows this is
+    /// `PROCESS_MEMORY_COUNTERS::PagefileUsage` — the process's private
+    /// committed bytes ("Commit Size" in Task Manager), which counts what
+    /// the process has actually allocated and excludes shared pages and
+    /// file-backed pages that merely happen to be resident.
+    ///
+    /// It exists to answer one question `total_rss_bytes` cannot: whether
+    /// a rise in `WorkingSetSize` (the number the memory budget decides
+    /// on) is the engine *allocating* more, or just *touching* pages that
+    /// were already committed or are shared (§47.8's two-step rise ~30 s
+    /// and ~65 s after a renderer starts). Same `None` rule as
+    /// `total_pss_bytes`: `None` means no process in the tree reported it
+    /// (every non-Windows platform today), never "zero".
+    pub total_private_bytes: Option<u64>,
+    /// How many of `process_count` processes contributed to
+    /// `total_private_bytes` — a partial sum is distinguishable from a
+    /// complete one, exactly like `pss_process_count`.
+    pub private_process_count: usize,
+    /// Private commit of the root process alone (`None` when it did not
+    /// report). The `browser` half of the same split as
+    /// `browser_rss_bytes`.
+    pub browser_private_bytes: Option<u64>,
+    /// Private commit summed over every reporting process **except** the
+    /// root (`None` when none of them reported). `total_private_bytes =
+    /// browser_private_bytes + engine_private_bytes` holds whenever both
+    /// halves are `Some`; when only one half is `Some`, the total equals
+    /// that half.
+    pub engine_private_bytes: Option<u64>,
 }
 
 impl fmt::Display for RssSample {
@@ -496,8 +525,13 @@ impl fmt::Display for RssSample {
         // Appended, never inserted — same rule D42 followed for the PSS
         // fields, so a scraper matching the original prefix keeps working.
         match self.total_cpu_seconds {
-            Some(secs) => write!(f, " cpu_s={secs:.2}"),
-            None => write!(f, " cpu_s=n/a"),
+            Some(secs) => write!(f, " cpu_s={secs:.2}")?,
+            None => write!(f, " cpu_s=n/a")?,
+        }
+        // Appended after `cpu_s` for the same reason (D150).
+        match self.total_private_bytes {
+            Some(bytes) => write!(f, " private_mib={:.1}", bytes as f64 / (1024.0 * 1024.0)),
+            None => write!(f, " private_mib=n/a"),
         }
     }
 }
@@ -569,9 +603,11 @@ impl std::error::Error for RssError {
 ///   equivalent here, so `total_pss_bytes` is always `None`.
 /// - Windows (Issue #136, D88 in `docs/decisions.md`): `CreateToolhelp32Snapshot`
 ///   walks the process tree (PID/PPID), `GetProcessMemoryInfo`'s
-///   `WorkingSetSize` gives RSS, and `GetProcessTimes` gives CPU time — all
-///   best-effort per process (a process this project's own, non-elevated
-///   process cannot `OpenProcess` simply contributes no RSS/CPU, mirroring
+///   `WorkingSetSize` gives RSS (and its `PagefileUsage` the private commit
+///   in [`RssSample::total_private_bytes`], D150), and `GetProcessTimes`
+///   gives CPU time — all best-effort per process (a process this project's
+///   own, non-elevated process cannot `OpenProcess` simply contributes no
+///   RSS/CPU, mirroring
 ///   the Linux/`ps` fallbacks' "exclude, don't fail the whole sample"
 ///   policy). **PSS has no Windows equivalent and is not attempted**:
 ///   `total_pss_bytes` is always `None` here, exactly as on non-Linux Unix.
@@ -599,6 +635,10 @@ struct ProcInfo {
     /// seconds. `None` where the platform does not provide it (see
     /// [`RssSample::total_cpu_seconds`]).
     cpu_seconds: Option<f64>,
+    /// Private committed bytes (Windows `PagefileUsage`); `None` where the
+    /// platform does not provide it or the process could not be queried
+    /// (see [`RssSample::total_private_bytes`]).
+    private_bytes: Option<u64>,
 }
 
 /// Pure tree-walk + summation, independent of how `processes` was obtained
@@ -618,6 +658,13 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
     // makes this exact and identical on every platform — see
     // `RssSample::browser_rss_bytes`.
     let mut browser_rss_bytes = 0u64;
+    // Issue #176 Stage 3 (D150): private commit, split the same way. Kept
+    // as `Option`s (not summed into a `u64` with 0 as "missing") because a
+    // process that could not be queried must be excluded, not zeroed —
+    // the same rule PSS follows.
+    let mut browser_private_bytes: Option<u64> = None;
+    let mut engine_private_bytes: Option<u64> = None;
+    let mut private_process_count = 0usize;
     for (pid, info) in tree
         .iter()
         .filter_map(|pid| processes.get(pid).map(|info| (*pid, info)))
@@ -634,7 +681,20 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
             total_cpu_seconds += cpu;
             cpu_process_count += 1;
         }
+        if let Some(private) = info.private_bytes {
+            private_process_count += 1;
+            let side = if pid == root_pid {
+                &mut browser_private_bytes
+            } else {
+                &mut engine_private_bytes
+            };
+            *side = Some(side.unwrap_or(0) + private);
+        }
     }
+    let total_private_bytes = match (browser_private_bytes, engine_private_bytes) {
+        (None, None) => None,
+        (browser, engine) => Some(browser.unwrap_or(0) + engine.unwrap_or(0)),
+    };
     Ok(RssSample {
         root_pid,
         process_count: tree.len(),
@@ -648,6 +708,10 @@ fn build_sample(root_pid: u32, processes: &HashMap<u32, ProcInfo>) -> Result<Rss
         // that invariant should give a wrong-looking 0 rather than panic in
         // a metrics sampler.
         engine_rss_bytes: total_rss_bytes.saturating_sub(browser_rss_bytes),
+        total_private_bytes,
+        private_process_count,
+        browser_private_bytes,
+        engine_private_bytes,
     })
 }
 
@@ -1199,6 +1263,30 @@ impl PerfRecord {
                     "engine_rss_bytes".to_owned(),
                     json!(sample.engine_rss_bytes),
                 );
+                // Issue #176 Stage 3 (D150): private commit, appended after
+                // the Stage 1 keys under the same rule. `total_private_bytes`
+                // / `browser_private_bytes` / `engine_private_bytes` are
+                // JSON `null` (present, never absent) when not reported —
+                // every non-Windows platform today — so a consumer cannot
+                // mistake "unmeasured" for "0 bytes", exactly like
+                // `total_pss_bytes`; `private_process_count` tells a
+                // partial sum from a complete one.
+                fields.insert(
+                    "total_private_bytes".to_owned(),
+                    json!(sample.total_private_bytes),
+                );
+                fields.insert(
+                    "private_process_count".to_owned(),
+                    json!(sample.private_process_count),
+                );
+                fields.insert(
+                    "browser_private_bytes".to_owned(),
+                    json!(sample.browser_private_bytes),
+                );
+                fields.insert(
+                    "engine_private_bytes".to_owned(),
+                    json!(sample.engine_private_bytes),
+                );
             }
             PerfRecord::Ipc {
                 direction,
@@ -1357,6 +1445,11 @@ mod imp {
             rss_bytes: rss_kb.unwrap_or(0) * 1024,
             pss_bytes: None,
             cpu_seconds: None,
+            // Not read on Linux (D150): the question it answers is about
+            // Windows' `WorkingSetSize`, and Linux already has PSS for the
+            // budget. `RssAnon:` in `status` would be the counterpart if
+            // it is ever needed.
+            private_bytes: None,
         })
     }
 
@@ -1529,6 +1622,8 @@ mod imp {
                     // a platform this project's CI never exercises is not
                     // worth it (Issue #64).
                     cpu_seconds: None,
+                    // Nor private commit (D150) — Windows-only today.
+                    private_bytes: None,
                 },
             );
         }
@@ -1611,11 +1706,12 @@ mod imp {
         );
 
         // Pass 1: pid -> ppid only, no `OpenProcess`/`GetProcessMemoryInfo`/
-        // `GetProcessTimes` yet. `rss_bytes` starts at 0 and `cpu_seconds`
-        // at `None`; pass 2 below fills both in for tree members only —
-        // every other entry keeps these placeholder values, which is fine
-        // since `build_sample` (via `super::collect_descendants`) never
-        // looks at a non-tree entry's `rss_bytes`/`cpu_seconds` at all.
+        // `GetProcessTimes` yet. `rss_bytes` starts at 0 and `cpu_seconds`/
+        // `private_bytes` at `None`; pass 2 below fills them in for tree
+        // members only — every other entry keeps these placeholder values,
+        // which is fine since `build_sample` (via `super::
+        // collect_descendants`) never looks at a non-tree entry's
+        // `rss_bytes`/`cpu_seconds`/`private_bytes` at all.
         let mut map = HashMap::new();
         let mut entry = PROCESSENTRY32W {
             dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
@@ -1638,6 +1734,7 @@ mod imp {
                     rss_bytes: 0,
                     pss_bytes: None,
                     cpu_seconds: None,
+                    private_bytes: None,
                 },
             );
 
@@ -1650,21 +1747,38 @@ mod imp {
         // processes directly via `OpenProcess`, not the snapshot.
         drop(snapshot);
 
-        // Pass 2: RSS + CPU time, only for root_pid and its descendants.
+        // Pass 2: RSS + private commit + CPU time, only for root_pid and its
+        // descendants.
         for pid in super::collect_descendants(root_pid, &map) {
             let Some(info) = map.get_mut(&pid) else {
                 continue;
             };
-            let (rss_bytes, cpu_seconds) = query_process(pid);
-            info.rss_bytes = rss_bytes.unwrap_or(0);
-            info.cpu_seconds = cpu_seconds;
+            let queried = query_process(pid);
+            info.rss_bytes = queried.working_set_bytes.unwrap_or(0);
+            info.private_bytes = queried.private_bytes;
+            info.cpu_seconds = queried.cpu_seconds;
         }
 
         Ok(map)
     }
 
-    /// Best-effort RSS + CPU time for one process: `OpenProcess` with the
-    /// minimal access rights `GetProcessMemoryInfo`/`GetProcessTimes`
+    /// What [`query_process`] could read for one process; each field is
+    /// `None` when its API call failed (or the process could not be opened
+    /// at all, in which case all three are).
+    struct QueriedProcess {
+        /// `PROCESS_MEMORY_COUNTERS::WorkingSetSize` — RSS.
+        working_set_bytes: Option<u64>,
+        /// `PROCESS_MEMORY_COUNTERS::PagefileUsage` — private commit
+        /// (D150). Read from the same `GetProcessMemoryInfo` call as the
+        /// working set, so the two are always from the same instant and
+        /// either both present or both absent.
+        private_bytes: Option<u64>,
+        cpu_seconds: Option<f64>,
+    }
+
+    /// Best-effort RSS + private commit + CPU time for one process:
+    /// `OpenProcess` with the minimal access rights
+    /// `GetProcessMemoryInfo`/`GetProcessTimes`
     /// need (`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`, never
     /// `PROCESS_ALL_ACCESS`). A process VeloX cannot open — a
     /// higher-privileged or another user's process, since this project does
@@ -1674,7 +1788,7 @@ mod imp {
     /// (`build_sample`'s summation already treats a missing map entry —
     /// which never happens here since a `ProcInfo` is inserted regardless —
     /// and a `None` field the same permissive way).
-    fn query_process(pid: u32) -> (Option<u64>, Option<f64>) {
+    fn query_process(pid: u32) -> QueriedProcess {
         // SAFETY: a plain FFI call; the access mask requested is the
         // minimal one documented above, `bInheritHandle = false` so this
         // handle is not inherited by any child process VeloX later spawns,
@@ -1689,10 +1803,16 @@ mod imp {
             )
         } {
             Ok(handle) => OwnedHandle(handle),
-            Err(_) => return (None, None),
+            Err(_) => {
+                return QueriedProcess {
+                    working_set_bytes: None,
+                    private_bytes: None,
+                    cpu_seconds: None,
+                }
+            }
         };
 
-        let rss_bytes = {
+        let memory = {
             let mut counters = PROCESS_MEMORY_COUNTERS {
                 cb: std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
                 ..Default::default()
@@ -1703,7 +1823,15 @@ mod imp {
             // matching what `GetProcessMemoryInfo` requires.
             unsafe { GetProcessMemoryInfo(handle.0, &mut counters, counters.cb) }
                 .ok()
-                .map(|()| counters.WorkingSetSize as u64)
+                .map(|()| {
+                    (
+                        counters.WorkingSetSize as u64,
+                        // Private committed bytes despite the name — the
+                        // field predates the "Commit Charge" wording. See
+                        // `RssSample::total_private_bytes` (D150).
+                        counters.PagefileUsage as u64,
+                    )
+                })
         };
 
         let cpu_seconds = {
@@ -1722,7 +1850,11 @@ mod imp {
                 })
         };
 
-        (rss_bytes, cpu_seconds)
+        QueriedProcess {
+            working_set_bytes: memory.map(|(working_set, _)| working_set),
+            private_bytes: memory.map(|(_, private)| private),
+            cpu_seconds,
+        }
     }
 
     /// A `windows::core::Error` (an `HRESULT` plus an optional message) as
@@ -2220,6 +2352,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 1000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
         processes.insert(
@@ -2229,6 +2362,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 2000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         ); // child of 1
         processes.insert(
@@ -2238,6 +2372,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 3000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         ); // grandchild
         processes.insert(
@@ -2247,6 +2382,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 4000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         ); // unrelated
 
@@ -2266,6 +2402,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 999,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
         let sample = build_sample(5, &processes).unwrap();
@@ -2282,6 +2419,7 @@ MemAvailable:    8901234 kB
             rss_bytes,
             pss_bytes: None,
             cpu_seconds: None,
+            private_bytes: None,
         }
     }
 
@@ -2371,6 +2509,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 1000,
                 pss_bytes: Some(400),
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
         processes.insert(
@@ -2380,6 +2519,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 2000,
                 pss_bytes: Some(600),
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
 
@@ -2399,6 +2539,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 1000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
         processes.insert(
@@ -2408,6 +2549,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 2000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
 
@@ -2432,6 +2574,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 1000,
                 pss_bytes: Some(300),
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
         processes.insert(
@@ -2441,6 +2584,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 2000,
                 pss_bytes: None,
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
         processes.insert(
@@ -2450,6 +2594,7 @@ MemAvailable:    8901234 kB
                 rss_bytes: 500,
                 pss_bytes: Some(150),
                 cpu_seconds: None,
+                private_bytes: None,
             },
         );
 
@@ -2463,6 +2608,65 @@ MemAvailable:    8901234 kB
         );
     }
 
+    // -- RSS: 私的コミット (Issue #176 Stage 3 / D150) ---------------------
+
+    fn proc_with_private(ppid: u32, rss_bytes: u64, private_bytes: Option<u64>) -> ProcInfo {
+        ProcInfo {
+            ppid,
+            rss_bytes,
+            pss_bytes: None,
+            cpu_seconds: None,
+            private_bytes,
+        }
+    }
+
+    #[test]
+    fn build_sample_splits_private_commit_like_rss() {
+        // 1 (root) -> 2 -> 3、無関係な 4。総量 = browser + engine。
+        let mut processes = HashMap::new();
+        processes.insert(1, proc_with_private(0, 1000, Some(700)));
+        processes.insert(2, proc_with_private(1, 2000, Some(1500)));
+        processes.insert(3, proc_with_private(2, 3000, Some(2500)));
+        processes.insert(4, proc_with_private(0, 4000, Some(9999)));
+
+        let sample = build_sample(1, &processes).unwrap();
+        assert_eq!(sample.total_private_bytes, Some(4700));
+        assert_eq!(sample.private_process_count, 3);
+        assert_eq!(sample.browser_private_bytes, Some(700));
+        assert_eq!(sample.engine_private_bytes, Some(4000));
+    }
+
+    #[test]
+    fn build_sample_private_commit_is_none_when_no_process_reports_it() {
+        // Linux / macOS の今の形: 全プロセスが `None` → 総量も `None` で
+        // 0 ではない (PSS と同じ規約)。
+        let mut processes = HashMap::new();
+        processes.insert(1, proc_with_private(0, 1000, None));
+        processes.insert(2, proc_with_private(1, 2000, None));
+
+        let sample = build_sample(1, &processes).unwrap();
+        assert_eq!(sample.total_private_bytes, None);
+        assert_eq!(sample.private_process_count, 0);
+        assert_eq!(sample.browser_private_bytes, None);
+        assert_eq!(sample.engine_private_bytes, None);
+    }
+
+    #[test]
+    fn build_sample_private_commit_partial_keeps_the_half_that_reported() {
+        // root は開けたが子は開けなかった (OpenProcess 失敗) 場合: engine
+        // 側は `None` のまま、総量は読めた分だけ。0 で埋めない。
+        let mut processes = HashMap::new();
+        processes.insert(1, proc_with_private(0, 1000, Some(700)));
+        processes.insert(2, proc_with_private(1, 2000, None));
+
+        let sample = build_sample(1, &processes).unwrap();
+        assert_eq!(sample.total_private_bytes, Some(700));
+        assert_eq!(sample.private_process_count, 1);
+        assert_eq!(sample.browser_private_bytes, Some(700));
+        assert_eq!(sample.engine_private_bytes, None);
+        assert!(sample.private_process_count < sample.process_count);
+    }
+
     #[test]
     fn rss_sample_display_reports_mib() {
         let sample = RssSample {
@@ -2474,10 +2678,14 @@ MemAvailable:    8901234 kB
             total_cpu_seconds: None,
             browser_rss_bytes: 0,
             engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         };
         assert_eq!(
             sample.to_string(),
-            "rss pid=42 processes=3 total_mib=2.0 pss_processes=3/3 pss_mib=1.0 cpu_s=n/a"
+            "rss pid=42 processes=3 total_mib=2.0 pss_processes=3/3 pss_mib=1.0 cpu_s=n/a private_mib=n/a"
         );
     }
 
@@ -2492,10 +2700,14 @@ MemAvailable:    8901234 kB
             total_cpu_seconds: None,
             browser_rss_bytes: 0,
             engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         };
         assert_eq!(
             sample.to_string(),
-            "rss pid=42 processes=3 total_mib=2.0 pss_processes=0/3 pss_mib=n/a cpu_s=n/a"
+            "rss pid=42 processes=3 total_mib=2.0 pss_processes=0/3 pss_mib=n/a cpu_s=n/a private_mib=n/a"
         );
     }
 
@@ -2625,6 +2837,10 @@ MemAvailable:    8901234 kB
             total_cpu_seconds: None,
             browser_rss_bytes: 0,
             engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         };
         let expected = sample.to_string();
         assert_eq!(PerfRecord::rss(sample).to_text(), expected);
@@ -2658,6 +2874,10 @@ MemAvailable:    8901234 kB
             total_cpu_seconds: cpu,
             browser_rss_bytes: 0,
             engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         };
         // 2 CPU-seconds over 1 second of wall time = two cores busy.
         let percent = PerfRecord::cpu_percent_between(
@@ -2847,6 +3067,10 @@ MemAvailable:    8901234 kB
             total_cpu_seconds: None,
             browser_rss_bytes: 0,
             engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         assert_eq!(value["pid"], 42);
@@ -2867,6 +3091,10 @@ MemAvailable:    8901234 kB
             total_cpu_seconds: None,
             browser_rss_bytes: 0,
             engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         // `null`, not an absent key — a consumer must be able to tell
@@ -2874,6 +3102,40 @@ MemAvailable:    8901234 kB
         // value, per the JSON schema in docs/architecture.md.
         assert!(value["total_pss_bytes"].is_null());
         assert_eq!(value["pss_process_count"], 0);
+        // 私的コミット (D150) も同じ規約: キーは常にあり、未計測は null。
+        for key in [
+            "total_private_bytes",
+            "browser_private_bytes",
+            "engine_private_bytes",
+        ] {
+            assert!(value.get(key).is_some(), "{key} must be present");
+            assert!(value[key].is_null(), "{key} must be null, not 0");
+        }
+        assert_eq!(value["private_process_count"], 0);
+    }
+
+    #[test]
+    fn perf_record_rss_json_carries_private_commit_when_reported() {
+        let sample = RssSample {
+            root_pid: 42,
+            process_count: 3,
+            total_rss_bytes: 2 * 1024 * 1024,
+            total_pss_bytes: None,
+            pss_process_count: 0,
+            total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
+            total_private_bytes: Some(1_500_000),
+            private_process_count: 3,
+            browser_private_bytes: Some(500_000),
+            engine_private_bytes: Some(1_000_000),
+        };
+        let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
+        assert_eq!(value["total_private_bytes"], 1_500_000);
+        assert_eq!(value["private_process_count"], 3);
+        assert_eq!(value["browser_private_bytes"], 500_000);
+        assert_eq!(value["engine_private_bytes"], 1_000_000);
+        assert!(sample.to_string().ends_with("cpu_s=n/a private_mib=1.4"));
     }
 
     #[test]
