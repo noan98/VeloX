@@ -187,6 +187,63 @@ class RenderTest(unittest.TestCase):
         self.assertIn("(休止なし)", text)
 
 
+class RssTrackTest(unittest.TestCase):
+    def test_tracks_rss_from_mark_in_steps_and_counts_suspends_per_window(self) -> None:
+        from perf_log_timeline import render_rss_track
+
+        tl = build_timeline(Path("b-trial-1.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        text = render_rss_track([tl], 5000.0, markdown=True)
+        # mark = 10.0s。+0 は 9.0s のサンプル (1200 MiB)、+5 は 12.0s の
+        # サンプル (1090 MiB、その区間に 4 休止)。最後のサンプルは 17.0s
+        # なので +10 (20.0s) には追いついておらず、行にしない — 最後の
+        # サンプルは quit の途中で採られうるため (run 35601333889)。
+        self.assertIn("| +0 | 1200.0 | - | 0 | 10 | 1173.0 | 27.0 |", text)
+        self.assertIn("| +5 | 1090.0 | -110.0 | 4 | 9 | 1063.0 | 27.0 |", text)
+        self.assertNotIn("| +10 |", text)
+        # 20.0s 以降にサンプルがあれば +10 の行が出て、16.7s の 4 休止を数える。
+        longer = build_timeline(Path("b.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS + [_rss(20_500.0, 1041.0, 8)])))
+        text = render_rss_track([longer], 5000.0, markdown=True)
+        self.assertIn("| +10 | 1040.0 | -50.0 | 4 | 8 | 1013.0 | 27.0 |", text)
+
+    def test_logs_without_mark_are_skipped_and_counted(self) -> None:
+        from perf_log_timeline import render_rss_track
+
+        no_mark = build_timeline(Path("cold-trial-1.jsonl"), parse_jsonl(_lines([_rss(100.0, 300.0)])))
+        text = render_rss_track([no_mark], 5000.0, markdown=True)
+        self.assertNotIn("cold-trial-1.jsonl", text)
+        self.assertIn("1 本は省略", text)
+
+    def test_rejects_non_positive_step(self) -> None:
+        # step が 0 以下だと刻みが進まず無限ループになる (PR #286 のレビュー
+        # 指摘)。関数と CLI の両方で弾く。
+        from perf_log_timeline import render_rss_track
+
+        tl = build_timeline(Path("b.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        with self.assertRaises(ValueError):
+            render_rss_track([tl], 0.0, markdown=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "b-trial-1.jsonl"
+            log.write_text(_lines(SAMPLE_EVENTS), encoding="utf-8")
+            with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                saved, sys.stderr = sys.stderr, io.StringIO()
+                try:
+                    main([str(log), "--rss-track", "--track-step-ms", "0"])
+                finally:
+                    sys.stderr = saved
+            self.assertEqual(raised.exception.code, 2)
+
+    def test_cli_switch_selects_the_track_view(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "b-trial-1.jsonl"
+            log.write_text(_lines(SAMPLE_EVENTS), encoding="utf-8")
+            out = io.StringIO()
+            with redirect_stdout(out):
+                code = main([str(log), "--rss-track", "--markdown"])
+            self.assertEqual(code, 0)
+            self.assertIn("秒刻みの rss の推移", out.getvalue())
+            self.assertNotIn("休止スイープの時系列", out.getvalue())
+
+
 class CliTest(unittest.TestCase):
     def test_reads_a_directory_and_computes_budget_from_ram(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
