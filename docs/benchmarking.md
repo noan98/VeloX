@@ -611,7 +611,7 @@ Windows では不要になる (Windows には Xvfb/D-Bus セッションバス�
 | `scenario` | `velox-bench list-scenarios` の一覧から選ぶシナリオ ID | `cold_startup` |
 | `scenarios` | 複数シナリオを 1 run で続けて計測する (カンマ区切り)。指定すると `scenario` より優先される | (空) |
 | `trials` | 試行回数 | `10` |
-| `compare_env` | A/B 比較の B 条件で追加する環境変数 (`KEY=VALUE`、複数はセミコロン区切り)。空欄なら A 条件だけを 1 回計測する | `VELOX_MEMORY_BUDGET_MB=0` |
+| `compare_env` | A/B 比較の B 条件で追加する環境変数 (`KEY=VALUE`、複数はセミコロン区切り)。空欄なら A 条件だけを 1 回計測する。`VELOX_MEMORY_BUDGET_INPUT=private` (D151) を含めると、休止スイープの表の「超過 / 要求」も B 側だけ私的コミットで出る | `VELOX_MEMORY_BUDGET_MB=0` |
 | `common_env` | A/B の両方に共通で設定する環境変数。測定条件を成立させるための設定に使う | (空) |
 | `repeats` | A/B のペアを何回繰り返すか | `2` |
 | `page` | loopback で配信する `scripts/bench/pages/` の固定ページ | `minimal.html` |

@@ -18695,3 +18695,65 @@ Windows の `WorkingSetSize` についてのもので、Linux の予算は PSS �
 Linux の `RssAnon:` も読んで対称にする。(2) 私的コミットを常用の指標に
 するなら、`velox-bench` の集計 (`rss_private_bytes` など) と
 `results/history/` の列に昇格させる。
+
+## D151: 予算の判定が比べる量を `VELOX_MEMORY_BUDGET_INPUT` で選べるようにする (Issue #176 Stage 3 / §47.9) — 既定は従来どおりワーキングセット、`private` は計測の腕。既定を替えるのは A/B の後
+
+**対象**: §47.9 (D150 の最初の実測) で、Windows の予算の判定が見ている
+`WorkingSetSize` は、レンダラが作られてから約 75 秒のあいだ**確保量が
+増えないまま**約 +470 MiB / 50 タブ増える (私的コミットは横ばい、むしろ
+−50 MiB) と分かった。判定はその常駐化を背景タブの `Discard` で徴収して
+おり、§46 以来の「5 秒に 4 タブ」「揺り戻し」はその帰結だった。一方、
+私的コミット (`PagefileUsage`、D150) はタブを開き終えた時点で定常で、
+`Discard` に 1 タブ約 24 MiB で確実に応じ、起動後の階段を持たない —
+予算の入力として求めていた性質を持つ。D150 Revisit (1) の後半
+(「出なければ判定の入力を私的コミットに替える検討に進む」) に当たる。
+
+### 決定1: ノブを足し、既定は変えない
+
+`browser::suspension::MemoryBudgetInput` (`Resident` / `PrivateCommit`)
+を足し、`app::spawn_memory_pressure_sampler` が `MemoryBudgetInput::pick`
+で 1 サンプルの 3 つの総量 (私的コミット / PSS / RSS) から判定の入力を
+選ぶ。`Resident` は従来の `total_pss_bytes.unwrap_or(total_rss_bytes)`
+そのもの。`PrivateCommit` は `total_private_bytes` があればそれ、無ければ
+`Resident` と同じ — つまり **Linux では両方とも PSS で、変わるのは
+Windows だけ**。入り口は `VELOX_MEMORY_BUDGET_INPUT=resident|private`
+(`config`、不明な綴りは既定に落とす。設定画面には出さない — 計測用)。
+
+**既定は `Resident` のまま。** §47.9 の数字は「山が確保量ではない」を
+示しただけで、私的コミットを入力にしたときの予算の挙動 (何タブ休止する
+か・落ち着くまでの時間・`ESTIMATED_BYTES_PER_TAB` との相性) は未計測で
+ある。`SuspendMechanism` (D121) と同じく、**ノブが先、既定は数字の後**。
+mark 時点で私的コミット 1512 MiB > ワーキングセット 1242 MiB だったので、
+同じ予算 (1024 MiB) に対して `private` は初回により多く休止する
+(要求 (1512 − 1024) / 64 ≈ 8 タブ vs 4 タブ) はずで、その代わり揺り戻しが
+消えるはず — それを A/B で確かめる。
+
+### 決定2: 時系列の表も同じ選択で読む
+
+`perf_log_timeline.py --budget-input resident|private` (既定 `resident`) が
+「超過 / 要求」を同じ量から出す (`judged_bytes`)。perf-windows.yml の
+「Show suspend sweep timeline」は `common_env` / `compare_env` から
+`VELOX_MEMORY_BUDGET_INPUT` を読み、腕ごとに入力が違うときは
+`-baseline-` / `-compare-` のファイルを分けて 2 回呼ぶ。判定が見た量を
+perf ログに書く案 (D148 Revisit (2)) はまだ採らない — 入力の綴りは
+環境から決まるので、ログを読む側が同じ規則で再現できる。
+
+### 見送ったもの・既知の制約
+
+(1) Linux の私的コミット相当 (`/proc/<pid>/status` の `RssAnon:`) は
+読まない。Linux の判定は PSS で、`RssAnon` はコミットではなく常駐の
+匿名ページなので対称にならない。Windows の結果が出てから要るか決める。
+(2) `ESTIMATED_BYTES_PER_TAB` (64 MiB) は触らない。§47.9 の 1 タブ約
+24 MiB (私的コミット) との差は、入力を替えた A/B の中で「要求 vs 実際」
+として読めるので、そこで決める (D145 Revisit (1) 後半)。(3) 本作業環境
+では `cargo test` を回せない (D146 (2))。`cargo clippy --target
+x86_64-pc-windows-msvc --all-targets` と単体テスト (CI) で担保する。
+
+**Revisit condition**: (1) A/B (`tabs_hold_bounce_50`、A = 既定 / B =
+`VELOX_MEMORY_BUDGET_INPUT=private`、60 秒窓) で B の休止が初回のスイープ
+で収束し、その後の揺り戻しが消えるなら、Windows の既定を `PrivateCommit`
+に替える (別 PR、D46)。休止数が増えすぎる (予算 1024 MiB に対して私的
+コミット 1512 MiB は 50 タブで常時超過) なら、`memory_budget_for_ram`
+の式を私的コミット基準で見直すのと組で決める。(2) 入力を替えた後も
+「5 秒に 4 タブ」が続くなら、疑似プロセスグループ上限 (4) の側を疑う
+(§47.1)。

@@ -183,6 +183,25 @@ class RenderTest(unittest.TestCase):
         )
         self.assertIn("予算 **1023 MiB**", text)
 
+    def test_budget_input_private_judges_on_private_commit(self) -> None:
+        # D151: `--budget-input private` は超過量と要求を私的コミット
+        # (rss の 0.8 倍) から出す。1150 × 0.8 = 920 MiB は予算 900 MiB を
+        # 20 MiB 超え → 要求 1。rss 直前の列そのものは変えない。
+        from perf_log_timeline import judged_bytes
+
+        tl = build_timeline(Path("b-trial-1.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        budget = 900 * MIB
+        text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, False, budget_input="private")
+        self.assertIn("判定の入力 **`private`**", text)
+        self.assertIn("| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 20.0 | 1 ⚠️ | 1090.0 |", text)
+        # 既定 (resident) は rss で判定: 1150 − 900 = 250 → ceil(250/64) = 4。
+        text = render_markdown([tl], budget, ESTIMATED_BYTES_PER_TAB, False)
+        self.assertIn("| 1 | +1.7 | 4 | memory×4 | 1150.0 | 700 | 250.0 | 4 | 1090.0 |", text)
+        # 私的コミットの無いログ (Linux / 古いログ) では private も rss に落ちる。
+        old = tl.rss[0]
+        old.total_private_bytes = None
+        self.assertEqual(judged_bytes(old, "private"), old.total_rss_bytes)
+
     def test_detail_columns_degrade_to_dash_on_old_logs(self) -> None:
         # Issue #176 Stage 1 より前のログには browser / engine の内訳が無い。
         # 列ごと消すのではなく `-` にして、行の形を変えない。

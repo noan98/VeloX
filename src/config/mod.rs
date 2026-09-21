@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use crate::browser::metrics::PerfFormat;
 use crate::browser::navigation;
-use crate::browser::suspension::{BackgroundMemoryTarget, SuspendMechanism, SuspensionPolicy};
+use crate::browser::suspension::{
+    BackgroundMemoryTarget, MemoryBudgetInput, SuspendMechanism, SuspensionPolicy,
+};
 
 /// Default interval between process-tree RSS samples when performance
 /// metrics are enabled but no explicit interval was requested.
@@ -222,6 +224,19 @@ pub struct Config {
     /// (§39.1). Suspension is now the safety net for workloads the hint
     /// cannot carry rather than the everyday mechanism (D123 決定2).
     pub background_memory_target: BackgroundMemoryTarget,
+    /// Which memory figure `suspension`'s memory budget is compared against
+    /// (Issue #176 Stage 3, docs/decisions.md D151). Only Windows has more
+    /// than one to choose from today (working set vs. private commit,
+    /// D150); elsewhere both spellings read the same PSS/RSS.
+    ///
+    /// **Defaults to [`MemoryBudgetInput::Resident`], the pre-D151
+    /// behavior.** `VELOX_MEMORY_BUDGET_INPUT=private` is the measurement
+    /// arm: `docs/performance-targets.md` §47.9 found that the working set
+    /// grows for ~75 s after a renderer starts without the process
+    /// allocating anything, and that the budget was discarding tabs to pay
+    /// for that. Whether private commit is the better input is what this
+    /// knob lets the A/B decide, on one binary.
+    pub memory_budget_input: MemoryBudgetInput,
     /// Whole-app private browsing mode (see docs/decisions.md D14). When
     /// `true`, every content webview runs with an ephemeral (non-persistent)
     /// data store and page visits are not recorded to `HistoryStore`.
@@ -297,6 +312,7 @@ impl Default for Config {
             suspension: SuspensionPolicy::default(),
             suspend_mechanism: SuspendMechanism::default(),
             background_memory_target: BackgroundMemoryTarget::default(),
+            memory_budget_input: MemoryBudgetInput::default(),
             private: false,
             search_engine: SearchEngine::default(),
             perf_metrics: false,
@@ -356,6 +372,13 @@ impl Config {
     ///   `VELOX_SUSPEND_MECHANISM`: this applies to tabs that are merely off
     ///   screen, suspended or not. Unset or an unrecognized spelling keeps
     ///   the default (`low`).
+    /// - `VELOX_MEMORY_BUDGET_INPUT` — which memory figure the memory
+    ///   budget below is compared against (Issue #176 Stage 3, D151):
+    ///   `resident` is PSS on Linux and the working set on Windows (the
+    ///   default, and everything VeloX did before D151); `private` is the
+    ///   private commit on Windows (`PagefileUsage`, D150) and identical to
+    ///   `resident` everywhere else. A measurement knob (§47.9): unset or an
+    ///   unrecognized spelling keeps `resident`.
     /// - `VELOX_AUTO_SUSPEND_AFTER_MS` — suspend a background tab once it
     ///   has been idle this many milliseconds (Issue #63,
     ///   `browser::suspension`). Off by default; unset or not a number
@@ -468,6 +491,13 @@ impl Config {
             .as_deref()
             .and_then(BackgroundMemoryTarget::parse)
             .unwrap_or_default();
+        // Issue #176 Stage 3 (D151). Same conservative rule again: a typo
+        // keeps the budget reading what every recorded number was taken with.
+        let memory_budget_input = std::env::var("VELOX_MEMORY_BUDGET_INPUT")
+            .ok()
+            .as_deref()
+            .and_then(MemoryBudgetInput::parse)
+            .unwrap_or_default();
         let restore_previous_session = std::env::var_os("VELOX_RESTORE_SESSION").is_some();
         let protect_form_input =
             resolve_protect_form_input(std::env::var("VELOX_PROTECT_FORM_INPUT").ok().as_deref());
@@ -479,6 +509,7 @@ impl Config {
             suspension,
             suspend_mechanism,
             background_memory_target,
+            memory_budget_input,
             perf_metrics,
             perf_rss_interval,
             perf_format,
@@ -1866,6 +1897,20 @@ mod tests {
         assert_eq!(
             Config::default().suspend_mechanism,
             SuspendMechanism::Discard
+        );
+    }
+
+    // -- Issue #176 Stage 3 (D151): VELOX_MEMORY_BUDGET_INPUT ----------
+
+    #[test]
+    fn memory_budget_input_defaults_to_resident() {
+        // Same shape as `suspend_mechanism`: the knob exists to measure the
+        // other arm (§47.9), so an unset `VELOX_MEMORY_BUDGET_INPUT` must
+        // keep comparing the budget against what §46〜§47 were measured
+        // with — the working set on Windows.
+        assert_eq!(
+            Config::default().memory_budget_input,
+            MemoryBudgetInput::Resident
         );
     }
 

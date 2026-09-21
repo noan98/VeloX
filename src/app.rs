@@ -20,7 +20,9 @@ use crate::browser::automation::{self, AutomationCommand};
 use crate::browser::downloads;
 use crate::browser::navigation::Intent;
 use crate::browser::perf_log::{IpcLog, PerfLog};
-use crate::browser::suspension::{self, MemorySample, SuspendReason, SuspensionPolicy};
+use crate::browser::suspension::{
+    self, MemoryBudgetInput, MemorySample, SuspendReason, SuspensionPolicy,
+};
 use crate::browser::{
     context_menu, find, input_history, metrics, navigation, omnibox, persistence, print,
     shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
@@ -848,6 +850,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     if suspension_policy.memory_budget_bytes.is_some() {
         spawn_memory_pressure_sampler(
             suspension_policy.memory_check_interval,
+            config.memory_budget_input,
             memory_sampler_proxy,
         );
     }
@@ -1462,17 +1465,22 @@ fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Insta
 /// as `UserEvent::MemorySampled`. Only ever spawned when
 /// `Config::suspension.memory_budget_bytes` is set.
 ///
-/// PSS is used when the platform can read it (Linux with `smaps_rollup`),
-/// because that is what the budget is meant to be compared against
-/// (`docs/performance-targets.md` §3.1: RSS double-counts shared pages
-/// once per process and would put a multi-process browser "over budget"
-/// on shared library pages alone). Where PSS is unavailable the RSS total
-/// is used instead — an over-estimate, so a budget tuned for PSS will
-/// suspend slightly earlier there; documented in D56. This is the normal
-/// case on Windows (Issue #136, D88: RSS is read via
-/// `GetProcessMemoryInfo`, but PSS has no Windows equivalent and is not
-/// attempted, so `total_pss_bytes` is always `None` there — same as the
-/// non-Linux Unix `ps` fallback). On a platform where RSS itself cannot be
+/// Which of the sample's totals is compared against the budget is
+/// `input`'s call (`MemoryBudgetInput::pick`, Issue #176 Stage 3 / D151).
+/// With the default (`Resident`): PSS is used when the platform can read
+/// it (Linux with `smaps_rollup`), because that is what the budget is
+/// meant to be compared against (`docs/performance-targets.md` §3.1: RSS
+/// double-counts shared pages once per process and would put a
+/// multi-process browser "over budget" on shared library pages alone).
+/// Where PSS is unavailable the RSS total is used instead — an
+/// over-estimate, so a budget tuned for PSS will suspend slightly earlier
+/// there; documented in D56. This is the normal case on Windows (Issue
+/// #136, D88: RSS is read via `GetProcessMemoryInfo`, but PSS has no
+/// Windows equivalent and is not attempted, so `total_pss_bytes` is always
+/// `None` there — same as the non-Linux Unix `ps` fallback). With
+/// `PrivateCommit` (`VELOX_MEMORY_BUDGET_INPUT=private`), Windows compares
+/// the private commit (`PagefileUsage`, D150) instead of the working set;
+/// other platforms are unchanged. On a platform where RSS itself cannot be
 /// read either (`RssError::Unsupported` — today, any OS other than Linux,
 /// other Unix, or Windows), the failure is logged once and the thread
 /// exits: the memory signal is simply inert, and the idle/tab-count
@@ -1480,7 +1488,11 @@ fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Insta
 ///
 /// Exits when the event loop is gone (`send_event` fails), like
 /// `spawn_automation`.
-fn spawn_memory_pressure_sampler(interval: Duration, proxy: EventLoopProxy<UserEvent>) {
+fn spawn_memory_pressure_sampler(
+    interval: Duration,
+    input: MemoryBudgetInput,
+    proxy: EventLoopProxy<UserEvent>,
+) {
     let pid = std::process::id();
     std::thread::spawn(move || loop {
         std::thread::sleep(interval);
@@ -1491,7 +1503,11 @@ fn spawn_memory_pressure_sampler(interval: Duration, proxy: EventLoopProxy<UserE
                 return;
             }
         };
-        let total_bytes = sample.total_pss_bytes.unwrap_or(sample.total_rss_bytes);
+        let total_bytes = input.pick(
+            sample.total_private_bytes,
+            sample.total_pss_bytes,
+            sample.total_rss_bytes,
+        );
         if proxy
             .send_event(UserEvent::MemorySampled(MemorySample { total_bytes }))
             .is_err()
