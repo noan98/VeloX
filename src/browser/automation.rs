@@ -528,8 +528,12 @@ const _: () = assert!(MEMORY_RESUME_ROUNDS <= MAX_RESUME_ROUNDS);
 /// も変わらない ([`generate_bench_script`] などの引数なし版はこれを渡す)。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BenchScriptOverrides {
-    /// `mark` の後に戻す (= `switch` する) ラウンド数。0 なら `mark` の後に
-    /// 何もせず待つだけになり、「切り替えなしの長い保持」という対照が作れる。
+    /// `mark` の後に戻す (= `switch` する) ラウンド数。0 は
+    /// `tabs_hold_bounce_N` でだけ許す — そこではラウンドの後に必ず
+    /// `bounce_settle_ms` の `wait` が続くので、「切り替えなしの長い保持」
+    /// という対照になる。`tabs_hold_resume_N` で 0 にすると `mark` の直後に
+    /// `quit` する空のスクリプトになって何も測らないため、
+    /// [`Self::validate_for`] が弾く (PR #287 のレビュー指摘)。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_rounds: Option<usize>,
     /// `tabs_hold_bounce_N` がラウンドの後に待つ時間 (ms)。
@@ -575,6 +579,17 @@ impl BenchScriptOverrides {
                 return Err(format!(
                     "--resume-rounds は {MAX_RESUME_ROUNDS} 以下で指定してください (受け取った値: {rounds})。\
                      50 タブで 48 休止のうち 1/4 以下しか戻さない、という前提を守るためです"
+                ));
+            }
+            // 0 ラウンドは、ラウンドの後に待ちが続く `tabs_hold_bounce_N` で
+            // だけ意味を持つ。`tabs_hold_resume_N` では `mark` の直後に `quit`
+            // する空のスクリプトになり、「有効な run」の顔をして何も測らない。
+            if rounds == 0 && !has_bounce {
+                return Err(format!(
+                    "--resume-rounds 0 は tabs_hold_bounce_N でしか意味を持ちません ({}): \
+                     mark の直後に quit するだけで何も測りません。切り替えなしの保持は \
+                     tabs_hold_bounce_N --resume-rounds 0 --bounce-settle-ms <ms> で作ってください",
+                    scenario.id()
                 ));
             }
         }
@@ -1553,11 +1568,45 @@ mod tests {
                 .any(|c| matches!(c, AutomationCommand::Switch { .. })),
             "0 ラウンドなら switch は 1 つも無い: {script:?}"
         );
+        // mark と quit の間には揺り戻しの待ちが残る (空のスクリプトにはならない)。
+        let mark_at = script
+            .iter()
+            .position(|c| matches!(c, AutomationCommand::Mark))
+            .unwrap();
+        assert_eq!(
+            script[mark_at + 1],
+            AutomationCommand::Wait {
+                ms: MEMORY_BOUNCE_SETTLE_MS
+            },
+            "bounce では mark の直後に待ちが続く: {script:?}"
+        );
         // 間隔は 0 にならず、tabs_hold_N と同じ窓で計算される。
         let interval =
-            recommended_rss_interval_ms_with(Scenario::TabCountMemoryResume(20), overrides)
+            recommended_rss_interval_ms_with(Scenario::TabCountMemoryBounce(20), overrides)
                 .unwrap();
         assert!(interval > 0);
+        // 一方 tabs_hold_resume_N で 0 ラウンドにすると mark の直後に quit する
+        // 空のスクリプトになるので、validate_for が弾く (PR #287 のレビュー指摘)。
+        assert!(overrides
+            .validate_for(Scenario::TabCountMemoryBounce(20))
+            .is_ok());
+        assert!(overrides
+            .validate_for(Scenario::TabCountMemoryResume(20))
+            .is_err());
+        let empty = parse_script(
+            &generate_bench_script_with(Scenario::TabCountMemoryResume(20), url, overrides)
+                .unwrap(),
+        )
+        .unwrap();
+        let empty_mark = empty
+            .iter()
+            .position(|c| matches!(c, AutomationCommand::Mark))
+            .unwrap();
+        assert_eq!(
+            empty[empty_mark + 1],
+            AutomationCommand::Quit,
+            "これが弾く理由そのもの: {empty:?}"
+        );
     }
 
     #[test]

@@ -375,9 +375,11 @@ cargo run --release --bin velox-bench -- run \
   にそのまま渡せる。
 - `--resume-rounds <n>` / `--bounce-settle-ms <ms>`: `tabs_hold_resume_N` /
   `tabs_hold_bounce_N` の**計測用の上書き** (Issue #176 Stage 3、D149)。
-  前者は `mark` の後に戻すラウンド数 (既定 4、0〜12。0 なら切り替えなしの
-  長い保持という対照になる)、後者は `tabs_hold_bounce_N` がラウンドの後に
-  待つ時間 (既定 22000)。効かないシナリオに指定するとエラーで止まる
+  前者は `mark` の後に戻すラウンド数 (既定 4、0〜12。0 は
+  `tabs_hold_bounce_N` でだけ許され、切り替えなしの長い保持という対照に
+  なる — `tabs_hold_resume_N` で 0 にすると `mark` の直後に `quit` する
+  空のスクリプトになるのでエラー)、後者は `tabs_hold_bounce_N` がラウンドの
+  後に待つ時間 (既定 22000)。効かないシナリオに指定するとエラーで止まる
   (黙って既定のまま測らない)。上書きした事実は結果 JSON の
   `script_overrides` に残るので、**既定のスクリプトの結果と同じ顔で並べない
   こと** (D96 / D111)。`--warmup-secs` の既定値と RSS サンプル間隔の自動
