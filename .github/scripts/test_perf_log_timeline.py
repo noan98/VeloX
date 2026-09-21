@@ -213,6 +213,25 @@ class RssTrackTest(unittest.TestCase):
         self.assertNotIn("cold-trial-1.jsonl", text)
         self.assertIn("1 本は省略", text)
 
+    def test_rejects_non_positive_step(self) -> None:
+        # step が 0 以下だと刻みが進まず無限ループになる (PR #286 のレビュー
+        # 指摘)。関数と CLI の両方で弾く。
+        from perf_log_timeline import render_rss_track
+
+        tl = build_timeline(Path("b.jsonl"), parse_jsonl(_lines(SAMPLE_EVENTS)))
+        with self.assertRaises(ValueError):
+            render_rss_track([tl], 0.0, markdown=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / "b-trial-1.jsonl"
+            log.write_text(_lines(SAMPLE_EVENTS), encoding="utf-8")
+            with redirect_stdout(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                saved, sys.stderr = sys.stderr, io.StringIO()
+                try:
+                    main([str(log), "--rss-track", "--track-step-ms", "0"])
+                finally:
+                    sys.stderr = saved
+            self.assertEqual(raised.exception.code, 2)
+
     def test_cli_switch_selects_the_track_view(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             log = Path(tmp) / "b-trial-1.jsonl"

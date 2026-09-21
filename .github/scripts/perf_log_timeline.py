@@ -361,6 +361,9 @@ def render_rss_track(timelines: list[Timeline], step_ms: float, markdown: bool) 
     各刻みの値は「その時刻以前で最も新しいサンプル」で、直前の刻みからの
     差と、その区間に起きた休止数を併記する。`mark` の無いログは省略する。
     """
+    # 0 以下だと下の while が進まず無限ループになる (PR #286 のレビュー指摘)。
+    if not step_ms > 0:
+        raise ValueError(f"step_ms は正の値でなければなりません (受け取った値: {step_ms})")
     lines: list[str] = []
     step_s = step_ms / 1000
     if markdown:
@@ -447,6 +450,19 @@ def render_plain(timelines: list[Timeline], budget: int | None, per_tab: int, on
     return "\n".join(lines)
 
 
+def _positive_float(raw: str) -> float:
+    """argparse 用: 正の実数だけを通す (`--track-step-ms 0` で無限ループにしない)。"""
+    import argparse
+
+    try:
+        value = float(raw)
+    except ValueError as err:
+        raise argparse.ArgumentTypeError(f"数値ではありません: {raw!r}") from err
+    if not value > 0:
+        raise argparse.ArgumentTypeError(f"正の値を指定してください: {raw!r}")
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -465,9 +481,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--rss-track",
         action="store_true",
-        help="スイープの表の代わりに、mark 基準 --track-step-ms 刻みの rss の推移を出す (休止の無い腕でも読める)",
+        help=(
+            "スイープの表の代わりに、mark 基準 --track-step-ms 刻みの rss の推移を出す (休止の無い腕でも読める)。"
+            "こちらは mark の無いログを省略する独自の絞り込みを持ち、--only-with-suspends は無視される"
+        ),
     )
-    parser.add_argument("--track-step-ms", type=float, default=5000.0, help="--rss-track の刻み (ms、既定 5000)")
+    parser.add_argument(
+        "--track-step-ms",
+        type=_positive_float,
+        default=5000.0,
+        help="--rss-track の刻み (ms、既定 5000、正の値のみ)",
+    )
     parser.add_argument(
         "--only-with-suspends",
         action="store_true",
