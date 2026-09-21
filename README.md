@@ -58,7 +58,10 @@ speed can be built on top of it rather than bolted on.
       read), 1024 MiB at 16 GiB, 2048 MiB at 32 GiB and above. Set
       `VELOX_MEMORY_BUDGET_MB` (or the settings screen's Performance tab)
       to pin an exact value — neither the floor nor the ceiling applies to
-      an explicit one — or `0` to turn even that off
+      an explicit one — or `0` to turn even that off. On Windows the budget
+      is compared against the process tree's **private commit** since D152
+      (`VELOX_MEMORY_BUDGET_INPUT=resident` restores the working set); on
+      Linux it is PSS either way
 - [x] Performance instrumentation and a benchmark suite (`velox-bench`),
       including IPC volume/latency accounting
 - [x] Performance regression gate in CI, and a dashboard that tracks results

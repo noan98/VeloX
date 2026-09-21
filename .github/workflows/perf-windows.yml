@@ -968,14 +968,15 @@ jobs:
           [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
           # 腕ごとの判定の入力 (D151)。`common_env` は両腕に、`compare_env`
-          # は B にだけ効く。どちらにも無ければ Rust 側の既定 (`resident`)。
+          # は B にだけ効く。どちらにも無ければ Rust 側の既定 (`private`、
+          # D152。それより前の run を読み直すなら `resident`)。
           function Get-BudgetInput([string] $envList, [string] $fallback) {
             if ($envList -match 'VELOX_MEMORY_BUDGET_INPUT\s*=\s*([A-Za-z]+)') {
               return $Matches[1].ToLowerInvariant()
             }
             return $fallback
           }
-          $baselineInput = Get-BudgetInput $env:COMMON_ENV "resident"
+          $baselineInput = Get-BudgetInput $env:COMMON_ENV "private"
           $compareInput = Get-BudgetInput $env:COMPARE_ENV $baselineInput
 
           # 腕ごとに入力が違うときだけ、ファイルを A / B に分けて 2 回呼ぶ
