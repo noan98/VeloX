@@ -94,6 +94,13 @@ class RssSample:
     ts_ms: float
     total_rss_bytes: int
     process_count: int | None
+    # Issue #176 Stage 1 が `rss` レコードに足した内訳 (`browser_rss_bytes` +
+    # `engine_rss_bytes` = `total_rss_bytes`)。§47.4 の「返した分が次の判定
+    # までに戻る」が engine 側 (レンダラ) で起きているのか browser 側かを、
+    # 新しい記録なしに切り分けるために表へ出す。古いログには無いので
+    # `None` を許す。
+    browser_rss_bytes: int | None = None
+    engine_rss_bytes: int | None = None
 
 
 @dataclass
@@ -162,7 +169,17 @@ def build_timeline(path: Path, events: list[dict]) -> Timeline:
             total = event.get("total_rss_bytes")
             if isinstance(total, (int, float)):
                 count = event.get("process_count")
-                rss.append(RssSample(ts, int(total), int(count) if isinstance(count, int) else None))
+                browser = event.get("browser_rss_bytes")
+                engine = event.get("engine_rss_bytes")
+                rss.append(
+                    RssSample(
+                        ts,
+                        int(total),
+                        int(count) if isinstance(count, int) else None,
+                        int(browser) if isinstance(browser, (int, float)) else None,
+                        int(engine) if isinstance(engine, (int, float)) else None,
+                    )
+                )
         elif kind == "tab_suspend":
             suspends.append(event)
         elif kind == "tab_resume":
@@ -209,6 +226,20 @@ def _mib(value: int | None) -> str:
     return "-" if value is None else f"{value / MIB:.1f}"
 
 
+def _pair(before: RssSample | None, after: RssSample | None, pick, as_mib: bool) -> str:
+    """スイープ直前→直後の値を `a→b` で。片方でも無ければその側は `-`。"""
+
+    def one(sample: RssSample | None) -> str:
+        if sample is None:
+            return "-"
+        value = pick(sample)
+        if value is None:
+            return "-"
+        return f"{value / MIB:.1f}" if as_mib else str(value)
+
+    return f"{one(before)}→{one(after)}"
+
+
 def _rel(ts_ms: float, mark_ms: float | None) -> str:
     """`mark` からの相対秒。`mark` が無ければプロセス開始からの絶対秒。"""
     if mark_ms is None:
@@ -241,6 +272,7 @@ def render_markdown(
     lines.append(
         "時刻は最後の `measure_start` (`mark`) からの相対秒 (無ければプロセス開始から)。"
         "`rss` は perf のサンプラの値で、判定が見た値そのものではない (「古さ」列はスイープまでの経過 ms)。"
+        "「プロセス」「engine」「browser」はスイープ直前→直後の値 (§47.4: 返した分が戻るのがどちら側かを見る)。"
     )
     lines.append("")
 
@@ -263,14 +295,17 @@ def render_markdown(
             lines.append("(休止なし)")
             lines.append("")
             continue
+        detail_head = " プロセス | engine (MiB) | browser (MiB) |"
+        detail_rule = " --- | --- | --- |"
         if budget is None:
-            lines.append("| # | t (s) | 休止 | 理由 | rss 直前 (MiB) | 古さ (ms) | プロセス | rss 直後 (MiB) |")
-            lines.append("| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: |")
+            lines.append("| # | t (s) | 休止 | 理由 | rss 直前 (MiB) | 古さ (ms) | rss 直後 (MiB) |" + detail_head)
+            lines.append("| ---: | ---: | ---: | --- | ---: | ---: | ---: |" + detail_rule)
         else:
             lines.append(
                 "| # | t (s) | 休止 | 理由 | rss 直前 (MiB) | 古さ (ms) | 超過 (MiB) | 要求 | rss 直後 (MiB) |"
+                + detail_head
             )
-            lines.append("| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |")
+            lines.append("| ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |" + detail_rule)
         for index, sweep in enumerate(tl.sweeps, start=1):
             before = sweep.rss_before
             after_rss = sweep.rss_after
@@ -283,9 +318,7 @@ def render_markdown(
                 _mib(before.total_rss_bytes if before else None),
                 age,
             ]
-            if budget is None:
-                cells.append("-" if before is None or before.process_count is None else str(before.process_count))
-            else:
+            if budget is not None:
                 if before is None:
                     cells.extend(["-", "-"])
                 else:
@@ -294,6 +327,9 @@ def render_markdown(
                     marker = "" if demand == sweep.count else (" ⚠️" if sweep.count > demand else " ↓")
                     cells.extend([f"{over / MIB:.1f}", f"{demand}{marker}"])
             cells.append(_mib(after_rss.total_rss_bytes if after_rss else None))
+            cells.append(_pair(before, after_rss, lambda s: s.process_count, as_mib=False))
+            cells.append(_pair(before, after_rss, lambda s: s.engine_rss_bytes, as_mib=True))
+            cells.append(_pair(before, after_rss, lambda s: s.browser_rss_bytes, as_mib=True))
             lines.append("| " + " | ".join(cells) + " |")
         lines.append("")
     if skipped:
@@ -322,6 +358,8 @@ def render_plain(timelines: list[Timeline], budget: int | None, per_tab: int, on
                 parts.append(f"over={max(before.total_rss_bytes - budget, 0) / MIB:.1f}MiB")
                 parts.append(f"demand={tabs_to_free(before.total_rss_bytes, budget, per_tab)}")
             parts.append(f"rss_after={_mib(sweep.rss_after.total_rss_bytes if sweep.rss_after else None)}MiB")
+            parts.append(f"procs={_pair(before, sweep.rss_after, lambda s: s.process_count, as_mib=False)}")
+            parts.append(f"engine={_pair(before, sweep.rss_after, lambda s: s.engine_rss_bytes, as_mib=True)}MiB")
             lines.append(" ".join(parts))
     return "\n".join(lines)
 
@@ -346,17 +384,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="tab_suspend が 1 件も無いログは省略する (cold_startup などで表が空にならないように)",
     )
-    args = parser.parse_args(argv)
-
     # Windows の Python は stdout をコンソールのコードページ (cp1252 など)
     # で開くので、表の日本語見出しがそのままでは `UnicodeEncodeError` に
     # なる — perf-windows の初回 (run 35561470137) で実際に落ちた。呼び出し
     # 側の `PYTHONUTF8` に頼らず、ここで UTF-8 に固定する (テストが
     # `PYTHONIOENCODING=cp1252` で再現している)。`StringIO` に差し替え
     # られている場合 (単体テスト) は `reconfigure` が無いので触らない。
+    # `parse_args` より前に置くのは、`--help` や引数エラーの日本語も同じ
+    # 経路で落ちるため (PR #283 のレビュー指摘)。
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8")
+
+    args = parser.parse_args(argv)
 
     budget: int | None
     if args.budget_bytes is not None:
