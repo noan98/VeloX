@@ -781,10 +781,7 @@ fn cmd_compare(args: &[String]) -> Result<i32, String> {
     print_comparison(&report);
 
     if let Some(output_path) = flags.one("output") {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|err| format!("比較結果のシリアライズに失敗しました: {err}"))?;
-        fs::write(output_path, json)
-            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+        write_file(output_path, pretty_json(&report, "比較結果")?)?;
     }
 
     Ok(if report.any_regressed { 1 } else { 0 })
@@ -807,18 +804,7 @@ fn print_comparison(report: &ComparisonReport) {
     for (name, diff) in &report.diffs {
         print_diff_row(name, diff);
     }
-    if !report.only_in_baseline.is_empty() {
-        println!(
-            "baseline のみに存在: {}",
-            report.only_in_baseline.join(", ")
-        );
-    }
-    if !report.only_in_candidate.is_empty() {
-        println!(
-            "candidate のみに存在: {}",
-            report.only_in_candidate.join(", ")
-        );
-    }
+    print_only_in(&report.only_in_baseline, &report.only_in_candidate);
     println!(
         "\n結果: {}",
         if report.any_regressed {
@@ -827,6 +813,17 @@ fn print_comparison(report: &ComparisonReport) {
             "回帰なし (ok)"
         }
     );
+}
+
+/// 片側にしか無いメトリクス名を (あれば) 1 行ずつ表示する
+/// (`compare` / `gate` 共通)。
+fn print_only_in(only_in_baseline: &[String], only_in_candidate: &[String]) {
+    if !only_in_baseline.is_empty() {
+        println!("baseline のみに存在: {}", only_in_baseline.join(", "));
+    }
+    if !only_in_candidate.is_empty() {
+        println!("candidate のみに存在: {}", only_in_candidate.join(", "));
+    }
 }
 
 fn print_diff_row(name: &str, diff: &MetricDiff) {
@@ -889,15 +886,10 @@ fn cmd_gate(args: &[String]) -> Result<i32, String> {
     print_gate_report(&report);
 
     if let Some(output_path) = flags.one("output") {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|err| format!("ゲート結果のシリアライズに失敗しました: {err}"))?;
-        fs::write(output_path, json)
-            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+        write_file(output_path, pretty_json(&report, "ゲート結果")?)?;
     }
     if let Some(markdown_path) = flags.one("markdown-output") {
-        let markdown = benchmark::render_gate_markdown(&report);
-        fs::write(markdown_path, markdown)
-            .map_err(|err| format!("{markdown_path} へ書き込めませんでした: {err}"))?;
+        write_file(markdown_path, benchmark::render_gate_markdown(&report))?;
     }
 
     Ok(match report.overall {
@@ -946,18 +938,7 @@ fn print_gate_report(report: &benchmark::GateReport) {
             }
         );
     }
-    if !report.only_in_baseline.is_empty() {
-        println!(
-            "baseline のみに存在: {}",
-            report.only_in_baseline.join(", ")
-        );
-    }
-    if !report.only_in_candidates.is_empty() {
-        println!(
-            "candidate のみに存在: {}",
-            report.only_in_candidates.join(", ")
-        );
-    }
+    print_only_in(&report.only_in_baseline, &report.only_in_candidates);
     // Issue #196: a precondition violation is the reason for the verdict
     // below, so print it right above that verdict — on stderr, since a
     // caller piping stdout into a report file still needs to see it.
@@ -1272,14 +1253,25 @@ fn write_result(path: &str, result: &BenchmarkResult) -> Result<(), String> {
 /// 無ければ作る (作れなくても書き込み側のエラーとして報告される)。
 /// `run` / `aggregate` の結果ファイルと `ipc-summary --output` で共有する。
 fn write_json_creating_parent<T: Serialize + ?Sized>(path: &str, value: &T) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|err| format!("結果のシリアライズに失敗しました: {err}"))?;
+    let json = pretty_json(value, "結果")?;
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
         }
     }
-    fs::write(path, json).map_err(|err| format!("{path} へ書き込めませんでした: {err}"))
+    write_file(path, json)
+}
+
+/// `value` を整形済み JSON 文字列にする。失敗時のメッセージは
+/// 「`{what}`のシリアライズに失敗しました」。
+fn pretty_json<T: Serialize + ?Sized>(value: &T, what: &str) -> Result<String, String> {
+    serde_json::to_string_pretty(value)
+        .map_err(|err| format!("{what}のシリアライズに失敗しました: {err}"))
+}
+
+/// `contents` を `path` に書き出す (親ディレクトリは作らない)。
+fn write_file(path: &str, contents: String) -> Result<(), String> {
+    fs::write(path, contents).map_err(|err| format!("{path} へ書き込めませんでした: {err}"))
 }
 
 fn print_result_summary(result: &BenchmarkResult) {
