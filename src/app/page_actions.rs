@@ -22,11 +22,7 @@ pub(super) fn show_print_status(window: &BrowserWindow, message: &str) {
 /// that means on each platform and its one caveat (a real print-job
 /// failure is invisible to wry's `Result`, only a failure to even dispatch
 /// the call is not).
-pub(super) fn print_active_tab(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-) {
+pub(super) fn print_active_tab(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
     let tab_id = tabs_of(state, window_id).active_id();
     if let Err(err) = window.print_tab(tab_id) {
         eprintln!("velox: failed to print the active tab: {err}");
@@ -50,7 +46,7 @@ pub(super) fn print_active_tab(
 /// `report (1).pdf` way a same-named download would) — rather than
 /// re-deriving either.
 pub(super) fn save_active_tab_as_pdf(
-    window: &mut BrowserWindow,
+    window: &BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
     config: &Config,
@@ -114,7 +110,7 @@ pub(super) fn save_active_tab_as_pdf(
 /// [`UserEvent::SavePageStarted`]/[`UserEvent::SavePageFinished`] —
 /// nothing further to do here.
 pub(super) fn request_save_page(
-    window: &mut BrowserWindow,
+    window: &BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
     config: &Config,

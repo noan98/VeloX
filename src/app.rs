@@ -48,8 +48,13 @@ use automation_script::{
     handle_automation_command, poll_automation_wait_timeout, resolve_automation_wait_for_startup,
     resolve_automation_wait_if_matching, spawn_automation, AutomationWaitState,
 };
-use download_actions::{cancel_download, open_download, open_downloads_folder};
-use find_bar::{close_find_bar, open_find_bar, step_find, update_find_query, FindDirection};
+use download_actions::{
+    cancel_download, open_download, open_downloads_folder, record_download_completion,
+    record_save_page_completion,
+};
+use find_bar::{
+    apply_find_matches, close_find_bar, open_find_bar, step_find, update_find_query, FindDirection,
+};
 use page_actions::{
     open_view_source_tab, print_active_tab, request_save_page, request_view_source,
     save_active_tab_as_pdf, show_print_status,
@@ -65,7 +70,8 @@ use perf::{
 };
 use persist::{persist_bookmarks, persist_history, persist_input_history, persist_session};
 use tab_suspension::{
-    choose_memory_sample_window, spawn_memory_pressure_sampler, suspend_tab, sweep_tabs,
+    choose_memory_sample_window, handle_tab_freeze_finished, spawn_memory_pressure_sampler,
+    suspend_tab, sweep_tabs,
 };
 
 /// Events forwarded from webview callbacks into the main event loop.
@@ -903,7 +909,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 }
             }
             Event::UserEvent(user_event) => {
-                if std::env::var_os("VELOX_DEBUG").is_some() {
+                if debug_logging_enabled() {
                     eprintln!("velox[debug]: {user_event:?}");
                 }
                 if let Some(log) = perf_log.as_deref() {
@@ -1449,67 +1455,7 @@ fn handle_user_event(
             path,
             success,
         } => {
-            let now = now_unix();
-            // Issue #128 / D140. The `success` flag alone is not reliable on
-            // Linux: wry 0.56 shares one set-only `failed` flag across every
-            // download of a registration, and D53 made that registration
-            // session-wide — so after any single failure every later
-            // download is reported failed (and with `path: None`) even
-            // though its file lands correctly. Reproduced end to end.
-            //
-            // The destination this entry recorded when it *started* is the
-            // check: on a real failure WebKitGTK removes the partial file,
-            // so a file that is there means the download finished. See
-            // `downloads::completion_succeeded` for the truth table and why
-            // presence — not size — is the signal.
-            //
-            // **Gated to the backend that actually has the bug**
-            // (`DOWNLOAD_SUCCESS_FLAG_IS_SHARED`, D140 決定5). WebView2 and
-            // WKWebView answer per download, so their `false` is real and
-            // overruling it would misreport a genuine failure as a success
-            // — on Windows, the priority OS, on the strength of behavior
-            // nobody has measured there.
-            //
-            // Reading the filesystem is why this lives here and not in
-            // `browser::downloads`, which stays pure (D20): that module
-            // gets the two booleans and decides.
-            let resolved = state.downloads.resolve_completion(&url, path.as_deref());
-            let succeeded = resolved.is_some_and(|id| {
-                // Only the poisoned backend gets its verdict second-guessed,
-                // and only then is the filesystem touched at all.
-                let exists = crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED
-                    && state
-                        .downloads
-                        .get(id)
-                        .is_some_and(|entry| entry.destination.exists());
-                downloads::completion_succeeded(
-                    success,
-                    exists,
-                    crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED,
-                )
-            });
-            if std::env::var_os("VELOX_DEBUG").is_some() {
-                eprintln!(
-                    "velox: download completion url={url:?} path={path:?} \
-reported_success={success} recorded_as_success={succeeded}"
-                );
-            }
-            match resolved {
-                Some(id) if succeeded => {
-                    state.downloads.complete(id, now);
-                }
-                Some(id) => {
-                    state
-                        .downloads
-                        .fail(id, "ダウンロードに失敗しました".to_owned(), now);
-                }
-                None => {
-                    eprintln!(
-                        "velox: could not correlate download completion for {url:?} \
-                         (path={path:?}, success={success})"
-                    );
-                }
-            }
+            record_download_completion(state, &url, path.as_deref(), success);
             if let Some(window) = ui_windows.get(&window_id) {
                 refresh_downloads_panel(window, state);
             }
@@ -1520,23 +1466,7 @@ reported_success={success} recorded_as_success={succeeded}"
             destination,
             error,
         } => {
-            let now = now_unix();
-            match state.downloads.resolve_completion(&url, Some(&destination)) {
-                Some(id) => match error {
-                    Some(reason) => {
-                        state.downloads.fail(id, reason, now);
-                    }
-                    None => {
-                        state.downloads.complete(id, now);
-                    }
-                },
-                None => {
-                    eprintln!(
-                        "velox: could not correlate page-save completion for {url:?} \
-                         (destination={destination:?}, error={error:?})"
-                    );
-                }
-            }
+            record_save_page_completion(state, &url, &destination, error);
             if let Some(window) = ui_windows.get(&window_id) {
                 refresh_downloads_panel(window, state);
             }
@@ -1597,30 +1527,8 @@ reported_success={success} recorded_as_success={succeeded}"
             tab_id,
             total,
         } => {
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
-            // A session for a *different* tab (the find bar moved on, or
-            // closed, while this DOM search was still running) means this
-            // result is stale — see this variant's doc comment. Scoped to
-            // `window_id`'s own find session (`Windows::find_mut`) — a
-            // result meant for one window's find bar can never update
-            // another window's, even one whose active tab happens to share
-            // this `tab_id` value (Issue #29/D68).
-            if let Some(session) = state
-                .windows
-                .find_mut(window_id)
-                .filter(|session| session.tab_id() == tab_id)
-            {
-                session.set_total(total);
-                let active = session.active();
-                log_failure("update find status", window.set_find_status(total, active));
-                if let Some(index) = active {
-                    log_failure(
-                        "highlight find match",
-                        window.highlight_find_match(tab_id, index),
-                    );
-                }
+            if let Some(window) = ui_windows.get(&window_id) {
+                apply_find_matches(window, window_id, state, tab_id, total);
             }
         }
         UserEvent::PdfExportFinished {
@@ -1662,63 +1570,7 @@ reported_success={success} recorded_as_success={succeeded}"
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            // The freeze is asynchronous, so by now the tab may have stopped
-            // being suspended: the user can click straight back to it
-            // between the `TrySuspend` call and its answer, which resumes it
-            // in place — and the engine then reports failure *because* the
-            // tab became visible again. Decide once, and let both branches
-            // below read it, so neither acts on a stale answer.
-            let still_suspended = suspension::late_freeze_failure_may_discard(
-                tabs_of(state, window_id).get(tab_id).map(Tab::state),
-            );
-            if !still_suspended {
-                // Nothing to do either way, but say so rather than claiming
-                // a freeze that no longer describes the tab: these lines are
-                // what a measurement reads to tell whether the `freeze` arm
-                // actually froze anything (docs/performance-targets.md §37).
-                eprintln!(
-                    "velox: tab {tab_id:?} の freeze 結果 (success={success}) は届いたが、既に休止が解けている (#243)"
-                );
-                return;
-            }
-            if success {
-                // Logged, not silent: this is the only positive evidence
-                // that the `freeze` arm of a measurement actually froze
-                // anything. Suspensions are rare enough (tens per
-                // benchmark run) that one line each is not noise.
-                eprintln!("velox: tab {tab_id:?} を freeze しました (#243)");
-                // The engine's own answer, for runs that are debugging the
-                // mechanism rather than measuring it — see
-                // `BrowserWindow::engine_reports_tab_suspended` for why this
-                // is not asked unconditionally.
-                if std::env::var_os("VELOX_DEBUG").is_some() {
-                    match window.engine_reports_tab_suspended(tab_id) {
-                        Some(engine_state) => eprintln!(
-                            "velox: tab {tab_id:?} engine IsSuspended={engine_state} (#243)"
-                        ),
-                        None => eprintln!(
-                            "velox: tab {tab_id:?} engine IsSuspended は取得できません (#243)"
-                        ),
-                    }
-                }
-                return;
-            }
-            // WebView2 declined and the tab really is still suspended, so it
-            // is marked suspended while holding a live webview. Fall back to
-            // what `Discard` would have done rather than leaving it awake —
-            // see the variant's docs.
-            match error {
-                Some(reason) => eprintln!(
-                    "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243): {reason}"
-                ),
-                None => eprintln!(
-                    "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243)"
-                ),
-            }
-            log_failure(
-                "discard frozen tab webview",
-                window.discard_tab_webview(tab_id),
-            );
+            handle_tab_freeze_finished(window, window_id, state, tab_id, success, error);
         }
         UserEvent::ViewSourceReady {
             window_id,
@@ -2428,7 +2280,7 @@ fn handle_toolbar_command(
 /// `ToolbarCommand::ToggleBookmark`, and Ctrl/Cmd+D from either the toolbar
 /// or a content webview — `ContentShortcut::ToggleBookmark` — all funnel
 /// through here).
-fn toggle_current_bookmark(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+fn toggle_current_bookmark(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
     let url = tabs_of(state, window_id).active().current_url().to_owned();
     let title = known_title_for(&state.history, &url);
     let now = now_unix();
@@ -2441,7 +2293,7 @@ fn toggle_current_bookmark(window: &mut BrowserWindow, window_id: WindowId, stat
 /// Show/hide the bookmark bar (Ctrl/Cmd+Shift+B from either the toolbar or a
 /// content webview, and the toolbar's own bar-toggle button all funnel
 /// through here).
-fn toggle_bookmark_bar(window: &mut BrowserWindow) {
+fn toggle_bookmark_bar(window: &BrowserWindow) {
     let next = !window.bookmark_bar_visible();
     log_failure("toggle bookmark bar", window.set_bookmark_bar_visible(next));
 }
@@ -2473,7 +2325,7 @@ fn resolve_intent(config: &Config, intent: Option<Intent>) -> Option<String> {
 /// toolbar), `ContentShortcut::FocusAddressBar` (Ctrl/Cmd+L from a content
 /// webview), and `ToolbarCommand::OmniboxClose` (Esc, which also needs the
 /// address bar restored to the real current URL).
-fn focus_address_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+fn focus_address_bar(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
     log_failure(
         "focus address bar",
         window.focus_address_bar(tabs_of(state, window_id).active().current_url()),
@@ -2489,7 +2341,7 @@ fn focus_address_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mu
 /// `browser::automation::parse_script`'s `navigation::normalize_input`
 /// call).
 fn navigate_active_tab(
-    window: &mut BrowserWindow,
+    window: &BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
     url: &str,
@@ -2995,6 +2847,11 @@ fn clear_all_site_data(window: &BrowserWindow) {
             first_error()
         ),
     }
+}
+
+/// `VELOX_DEBUG` が設定されていれば、診断用の詳細ログを stderr に出す。
+fn debug_logging_enabled() -> bool {
+    std::env::var_os("VELOX_DEBUG").is_some()
 }
 
 /// Current time as a unix timestamp (seconds). Falls back to `0` on a clock

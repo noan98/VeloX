@@ -193,6 +193,76 @@ pub(super) fn suspend_tab(
     true
 }
 
+/// `UserEvent::TabFreezeFinished` (Issue #243) の処理本体。呼び出し側が
+/// `window_id` を生きている `window` に解決済みであること (その順序が
+/// 重要な理由は呼び出し側のコメント参照) が前提。
+pub(super) fn handle_tab_freeze_finished(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    tab_id: TabId,
+    success: bool,
+    error: Option<String>,
+) {
+    // The freeze is asynchronous, so by now the tab may have stopped
+    // being suspended: the user can click straight back to it
+    // between the `TrySuspend` call and its answer, which resumes it
+    // in place — and the engine then reports failure *because* the
+    // tab became visible again. Decide once, and let both branches
+    // below read it, so neither acts on a stale answer.
+    let still_suspended = suspension::late_freeze_failure_may_discard(
+        tabs_of(state, window_id).get(tab_id).map(Tab::state),
+    );
+    if !still_suspended {
+        // Nothing to do either way, but say so rather than claiming
+        // a freeze that no longer describes the tab: these lines are
+        // what a measurement reads to tell whether the `freeze` arm
+        // actually froze anything (docs/performance-targets.md §37).
+        eprintln!(
+            "velox: tab {tab_id:?} の freeze 結果 (success={success}) は届いたが、既に休止が解けている (#243)"
+        );
+        return;
+    }
+    if success {
+        // Logged, not silent: this is the only positive evidence
+        // that the `freeze` arm of a measurement actually froze
+        // anything. Suspensions are rare enough (tens per
+        // benchmark run) that one line each is not noise.
+        eprintln!("velox: tab {tab_id:?} を freeze しました (#243)");
+        // The engine's own answer, for runs that are debugging the
+        // mechanism rather than measuring it — see
+        // `BrowserWindow::engine_reports_tab_suspended` for why this
+        // is not asked unconditionally.
+        if debug_logging_enabled() {
+            match window.engine_reports_tab_suspended(tab_id) {
+                Some(engine_state) => {
+                    eprintln!("velox: tab {tab_id:?} engine IsSuspended={engine_state} (#243)")
+                }
+                None => {
+                    eprintln!("velox: tab {tab_id:?} engine IsSuspended は取得できません (#243)")
+                }
+            }
+        }
+        return;
+    }
+    // WebView2 declined and the tab really is still suspended, so it
+    // is marked suspended while holding a live webview. Fall back to
+    // what `Discard` would have done rather than leaving it awake —
+    // see the variant's docs.
+    match error {
+        Some(reason) => eprintln!(
+            "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243): {reason}"
+        ),
+        None => {
+            eprintln!("velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243)")
+        }
+    }
+    log_failure(
+        "discard frozen tab webview",
+        window.discard_tab_webview(tab_id),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -96,13 +96,13 @@ pub(super) fn persist_input_history(state: &AppState) {
 /// refresh_history_panel_if_open` (Issue #66) skipped a redundant
 /// `set_history` push — same shape, different layer (disk I/O, not IPC).
 pub(super) fn persist_session(state: &mut AppState) {
-    let Some(dir) = state.data_dir.clone() else {
+    let Some(dir) = state.data_dir.as_deref() else {
         return;
     };
     let restorable: Vec<&Tabs> = state
         .windows
         .ids()
-        .filter(|id| !state.windows.is_private(*id).unwrap_or(true))
+        .filter(|id| !window_is_private(state, *id))
         .filter_map(|id| state.windows.tabs(id))
         .collect();
     if restorable.is_empty() {
@@ -113,7 +113,7 @@ pub(super) fn persist_session(state: &mut AppState) {
         return;
     }
     let started = Instant::now();
-    let result = persistence::save_session(&dir, &snapshot);
+    let result = persistence::save_session(dir, &snapshot);
     record_state_write(state, metrics::StateWriteKind::Session, started);
     let succeeded = result.is_ok();
     log_failure("save session", result);

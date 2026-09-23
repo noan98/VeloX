@@ -1,5 +1,7 @@
 //! ダウンロードパネルからの操作 (Issue #16, docs/decisions.md D28):
-//! ファイル/フォルダを開く、キャンセルする。
+//! ファイル/フォルダを開く、キャンセルする。完了通知の記録もここで行う。
+
+use std::path::Path;
 
 use super::*;
 
@@ -62,6 +64,106 @@ pub(super) fn cancel_download(state: &mut AppState, id: DownloadId) {
             Err(err) => eprintln!(
                 "velox: failed to remove cancelled download's partial file {destination:?}: {err}"
             ),
+        }
+    }
+}
+
+/// `UserEvent::DownloadCompleted` の結果を `state.downloads` に反映する。
+/// どのダウンロードかは `DownloadStore::resolve_completion` で特定し、
+/// 特定できなければログに残すだけで何もしない。
+pub(super) fn record_download_completion(
+    state: &mut AppState,
+    url: &str,
+    path: Option<&Path>,
+    success: bool,
+) {
+    let now = now_unix();
+    // Issue #128 / D140. The `success` flag alone is not reliable on
+    // Linux: wry 0.56 shares one set-only `failed` flag across every
+    // download of a registration, and D53 made that registration
+    // session-wide — so after any single failure every later
+    // download is reported failed (and with `path: None`) even
+    // though its file lands correctly. Reproduced end to end.
+    //
+    // The destination this entry recorded when it *started* is the
+    // check: on a real failure WebKitGTK removes the partial file,
+    // so a file that is there means the download finished. See
+    // `downloads::completion_succeeded` for the truth table and why
+    // presence — not size — is the signal.
+    //
+    // **Gated to the backend that actually has the bug**
+    // (`DOWNLOAD_SUCCESS_FLAG_IS_SHARED`, D140 決定5). WebView2 and
+    // WKWebView answer per download, so their `false` is real and
+    // overruling it would misreport a genuine failure as a success
+    // — on Windows, the priority OS, on the strength of behavior
+    // nobody has measured there.
+    //
+    // Reading the filesystem is why this lives here and not in
+    // `browser::downloads`, which stays pure (D20): that module
+    // gets the two booleans and decides.
+    let resolved = state.downloads.resolve_completion(url, path);
+    let succeeded = resolved.is_some_and(|id| {
+        // Only the poisoned backend gets its verdict second-guessed,
+        // and only then is the filesystem touched at all.
+        let exists = crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED
+            && state
+                .downloads
+                .get(id)
+                .is_some_and(|entry| entry.destination.exists());
+        downloads::completion_succeeded(
+            success,
+            exists,
+            crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED,
+        )
+    });
+    if debug_logging_enabled() {
+        eprintln!(
+            "velox: download completion url={url:?} path={path:?} \
+reported_success={success} recorded_as_success={succeeded}"
+        );
+    }
+    match resolved {
+        Some(id) if succeeded => {
+            state.downloads.complete(id, now);
+        }
+        Some(id) => {
+            state
+                .downloads
+                .fail(id, "ダウンロードに失敗しました".to_owned(), now);
+        }
+        None => {
+            eprintln!(
+                "velox: could not correlate download completion for {url:?} \
+                 (path={path:?}, success={success})"
+            );
+        }
+    }
+}
+
+/// `UserEvent::SavePageFinished` (Issue #46) の結果を `state.downloads` に
+/// 反映する。保存先は最初から確定しているので、`resolve_completion` の
+/// 保存先完全一致の経路で特定する。
+pub(super) fn record_save_page_completion(
+    state: &mut AppState,
+    url: &str,
+    destination: &Path,
+    error: Option<String>,
+) {
+    let now = now_unix();
+    match state.downloads.resolve_completion(url, Some(destination)) {
+        Some(id) => match error {
+            Some(reason) => {
+                state.downloads.fail(id, reason, now);
+            }
+            None => {
+                state.downloads.complete(id, now);
+            }
+        },
+        None => {
+            eprintln!(
+                "velox: could not correlate page-save completion for {url:?} \
+                 (destination={destination:?}, error={error:?})"
+            );
         }
     }
 }

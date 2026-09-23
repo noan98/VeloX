@@ -133,27 +133,31 @@ pub(super) fn refresh_settings_panel(window: &BrowserWindow, state: &AppState) {
 /// reflected in the chrome of *every* open window immediately, not just the
 /// one that made it, and every open window's own settings screen (if it
 /// happens to be open there too) must echo the same saved value back. This
-/// is why the function takes `ui_windows: &mut HashMap<WindowId,
+/// is why the function takes `ui_windows: &HashMap<WindowId,
 /// BrowserWindow>` as a whole and loops over every entry, rather than the
 /// single already-resolved `window: &mut BrowserWindow` most other
 /// `ToolbarCommand` handlers take — see `handle_user_event`'s doc comment
 /// for why `UpdateSettings`/`ResetSettings` are intercepted there, before a
 /// single window is resolved, the same way `NewWindow` is.
 pub(super) fn apply_updated_settings(
-    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
+    ui_windows: &HashMap<WindowId, BrowserWindow>,
     state: &mut AppState,
     settings: Settings,
 ) {
-    let sanitized = settings.sanitize();
-    state.settings = sanitized.clone();
+    state.settings = settings.sanitize();
+    let state = &*state;
     if let Some(dir) = &state.data_dir {
-        log_failure("save settings", persistence::save_settings(dir, &sanitized));
+        log_failure(
+            "save settings",
+            persistence::save_settings(dir, &state.settings),
+        );
     }
+    let appearance = &state.settings.appearance;
     for window in ui_windows.values() {
-        log_failure("apply theme", window.set_theme(sanitized.appearance.theme));
+        log_failure("apply theme", window.set_theme(appearance.theme));
         log_failure(
             "apply bookmark bar visibility",
-            window.set_bookmark_bar_visible(sanitized.appearance.show_bookmark_bar),
+            window.set_bookmark_bar_visible(appearance.show_bookmark_bar),
         );
         refresh_settings_panel(window, state);
     }
