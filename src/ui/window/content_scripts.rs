@@ -1370,18 +1370,12 @@ mod tests {
 
     #[test]
     fn parse_context_menu_action_accepts_small_plain_integers() {
-        assert_eq!(
-            parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}0")),
-            Some(0)
-        );
-        assert_eq!(
-            parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}7")),
-            Some(7)
-        );
-        assert_eq!(
-            parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}42")),
-            Some(42)
-        );
+        for index in [0, 7, 42] {
+            assert_eq!(
+                parse_context_menu_action(&format!("{CONTEXT_MENU_ACTION_PREFIX}{index}")),
+                Some(index)
+            );
+        }
     }
 
     #[test]
@@ -1408,13 +1402,19 @@ mod tests {
         assert_eq!(parse_context_menu_action(&huge), None);
     }
 
+    /// `action` 1 行だけのメニューを `(x, y)` に描画するスクリプト。
+    fn render_single_entry(
+        action: context_menu::MenuAction,
+        enabled: bool,
+        x: f64,
+        y: f64,
+    ) -> String {
+        context_menu_render_script(&[context_menu::MenuEntry { action, enabled }], x, y)
+    }
+
     #[test]
     fn context_menu_render_script_embeds_labels_and_positions_via_textcontent() {
-        let entries = vec![context_menu::MenuEntry {
-            action: context_menu::MenuAction::Back,
-            enabled: true,
-        }];
-        let script = context_menu_render_script(&entries, 12.0, 34.0);
+        let script = render_single_entry(context_menu::MenuAction::Back, true, 12.0, 34.0);
         assert!(script.contains("row.textContent = item.label;"));
         assert!(script.contains("\"label\":\"戻る\""));
         assert!(script.contains("let left = 12;"));
@@ -1429,11 +1429,12 @@ mod tests {
         // against: a value trying to break out of the JS string literal the
         // `items` JSON array is spliced into.
         let hostile = r#""; document.body.innerHTML = "pwned"; //"#.to_owned();
-        let entries = vec![context_menu::MenuEntry {
-            action: context_menu::MenuAction::SearchSelection(hostile),
-            enabled: true,
-        }];
-        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        let script = render_single_entry(
+            context_menu::MenuAction::SearchSelection(hostile),
+            true,
+            0.0,
+            0.0,
+        );
         // The generated `const items = [...]` must remain one syntactically
         // closed JS statement — i.e. still contain the trailing pieces of
         // the script that come after it, proving the hostile string did not
@@ -1446,11 +1447,12 @@ mod tests {
     #[test]
     fn context_menu_render_script_escapes_u2028_and_u2029_line_terminators_in_a_label() {
         let hostile = "foo\u{2028}bar\u{2029}baz".to_owned();
-        let entries = vec![context_menu::MenuEntry {
-            action: context_menu::MenuAction::SearchSelection(hostile),
-            enabled: true,
-        }];
-        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        let script = render_single_entry(
+            context_menu::MenuAction::SearchSelection(hostile),
+            true,
+            0.0,
+            0.0,
+        );
         assert!(script.contains("\\u2028"), "{script}");
         assert!(script.contains("\\u2029"), "{script}");
         assert!(!script.contains('\u{2028}'));
@@ -1467,11 +1469,12 @@ mod tests {
         // value assigned to a JS variable, never inside an HTML tag
         // position).
         let hostile = "<script>alert(document.cookie)</script>".to_owned();
-        let entries = vec![context_menu::MenuEntry {
-            action: context_menu::MenuAction::SearchSelection(hostile.clone()),
-            enabled: true,
-        }];
-        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        let script = render_single_entry(
+            context_menu::MenuAction::SearchSelection(hostile),
+            true,
+            0.0,
+            0.0,
+        );
         // The text is present (it is safe precisely *because* it ends up as
         // a JS string value, never HTML) but only inside the `items` JSON,
         // never as a document-level `<script>` tag of its own.
@@ -1485,11 +1488,7 @@ mod tests {
 
     #[test]
     fn context_menu_render_script_shows_disabled_entries_as_unclickable() {
-        let entries = vec![context_menu::MenuEntry {
-            action: context_menu::MenuAction::Copy,
-            enabled: false,
-        }];
-        let script = context_menu_render_script(&entries, 0.0, 0.0);
+        let script = render_single_entry(context_menu::MenuAction::Copy, false, 0.0, 0.0);
         assert!(script.contains("\"enabled\":false"));
     }
 
