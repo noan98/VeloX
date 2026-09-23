@@ -120,16 +120,21 @@ impl TabState {
         matches!(self, TabState::Suspended)
     }
 
+    /// `self -> to` を、`allowed` のときだけ許す共通部分。各遷移メソッドは
+    /// 「どの状態からなら許されるか」だけを書き、拒否時のエラー値の組み立ては
+    /// ここに一本化する。
+    fn transition(self, to: TabState, allowed: bool) -> Result<Self, InvalidTabTransition> {
+        if allowed {
+            Ok(to)
+        } else {
+            Err(InvalidTabTransition { from: self, to })
+        }
+    }
+
     /// `Active -> Background`: this tab stopped being the visible tab.
     /// Valid only from `Active`.
     fn background(self) -> Result<Self, InvalidTabTransition> {
-        match self {
-            TabState::Active => Ok(TabState::Background),
-            _ => Err(InvalidTabTransition {
-                from: self,
-                to: TabState::Background,
-            }),
-        }
+        self.transition(TabState::Background, self == TabState::Active)
     }
 
     /// `Background -> Active` or `Restoring -> Active`: this tab became (or
@@ -138,13 +143,10 @@ impl TabState {
     /// `Suspended -> Active` edge, since resuming requires rebuilding a
     /// webview, which `browser::` itself has no part in.
     fn activate(self) -> Result<Self, InvalidTabTransition> {
-        match self {
-            TabState::Background | TabState::Restoring => Ok(TabState::Active),
-            _ => Err(InvalidTabTransition {
-                from: self,
-                to: TabState::Active,
-            }),
-        }
+        self.transition(
+            TabState::Active,
+            matches!(self, TabState::Background | TabState::Restoring),
+        )
     }
 
     /// `Background -> Suspended`. Valid only from `Background` — the active
@@ -152,26 +154,14 @@ impl TabState {
     /// has nothing left to drop, so both are rejected by construction
     /// rather than by a separate guard at the call site.
     fn suspend(self) -> Result<Self, InvalidTabTransition> {
-        match self {
-            TabState::Background => Ok(TabState::Suspended),
-            _ => Err(InvalidTabTransition {
-                from: self,
-                to: TabState::Suspended,
-            }),
-        }
+        self.transition(TabState::Suspended, self == TabState::Background)
     }
 
     /// `Suspended -> Restoring`: this tab was selected while suspended;
     /// resuming (rebuilding its webview) is about to start. Valid only from
     /// `Suspended`.
     fn begin_restore(self) -> Result<Self, InvalidTabTransition> {
-        match self {
-            TabState::Suspended => Ok(TabState::Restoring),
-            _ => Err(InvalidTabTransition {
-                from: self,
-                to: TabState::Restoring,
-            }),
-        }
+        self.transition(TabState::Restoring, self == TabState::Suspended)
     }
 }
 
@@ -252,18 +242,7 @@ impl Tab {
     /// it starts in [`TabState::Active`] — there is currently no path that
     /// opens a tab directly into the background.
     pub fn new(id: TabId, initial_url: impl Into<String>) -> Self {
-        Self {
-            id,
-            current_url: initial_url.into(),
-            title: None,
-            favicon: Favicon::default(),
-            loading: true,
-            blocked_count: 0,
-            state: TabState::Active,
-            last_active: Instant::now(),
-            has_form_input: false,
-            pinned: false,
-        }
+        Self::with_state(id, initial_url.into(), TabState::Active, true)
     }
 
     /// Construct a tab directly in [`TabState::Suspended`], skipping the
@@ -279,14 +258,20 @@ impl Tab {
     /// that no longer exists — `Instant` cannot be persisted across a
     /// restart.
     pub(super) fn new_suspended(id: TabId, initial_url: impl Into<String>) -> Self {
+        Self::with_state(id, initial_url.into(), TabState::Suspended, false)
+    }
+
+    /// [`Self::new`] / [`Self::new_suspended`] の共通部分。違いは初期状態と
+    /// `loading` だけで、ページ由来のメタデータはどちらも空から始まる。
+    fn with_state(id: TabId, current_url: String, state: TabState, loading: bool) -> Self {
         Self {
             id,
-            current_url: initial_url.into(),
+            current_url,
             title: None,
             favicon: Favicon::default(),
-            loading: false,
+            loading,
             blocked_count: 0,
-            state: TabState::Suspended,
+            state,
             last_active: Instant::now(),
             has_form_input: false,
             pinned: false,
@@ -496,9 +481,14 @@ impl Tab {
 mod tests {
     use super::*;
 
+    /// `https://example.com/` を読み込み始めたばかりの新規タブ。
+    fn example_tab() -> Tab {
+        Tab::new(TabId::from(0), "https://example.com/")
+    }
+
     #[test]
     fn new_tab_is_loading_its_initial_url() {
-        let tab = Tab::new(TabId::from(0), "https://example.com/");
+        let tab = example_tab();
         assert_eq!(tab.current_url(), "https://example.com/");
         assert!(tab.is_loading());
         assert_eq!(tab.id(), TabId::from(0));
@@ -506,7 +496,7 @@ mod tests {
 
     #[test]
     fn navigation_updates_url_and_sets_loading() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_load_finished("https://example.com/");
         assert!(!tab.is_loading());
 
@@ -517,7 +507,7 @@ mod tests {
 
     #[test]
     fn failed_load_keeps_attempted_url() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_navigation_started("https://unreachable.invalid/");
         tab.on_load_failed();
         assert_eq!(tab.current_url(), "https://unreachable.invalid/");
@@ -526,7 +516,7 @@ mod tests {
 
     #[test]
     fn finished_load_records_final_url_after_redirects() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_navigation_started("http://example.com/old");
         tab.on_load_finished("https://example.com/new");
         assert_eq!(tab.current_url(), "https://example.com/new");
@@ -535,13 +525,13 @@ mod tests {
 
     #[test]
     fn new_tab_has_no_blocked_navigations() {
-        let tab = Tab::new(TabId::from(0), "https://example.com/");
+        let tab = example_tab();
         assert_eq!(tab.blocked_count(), 0);
     }
 
     #[test]
     fn blocked_navigation_increments_the_counter_without_changing_the_page() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_load_finished("https://example.com/");
 
         tab.on_navigation_blocked("https://doubleclick.net/");
@@ -555,7 +545,7 @@ mod tests {
 
     #[test]
     fn blocked_subresource_shares_the_counter_with_blocked_navigations() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_load_finished("https://example.com/");
 
         tab.on_subresource_blocked("https://ads.example/banner.js");
@@ -568,21 +558,21 @@ mod tests {
 
     #[test]
     fn new_tab_is_active_and_not_suspended() {
-        let tab = Tab::new(TabId::from(0), "https://example.com/");
+        let tab = example_tab();
         assert_eq!(tab.state(), TabState::Active);
         assert!(!tab.is_suspended());
     }
 
     #[test]
     fn new_tab_has_no_title_or_favicon_yet() {
-        let tab = Tab::new(TabId::from(0), "https://example.com/");
+        let tab = example_tab();
         assert_eq!(tab.title(), None);
         assert_eq!(tab.favicon(), &Favicon::Unknown);
     }
 
     #[test]
     fn title_and_favicon_can_be_set_and_read_back() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.set_title("Example Domain");
         tab.set_favicon_url("https://example.com/favicon.ico");
 
@@ -595,7 +585,7 @@ mod tests {
 
     #[test]
     fn navigation_clears_the_previous_pages_title_and_favicon() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.set_title("Example Domain");
         tab.set_favicon_url("https://example.com/favicon.ico");
 
@@ -607,7 +597,7 @@ mod tests {
 
     #[test]
     fn suspend_clears_loading_and_sets_suspended_state() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_load_finished("https://example.com/"); // stop loading first
         tab.on_navigation_started("https://example.com/still-loading");
         // A freshly created tab is Active; it must background first.
@@ -624,7 +614,7 @@ mod tests {
 
     #[test]
     fn resume_clears_suspended_state_and_starts_loading() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.on_load_finished("https://example.com/");
         tab.background().unwrap();
         tab.suspend().unwrap();
@@ -639,7 +629,7 @@ mod tests {
 
     #[test]
     fn idle_for_measures_time_since_last_backgrounded() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         let t0 = Instant::now();
         tab.mark_backgrounded(t0);
 
@@ -652,7 +642,7 @@ mod tests {
 
     #[test]
     fn idle_for_never_goes_negative() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         let t0 = Instant::now();
         tab.mark_backgrounded(t0 + Duration::from_secs(10));
 
@@ -747,7 +737,7 @@ mod tests {
 
     #[test]
     fn tab_rejects_suspending_the_active_state() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         assert_eq!(tab.state(), TabState::Active);
 
         let err = tab.suspend().unwrap_err();
@@ -758,7 +748,7 @@ mod tests {
 
     #[test]
     fn tab_rejects_suspending_an_already_suspended_tab() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.background().unwrap();
         tab.suspend().unwrap();
 
@@ -768,7 +758,7 @@ mod tests {
 
     #[test]
     fn tab_rejects_resuming_a_tab_that_is_not_suspended() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         let err = tab.resume().unwrap_err();
         assert_eq!(err.from, TabState::Active);
         assert_eq!(err.to, TabState::Restoring);
@@ -825,13 +815,13 @@ mod tests {
 
     #[test]
     fn new_tabs_are_not_pinned() {
-        assert!(!Tab::new(TabId::from(0), "https://example.com/").is_pinned());
+        assert!(!example_tab().is_pinned());
         assert!(!Tab::new_suspended(TabId::from(0), "https://example.com/").is_pinned());
     }
 
     #[test]
     fn pinned_is_a_tab_property_that_navigation_does_not_clear() {
-        let mut tab = Tab::new(TabId::from(0), "https://example.com/");
+        let mut tab = example_tab();
         tab.set_pinned(true);
         assert!(tab.is_pinned());
 

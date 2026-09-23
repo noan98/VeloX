@@ -725,14 +725,13 @@ pub fn plan(
             .iter()
             .filter(|tab| tab.eligible() && tab.idle >= idle_after)
             .collect();
-        idle.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+        sort_least_recently_used_first(&mut idle);
         planned.extend(idle.iter().map(|tab| (tab.id, SuspendReason::Idle)));
     }
 
     let count_demand = policy
         .max_live_tabs
-        .map(|max| live_tabs.saturating_sub(max.max(1)))
-        .unwrap_or(0);
+        .map_or(0, |max| live_tabs.saturating_sub(max.max(1)));
     let memory_demand = match (policy.memory_budget_bytes, memory) {
         (Some(budget), Some(sample)) => tabs_to_free(
             sample.total_bytes,
@@ -806,9 +805,9 @@ pub fn reclaim_order(candidates: &[Candidate]) -> Vec<Vec<&Candidate>> {
 
     let mut emptyable: Vec<Vec<&Candidate>> = Vec::new();
     let mut leftovers: Vec<&Candidate> = ungrouped.into_iter().filter(|t| t.eligible()).collect();
-    for (_, (mut tabs, all_eligible)) in groups {
+    for (mut tabs, all_eligible) in groups.into_values() {
         if all_eligible && !tabs.is_empty() {
-            tabs.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+            sort_least_recently_used_first(&mut tabs);
             emptyable.push(tabs);
         } else {
             leftovers.extend(tabs.into_iter().filter(|t| t.eligible()));
@@ -821,11 +820,17 @@ pub fn reclaim_order(candidates: &[Candidate]) -> Vec<Vec<&Candidate>> {
     // recency) resolve by ascending group id.
     emptyable
         .sort_by_key(|tabs| std::cmp::Reverse(tabs.last().map(|tab| tab.idle).unwrap_or_default()));
-    leftovers.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
+    sort_least_recently_used_first(&mut leftovers);
 
     let mut order = emptyable;
     order.extend(leftovers.into_iter().map(|tab| vec![tab]));
     order
+}
+
+/// アイドル時間の長い (= 最も長く使われていない) タブから順に並べる。安定ソート
+/// なので、アイドル時間が同じタブ同士は呼び出し側の順序を保つ。
+fn sort_least_recently_used_first(tabs: &mut [&Candidate]) {
+    tabs.sort_by_key(|tab| std::cmp::Reverse(tab.idle));
 }
 
 /// How many tabs' worth of memory `total` is over `budget`, rounded up —
@@ -908,6 +913,11 @@ mod tests {
         memory: Option<MemorySample>,
     ) -> Vec<(TabId, SuspendReason)> {
         plan(policy, candidates, memory, SuspendMechanism::Discard)
+    }
+
+    /// 合計 `total_bytes` の新しいメモリサンプル。
+    fn memory_sample(total_bytes: u64) -> Option<MemorySample> {
+        Some(MemorySample { total_bytes })
     }
 
     fn ids(planned: &[(TabId, SuspendReason)]) -> Vec<u64> {
@@ -1067,9 +1077,7 @@ mod tests {
             None
         )
         .is_empty());
-        let under_budget = Some(MemorySample {
-            total_bytes: 400 * MIB,
-        });
+        let under_budget = memory_sample(400 * MIB);
         assert!(plan_discarding(
             &SuspensionPolicy::default(),
             &with_active(&candidates),
@@ -1085,9 +1093,7 @@ mod tests {
         // the memory reason, exactly like an explicit
         // `VELOX_MEMORY_BUDGET_MB` would.
         let candidates = [tab(1, 5), tab(2, 10)];
-        let over_budget = Some(MemorySample {
-            total_bytes: 900 * MIB,
-        });
+        let over_budget = memory_sample(900 * MIB);
         let planned = plan_discarding(
             &SuspensionPolicy::default(),
             &with_active(&candidates),
@@ -1108,9 +1114,7 @@ mod tests {
         };
         let candidates: Vec<Candidate> = (1..=20).map(|i| tab(i, i * 10)).collect();
         // §37.1 の `freeze` 側の着地点。休止を重ねても動かなかった値。
-        let sample = Some(MemorySample {
-            total_bytes: 1622 * MIB,
-        });
+        let sample = memory_sample(1622 * MIB);
         (policy, with_active(&candidates), sample)
     }
 
@@ -1188,9 +1192,7 @@ mod tests {
     #[test]
     fn disabled_policy_never_plans_anything() {
         let candidates = [tab(1, 3600), tab(2, 3600)];
-        let memory = Some(MemorySample {
-            total_bytes: 10_000 * MIB,
-        });
+        let memory = memory_sample(10_000 * MIB);
         assert!(plan_discarding(&disabled_policy(), &with_active(&candidates), memory).is_empty());
     }
 
@@ -1258,55 +1260,22 @@ mod tests {
             ..disabled_policy()
         };
         let candidates = [tab(1, 1), tab(2, 2), tab(3, 3), tab(4, 4), tab(5, 5)];
-        let over_by = |mib: u64| {
-            Some(MemorySample {
-                total_bytes: (500 + mib) * MIB,
-            })
+        let planned_ids = |over_by_mib: u64| {
+            ids(&plan_discarding(
+                &policy,
+                &with_active(&candidates),
+                memory_sample((500 + over_by_mib) * MIB),
+            ))
         };
         // Just over: one tab. 64 MiB over: still one. 65 MiB over: two.
-        assert_eq!(
-            ids(&plan_discarding(
-                &policy,
-                &with_active(&candidates),
-                over_by(1)
-            )),
-            vec![5]
-        );
-        assert_eq!(
-            ids(&plan_discarding(
-                &policy,
-                &with_active(&candidates),
-                over_by(64)
-            )),
-            vec![5]
-        );
-        assert_eq!(
-            ids(&plan_discarding(
-                &policy,
-                &with_active(&candidates),
-                over_by(65)
-            )),
-            vec![5, 4]
-        );
+        assert_eq!(planned_ids(1), vec![5]);
+        assert_eq!(planned_ids(64), vec![5]);
+        assert_eq!(planned_ids(65), vec![5, 4]);
         // 200 MiB over: four tabs in one sweep.
-        assert_eq!(
-            ids(&plan_discarding(
-                &policy,
-                &with_active(&candidates),
-                over_by(200)
-            )),
-            vec![5, 4, 3, 2]
-        );
+        assert_eq!(planned_ids(200), vec![5, 4, 3, 2]);
         // Far more than there are tabs to free: everything eligible, no
         // panic.
-        assert_eq!(
-            ids(&plan_discarding(
-                &policy,
-                &with_active(&candidates),
-                over_by(100_000)
-            )),
-            vec![5, 4, 3, 2, 1]
-        );
+        assert_eq!(planned_ids(100_000), vec![5, 4, 3, 2, 1]);
     }
 
     #[test]
@@ -1317,7 +1286,7 @@ mod tests {
         };
         let candidates = [tab(1, 1), tab(2, 2)];
         for total in [0, 100 * MIB, 500 * MIB] {
-            let memory = Some(MemorySample { total_bytes: total });
+            let memory = memory_sample(total);
             assert!(plan_discarding(&policy, &with_active(&candidates), memory).is_empty());
         }
     }
@@ -1370,9 +1339,7 @@ mod tests {
             },
             tab(3, 1000),
         ];
-        let memory = Some(MemorySample {
-            total_bytes: 10_000 * MIB,
-        });
+        let memory = memory_sample(10_000 * MIB);
         // Every signal is screaming, yet only the plain tab goes.
         assert_eq!(
             ids(&plan_discarding(&policy, &with_active(&candidates), memory)),
@@ -1411,9 +1378,7 @@ mod tests {
         };
         // Live = 6, limit 4 -> count wants 2. 150 MiB over -> memory wants 3.
         let candidates = [tab(1, 1), tab(2, 2), tab(3, 3), tab(4, 4), tab(5, 5)];
-        let memory = Some(MemorySample {
-            total_bytes: 650 * MIB,
-        });
+        let memory = memory_sample(650 * MIB);
         let planned = plan_discarding(&policy, &with_active(&candidates), memory);
         assert_eq!(
             planned,
@@ -1549,9 +1514,7 @@ mod tests {
             ..disabled_policy()
         };
         let candidates = [active(0, 0)];
-        let memory = Some(MemorySample {
-            total_bytes: 10_000 * MIB,
-        });
+        let memory = memory_sample(10_000 * MIB);
         assert!(plan_discarding(&policy, &candidates, memory).is_empty());
     }
 
@@ -1692,13 +1655,84 @@ mod tests {
         assert_eq!(MemoryBudgetInput::PrivateCommit.pick(None, None, 900), 900);
     }
 
+    /// `guard` を付けたタブ 1 が、3 つの信号がそれぞれ単独でも取りに来る
+    /// 状況 (最もアイドル・タブ数超過・メモリ大幅超過) で生き残り、保護の無い
+    /// タブ 2 は変わらず休止対象になることを確かめる。`what` は失敗時の
+    /// メッセージに入るタブの呼び名。
+    fn assert_survives_every_signal(guard: fn(Candidate) -> Candidate, what: &str) {
+        let policy = SuspensionPolicy {
+            idle_after: Some(Duration::from_secs(60)),
+            max_live_tabs: Some(1),
+            memory_budget_bytes: Some(100 * MIB),
+            ..SuspensionPolicy::default()
+        };
+        let candidates = vec![
+            Candidate {
+                active: true,
+                ..tab(0, 0)
+            },
+            guard(tab(1, 600)),
+            tab(2, 300),
+        ];
+        let sample = memory_sample(4096 * MIB);
+
+        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Discard);
+        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
+
+        assert!(
+            !taken.contains(&TabId::from(1)),
+            "{what} must survive all three signals, got {taken:?}"
+        );
+        assert!(
+            taken.contains(&TabId::from(2)),
+            "the other background tab is still fair game, got {taken:?}"
+        );
+    }
+
+    /// `guard` を付けたタブ 1 と保護の無いタブ 2 が同じプロセスグループ (7)
+    /// にいるとき、グループ全体が「空にできる」塊として差し出されず、
+    /// タブ 1 自体も一切休止対象にならないことを確かめる。`protected` /
+    /// `active` と同じ規則である。
+    fn assert_pins_its_process_group(guard: fn(Candidate) -> Candidate, what: &str) {
+        let policy = SuspensionPolicy {
+            max_live_tabs: Some(1),
+            ..SuspensionPolicy::default()
+        };
+        let candidates = vec![
+            Candidate {
+                active: true,
+                ..grouped(0, 0, 9)
+            },
+            guard(grouped(1, 600, 7)),
+            grouped(2, 300, 7),
+        ];
+
+        let order = reclaim_order(&candidates);
+        let flattened: Vec<TabId> = order
+            .iter()
+            .flat_map(|chunk| chunk.iter().map(|tab| tab.id))
+            .collect();
+        assert!(
+            !flattened.contains(&TabId::from(1)),
+            "{what} is never offered for reclaim, got {flattened:?}"
+        );
+        assert!(
+            !order.iter().any(|chunk| chunk.len() > 1),
+            "group 7 must not be offered as an emptyable whole: {order:?}"
+        );
+
+        let planned = plan(&policy, &candidates, None, SuspendMechanism::Discard);
+        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
+        assert!(!taken.contains(&TabId::from(1)), "got {taken:?}");
+    }
+
     // -- Issue #272 (D142): a tab with form input is never suspended ----
 
     /// The same tab, with the page having reported form input.
-    fn typing(id: u64, idle_secs: u64) -> Candidate {
+    fn typing(tab: Candidate) -> Candidate {
         Candidate {
             has_form_input: true,
-            ..tab(id, idle_secs)
+            ..tab
         }
     }
 
@@ -1707,35 +1741,7 @@ mod tests {
         // One policy with all three signals on at once, each of which
         // would take this tab on its own: it is the idlest, the count is
         // over, and the memory sample is far over budget.
-        let policy = SuspensionPolicy {
-            idle_after: Some(Duration::from_secs(60)),
-            max_live_tabs: Some(1),
-            memory_budget_bytes: Some(100 * MIB),
-            ..SuspensionPolicy::default()
-        };
-        let candidates = vec![
-            Candidate {
-                active: true,
-                ..tab(0, 0)
-            },
-            typing(1, 600),
-            tab(2, 300),
-        ];
-        let sample = Some(MemorySample {
-            total_bytes: 4096 * MIB,
-        });
-
-        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Discard);
-        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
-
-        assert!(
-            !taken.contains(&TabId::from(1)),
-            "the tab being typed in must survive all three signals, got {taken:?}"
-        );
-        assert!(
-            taken.contains(&TabId::from(2)),
-            "the other background tab is still fair game, got {taken:?}"
-        );
+        assert_survives_every_signal(typing, "the tab being typed in");
     }
 
     #[test]
@@ -1744,48 +1750,16 @@ mod tests {
         // *both* are eligible — the same rule `protected`/`active` follow.
         // Without the pin, tab 2 would be suspended for nothing: its
         // process would stay alive for tab 1 anyway.
-        let policy = SuspensionPolicy {
-            max_live_tabs: Some(1),
-            ..SuspensionPolicy::default()
-        };
-        let candidates = vec![
-            Candidate {
-                active: true,
-                ..grouped(0, 0, 9)
-            },
-            Candidate {
-                has_form_input: true,
-                ..grouped(1, 600, 7)
-            },
-            grouped(2, 300, 7),
-        ];
-
-        let order = reclaim_order(&candidates);
-        let flattened: Vec<TabId> = order
-            .iter()
-            .flat_map(|chunk| chunk.iter().map(|tab| tab.id))
-            .collect();
-        assert!(
-            !flattened.contains(&TabId::from(1)),
-            "the typed-in tab is never offered for reclaim, got {flattened:?}"
-        );
-        assert!(
-            !order.iter().any(|chunk| chunk.len() > 1),
-            "group 7 must not be offered as an emptyable whole: {order:?}"
-        );
-
-        let planned = plan(&policy, &candidates, None, SuspendMechanism::Discard);
-        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
-        assert!(!taken.contains(&TabId::from(1)), "got {taken:?}");
+        assert_pins_its_process_group(typing, "the typed-in tab");
     }
 
     // -- Issue #277 (D144): a pinned tab is never suspended --------------
 
     /// The same tab, pinned by the user.
-    fn pinned(id: u64, idle_secs: u64) -> Candidate {
+    fn pinned(tab: Candidate) -> Candidate {
         Candidate {
             pinned: true,
-            ..tab(id, idle_secs)
+            ..tab
         }
     }
 
@@ -1793,71 +1767,11 @@ mod tests {
     fn a_pinned_tab_survives_every_signal() {
         // Same shape as `a_tab_with_form_input_survives_every_signal`: all
         // three signals would take this tab on their own.
-        let policy = SuspensionPolicy {
-            idle_after: Some(Duration::from_secs(60)),
-            max_live_tabs: Some(1),
-            memory_budget_bytes: Some(100 * MIB),
-            ..SuspensionPolicy::default()
-        };
-        let candidates = vec![
-            Candidate {
-                active: true,
-                ..tab(0, 0)
-            },
-            pinned(1, 600),
-            tab(2, 300),
-        ];
-        let sample = Some(MemorySample {
-            total_bytes: 4096 * MIB,
-        });
-
-        let planned = plan(&policy, &candidates, sample, SuspendMechanism::Discard);
-        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
-
-        assert!(
-            !taken.contains(&TabId::from(1)),
-            "the pinned tab must survive all three signals, got {taken:?}"
-        );
-        assert!(
-            taken.contains(&TabId::from(2)),
-            "the other background tab is still fair game, got {taken:?}"
-        );
+        assert_survives_every_signal(pinned, "the pinned tab");
     }
 
     #[test]
     fn pinning_pins_its_process_group_like_a_protected_tab() {
-        let policy = SuspensionPolicy {
-            max_live_tabs: Some(1),
-            ..SuspensionPolicy::default()
-        };
-        let candidates = vec![
-            Candidate {
-                active: true,
-                ..grouped(0, 0, 9)
-            },
-            Candidate {
-                pinned: true,
-                ..grouped(1, 600, 7)
-            },
-            grouped(2, 300, 7),
-        ];
-
-        let order = reclaim_order(&candidates);
-        let flattened: Vec<TabId> = order
-            .iter()
-            .flat_map(|chunk| chunk.iter().map(|tab| tab.id))
-            .collect();
-        assert!(
-            !flattened.contains(&TabId::from(1)),
-            "the pinned tab is never offered for reclaim, got {flattened:?}"
-        );
-        assert!(
-            !order.iter().any(|chunk| chunk.len() > 1),
-            "group 7 must not be offered as an emptyable whole: {order:?}"
-        );
-
-        let planned = plan(&policy, &candidates, None, SuspendMechanism::Discard);
-        let taken: Vec<TabId> = planned.iter().map(|(id, _)| *id).collect();
-        assert!(!taken.contains(&TabId::from(1)), "got {taken:?}");
+        assert_pins_its_process_group(pinned, "the pinned tab");
     }
 }
