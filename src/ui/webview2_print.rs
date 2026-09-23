@@ -88,13 +88,12 @@ pub fn export_as_pdf(
         print_settings
     };
 
-    let destination = destination.to_path_buf();
     let path_arg = HSTRING::from(destination.to_string_lossy().as_ref());
-    let handler_destination = destination.clone();
+    let destination = destination.to_path_buf();
 
     // SAFETY: same COM-reference reasoning as above. The completion
     // handler closure only touches values it owns (`proxy`/`window_id`/
-    // `tab_id`/`handler_destination`, all moved in) plus the two arguments
+    // `tab_id`/`destination`, all moved in) plus the two arguments
     // WebView2 hands it for this one callback — never a pointer whose
     // validity this function cannot account for.
     unsafe {
@@ -107,12 +106,13 @@ pub fn export_as_pdf(
                     Ok(()) => Some("PDF の生成に失敗しました".to_owned()),
                     Err(err) => Some(err.to_string()),
                 };
-                let success = result.is_ok() && succeeded;
+                // 完了ハンドラは `FnOnce` なので、所有している値をそのまま
+                // イベントへ移せる。
                 let _ = proxy.send_event(UserEvent::PdfExportFinished {
                     window_id,
                     tab_id,
-                    destination: handler_destination.clone(),
-                    success,
+                    destination,
+                    success: error.is_none(),
                     error,
                 });
                 Ok(())

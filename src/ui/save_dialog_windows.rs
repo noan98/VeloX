@@ -146,16 +146,13 @@ pub fn show_save_dialog(default_file_name: &str) -> Result<Option<PathBuf>, Stri
 /// that stays valid for the duration of this call (true for a COM
 /// allocator's out-parameter that has not been freed yet).
 unsafe fn pwstr_to_string(pwstr: PWSTR) -> String {
-    if pwstr.0.is_null() {
+    if pwstr.is_null() {
         return String::new();
     }
     // SAFETY: caller guarantees `pwstr` points at a valid null-terminated
-    // UTF-16 buffer; reading one `u16` at a time until the terminator never
-    // reads past its end.
-    let len = unsafe { (0..).take_while(|&i| *pwstr.0.add(i) != 0).count() };
-    // SAFETY: `len` was just measured from the same valid buffer above.
-    let slice = unsafe { std::slice::from_raw_parts(pwstr.0, len) };
-    String::from_utf16_lossy(slice)
+    // UTF-16 buffer, which is exactly `PWSTR::as_wide`'s requirement (it
+    // measures up to the terminator and never reads past it).
+    String::from_utf16_lossy(unsafe { pwstr.as_wide() })
 }
 
 /// Capture `webview`'s current page as MHTML (via Chromium DevTools
@@ -180,6 +177,8 @@ pub fn capture_and_write_mhtml(
     // Kept for the synchronous-failure branch below: `proxy` itself is
     // moved into the completion closure, which never runs at all if the
     // COM call below fails outright, so that branch needs its own handle.
+    // `url`/`destination` も同じ理由で複製しておく。完了ハンドラは
+    // `FnOnce` なので、ハンドラ側は自分の複製をそのままイベントへ移す。
     let sync_failure_proxy = proxy.clone();
     let closure_url = url.clone();
     let closure_destination = destination.clone();
@@ -210,8 +209,8 @@ pub fn capture_and_write_mhtml(
                     };
                     let _ = proxy.send_event(UserEvent::SavePageFinished {
                         window_id,
-                        url: closure_url.clone(),
-                        destination: closure_destination.clone(),
+                        url: closure_url,
+                        destination: closure_destination,
                         error,
                     });
                     Ok(())
