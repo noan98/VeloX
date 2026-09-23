@@ -2471,10 +2471,10 @@ impl BrowserWindow {
         _destination: PathBuf,
         _settings: &crate::browser::print::PdfExportSettings,
     ) -> PdfExportRequest {
-        if !self
+        if self
             .contents
             .get(&tab_id)
-            .is_some_and(|tab| tab.webview.is_some())
+            .is_none_or(|tab| tab.webview.is_none())
         {
             return PdfExportRequest::NoWebview;
         }
