@@ -119,7 +119,6 @@ pub(super) fn content_webview_builder<'a>(
     // Never relate a private webview (see `WebviewIsolation::related`).
     let related = if private { None } else { related };
     let nav_proxy = proxy.clone();
-    let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
     let ipc_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
@@ -198,7 +197,7 @@ pub(super) fn content_webview_builder<'a>(
     let builder = builder
         .with_navigation_handler(move |url| {
             if content_blocking_enabled && blocklist.is_blocked(&url) {
-                let _ = block_proxy.send_event(UserEvent::NavigationBlocked(own_id, id, url));
+                let _ = nav_proxy.send_event(UserEvent::NavigationBlocked(own_id, id, url));
                 return false;
             }
             // Keep the permission handler's notion of "current origin" in

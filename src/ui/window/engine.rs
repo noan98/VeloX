@@ -3,13 +3,6 @@
 //! 対応していないプラットフォームでは何もしない版を持つ。
 
 use tao::event_loop::EventLoopProxy;
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-)))]
 use tao::window::Window;
 use wry::{WebContext, WebView, WebViewBuilder};
 
@@ -284,6 +277,12 @@ pub(super) fn disable_default_context_menus(builder: WebViewBuilder<'_>) -> WebV
     builder
 }
 
+/// Create the container every webview of `window` is placed in on
+/// Linux/BSD: tao windows are gtk windows and wry webviews are gtk widgets,
+/// so every webview goes in this one `gtk::Fixed` (positioned via
+/// `with_bounds`/`set_bounds`), created once per window and reused for
+/// every tab opened afterwards. Everywhere else wry supports true child
+/// webviews directly, so no such container exists.
 #[cfg(any(
     target_os = "linux",
     target_os = "dragonfly",
@@ -291,6 +290,21 @@ pub(super) fn disable_default_context_menus(builder: WebViewBuilder<'_>) -> WebV
     target_os = "openbsd",
     target_os = "netbsd",
 ))]
+pub(super) fn create_webview_host(
+    window: &Window,
+) -> Result<gtk::Fixed, Box<dyn std::error::Error>> {
+    use gtk::prelude::{BoxExt, WidgetExt};
+    use tao::platform::unix::WindowExtUnix;
+
+    let vbox = window
+        .default_vbox()
+        .ok_or("tao window was created without its default gtk vbox")?;
+    let fixed = gtk::Fixed::new();
+    vbox.pack_start(&fixed, true, true, 0);
+    fixed.show_all();
+    Ok(fixed)
+}
+
 /// Attach a webview built by `builder` to the window: as a gtk widget in
 /// the window's shared `gtk::Fixed` on Linux/BSD. Used both by
 /// `BrowserWindow::new` (toolbar + first tab) and by
@@ -301,6 +315,13 @@ pub(super) fn disable_default_context_menus(builder: WebViewBuilder<'_>) -> WebV
 /// already hold a `&mut` borrow of `self.context` (docs/decisions.md D49);
 /// a `&self` method here would borrow the whole struct and conflict with
 /// that, whereas a disjoint `&self.host` argument does not.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "netbsd",
+))]
 pub(super) fn attach_webview(
     host: &gtk::Fixed,
     builder: WebViewBuilder<'_>,

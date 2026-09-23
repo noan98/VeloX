@@ -240,6 +240,12 @@ fn tao_theme_of(theme: crate::browser::ResolvedTheme) -> tao::window::Theme {
     }
 }
 
+/// `window` の内側サイズ (論理ピクセル) を `(width, height)` で返す。
+fn logical_inner_size(window: &Window) -> (u32, u32) {
+    let size = window.inner_size().to_logical::<u32>(window.scale_factor());
+    (size.width, size.height)
+}
+
 /// Split the window area into a toolbar strip and the content area below it.
 fn split_layout(width: u32, height: u32, toolbar_height: u32) -> (LogicalRect, LogicalRect) {
     let toolbar_height = toolbar_height.min(height);
@@ -627,11 +633,9 @@ impl BrowserWindow {
             timings.native_window_built = Some(Instant::now());
         }
 
-        // On Linux/BSD, tao windows are gtk windows and wry webviews are gtk
-        // widgets, so every webview goes in this `gtk::Fixed` container
-        // (positioned via `with_bounds`/`set_bounds`), created once and
-        // reused for every tab opened afterwards. Everywhere else wry
-        // supports true child webviews directly (see `attach` below).
+        // On Linux/BSD every webview goes in one `gtk::Fixed` container (see
+        // `engine::create_webview_host`); everywhere else wry supports true
+        // child webviews directly (see `attach` below).
         #[cfg(any(
             target_os = "linux",
             target_os = "dragonfly",
@@ -639,18 +643,7 @@ impl BrowserWindow {
             target_os = "openbsd",
             target_os = "netbsd",
         ))]
-        let host = {
-            use gtk::prelude::{BoxExt, WidgetExt};
-            use tao::platform::unix::WindowExtUnix;
-
-            let vbox = window
-                .default_vbox()
-                .ok_or("tao window was created without its default gtk vbox")?;
-            let fixed = gtk::Fixed::new();
-            vbox.pack_start(&fixed, true, true, 0);
-            fixed.show_all();
-            fixed
-        };
+        let host = engine::create_webview_host(&window)?;
 
         #[cfg(any(
             target_os = "linux",
@@ -669,9 +662,8 @@ impl BrowserWindow {
         )))]
         let attach = |builder: WebViewBuilder<'_>| attach_webview(&window, builder);
 
-        let size = window.inner_size().to_logical::<u32>(window.scale_factor());
-        let (toolbar_rect, content_rect) =
-            split_layout(size.width, size.height, config.toolbar_height);
+        let (width, height) = logical_inner_size(&window);
+        let (toolbar_rect, content_rect) = split_layout(width, height, config.toolbar_height);
 
         // Shared across the toolbar and every content webview in non-private
         // mode only — see docs/decisions.md D49 and `BrowserWindow::context`'s
@@ -834,10 +826,7 @@ impl BrowserWindow {
     /// accounting for whether a history/bookmarks panel is currently open
     /// (it grows the toolbar webview and shrinks the content area).
     fn layout(&self) -> (LogicalRect, LogicalRect) {
-        let size = self
-            .window
-            .inner_size()
-            .to_logical::<u32>(self.window.scale_factor());
+        let (width, height) = logical_inner_size(&self.window);
         let toolbar_height = effective_toolbar_height(
             self.toolbar_height,
             self.panel_height,
@@ -847,7 +836,7 @@ impl BrowserWindow {
             self.find_bar_height,
             self.find_bar_visible.get(),
         );
-        split_layout(size.width, size.height, toolbar_height)
+        split_layout(width, height, toolbar_height)
     }
 
     /// Recompute webview bounds after the window was resized (or a panel was
