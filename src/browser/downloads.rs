@@ -279,18 +279,14 @@ impl DownloadStore {
     /// ambiguous only if the same URL is downloaded twice concurrently,
     /// documented as a known limitation).
     pub fn resolve_completion(&self, url: &str, destination: Option<&Path>) -> Option<DownloadId> {
-        if let Some(destination) = destination {
-            if let Some(entry) = self.entries.iter().find(|entry| {
-                entry.state == DownloadState::InProgress
-                    && entry.url == url
-                    && entry.destination == destination
-            }) {
-                return Some(entry.id);
-            }
-        }
-        self.entries
-            .iter()
-            .find(|entry| entry.state == DownloadState::InProgress && entry.url == url)
+        let candidates = || {
+            self.entries
+                .iter()
+                .filter(|entry| entry.state == DownloadState::InProgress && entry.url == url)
+        };
+        destination
+            .and_then(|destination| candidates().find(|entry| entry.destination == destination))
+            .or_else(|| candidates().next())
             .map(|entry| entry.id)
     }
 }
