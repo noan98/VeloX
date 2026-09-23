@@ -632,6 +632,7 @@ pub fn spawn_open(path: &Path) -> std::io::Result<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::util::unique_temp_path;
 
     /// `/tmp/{file_name}` を保存先としてダウンロードを 1 件開始する。
     fn start(store: &mut DownloadStore, url: &str, file_name: &str, started_at: u64) -> DownloadId {
@@ -1014,7 +1015,7 @@ mod tests {
 
     #[test]
     fn build_destination_sanitizes_then_avoids_collisions_on_a_real_directory() {
-        let dir = unique_temp_dir("velox-downloads-collision");
+        let dir = unique_temp_path("velox-downloads-collision");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("report.pdf"), b"existing").unwrap();
 
@@ -1026,7 +1027,7 @@ mod tests {
 
     #[test]
     fn prepare_destination_creates_missing_directories() {
-        let dir = unique_temp_dir("velox-downloads-mkdir")
+        let dir = unique_temp_path("velox-downloads-mkdir")
             .join("nested")
             .join("downloads");
         assert!(!dir.exists());
@@ -1119,20 +1120,5 @@ mod tests {
     fn open_path_command_uses_xdg_open_on_linux() {
         let (program, _) = open_path_command(Path::new("/tmp/x"));
         assert_eq!(program, "xdg-open");
-    }
-
-    /// A per-test temp directory under the OS temp dir, distinguished by
-    /// `label` plus the current thread so parallel tests never collide —
-    /// same helper shape as `persistence`'s tests.
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let unique = format!(
-            "{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
     }
 }

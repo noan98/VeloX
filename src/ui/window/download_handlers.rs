@@ -8,6 +8,7 @@ use wry::WebViewBuilder;
 
 use crate::app::UserEvent;
 use crate::browser::downloads;
+use crate::browser::util::now_unix;
 use crate::browser::WindowId;
 
 /// Whether wry's download-completed callback can report a **successful**
@@ -165,7 +166,7 @@ pub(super) fn with_download_handlers<'a>(
                 url,
                 file_name,
                 destination: final_path,
-                started_at: unix_now(),
+                started_at: now_unix(),
             });
             true
         })
@@ -177,19 +178,6 @@ pub(super) fn with_download_handlers<'a>(
                 success,
             });
         })
-}
-
-/// Current time as a unix timestamp (seconds); `0` on a clock set before
-/// 1970, which should never happen in practice. A separate copy of
-/// `app::now_unix` (private there) — `ui::window` needs a timestamp at the
-/// moment a download is accepted, inside a wry callback that has no access
-/// to `app.rs`'s state, so duplicating this trivial conversion is simpler
-/// than threading a clock dependency through.
-fn unix_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// 保存対象のタブに生きた webview がないときに「名前を付けて保存」
@@ -217,7 +205,7 @@ pub(super) fn send_save_page_started(
         url,
         file_name,
         destination,
-        started_at: unix_now(),
+        started_at: now_unix(),
     });
 }
 

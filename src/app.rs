@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{
@@ -23,6 +23,7 @@ use crate::browser::perf_log::{IpcLog, PerfLog};
 use crate::browser::suspension::{
     self, MemoryBudgetInput, MemorySample, SuspendReason, SuspensionPolicy,
 };
+use crate::browser::util::now_unix;
 use crate::browser::{
     context_menu, find, input_history, metrics, navigation, omnibox, persistence, print,
     shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
@@ -2843,16 +2844,6 @@ fn debug_logging_enabled() -> bool {
     std::env::var_os("VELOX_DEBUG").is_some()
 }
 
-/// Current time as a unix timestamp (seconds). Falls back to `0` on a clock
-/// set before 1970, which should never happen in practice; kept infallible
-/// so callers never need to thread a `Result` through for it.
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// Maximum number of `char`s of a malformed/oversized IPC body ever printed
 /// to stderr by [`handle_user_event`]'s `ToolbarMessage` arm.
 const LOG_PREVIEW_MAX_CHARS: usize = 200;
@@ -2891,6 +2882,7 @@ fn log_failure<T, E: std::fmt::Display>(action: &str, result: Result<T, E>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::util::unique_temp_path;
     use std::path::Path;
 
     // --- log_preview (Issue #35): a malformed/oversized IPC body must
@@ -3109,11 +3101,11 @@ mod tests {
     }
 
     /// A fresh, unique temp directory for a `persist_session` test to write
-    /// into — mirrors `unique_temp_file` below (added for the download
+    /// into — built on `unique_temp_path` (also used by the download
     /// tests) but for a directory `persistence::save_session` can create
     /// `session.json` under.
     fn unique_temp_dir(label: &str) -> PathBuf {
-        let dir = unique_temp_file(&format!("velox-app-test-{label}"));
+        let dir = unique_temp_path(&format!("velox-app-test-{label}"));
         std::fs::create_dir_all(&dir).expect("create a temp dir for a persist_session test");
         dir
     }
@@ -3315,7 +3307,7 @@ mod tests {
         // `velox-bench` trial would parse.
         let mut page_load_timers: PageLoadTimers = HashMap::new();
         let mut startup = None;
-        let path = unique_temp_file("velox-app-page-load-stages");
+        let path = unique_temp_path("velox-app-page-load-stages");
         let _ = std::fs::remove_file(&path);
         let log = PerfLog::to_file(metrics::PerfFormat::Json, &path).expect("open perf log file");
         let process_start = Instant::now();
@@ -3413,22 +3405,10 @@ mod tests {
 
     // --- Downloads (Issue #16, see docs/decisions.md D28) ---
 
-    fn unique_temp_file(label: &str) -> PathBuf {
-        let unique = format!(
-            "{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
-    }
-
     #[test]
     fn cancel_download_marks_the_entry_cancelled_and_removes_the_partial_file() {
         let mut state = state_with_history_enabled(true);
-        let path = unique_temp_file("velox-app-cancel");
+        let path = unique_temp_path("velox-app-cancel");
         std::fs::write(&path, b"partial").unwrap();
 
         let id = state.downloads.start(
@@ -3456,7 +3436,7 @@ mod tests {
     #[test]
     fn cancel_download_on_an_already_completed_entry_is_a_noop() {
         let mut state = state_with_history_enabled(true);
-        let path = unique_temp_file("velox-app-cancel-completed");
+        let path = unique_temp_path("velox-app-cancel-completed");
         std::fs::write(&path, b"done").unwrap();
 
         let id = state.downloads.start(

@@ -187,10 +187,11 @@ fn write_json<T: Serialize>(dir: &Path, file: &str, value: &T) -> std::io::Resul
 mod tests {
     use super::super::session::{SavedTab, SavedWindow};
     use super::*;
+    use crate::browser::util::unique_temp_path;
 
     #[test]
     fn missing_files_load_as_empty_stores() {
-        let dir = unique_temp_dir("velox-persist-missing");
+        let dir = unique_temp_path("velox-persist-missing");
         assert_eq!(load_history(&dir), HistoryStore::new());
         assert_eq!(load_bookmarks(&dir), BookmarkStore::new());
         assert_eq!(load_input_history(&dir), InputHistoryStore::new());
@@ -199,7 +200,7 @@ mod tests {
 
     #[test]
     fn input_history_round_trips_through_disk() {
-        let dir = unique_temp_dir("velox-persist-input-history");
+        let dir = unique_temp_path("velox-persist-input-history");
         let mut store = InputHistoryStore::new();
         store.record("rust ownership", 100, 0);
         store.record("rust async", 200, 0);
@@ -213,7 +214,7 @@ mod tests {
 
     #[test]
     fn history_round_trips_through_disk() {
-        let dir = unique_temp_dir("velox-persist-history");
+        let dir = unique_temp_path("velox-persist-history");
         let mut store = HistoryStore::new();
         store.record_visit("https://example.com/", Some("Example".to_owned()), 100, 0);
         store.record_visit("https://rust-lang.org/", None, 200, 0);
@@ -227,7 +228,7 @@ mod tests {
 
     #[test]
     fn bookmarks_round_trip_through_disk() {
-        let dir = unique_temp_dir("velox-persist-bookmarks");
+        let dir = unique_temp_path("velox-persist-bookmarks");
         let mut store = BookmarkStore::new();
         store.add("https://example.com/", Some("Example".to_owned()), 100);
 
@@ -240,7 +241,7 @@ mod tests {
 
     #[test]
     fn save_creates_missing_parent_directories() {
-        let root = unique_temp_dir("velox-persist-mkdir");
+        let root = unique_temp_path("velox-persist-mkdir");
         let dir = root.join("nested").join("data");
         assert!(!dir.exists());
         save_history(&dir, &HistoryStore::new()).expect("save_history should create the dir");
@@ -264,7 +265,7 @@ mod tests {
 
     #[test]
     fn truncated_json_falls_back_to_an_empty_store_for_every_store() {
-        let dir = unique_temp_dir("velox-persist-truncated");
+        let dir = unique_temp_path("velox-persist-truncated");
         fs::create_dir_all(&dir).unwrap();
         // A file that starts out as valid-looking JSON but is cut off
         // mid-value, e.g. by a crash or a full disk during a previous save.
@@ -289,7 +290,7 @@ mod tests {
 
     #[test]
     fn json_of_the_wrong_shape_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-wrong-shape");
+        let dir = unique_temp_path("velox-persist-wrong-shape");
         fs::create_dir_all(&dir).unwrap();
         // Valid JSON, but not the shape any of these stores expect (e.g. a
         // bare array, or an object missing every required field).
@@ -306,7 +307,7 @@ mod tests {
 
     #[test]
     fn json_with_wrong_field_types_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-wrong-types");
+        let dir = unique_temp_path("velox-persist-wrong-types");
         fs::create_dir_all(&dir).unwrap();
         // `id` should be a `u64`, `visited_at` a `u64` — strings/negative
         // numbers here must fail deserialization cleanly, not panic.
@@ -325,7 +326,7 @@ mod tests {
         // Same JSON-bomb shape `ui::toolbar`'s IPC parser is hardened
         // against — the store loader goes through the same `serde_json`
         // parser and must be equally immune to a stack overflow.
-        let dir = unique_temp_dir("velox-persist-deep-nesting");
+        let dir = unique_temp_path("velox-persist-deep-nesting");
         fs::create_dir_all(&dir).unwrap();
         let depth = 100_000;
         let bomb = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
@@ -341,7 +342,7 @@ mod tests {
         // issue: a large *legitimate* history file (many entries
         // accumulated over a long-lived profile) must still load — nothing
         // here should impose an accidental low ceiling.
-        let dir = unique_temp_dir("velox-persist-huge-legit");
+        let dir = unique_temp_path("velox-persist-huge-legit");
         let mut store = HistoryStore::new();
         for i in 0..20_000u64 {
             store.record_visit(&format!("https://example.com/{i}"), None, i, 0);
@@ -398,7 +399,7 @@ mod tests {
     fn site_permissions_round_trip_through_disk() {
         use super::super::site_permissions::{PermissionDecision, PermissionKind};
 
-        let dir = unique_temp_dir("velox-persist-site-permissions");
+        let dir = unique_temp_path("velox-persist-site-permissions");
         let mut store = SitePermissionStore::new();
         store.set(
             "https://example.com",
@@ -436,13 +437,13 @@ mod tests {
 
     #[test]
     fn missing_session_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-missing");
+        let dir = unique_temp_path("velox-persist-session-missing");
         assert_eq!(load_session(&dir), None);
     }
 
     #[test]
     fn session_round_trips_through_disk() {
-        let dir = unique_temp_dir("velox-persist-session");
+        let dir = unique_temp_path("velox-persist-session");
         let snapshot = SessionSnapshot {
             windows: vec![SavedWindow {
                 tabs: vec![
@@ -481,7 +482,7 @@ mod tests {
 
     #[test]
     fn truncated_session_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-truncated");
+        let dir = unique_temp_path("velox-persist-session-truncated");
         fs::create_dir_all(&dir).unwrap();
         // A well-formed session, chopped off mid-object — simulates a write
         // interrupted by a crash or power loss.
@@ -507,7 +508,7 @@ mod tests {
 
     #[test]
     fn session_file_of_the_wrong_json_shape_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-wrong-shape");
+        let dir = unique_temp_path("velox-persist-session-wrong-shape");
         fs::create_dir_all(&dir).unwrap();
         // A bare array/number/string instead of the expected object.
         for wrong in ["[1,2,3]", "42", "\"hello\"", "null"] {
@@ -520,7 +521,7 @@ mod tests {
 
     #[test]
     fn session_file_with_wrong_field_types_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-wrong-types");
+        let dir = unique_temp_path("velox-persist-session-wrong-types");
         fs::create_dir_all(&dir).unwrap();
         // `active_index` as a string, `tabs` as an object instead of an
         // array — both should fail to deserialize rather than panicking or
@@ -542,7 +543,7 @@ mod tests {
         // `serde_json` streams through `fs::read_to_string` just like every
         // other store here, so this exercises that path at a size no real
         // user session would ever reach.
-        let dir = unique_temp_dir("velox-persist-session-large");
+        let dir = unique_temp_path("velox-persist-session-large");
         let tabs: Vec<SavedTab> = (0..20_000)
             .map(|i| SavedTab {
                 url: format!("https://{i}.example/"),
@@ -571,13 +572,13 @@ mod tests {
 
     #[test]
     fn missing_settings_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-settings-missing");
+        let dir = unique_temp_path("velox-persist-settings-missing");
         assert_eq!(load_settings(&dir), None);
     }
 
     #[test]
     fn settings_round_trip_through_disk() {
-        let dir = unique_temp_dir("velox-persist-settings");
+        let dir = unique_temp_path("velox-persist-settings");
         let mut settings = Settings::default();
         settings.general.homepage = "https://example.com/".to_owned();
         settings.privacy.content_blocking_site_exceptions = vec!["example.com".to_owned()];
@@ -599,7 +600,7 @@ mod tests {
 
     #[test]
     fn truncated_settings_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-settings-truncated");
+        let dir = unique_temp_path("velox-persist-settings-truncated");
         fs::create_dir_all(&dir).unwrap();
         let full = serde_json::to_string(&Settings::default()).unwrap();
         let truncated = &full[..full.len() / 2];
@@ -629,26 +630,12 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// [`unique_temp_dir`] を作成し、その中の `file` に `contents` を書き
+    /// [`unique_temp_path`] を作成し、その中の `file` に `contents` を書き
     /// 込んで返す。壊れた/想定外の内容のファイルを 1 つ置くだけのテスト用。
     fn temp_dir_with_file(label: &str, file: &str, contents: impl AsRef<[u8]>) -> PathBuf {
-        let dir = unique_temp_dir(label);
+        let dir = unique_temp_path(label);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(file), contents).unwrap();
         dir
-    }
-
-    /// A per-test temp directory under the OS temp dir, distinguished by
-    /// `label` plus the current thread so parallel tests never collide.
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let unique = format!(
-            "{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
     }
 }

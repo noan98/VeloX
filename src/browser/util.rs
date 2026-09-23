@@ -1,6 +1,6 @@
 //! `browser::` の複数モジュールで共有する小さな汎用ヘルパー。
 //!
-//! 特定の機能に属さない、文字列や `Vec` に対する数行の処理だけを置く。
+//! 特定の機能に属さない、文字列・`Vec`・時刻などに対する数行の処理だけを置く。
 //! 各モジュールがそれぞれ同じ実装を持っていたものを 1 か所にまとめたもので、
 //! 振る舞いは元の実装と同一。
 
@@ -24,6 +24,32 @@ pub(crate) fn remove_where<T>(items: &mut Vec<T>, mut pred: impl FnMut(&T) -> bo
     let before = items.len();
     items.retain(|item| !pred(item));
     items.len() != before
+}
+
+/// 現在時刻の unix タイムスタンプ (秒)。1970 年より前に設定された時計
+/// (実運用ではまず起きない) では `0` を返す。呼び出し側が `Result` を
+/// 引き回さずに済むよう infallible にしている。`app` と `ui::window` の
+/// ダウンロード受付 (wry コールバック内) の両方から使う。
+pub(crate) fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// テスト用: OS の一時ディレクトリ配下の、`label` + 現在スレッド + 現在時刻
+/// (ナノ秒) で一意なパス (作成はしない)。並列に走るテスト同士で衝突しない。
+#[cfg(test)]
+pub(crate) fn unique_temp_path(label: &str) -> std::path::PathBuf {
+    let unique = format!(
+        "{label}-{:?}-{}",
+        std::thread::current().id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default()
+    );
+    std::env::temp_dir().join(unique)
 }
 
 #[cfg(test)]
