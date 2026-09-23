@@ -9,6 +9,7 @@
 //! rationale behind the exact numbers below; `browser::omnibox_candidates`
 //! is where these functions are wired into `CandidateSource` impls.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 use crate::browser::bookmarks::BookmarkEntry;
@@ -42,15 +43,12 @@ const RECENCY_LAST_7_DAYS: f64 = 10.0;
 const RECENCY_OLDER: f64 = 0.0;
 
 fn recency_score(timestamp: Option<u64>, now: u64) -> f64 {
-    match timestamp {
-        None => 0.0,
-        Some(ts) => match date_bucket(ts, now) {
-            HistoryDateBucket::Today => RECENCY_TODAY,
-            HistoryDateBucket::Yesterday => RECENCY_YESTERDAY,
-            HistoryDateBucket::Last7Days => RECENCY_LAST_7_DAYS,
-            HistoryDateBucket::Older => RECENCY_OLDER,
-        },
-    }
+    timestamp.map_or(0.0, |ts| match date_bucket(ts, now) {
+        HistoryDateBucket::Today => RECENCY_TODAY,
+        HistoryDateBucket::Yesterday => RECENCY_YESTERDAY,
+        HistoryDateBucket::Last7Days => RECENCY_LAST_7_DAYS,
+        HistoryDateBucket::Older => RECENCY_OLDER,
+    })
 }
 
 /// Extra points for a match that accounts for a larger share of the
@@ -67,6 +65,34 @@ fn match_ratio_bonus(query_len_chars: usize, field_len_chars: usize) -> f64 {
     }
     let ratio = (query_len_chars as f64 / field_len_chars as f64).min(1.0);
     ratio * MATCH_RATIO_WEIGHT
+}
+
+/// 前後の空白を除いて小文字化したクエリと、その `char` 数。空白だけ・空の
+/// クエリは何にもマッチさせないので `None`。
+fn normalize_query(query: &str) -> Option<(String, usize)> {
+    let query = query.trim();
+    if query.is_empty() {
+        return None;
+    }
+    let query_lower = query.to_lowercase();
+    let query_len = query_lower.chars().count();
+    Some((query_lower, query_len))
+}
+
+/// スコア付きの候補を「スコア降順 → `tie_break`」で並べ、`limit` 件に
+/// 切り詰めて候補だけを返す。
+fn sort_and_truncate<T>(
+    mut scored: Vec<(T, f64)>,
+    limit: usize,
+    tie_break: impl Fn(&T, &T) -> Ordering,
+) -> Vec<T> {
+    scored.sort_by(|(a_entry, a_score), (b_entry, b_score)| {
+        b_score
+            .total_cmp(a_score)
+            .then_with(|| tie_break(a_entry, b_entry))
+    });
+    scored.truncate(limit);
+    scored.into_iter().map(|(entry, _)| entry).collect()
 }
 
 // --- History/bookmark ("page") entries ---
@@ -122,53 +148,32 @@ fn host_lower(url: &str) -> String {
 /// frecency/bookmark status only ever break ties among actual matches, they
 /// never manufacture one).
 pub fn score_page_entry(entry: &RankableEntry<'_>, query: &str, now: u64) -> Option<f64> {
-    let query = query.trim();
-    if query.is_empty() {
-        return None;
-    }
-    let query_lower = query.to_lowercase();
-    let query_len = query_lower.chars().count();
+    let (query_lower, query_len) = normalize_query(query)?;
+    let query_lower = query_lower.as_str();
 
     let host = host_lower(entry.url);
     let title_lower = entry.title.map(str::to_lowercase);
-    let url_lower = entry.url.to_lowercase();
+    let title = title_lower.as_deref();
+    // URL 全体の小文字化は最弱の段にたどり着いたときだけ行う。
+    let url_lower: String;
 
-    let (tier, ratio_bonus) = if host.starts_with(&query_lower) {
-        (
-            TIER_HOST_PREFIX,
-            match_ratio_bonus(query_len, host.chars().count()),
-        )
-    } else if title_lower
-        .as_deref()
-        .is_some_and(|title| title.starts_with(&query_lower))
-    {
-        let title = title_lower.as_deref().unwrap();
-        (
-            TIER_TITLE_PREFIX,
-            match_ratio_bonus(query_len, title.chars().count()),
-        )
-    } else if host.contains(&query_lower) {
-        (
-            TIER_HOST_CONTAINS,
-            match_ratio_bonus(query_len, host.chars().count()),
-        )
-    } else if title_lower
-        .as_deref()
-        .is_some_and(|title| title.contains(&query_lower))
-    {
-        let title = title_lower.as_deref().unwrap();
-        (
-            TIER_TITLE_CONTAINS,
-            match_ratio_bonus(query_len, title.chars().count()),
-        )
-    } else if url_lower.contains(&query_lower) {
-        (
-            TIER_URL_CONTAINS,
-            match_ratio_bonus(query_len, url_lower.chars().count()),
-        )
+    // マッチした段と、マッチ率の分母にするフィールド。
+    let (tier, matched_field) = if host.starts_with(query_lower) {
+        (TIER_HOST_PREFIX, host.as_str())
+    } else if let Some(title) = title.filter(|title| title.starts_with(query_lower)) {
+        (TIER_TITLE_PREFIX, title)
+    } else if host.contains(query_lower) {
+        (TIER_HOST_CONTAINS, host.as_str())
+    } else if let Some(title) = title.filter(|title| title.contains(query_lower)) {
+        (TIER_TITLE_CONTAINS, title)
     } else {
-        return None;
+        url_lower = entry.url.to_lowercase();
+        if !url_lower.contains(query_lower) {
+            return None;
+        }
+        (TIER_URL_CONTAINS, url_lower.as_str())
     };
+    let ratio_bonus = match_ratio_bonus(query_len, matched_field.chars().count());
 
     let bookmark_bonus = if entry.is_bookmark {
         BOOKMARK_BONUS
@@ -248,19 +253,15 @@ pub fn rank_page_entries<'a>(
     now: u64,
     limit: usize,
 ) -> Vec<RankableEntry<'a>> {
-    let mut scored: Vec<(RankableEntry<'a>, f64)> = entries
+    let scored = entries
         .into_iter()
         .filter_map(|entry| score_page_entry(&entry, query, now).map(|score| (entry, score)))
         .collect();
-
-    scored.sort_by(|(a_entry, a_score), (b_entry, b_score)| {
-        b_score
-            .total_cmp(a_score)
-            .then_with(|| b_entry.last_visited_at.cmp(&a_entry.last_visited_at))
-            .then_with(|| a_entry.url.cmp(b_entry.url))
-    });
-    scored.truncate(limit);
-    scored.into_iter().map(|(entry, _)| entry).collect()
+    sort_and_truncate(scored, limit, |a, b| {
+        b.last_visited_at
+            .cmp(&a.last_visited_at)
+            .then_with(|| a.url.cmp(b.url))
+    })
 }
 
 // --- Typed search-query ("input history") entries ---
@@ -269,27 +270,17 @@ const TIER_TEXT_PREFIX: f64 = 80.0;
 const TIER_TEXT_CONTAINS: f64 = 40.0;
 
 fn score_input_history_entry(entry: &InputHistoryEntry, query: &str, now: u64) -> Option<f64> {
-    let query = query.trim();
-    if query.is_empty() {
-        return None;
-    }
-    let query_lower = query.to_lowercase();
-    let query_len = query_lower.chars().count();
+    let (query_lower, query_len) = normalize_query(query)?;
     let text_lower = entry.text.to_lowercase();
 
-    let (tier, ratio_bonus) = if text_lower.starts_with(&query_lower) {
-        (
-            TIER_TEXT_PREFIX,
-            match_ratio_bonus(query_len, text_lower.chars().count()),
-        )
+    let tier = if text_lower.starts_with(&query_lower) {
+        TIER_TEXT_PREFIX
     } else if text_lower.contains(&query_lower) {
-        (
-            TIER_TEXT_CONTAINS,
-            match_ratio_bonus(query_len, text_lower.chars().count()),
-        )
+        TIER_TEXT_CONTAINS
     } else {
         return None;
     };
+    let ratio_bonus = match_ratio_bonus(query_len, text_lower.chars().count());
 
     Some(
         tier + ratio_bonus
@@ -306,21 +297,17 @@ pub fn rank_input_history<'a>(
     now: u64,
     limit: usize,
 ) -> Vec<&'a InputHistoryEntry> {
-    let mut scored: Vec<(&'a InputHistoryEntry, f64)> = entries
+    let scored = entries
         .iter()
         .filter_map(|entry| {
             score_input_history_entry(entry, query, now).map(|score| (entry, score))
         })
         .collect();
-
-    scored.sort_by(|(a_entry, a_score), (b_entry, b_score)| {
-        b_score
-            .total_cmp(a_score)
-            .then_with(|| b_entry.last_used_at.cmp(&a_entry.last_used_at))
-            .then_with(|| a_entry.text.cmp(&b_entry.text))
-    });
-    scored.truncate(limit);
-    scored.into_iter().map(|(entry, _)| entry).collect()
+    sort_and_truncate(scored, limit, |a, b| {
+        b.last_used_at
+            .cmp(&a.last_used_at)
+            .then_with(|| a.text.cmp(&b.text))
+    })
 }
 
 #[cfg(test)]
@@ -549,24 +536,37 @@ mod tests {
 
     // --- merge_entries ---
 
-    #[test]
-    fn merge_keeps_history_only_and_bookmark_only_entries_separate() {
-        let history = vec![HistoryEntry {
+    fn history_entry(
+        url: &str,
+        title: Option<&str>,
+        visited_at: u64,
+        visit_count: u32,
+    ) -> HistoryEntry {
+        HistoryEntry {
             id: 1,
-            url: "https://a.example/".to_owned(),
-            title: Some("A".to_owned()),
-            visited_at: 100,
+            url: url.to_owned(),
+            title: title.map(str::to_owned),
+            visited_at,
             favicon: None,
-            visit_count: 3,
-        }];
-        let bookmarks = vec![BookmarkEntry {
+            visit_count,
+        }
+    }
+
+    fn bookmark_entry(url: &str, title: Option<&str>) -> BookmarkEntry {
+        BookmarkEntry {
             id: 1,
-            url: "https://b.example/".to_owned(),
-            title: Some("B".to_owned()),
+            url: url.to_owned(),
+            title: title.map(str::to_owned),
             created_at: 100,
             folder_id: None,
             favicon: None,
-        }];
+        }
+    }
+
+    #[test]
+    fn merge_keeps_history_only_and_bookmark_only_entries_separate() {
+        let history = vec![history_entry("https://a.example/", Some("A"), 100, 3)];
+        let bookmarks = vec![bookmark_entry("https://b.example/", Some("B"))];
         let merged = merge_entries(&history, &bookmarks);
         assert_eq!(merged.len(), 2);
         let a = merged
@@ -586,22 +586,16 @@ mod tests {
 
     #[test]
     fn merge_combines_a_url_that_is_both_visited_and_bookmarked_into_one_entry() {
-        let history = vec![HistoryEntry {
-            id: 1,
-            url: "https://example.com/".to_owned(),
-            title: Some("History Title".to_owned()),
-            visited_at: 500,
-            favicon: None,
-            visit_count: 7,
-        }];
-        let bookmarks = vec![BookmarkEntry {
-            id: 1,
-            url: "https://example.com/".to_owned(),
-            title: Some("Bookmark Title".to_owned()),
-            created_at: 100,
-            folder_id: None,
-            favicon: None,
-        }];
+        let history = vec![history_entry(
+            "https://example.com/",
+            Some("History Title"),
+            500,
+            7,
+        )];
+        let bookmarks = vec![bookmark_entry(
+            "https://example.com/",
+            Some("Bookmark Title"),
+        )];
         let merged = merge_entries(&history, &bookmarks);
         assert_eq!(merged.len(), 1);
         let e = &merged[0];
@@ -616,22 +610,13 @@ mod tests {
 
     #[test]
     fn merge_falls_back_to_the_history_title_when_the_bookmark_has_none() {
-        let history = vec![HistoryEntry {
-            id: 1,
-            url: "https://example.com/".to_owned(),
-            title: Some("History Title".to_owned()),
-            visited_at: 500,
-            favicon: None,
-            visit_count: 1,
-        }];
-        let bookmarks = vec![BookmarkEntry {
-            id: 1,
-            url: "https://example.com/".to_owned(),
-            title: None,
-            created_at: 100,
-            folder_id: None,
-            favicon: None,
-        }];
+        let history = vec![history_entry(
+            "https://example.com/",
+            Some("History Title"),
+            500,
+            1,
+        )];
+        let bookmarks = vec![bookmark_entry("https://example.com/", None)];
         let merged = merge_entries(&history, &bookmarks);
         assert_eq!(merged[0].title, Some("History Title"));
     }
@@ -675,13 +660,10 @@ mod tests {
 
     #[test]
     fn rank_page_entries_truncates_to_the_limit() {
-        let entries: Vec<RankableEntry> = (0..10)
-            .map(|i| {
-                let url: &'static str =
-                    Box::leak(format!("https://example{i}.test/").into_boxed_str());
-                entry(url, None, 0, None, false)
-            })
+        let urls: Vec<String> = (0..10)
+            .map(|i| format!("https://example{i}.test/"))
             .collect();
+        let entries = urls.iter().map(|url| entry(url, None, 0, None, false));
         let ranked = rank_page_entries(entries, "example", now(), 3);
         assert_eq!(ranked.len(), 3);
     }

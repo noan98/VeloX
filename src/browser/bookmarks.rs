@@ -9,6 +9,8 @@
 //! reference (one level, no nesting) rather than a tree, and D34 for the
 //! manual-reorder scheme (`move_up`/`move_down`).
 
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 /// One bookmarked page.
@@ -172,16 +174,19 @@ impl BookmarkStore {
     /// Remove the bookmark with the given id. Returns `true` when a
     /// bookmark was removed.
     pub fn remove(&mut self, id: u64) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        self.remove_entries_where(|entry| entry.id == id)
     }
 
     /// Remove the bookmark for `url`, if any. Returns `true` when a
     /// bookmark was removed.
     pub fn remove_by_url(&mut self, url: &str) -> bool {
+        self.remove_entries_where(|entry| entry.url == url)
+    }
+
+    /// `pred` に当てはまるエントリをすべて取り除き、1 件でも消えたら `true`。
+    fn remove_entries_where(&mut self, mut pred: impl FnMut(&BookmarkEntry) -> bool) -> bool {
         let before = self.entries.len();
-        self.entries.retain(|entry| entry.url != url);
+        self.entries.retain(|entry| !pred(entry));
         self.entries.len() != before
     }
 
@@ -222,16 +227,21 @@ impl BookmarkStore {
         if self.entries.iter().any(|e| e.id != id && e.url == url) {
             return Err(BookmarkEditError::DuplicateUrl);
         }
-        let folder_id = folder_id.filter(|fid| self.folders.iter().any(|f| f.id == *fid));
-        match self.entries.iter_mut().find(|entry| entry.id == id) {
-            Some(entry) => {
-                entry.title = title;
-                entry.url = url;
-                entry.folder_id = folder_id;
-                Ok(())
-            }
-            None => Err(BookmarkEditError::NotFound),
-        }
+        let folder_id = folder_id.filter(|&fid| self.has_folder(fid));
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == id)
+            .ok_or(BookmarkEditError::NotFound)?;
+        entry.title = title;
+        entry.url = url;
+        entry.folder_id = folder_id;
+        Ok(())
+    }
+
+    /// `id` のフォルダが存在するか。
+    fn has_folder(&self, id: u64) -> bool {
+        self.folders.iter().any(|folder| folder.id == id)
     }
 
     /// Move the nearest neighbor, within the same [`Self::entries_in`]
@@ -261,13 +271,11 @@ impl BookmarkStore {
                 .position(|entry| entry.folder_id == folder_id)
                 .map(|offset| index + 1 + offset),
         };
-        match neighbor {
-            Some(neighbor_index) => {
-                self.entries.swap(index, neighbor_index);
-                true
-            }
-            None => false,
-        }
+        let Some(neighbor_index) = neighbor else {
+            return false;
+        };
+        self.entries.swap(index, neighbor_index);
+        true
     }
 
     /// Create a new folder, returning its id.
@@ -285,13 +293,11 @@ impl BookmarkStore {
     /// Rename an existing folder. Returns `true` when the folder was found
     /// and renamed.
     pub fn rename_folder(&mut self, id: u64, name: String) -> bool {
-        match self.folders.iter_mut().find(|folder| folder.id == id) {
-            Some(folder) => {
-                folder.name = name;
-                true
-            }
-            None => false,
-        }
+        let Some(folder) = self.folders.iter_mut().find(|folder| folder.id == id) else {
+            return false;
+        };
+        folder.name = name;
+        true
     }
 
     /// Remove a folder. Every bookmark that was in it is reparented to the
@@ -302,15 +308,15 @@ impl BookmarkStore {
     pub fn remove_folder(&mut self, id: u64) -> bool {
         let before = self.folders.len();
         self.folders.retain(|folder| folder.id != id);
-        let removed = self.folders.len() != before;
-        if removed {
-            for entry in &mut self.entries {
-                if entry.folder_id == Some(id) {
-                    entry.folder_id = None;
-                }
+        if self.folders.len() == before {
+            return false;
+        }
+        for entry in &mut self.entries {
+            if entry.folder_id == Some(id) {
+                entry.folder_id = None;
             }
         }
-        removed
+        true
     }
 
     /// Update the favicon URL of the bookmark for `url`, if one exists.
@@ -320,13 +326,11 @@ impl BookmarkStore {
     /// *page* a favicon belongs to, not whether/which bookmark id that page
     /// happens to have (see docs/decisions.md D34).
     pub fn update_favicon_by_url(&mut self, url: &str, favicon: String) -> bool {
-        match self.entries.iter_mut().find(|entry| entry.url == url) {
-            Some(entry) => {
-                entry.favicon = Some(favicon);
-                true
-            }
-            None => false,
-        }
+        let Some(entry) = self.entries.iter_mut().find(|entry| entry.url == url) else {
+            return false;
+        };
+        entry.favicon = Some(favicon);
+        true
     }
 
     /// Reparent every entry whose `folder_id` does not name a folder that
@@ -347,14 +351,15 @@ impl BookmarkStore {
     /// and not in the folder it claims either (that folder does not exist
     /// to render it) — see docs/decisions.md D62.
     pub fn repair_dangling_folder_ids(&mut self) -> usize {
-        let valid: std::collections::HashSet<u64> = self.folders.iter().map(|f| f.id).collect();
+        let valid: HashSet<u64> = self.folders.iter().map(|f| f.id).collect();
         let mut repaired = 0;
         for entry in &mut self.entries {
-            if let Some(folder_id) = entry.folder_id {
-                if !valid.contains(&folder_id) {
-                    entry.folder_id = None;
-                    repaired += 1;
-                }
+            if entry
+                .folder_id
+                .is_some_and(|folder_id| !valid.contains(&folder_id))
+            {
+                entry.folder_id = None;
+                repaired += 1;
             }
         }
         repaired
@@ -370,6 +375,23 @@ enum Direction {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `id` のブックマークを URL・タイトル (`None`) はそのままに `folder` へ移す。
+    fn put_in_folder(store: &mut BookmarkStore, id: u64, folder: u64) {
+        let url = store
+            .entries()
+            .iter()
+            .find(|entry| entry.id == id)
+            .expect("bookmark should exist")
+            .url
+            .clone();
+        store.edit(id, None, url, Some(folder)).unwrap();
+    }
+
+    /// 表示順どおりの全エントリ id。
+    fn ids(store: &BookmarkStore) -> Vec<u64> {
+        store.entries().iter().map(|e| e.id).collect()
+    }
 
     #[test]
     fn adds_a_bookmark() {
@@ -490,9 +512,7 @@ mod tests {
         let mut store = BookmarkStore::new();
         let folder = store.create_folder("仕事".to_owned(), 1);
         let entry = store.add("https://example.com/", None, 1);
-        store
-            .edit(entry, None, "https://example.com/".to_owned(), Some(folder))
-            .unwrap();
+        put_in_folder(&mut store, entry, folder);
         assert_eq!(store.entries()[0].folder_id, Some(folder));
 
         assert!(store.remove_folder(folder));
@@ -513,9 +533,7 @@ mod tests {
         let a = store.add("https://a.example/", None, 1);
         let b = store.add("https://b.example/", None, 2);
         let c = store.add("https://c.example/", None, 3);
-        store
-            .edit(b, None, "https://b.example/".to_owned(), Some(folder))
-            .unwrap();
+        put_in_folder(&mut store, b, folder);
 
         let root: Vec<u64> = store.entries_in(None).map(|e| e.id).collect();
         assert_eq!(root, [a, c]);
@@ -608,15 +626,9 @@ mod tests {
         let c = store.add("https://c.example/", None, 3);
 
         assert!(store.move_up(c));
-        assert_eq!(
-            store.entries().iter().map(|e| e.id).collect::<Vec<_>>(),
-            [a, c, b]
-        );
+        assert_eq!(ids(&store), [a, c, b]);
         assert!(store.move_down(a));
-        assert_eq!(
-            store.entries().iter().map(|e| e.id).collect::<Vec<_>>(),
-            [c, a, b]
-        );
+        assert_eq!(ids(&store), [c, a, b]);
     }
 
     #[test]
@@ -649,9 +661,7 @@ mod tests {
         let folder = store.create_folder("仕事".to_owned(), 1);
         let a = store.add("https://a.example/", None, 1);
         let b = store.add("https://b.example/", None, 2);
-        store
-            .edit(b, None, "https://b.example/".to_owned(), Some(folder))
-            .unwrap();
+        put_in_folder(&mut store, b, folder);
         // `a` is the only root-level entry now (`b` moved to `folder`), so
         // there is no root-level neighbor for it to swap with even though
         // `b` sits right next to it in the underlying vector.
@@ -749,9 +759,7 @@ mod tests {
         let mut ids = Vec::new();
         for i in 0..500u64 {
             let id = store.add(&format!("https://{i}.example/"), None, i);
-            store
-                .edit(id, None, format!("https://{i}.example/"), Some(folder))
-                .unwrap();
+            put_in_folder(&mut store, id, folder);
             ids.push(id);
         }
         // Repeatedly moving the same (now-first) entry up must be a no-op,
@@ -811,9 +819,7 @@ mod tests {
         let mut store = BookmarkStore::new();
         let folder = store.create_folder("仕事".to_owned(), 1);
         let id = store.add("https://example.com/", None, 1);
-        store
-            .edit(id, None, "https://example.com/".to_owned(), Some(folder))
-            .unwrap();
+        put_in_folder(&mut store, id, folder);
         assert_eq!(store.repair_dangling_folder_ids(), 0);
         assert_eq!(store.entries()[0].folder_id, Some(folder));
     }
