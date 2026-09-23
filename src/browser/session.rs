@@ -586,10 +586,8 @@ mod tests {
         let snapshot = snapshot(vec![window(
             vec![
                 SavedTab {
-                    url: "https://a.example/".to_owned(),
-                    title: None,
-                    favicon: None,
                     pinned: true,
+                    ..saved("https://a.example/")
                 },
                 saved("https://b.example/"),
             ],

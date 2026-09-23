@@ -721,6 +721,20 @@ fn apply_settings_copies_performance_fields_into_the_suspension_policy() {
     assert!(config.suspension.is_enabled());
 }
 
+/// 休止ポリシーの 3 信号をすべて既定とは違う値でオンにした `Config`。
+/// `apply_settings` が上書き (マージではなく) することを確かめる出発点。
+fn config_with_every_suspension_signal_on() -> Config {
+    Config {
+        suspension: SuspensionPolicy {
+            idle_after: Some(Duration::from_secs(10)),
+            max_live_tabs: Some(3),
+            memory_budget_bytes: Some(100),
+            memory_check_interval: Duration::from_secs(1),
+        },
+        ..Config::default()
+    }
+}
+
 #[test]
 fn apply_settings_with_default_settings_leaves_the_default_on_memory_signal_enabled() {
     // Since D90, `Settings::default()` (a settings screen never opened,
@@ -729,15 +743,7 @@ fn apply_settings_with_default_settings_leaves_the_default_on_memory_signal_enab
     // (`PerformanceSettings::default`'s `memory_budget_mb` mirrors it —
     // see that constant's doc comment) — applying it must not silently
     // disable what a fresh checkout already has on.
-    let mut config = Config {
-        suspension: SuspensionPolicy {
-            idle_after: Some(Duration::from_secs(10)),
-            max_live_tabs: Some(3),
-            memory_budget_bytes: Some(100),
-            memory_check_interval: Duration::from_secs(1),
-        },
-        ..Config::default()
-    };
+    let mut config = config_with_every_suspension_signal_on();
     config.apply_settings(&Settings::default());
     assert_eq!(config.suspension, SuspensionPolicy::default());
     assert!(config.suspension.is_enabled());
@@ -753,15 +759,7 @@ fn apply_settings_explicit_none_signals_disable_the_suspension_policy() {
     // disabled one — proving `apply_settings` overwrites rather than
     // merges, and that D90's default-on memory signal really can be
     // turned off from the UI, not just via `VELOX_MEMORY_BUDGET_MB=0`.
-    let mut config = Config {
-        suspension: SuspensionPolicy {
-            idle_after: Some(Duration::from_secs(10)),
-            max_live_tabs: Some(3),
-            memory_budget_bytes: Some(100),
-            memory_check_interval: Duration::from_secs(1),
-        },
-        ..Config::default()
-    };
+    let mut config = config_with_every_suspension_signal_on();
     let mut settings = Settings::default();
     settings.performance.auto_suspend_after_ms = None;
     settings.performance.max_live_tabs = None;
