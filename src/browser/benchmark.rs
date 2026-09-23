@@ -2119,7 +2119,7 @@ mod gate_tests {
 
     #[test]
     fn tiny_absolute_change_stays_ok_despite_huge_pct_change() {
-        // tab_switch_ms floor is 15.0ms; 0.1ms -> 5.0ms is a 4900% change
+        // tab_switch_ms floor is 20.0ms; 0.1ms -> 5.0ms is a 4900% change
         // but only a 4.9ms absolute delta, below the floor.
         let baseline = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 0.1))]);
         let candidate = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 5.0))]);
@@ -2130,7 +2130,7 @@ mod gate_tests {
     #[test]
     fn zero_baseline_with_delta_above_floor_is_fail() {
         // Infinite pct_change, but the 20ms absolute delta clears
-        // tab_switch_ms's 15ms floor, so it is evaluated normally.
+        // tab_switch_ms's 20ms floor, so it is evaluated normally.
         let baseline = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 0.0))]);
         let candidate = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 20.0))]);
         let report = gate(&baseline, &[&candidate]);
