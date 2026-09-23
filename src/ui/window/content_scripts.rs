@@ -605,8 +605,7 @@ pub(super) fn context_menu_render_script(
         .enumerate()
         .map(|(index, entry)| context_menu_item_json(index, entry))
         .collect();
-    let items_json =
-        toolbar::escape_js_line_terminators(serde_json::Value::Array(items).to_string());
+    let items_json = toolbar::value_to_json(&items);
     format!(
         r#"(() => {{
   "use strict";
@@ -706,12 +705,11 @@ pub(super) fn find_search_total(raw: &str) -> usize {
 /// Embeds `query` as a JSON string literal, hardened against
 /// U+2028/U+2029 breaking a JS string literal early exactly the way
 /// `ui::toolbar`'s `set_*_script` functions are (D62) — reused here via
-/// `toolbar::escape_js_line_terminators` rather than a second copy of that
-/// logic, since this splices into a script too (just for the content
-/// webview instead of the toolbar's).
+/// `toolbar::value_to_json` rather than a second copy of that logic, since
+/// this splices into a script too (just for the content webview instead of
+/// the toolbar's).
 pub(super) fn find_query_literal(query: &str) -> String {
-    let json = serde_json::Value::String(query.to_owned()).to_string();
-    toolbar::escape_js_line_terminators(json)
+    toolbar::value_to_json(query)
 }
 
 /// Builds the script [`BrowserWindow::search_in_page`](super::BrowserWindow::search_in_page) evaluates in a

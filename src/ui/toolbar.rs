@@ -728,7 +728,9 @@ fn entries_to_json<T: Serialize>(entries: &[T]) -> String {
 /// Same shape and reasoning as [`entries_to_json`], for a single (non-slice)
 /// value such as [`BookmarksView`] or a bare string (embedded as a JSON
 /// string literal), falling back to `null` instead of an empty array.
-fn value_to_json<T: Serialize + ?Sized>(value: &T) -> String {
+/// `ui::window` の content webview 向けスクリプトも同じ埋め込み方をする
+/// ため `pub(crate)` にしている。
+pub(crate) fn value_to_json<T: Serialize + ?Sized>(value: &T) -> String {
     let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
     escape_js_line_terminators(json)
 }
