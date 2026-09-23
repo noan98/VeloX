@@ -20,6 +20,8 @@
 //! fetches the raw source (`document.documentElement.outerHTML`) and
 //! `app.rs` calls into here to turn it into something displayable.
 
+use super::util::truncate_utf8;
+
 /// Maximum number of UTF-8 bytes of raw page source rendered before
 /// truncating (see [`truncate_source_utf8`]).
 ///
@@ -72,14 +74,8 @@ pub fn escape_html(input: &str) -> String {
 /// panic on the slice below), returning the possibly-shortened source and
 /// whether truncation actually happened (`false` when `source` already fit).
 pub fn truncate_source_utf8(source: &str, max_bytes: usize) -> (&str, bool) {
-    if source.len() <= max_bytes {
-        return (source, false);
-    }
-    let mut end = max_bytes;
-    while end > 0 && !source.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&source[..end], true)
+    let visible = truncate_utf8(source, max_bytes);
+    (visible, visible.len() != source.len())
 }
 
 /// Build the full HTML document View Source shows: a header naming

@@ -13,6 +13,8 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use super::util::remove_where;
+
 /// One bookmarked page.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookmarkEntry {
@@ -184,10 +186,8 @@ impl BookmarkStore {
     }
 
     /// `pred` に当てはまるエントリをすべて取り除き、1 件でも消えたら `true`。
-    fn remove_entries_where(&mut self, mut pred: impl FnMut(&BookmarkEntry) -> bool) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| !pred(entry));
-        self.entries.len() != before
+    fn remove_entries_where(&mut self, pred: impl FnMut(&BookmarkEntry) -> bool) -> bool {
+        remove_where(&mut self.entries, pred)
     }
 
     /// Toggle the bookmark state of `url`: removes it if present, otherwise
@@ -306,9 +306,7 @@ impl BookmarkStore {
     /// bookmark itself (see docs/decisions.md D32). Returns `true` when the
     /// folder was found and removed.
     pub fn remove_folder(&mut self, id: u64) -> bool {
-        let before = self.folders.len();
-        self.folders.retain(|folder| folder.id != id);
-        if self.folders.len() == before {
+        if !remove_where(&mut self.folders, |folder| folder.id == id) {
             return false;
         }
         for entry in &mut self.entries {

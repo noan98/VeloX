@@ -39,6 +39,7 @@ pub mod subresource;
 pub mod suspension;
 pub mod tab;
 pub mod tabs;
+pub(crate) mod util;
 pub mod view_source;
 pub mod window_id;
 pub mod windows;

@@ -41,6 +41,7 @@ use super::context_menu::OpenContextMenu;
 use super::find::FindState;
 use super::session::SavedTab;
 use super::tabs::Tabs;
+use super::util::remove_where;
 use super::window_id::WindowId;
 
 /// One open window's worth of state this layer tracks: its id, its own
@@ -208,9 +209,7 @@ impl Windows {
     /// Removing the *last* window is allowed and leaves `Windows` empty —
     /// see the struct doc comment for why that differs from `Tabs::close`.
     pub fn close_window(&mut self, id: WindowId) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        remove_where(&mut self.entries, |entry| entry.id == id)
     }
 
     /// The tabs belonging to window `id`, or `None` if no such window is

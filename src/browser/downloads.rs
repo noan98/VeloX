@@ -19,6 +19,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
+use super::util::{remove_where, truncate_utf8};
+
 /// Opaque, stable identifier for one download, issued by [`DownloadStore`]
 /// and never reused — same shape and reasoning as `browser::TabId` (a stale
 /// id, e.g. a `cancel_download` message racing a completion, simply misses
@@ -260,9 +262,7 @@ impl DownloadStore {
     /// never touches the file on disk). Returns `true` if an entry with
     /// this id existed.
     pub fn remove(&mut self, id: DownloadId) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        remove_where(&mut self.entries, |entry| entry.id == id)
     }
 
     /// Find the id of the `InProgress` entry that wry's
@@ -451,21 +451,10 @@ fn truncate_filename(name: &str, max_bytes: usize) -> String {
     match split_stem_and_ext(name) {
         (stem, Some(ext)) if ext.len() + 1 < max_bytes => {
             let budget = max_bytes - ext.len() - 1;
-            join_stem_and_ext(truncate_at_char_boundary(stem, budget), Some(ext))
+            join_stem_and_ext(truncate_utf8(stem, budget), Some(ext))
         }
-        _ => truncate_at_char_boundary(name, max_bytes).to_owned(),
+        _ => truncate_utf8(name, max_bytes).to_owned(),
     }
-}
-
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
-    if s.len() <= max_bytes {
-        return s;
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 /// Given a predicate telling whether a candidate name is already taken,

@@ -36,6 +36,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::util::remove_where;
+
 /// A kind of permission a site can request, independent of how any
 /// particular platform/engine spells it (that mapping lives in
 /// `src/ui/window.rs`).
@@ -210,9 +212,7 @@ impl SitePermissionStore {
 
     /// `pred` に当てはまるレコードをすべて取り除き、1 件でも消えたら `true`。
     fn remove_records_where(&mut self, pred: impl Fn(&PermissionRecord) -> bool) -> bool {
-        let before = self.records.len();
-        self.records.retain(|record| !pred(record));
-        self.records.len() != before
+        remove_where(&mut self.records, pred)
     }
 }
 

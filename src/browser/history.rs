@@ -11,6 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::util::remove_where;
+
 /// One recorded visit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistoryEntry {
@@ -175,9 +177,7 @@ impl HistoryStore {
 
     /// Remove one entry by id. Returns `true` when an entry was removed.
     pub fn remove(&mut self, id: u64) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        remove_where(&mut self.entries, |entry| entry.id == id)
     }
 
     /// Remove every entry, keeping the id counter monotonic.
