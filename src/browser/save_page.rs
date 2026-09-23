@@ -56,15 +56,7 @@ pub const HTML_EXTENSION: &str = "html";
 const FORBIDDEN_FILENAME_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
 fn replace_forbidden_filename_chars(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if FORBIDDEN_FILENAME_CHARS.contains(&c) {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
+    raw.replace(FORBIDDEN_FILENAME_CHARS, "_")
 }
 
 /// The base name (no extension) to suggest for `title`/`url`: the page
@@ -72,20 +64,16 @@ fn replace_forbidden_filename_chars(raw: &str) -> String {
 /// otherwise a fixed fallback. Not itself guaranteed to be a safe file
 /// name — see [`suggested_file_name`], which every real caller uses.
 fn default_file_stem(title: Option<&str>, url: &str) -> String {
-    if let Some(title) = title {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            if !host.is_empty() {
-                return host.to_owned();
-            }
-        }
-    }
-    "page".to_owned()
+    let non_blank = |s: &&str| !s.is_empty();
+    title
+        .map(str::trim)
+        .filter(non_blank)
+        .map(str::to_owned)
+        .or_else(|| {
+            let parsed = url::Url::parse(url).ok()?;
+            parsed.host_str().filter(non_blank).map(str::to_owned)
+        })
+        .unwrap_or_else(|| "page".to_owned())
 }
 
 /// A safe, bare (no directory component) file name to suggest for saving
