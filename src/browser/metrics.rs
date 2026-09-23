@@ -1480,14 +1480,10 @@ mod imp {
             assert_eq!(info.rss_bytes, 0);
         }
 
-        /// このテストプロセス + スレッドに固有の一時ディレクトリ。並列に
-        /// 走る `cargo test` 同士で衝突しないようにする。
+        /// このテスト固有の一時ディレクトリ (`util::unique_temp_path`)。
+        /// 並列に走る `cargo test` 同士で衝突しないようにする。
         fn pss_test_dir(suffix: &str) -> std::path::PathBuf {
-            std::env::temp_dir().join(format!(
-                "velox-pss-test-{}-{:?}-{suffix}",
-                std::process::id(),
-                std::thread::current().id()
-            ))
+            crate::browser::util::unique_temp_path(&format!("velox-pss-test-{suffix}"))
         }
 
         #[test]
