@@ -245,9 +245,6 @@ mod tests {
 
     #[test]
     fn ipc_log_writes_an_ipc_record() {
-        use crate::browser::metrics::IpcDirection;
-        use std::time::Instant;
-
         let path = temp_path("ipc.jsonl");
         let _ = fs::remove_file(&path);
 

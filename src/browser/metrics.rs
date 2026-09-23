@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use super::suspension::SuspendReason;
+
 // ---------------------------------------------------------------------
 // Startup timestamps
 // ---------------------------------------------------------------------
@@ -921,7 +923,7 @@ pub enum PerfRecord {
     /// samples that follow.
     TabSuspend {
         tab_id: u64,
-        reason: crate::browser::suspension::SuspendReason,
+        reason: SuspendReason,
     },
     Rss(RssSample),
     /// CPU utilization of the whole process tree over the interval between
@@ -988,6 +990,10 @@ impl PerfRecord {
         PerfRecord::Rss(sample)
     }
 
+    pub fn cpu(percent: f64) -> Self {
+        PerfRecord::Cpu { percent }
+    }
+
     /// Average CPU utilization of the whole process tree between two
     /// samples, as a percentage of one core (Issue #64): 100 means one core
     /// fully busy, 400 means four. `None` when either sample lacks CPU
@@ -999,10 +1005,6 @@ impl PerfRecord {
     /// of both samples and of the clock: the sampler already knows the wall
     /// time between its own two reads, and nothing here should read a clock
     /// of its own.
-    pub fn cpu(percent: f64) -> Self {
-        PerfRecord::Cpu { percent }
-    }
-
     pub fn cpu_percent_between(
         previous: &RssSample,
         current: &RssSample,
@@ -1017,7 +1019,7 @@ impl PerfRecord {
         Some((after - before) / elapsed * 100.0)
     }
 
-    pub fn tab_suspend(tab_id: u64, reason: crate::browser::suspension::SuspendReason) -> Self {
+    pub fn tab_suspend(tab_id: u64, reason: SuspendReason) -> Self {
         PerfRecord::TabSuspend { tab_id, reason }
     }
 
@@ -2792,7 +2794,6 @@ MemAvailable:    8901234 kB
 
     #[test]
     fn perf_record_tab_suspend_carries_the_reason_in_both_formats() {
-        use crate::browser::suspension::SuspendReason;
         let record = PerfRecord::tab_suspend(9, SuspendReason::Memory);
         assert_eq!(record.event_name(), "tab_suspend");
         assert_eq!(record.to_text(), "tab_suspend id=9 reason=memory");
