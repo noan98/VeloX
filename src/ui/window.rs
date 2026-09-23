@@ -2342,7 +2342,7 @@ impl BrowserWindow {
     /// navigate away (`app::close_find_bar`). A no-op for an unknown/
     /// suspended tab — nothing to clear, e.g. the tab already closed.
     pub fn clear_find_highlights(&self, tab_id: TabId) -> wry::Result<()> {
-        self.eval_in_tab(tab_id, &find_clear_script())
+        self.eval_in_tab(tab_id, FIND_CLEAR_SCRIPT)
     }
 
     // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
@@ -3055,96 +3055,82 @@ fn find_query_literal(query: &str) -> String {
 /// text a user cannot see.
 fn find_search_script(query_literal: &str, case_sensitive: bool) -> String {
     let flags = if case_sensitive { "g" } else { "gi" };
-    let mut script = String::new();
-    script.push_str("(() => {\n");
-    script.push_str("  \"use strict\";\n");
-    script.push_str("  const HL_CLASS = \"velox-find-hl\";\n");
-    script.push_str("  const STYLE_ID = \"velox-find-style\";\n");
-    script.push_str("  if (!document.getElementById(STYLE_ID)) {\n");
-    script.push_str("    const style = document.createElement(\"style\");\n");
-    script.push_str("    style.id = STYLE_ID;\n");
-    script.push_str(
-        "    style.textContent = \".velox-find-hl{background:#ffd54f !important;color:#000 !important;}.velox-find-hl-active{background:#ff7043 !important;}\";\n",
-    );
-    script.push_str("    (document.head || document.documentElement).appendChild(style);\n");
-    script.push_str("  }\n");
-    script.push_str("  const prevMatches = window.__veloxFindMatches || [];\n");
-    script.push_str("  for (const el of prevMatches) {\n");
-    script.push_str("    if (!el || !el.parentNode) continue;\n");
-    script.push_str("    const parent = el.parentNode;\n");
-    script.push_str("    parent.replaceChild(document.createTextNode(el.textContent), el);\n");
-    script.push_str("    parent.normalize();\n");
-    script.push_str("  }\n");
-    script.push_str("  window.__veloxFindMatches = [];\n");
-    script.push_str("  window.__veloxFindActiveIndex = -1;\n");
-    script.push_str(&format!("  const query = {query_literal};\n"));
-    script.push_str("  if (!query || !document.body) {\n");
-    script.push_str("    return JSON.stringify({ total: 0 });\n");
-    script.push_str("  }\n");
-    script.push_str("  const escaped = query.replace(/[.*+?^${}()|[\\]\\\\]/g, \"\\\\$&\");\n");
-    script.push_str(&format!("  const flags = {flags:?};\n"));
-    script.push_str("  let re;\n");
-    script.push_str("  try {\n");
-    script.push_str("    re = new RegExp(escaped, flags);\n");
-    script.push_str("  } catch (e) {\n");
-    script.push_str("    return JSON.stringify({ total: 0 });\n");
-    script.push_str("  }\n");
-    script.push_str(
-        "  const SKIP_TAGS = new Set([\"SCRIPT\", \"STYLE\", \"NOSCRIPT\", \"TEXTAREA\", \"INPUT\"]);\n",
-    );
-    script.push_str(
-        "  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {\n",
-    );
-    script.push_str("    acceptNode(node) {\n");
-    script.push_str("      const parent = node.parentElement;\n");
-    script.push_str(
-        "      if (!parent || SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;\n",
-    );
-    script.push_str("      if (!node.nodeValue) return NodeFilter.FILTER_SKIP;\n");
-    script.push_str("      re.lastIndex = 0;\n");
-    script.push_str(
-        "      return re.test(node.nodeValue) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;\n",
-    );
-    script.push_str("    }\n");
-    script.push_str("  });\n");
-    script.push_str("  const nodes = [];\n");
-    script.push_str("  let n;\n");
-    script.push_str("  while ((n = walker.nextNode())) { nodes.push(n); }\n");
-    script.push_str("  const matches = [];\n");
-    script.push_str("  for (const node of nodes) {\n");
-    script.push_str("    const text = node.nodeValue;\n");
-    script.push_str("    re.lastIndex = 0;\n");
-    script.push_str("    let match;\n");
-    script.push_str("    let lastIndex = 0;\n");
-    script.push_str("    let any = false;\n");
-    script.push_str("    const frag = document.createDocumentFragment();\n");
-    script.push_str("    while ((match = re.exec(text)) !== null) {\n");
-    script.push_str("      any = true;\n");
-    script.push_str("      if (match.index > lastIndex) {\n");
-    script.push_str(
-        "        frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));\n",
-    );
-    script.push_str("      }\n");
-    script.push_str("      const span = document.createElement(\"span\");\n");
-    script.push_str("      span.className = HL_CLASS;\n");
-    script.push_str("      span.textContent = match[0];\n");
-    script.push_str("      frag.appendChild(span);\n");
-    script.push_str("      matches.push(span);\n");
-    script.push_str("      lastIndex = match.index + match[0].length;\n");
-    script.push_str(
-        "      if (match[0].length === 0) { re.lastIndex += 1; lastIndex = re.lastIndex; }\n",
-    );
-    script.push_str("    }\n");
-    script.push_str("    if (!any) continue;\n");
-    script.push_str("    if (lastIndex < text.length) {\n");
-    script.push_str("      frag.appendChild(document.createTextNode(text.slice(lastIndex)));\n");
-    script.push_str("    }\n");
-    script.push_str("    node.parentNode.replaceChild(frag, node);\n");
-    script.push_str("  }\n");
-    script.push_str("  window.__veloxFindMatches = matches;\n");
-    script.push_str("  return JSON.stringify({ total: matches.length });\n");
-    script.push_str("})();");
-    script
+    format!(
+        r#"(() => {{
+  "use strict";
+  const HL_CLASS = "velox-find-hl";
+  const STYLE_ID = "velox-find-style";
+  if (!document.getElementById(STYLE_ID)) {{
+    const style = document.createElement("style");
+    style.id = STYLE_ID;
+    style.textContent = ".velox-find-hl{{background:#ffd54f !important;color:#000 !important;}}.velox-find-hl-active{{background:#ff7043 !important;}}";
+    (document.head || document.documentElement).appendChild(style);
+  }}
+  const prevMatches = window.__veloxFindMatches || [];
+  for (const el of prevMatches) {{
+    if (!el || !el.parentNode) continue;
+    const parent = el.parentNode;
+    parent.replaceChild(document.createTextNode(el.textContent), el);
+    parent.normalize();
+  }}
+  window.__veloxFindMatches = [];
+  window.__veloxFindActiveIndex = -1;
+  const query = {query_literal};
+  if (!query || !document.body) {{
+    return JSON.stringify({{ total: 0 }});
+  }}
+  const escaped = query.replace(/[.*+?^${{}}()|[\]\\]/g, "\\$&");
+  const flags = {flags:?};
+  let re;
+  try {{
+    re = new RegExp(escaped, flags);
+  }} catch (e) {{
+    return JSON.stringify({{ total: 0 }});
+  }}
+  const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "NOSCRIPT", "TEXTAREA", "INPUT"]);
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {{
+    acceptNode(node) {{
+      const parent = node.parentElement;
+      if (!parent || SKIP_TAGS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
+      if (!node.nodeValue) return NodeFilter.FILTER_SKIP;
+      re.lastIndex = 0;
+      return re.test(node.nodeValue) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
+    }}
+  }});
+  const nodes = [];
+  let n;
+  while ((n = walker.nextNode())) {{ nodes.push(n); }}
+  const matches = [];
+  for (const node of nodes) {{
+    const text = node.nodeValue;
+    re.lastIndex = 0;
+    let match;
+    let lastIndex = 0;
+    let any = false;
+    const frag = document.createDocumentFragment();
+    while ((match = re.exec(text)) !== null) {{
+      any = true;
+      if (match.index > lastIndex) {{
+        frag.appendChild(document.createTextNode(text.slice(lastIndex, match.index)));
+      }}
+      const span = document.createElement("span");
+      span.className = HL_CLASS;
+      span.textContent = match[0];
+      frag.appendChild(span);
+      matches.push(span);
+      lastIndex = match.index + match[0].length;
+      if (match[0].length === 0) {{ re.lastIndex += 1; lastIndex = re.lastIndex; }}
+    }}
+    if (!any) continue;
+    if (lastIndex < text.length) {{
+      frag.appendChild(document.createTextNode(text.slice(lastIndex)));
+    }}
+    node.parentNode.replaceChild(frag, node);
+  }}
+  window.__veloxFindMatches = matches;
+  return JSON.stringify({{ total: matches.length }});
+}})();"#
+    )
 }
 
 /// Builds the script [`BrowserWindow::highlight_find_match`] evaluates:
@@ -3154,32 +3140,31 @@ fn find_search_script(query_literal: &str, case_sensitive: bool) -> String {
 /// the `matches[index]` guard if it did not, e.g. a stale index after the
 /// page navigated).
 fn find_activate_script(index: usize) -> String {
-    let mut script = String::new();
-    script.push_str("(() => {\n");
-    script.push_str("  \"use strict\";\n");
-    script.push_str("  const matches = window.__veloxFindMatches || [];\n");
-    script.push_str("  const prevIndex = window.__veloxFindActiveIndex;\n");
-    script.push_str("  if (typeof prevIndex === \"number\" && matches[prevIndex]) {\n");
-    script.push_str("    matches[prevIndex].classList.remove(\"velox-find-hl-active\");\n");
-    script.push_str("  }\n");
-    script.push_str(&format!("  const index = {index};\n"));
-    script.push_str("  const el = matches[index];\n");
-    script.push_str("  if (el) {\n");
-    script.push_str("    el.classList.add(\"velox-find-hl-active\");\n");
-    script.push_str("    el.scrollIntoView({ block: \"center\", inline: \"nearest\" });\n");
-    script.push_str("  }\n");
-    script.push_str("  window.__veloxFindActiveIndex = index;\n");
-    script.push_str("})();");
-    script
+    format!(
+        r#"(() => {{
+  "use strict";
+  const matches = window.__veloxFindMatches || [];
+  const prevIndex = window.__veloxFindActiveIndex;
+  if (typeof prevIndex === "number" && matches[prevIndex]) {{
+    matches[prevIndex].classList.remove("velox-find-hl-active");
+  }}
+  const index = {index};
+  const el = matches[index];
+  if (el) {{
+    el.classList.add("velox-find-hl-active");
+    el.scrollIntoView({{ block: "center", inline: "nearest" }});
+  }}
+  window.__veloxFindActiveIndex = index;
+}})();"#
+    )
 }
 
-/// Builds the script [`BrowserWindow::clear_find_highlights`] evaluates:
+/// The script [`BrowserWindow::clear_find_highlights`] evaluates:
 /// unwraps every `<span class="velox-find-hl">` [`find_search_script`]
 /// inserted back into plain text and resets the DOM-side bookkeeping.
 /// Idempotent — safe to call with no search having run (`window.
 /// __veloxFindMatches` is then `undefined`, treated as empty).
-fn find_clear_script() -> String {
-    r#"(() => {
+const FIND_CLEAR_SCRIPT: &str = r#"(() => {
   "use strict";
   const prev = window.__veloxFindMatches || [];
   for (const el of prev) {
@@ -3190,9 +3175,7 @@ fn find_clear_script() -> String {
   }
   window.__veloxFindMatches = [];
   window.__veloxFindActiveIndex = -1;
-})();"#
-        .to_owned()
-}
+})();"#;
 
 /// A webview's private-browsing/`WebContext` isolation settings, bundled so
 /// [`content_webview_builder`] stays under clippy's argument-count lint
@@ -3873,50 +3856,54 @@ mod tests {
 
     // --- Site permissions (Issue #24, docs/decisions.md D60) ---
 
+    use crate::browser::site_permissions::PermissionDecision;
+
+    /// `origin` の `kind` に `decision` を 1 件だけ保存したストア。
+    fn store_with(
+        origin: &str,
+        kind: PermissionKind,
+        decision: PermissionDecision,
+    ) -> SitePermissionStore {
+        let mut store = SitePermissionStore::new();
+        store.set(origin, kind, decision, 1);
+        store
+    }
+
     #[test]
     fn known_wry_kinds_map_onto_velox_kinds() {
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::Camera),
-            PermissionKind::Camera
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::Microphone),
-            PermissionKind::Microphone
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::Geolocation),
-            PermissionKind::Geolocation
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::Notifications),
-            PermissionKind::Notifications
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::ClipboardRead),
-            PermissionKind::ClipboardRead
-        );
+        for (wry_kind, expected) in [
+            (WryPermissionKind::Camera, PermissionKind::Camera),
+            (WryPermissionKind::Microphone, PermissionKind::Microphone),
+            (WryPermissionKind::Geolocation, PermissionKind::Geolocation),
+            (
+                WryPermissionKind::Notifications,
+                PermissionKind::Notifications,
+            ),
+            (
+                WryPermissionKind::ClipboardRead,
+                PermissionKind::ClipboardRead,
+            ),
+        ] {
+            assert_eq!(map_permission_kind(wry_kind), expected, "{wry_kind:?}");
+        }
     }
 
     #[test]
     fn unmapped_wry_kinds_fall_back_to_other() {
         // A representative sample of the kinds VeloX does not track —
         // every one of these must land on `Other`, which always denies.
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::Midi),
-            PermissionKind::Other
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::WindowManagement),
-            PermissionKind::Other
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::DisplayCapture),
-            PermissionKind::Other
-        );
-        assert_eq!(
-            map_permission_kind(WryPermissionKind::Other),
-            PermissionKind::Other
-        );
+        for wry_kind in [
+            WryPermissionKind::Midi,
+            WryPermissionKind::WindowManagement,
+            WryPermissionKind::DisplayCapture,
+            WryPermissionKind::Other,
+        ] {
+            assert_eq!(
+                map_permission_kind(wry_kind),
+                PermissionKind::Other,
+                "{wry_kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -3952,12 +3939,10 @@ mod tests {
 
     #[test]
     fn resolve_permission_applies_a_stored_allow() {
-        let mut store = SitePermissionStore::new();
-        store.set(
+        let store = store_with(
             "https://example.com",
             PermissionKind::Camera,
-            crate::browser::site_permissions::PermissionDecision::Allow,
-            1,
+            PermissionDecision::Allow,
         );
         assert_eq!(
             resolve_permission(
@@ -3971,12 +3956,10 @@ mod tests {
 
     #[test]
     fn resolve_permission_applies_a_stored_block() {
-        let mut store = SitePermissionStore::new();
-        store.set(
+        let store = store_with(
             "https://example.com",
             PermissionKind::Microphone,
-            crate::browser::site_permissions::PermissionDecision::Block,
-            1,
+            PermissionDecision::Block,
         );
         assert_eq!(
             resolve_permission(
@@ -3990,12 +3973,10 @@ mod tests {
 
     #[test]
     fn resolve_permission_is_scoped_to_the_given_origin() {
-        let mut store = SitePermissionStore::new();
-        store.set(
+        let store = store_with(
             "https://a.example",
             PermissionKind::Camera,
-            crate::browser::site_permissions::PermissionDecision::Allow,
-            1,
+            PermissionDecision::Allow,
         );
         assert_eq!(
             resolve_permission(&store, Some("https://b.example"), WryPermissionKind::Camera),
@@ -4248,54 +4229,38 @@ mod tests {
 
     #[test]
     fn parse_content_shortcut_matches_every_sentinel_exactly() {
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::NewTab.sentinel()),
-            Some(ContentShortcut::NewTab)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::CloseTab.sentinel()),
-            Some(ContentShortcut::CloseTab)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::ReopenClosedTab.sentinel()),
-            Some(ContentShortcut::ReopenClosedTab)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::NextTab.sentinel()),
-            Some(ContentShortcut::NextTab)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::PrevTab.sentinel()),
-            Some(ContentShortcut::PrevTab)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::ActivateLastTab.sentinel()),
-            Some(ContentShortcut::ActivateLastTab)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::FocusAddressBar.sentinel()),
-            Some(ContentShortcut::FocusAddressBar)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::ToggleBookmark.sentinel()),
-            Some(ContentShortcut::ToggleBookmark)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::ToggleBookmarkBar.sentinel()),
-            Some(ContentShortcut::ToggleBookmarkBar)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::NewWindow.sentinel()),
-            Some(ContentShortcut::NewWindow)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::OpenFindBar.sentinel()),
-            Some(ContentShortcut::OpenFindBar)
-        );
-        assert_eq!(
-            parse_content_shortcut(&ShortcutId::ViewSource.sentinel()),
-            Some(ContentShortcut::ViewSource)
-        );
+        for (id, expected) in [
+            (ShortcutId::NewTab, ContentShortcut::NewTab),
+            (ShortcutId::CloseTab, ContentShortcut::CloseTab),
+            (
+                ShortcutId::ReopenClosedTab,
+                ContentShortcut::ReopenClosedTab,
+            ),
+            (ShortcutId::NextTab, ContentShortcut::NextTab),
+            (ShortcutId::PrevTab, ContentShortcut::PrevTab),
+            (
+                ShortcutId::ActivateLastTab,
+                ContentShortcut::ActivateLastTab,
+            ),
+            (
+                ShortcutId::FocusAddressBar,
+                ContentShortcut::FocusAddressBar,
+            ),
+            (ShortcutId::ToggleBookmark, ContentShortcut::ToggleBookmark),
+            (
+                ShortcutId::ToggleBookmarkBar,
+                ContentShortcut::ToggleBookmarkBar,
+            ),
+            (ShortcutId::NewWindow, ContentShortcut::NewWindow),
+            (ShortcutId::OpenFindBar, ContentShortcut::OpenFindBar),
+            (ShortcutId::ViewSource, ContentShortcut::ViewSource),
+        ] {
+            assert_eq!(
+                parse_content_shortcut(&id.sentinel()),
+                Some(expected),
+                "{id:?}"
+            );
+        }
         assert_eq!(
             parse_content_shortcut(&ShortcutId::OpenDevtools.sentinel()),
             None,
@@ -4373,10 +4338,9 @@ mod tests {
 
     #[test]
     fn find_clear_script_unwraps_previous_highlights() {
-        let script = find_clear_script();
-        assert!(script.contains("__veloxFindMatches"));
-        assert!(script.contains("replaceChild"));
-        assert!(script.ends_with("})();"));
+        assert!(FIND_CLEAR_SCRIPT.contains("__veloxFindMatches"));
+        assert!(FIND_CLEAR_SCRIPT.contains("replaceChild"));
+        assert!(FIND_CLEAR_SCRIPT.ends_with("})();"));
     }
 
     #[test]
@@ -4529,6 +4493,46 @@ mod tests {
             !subframe.contains("window.ipc"),
             "the subframe path must not look at `window.ipc`: {subframe}"
         );
+    }
+
+    #[test]
+    fn content_ipc_event_maps_each_message_kind_and_ignores_the_rest() {
+        let (w, t) = (WindowId::from(1), TabId::from(2));
+        let event = |body: &str| content_ipc_event(w, t, body);
+        assert!(matches!(
+            event(OPEN_DEVTOOLS_MESSAGE),
+            Some(UserEvent::OpenDevtoolsRequested(id)) if id == w
+        ));
+        assert!(matches!(
+            event(&ShortcutId::NewTab.sentinel()),
+            Some(UserEvent::ContentShortcut(id, ContentShortcut::NewTab)) if id == w
+        ));
+        assert!(matches!(
+            event(&format!("{CONTEXT_MENU_OPEN_PREFIX}{{\"x\":1,\"y\":2}}")),
+            Some(UserEvent::ContextMenuRequested { window_id, tab_id, .. })
+                if window_id == w && tab_id == t
+        ));
+        assert!(matches!(
+            event(FORM_INPUT_MESSAGE),
+            Some(UserEvent::FormInputDetected(id, tab)) if id == w && tab == t
+        ));
+        assert!(matches!(
+            event(CONTEXT_MENU_CLOSE_MESSAGE),
+            Some(UserEvent::ContextMenuClosed(id, tab)) if id == w && tab == t
+        ));
+        assert!(matches!(
+            event(&format!("{CONTEXT_MENU_ACTION_PREFIX}3")),
+            Some(UserEvent::ContextMenuActionSelected { window_id, tab_id, index: 3 })
+                if window_id == w && tab_id == t
+        ));
+        for ignored in [
+            "",
+            "velox:quit",
+            r#"{"cmd":"new_tab"}"#,
+            FORM_INPUT_RELAY_TOKEN,
+        ] {
+            assert!(event(ignored).is_none(), "{ignored:?}");
+        }
     }
 
     #[test]
