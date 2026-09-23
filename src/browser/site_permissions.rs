@@ -101,6 +101,13 @@ pub struct PermissionRecord {
     pub updated_at: u64,
 }
 
+impl PermissionRecord {
+    /// このレコードが `(origin, kind)` の組のものか。
+    fn is_for(&self, origin: &str, kind: PermissionKind) -> bool {
+        self.origin == origin && self.kind == kind
+    }
+}
+
 /// An unordered collection of [`PermissionRecord`]s, at most one per
 /// `(origin, kind)` pair (enforced by [`Self::set`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -149,17 +156,13 @@ impl SitePermissionStore {
         if kind == PermissionKind::Other {
             return Resolution::Block;
         }
-        match self
-            .records
+        self.records
             .iter()
-            .find(|record| record.origin == origin && record.kind == kind)
-        {
-            Some(record) => match record.decision {
+            .find(|record| record.is_for(origin, kind))
+            .map_or(Resolution::Ask, |record| match record.decision {
                 PermissionDecision::Allow => Resolution::Allow,
                 PermissionDecision::Block => Resolution::Block,
-            },
-            None => Resolution::Ask,
-        }
+            })
     }
 
     /// Store an always-allow/always-block decision for `(origin, kind)`,
@@ -177,7 +180,7 @@ impl SitePermissionStore {
         match self
             .records
             .iter_mut()
-            .find(|record| record.origin == origin && record.kind == kind)
+            .find(|record| record.is_for(&origin, kind))
         {
             Some(record) => {
                 record.decision = decision;
@@ -196,17 +199,19 @@ impl SitePermissionStore {
     /// requests to [`Resolution::Ask`]. Returns `true` when a record was
     /// removed.
     pub fn clear(&mut self, origin: &str, kind: PermissionKind) -> bool {
-        let before = self.records.len();
-        self.records
-            .retain(|record| !(record.origin == origin && record.kind == kind));
-        self.records.len() != before
+        self.remove_records_where(|record| record.is_for(origin, kind))
     }
 
     /// Remove every stored decision for `origin` (all kinds). Returns
     /// `true` when at least one record was removed.
     pub fn clear_origin(&mut self, origin: &str) -> bool {
+        self.remove_records_where(|record| record.origin == origin)
+    }
+
+    /// `pred` に当てはまるレコードをすべて取り除き、1 件でも消えたら `true`。
+    fn remove_records_where(&mut self, pred: impl Fn(&PermissionRecord) -> bool) -> bool {
         let before = self.records.len();
-        self.records.retain(|record| record.origin != origin);
+        self.records.retain(|record| !pred(record));
         self.records.len() != before
     }
 }
@@ -227,14 +232,15 @@ impl SitePermissionStore {
 /// decided; this function only ever narrows further, for permissions).
 pub fn origin_of(url: &str) -> Option<String> {
     let parsed = url::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") {
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "http" | "https") {
         return None;
     }
     let host = parsed.host_str()?;
-    match parsed.port() {
-        Some(port) => Some(format!("{}://{host}:{port}", parsed.scheme())),
-        None => Some(format!("{}://{host}", parsed.scheme())),
-    }
+    Some(match parsed.port() {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
+    })
 }
 
 #[cfg(test)]

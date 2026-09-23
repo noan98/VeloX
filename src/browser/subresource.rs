@@ -75,7 +75,7 @@ impl SiteExceptions {
 
     /// Except `host` from content blocking. A no-op for an empty string.
     pub fn add(&mut self, host: &str) {
-        let host = host.trim().to_ascii_lowercase();
+        let host = normalize_host(host);
         if !host.is_empty() {
             self.hosts.insert(host);
         }
@@ -83,12 +83,12 @@ impl SiteExceptions {
 
     /// Re-enable content blocking for `host`.
     pub fn remove(&mut self, host: &str) {
-        self.hosts.remove(&host.trim().to_ascii_lowercase());
+        self.hosts.remove(&normalize_host(host));
     }
 
     /// Whether `host` is on the exception list.
     pub fn contains(&self, host: &str) -> bool {
-        self.hosts.contains(&host.trim().to_ascii_lowercase())
+        self.hosts.contains(&normalize_host(host))
     }
 
     /// Number of excepted sites (diagnostics/tests).
@@ -99,6 +99,11 @@ impl SiteExceptions {
     pub fn is_empty(&self) -> bool {
         self.hosts.is_empty()
     }
+}
+
+/// 例外リストの照合キー: 前後の空白を除いて ASCII 小文字化したホスト名。
+fn normalize_host(host: &str) -> String {
+    host.trim().to_ascii_lowercase()
 }
 
 /// Decide whether a subresource request for `url` should be blocked.
@@ -129,10 +134,8 @@ pub fn is_blocked_resource(
     if resource_type == ResourceType::Document {
         return false;
     }
-    if let Some(host) = page_host {
-        if exceptions.contains(host) {
-            return false;
-        }
+    if page_host.is_some_and(|host| exceptions.contains(host)) {
+        return false;
     }
     list.is_blocked(url)
 }
