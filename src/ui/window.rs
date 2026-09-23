@@ -1588,10 +1588,8 @@ impl BrowserWindow {
         let (toolbar_rect, content_rect) = self.layout();
         self.toolbar.set_bounds(to_bounds(toolbar_rect))?;
         let bounds = to_bounds(content_rect);
-        for tab in self.contents.values() {
-            if let Some(webview) = &tab.webview {
-                webview.set_bounds(bounds)?;
-            }
+        for webview in self.live_webviews() {
+            webview.set_bounds(bounds)?;
         }
         Ok(())
     }
@@ -1638,8 +1636,8 @@ impl BrowserWindow {
                 let related = self
                     .contents
                     .values()
-                    .find(|tab| tab.process_group == group && tab.webview.is_some())
-                    .and_then(|tab| tab.webview.as_ref());
+                    .filter(|tab| tab.process_group == group)
+                    .find_map(|tab| tab.webview.as_ref());
                 (group, related)
             }
             None => {
@@ -1739,52 +1737,46 @@ impl BrowserWindow {
         if self.active == Some(id) {
             return Ok(());
         }
-        if let Some(previous) = self.active.and_then(|prev| self.contents.get(&prev)) {
-            if let Some(webview) = &previous.webview {
-                webview.set_visible(false)?;
-                // Issue #242: the tab just left the screen, so it may
-                // economize — unless the user is listening to it (#247).
-                //
-                // The automatic suspension policy already refuses to reclaim
-                // a tab that is playing (`browser::suspension`, D56), and
-                // CLAUDE.md's design principle 5 says the same. Asking a tab
-                // we have decided is too valuable to suspend to economize
-                // anyway would be inconsistent, so the hint follows the same
-                // rule rather than waiting for a measurement to say whether
-                // the engine happens to keep audio intact under `Low`.
-                let target = if webview_is_playing_audio(webview) {
-                    BackgroundMemoryTarget::Normal
-                } else {
-                    self.background_memory_target
-                };
-                apply_memory_target(webview, target);
-            }
+        if let Some(webview) = self.active.and_then(|prev| self.tab_webview(prev)) {
+            webview.set_visible(false)?;
+            // Issue #242: the tab just left the screen, so it may
+            // economize — unless the user is listening to it (#247).
+            //
+            // The automatic suspension policy already refuses to reclaim
+            // a tab that is playing (`browser::suspension`, D56), and
+            // CLAUDE.md's design principle 5 says the same. Asking a tab
+            // we have decided is too valuable to suspend to economize
+            // anyway would be inconsistent, so the hint follows the same
+            // rule rather than waiting for a measurement to say whether
+            // the engine happens to keep audio intact under `Low`.
+            let target = if webview_is_playing_audio(webview) {
+                BackgroundMemoryTarget::Normal
+            } else {
+                self.background_memory_target
+            };
+            apply_memory_target(webview, target);
         }
-        match self.contents.get(&id) {
-            Some(tab) => {
-                if let Some(webview) = &tab.webview {
-                    let (_, content_rect) = self.layout();
-                    webview.set_bounds(to_bounds(content_rect))?;
-                    webview.set_visible(true)?;
-                    // Issue #242: and the tab arriving on screen must be
-                    // taken back off the hint, or it would keep economizing
-                    // while the user is looking at it. Unconditional rather
-                    // than paired with the knob: a tab can have been put at
-                    // `Low` by an earlier activation even if the knob were
-                    // somehow read differently later, and `Normal` is the
-                    // engine's own default, so saying it is always safe.
-                    apply_memory_target(webview, BackgroundMemoryTarget::Normal);
-                }
-                self.active = Some(id);
-                Ok(())
-            }
-            None => {
-                // Should not happen: `app.rs` only ever activates a tab it
-                // just opened or that is already tracked here.
-                eprintln!("velox: activate_tab: unknown tab {id:?}");
-                Ok(())
-            }
+        let Some(tab) = self.contents.get(&id) else {
+            // Should not happen: `app.rs` only ever activates a tab it
+            // just opened or that is already tracked here.
+            eprintln!("velox: activate_tab: unknown tab {id:?}");
+            return Ok(());
+        };
+        if let Some(webview) = &tab.webview {
+            let (_, content_rect) = self.layout();
+            webview.set_bounds(to_bounds(content_rect))?;
+            webview.set_visible(true)?;
+            // Issue #242: and the tab arriving on screen must be
+            // taken back off the hint, or it would keep economizing
+            // while the user is looking at it. Unconditional rather
+            // than paired with the knob: a tab can have been put at
+            // `Low` by an earlier activation even if the knob were
+            // somehow read differently later, and `Normal` is the
+            // engine's own default, so saying it is always safe.
+            apply_memory_target(webview, BackgroundMemoryTarget::Normal);
         }
+        self.active = Some(id);
+        Ok(())
     }
 
     /// Suspend tab `id`: drop its content webview to reclaim memory,
@@ -1843,7 +1835,7 @@ impl BrowserWindow {
     /// documented way to ask — but "should not" is not a measurement, and a
     /// benchmark run must not be the place that finds out otherwise.
     pub fn engine_reports_tab_suspended(&self, id: TabId) -> Option<bool> {
-        let _webview = self.contents.get(&id)?.webview.as_ref()?;
+        let _webview = self.tab_webview(id)?;
         #[cfg(windows)]
         {
             crate::ui::webview2_suspend::is_suspended(_webview).ok()
@@ -1896,10 +1888,7 @@ impl BrowserWindow {
     /// platform this is always `false`: wry exposes no equivalent there
     /// yet, so the protection simply does not apply (documented in D56).
     pub fn is_playing_audio(&self, id: TabId) -> bool {
-        self.contents
-            .get(&id)
-            .and_then(|tab| tab.webview.as_ref())
-            .is_some_and(webview_is_playing_audio)
+        self.tab_webview(id).is_some_and(webview_is_playing_audio)
     }
 
     /// Which `WebKitWebProcess` group (D54, [`pick_process_group`]) tab
@@ -1956,7 +1945,7 @@ impl BrowserWindow {
         // suspended WebView2 resumes it implicitly anyway; the explicit
         // `Resume` here keeps VeloX's intent in the code rather than
         // relying on that side effect.
-        if let Some(webview) = self.contents.get(&id).and_then(|tab| tab.webview.as_ref()) {
+        if let Some(webview) = self.tab_webview(id) {
             thaw_webview(webview, id);
             return self.activate_tab(id);
         }
@@ -1964,45 +1953,60 @@ impl BrowserWindow {
         self.activate_tab(id)
     }
 
+    /// タブ `id` の生きている content webview。未知のタブや休止中
+    /// (`webview: None`) のタブでは `None`。
+    fn tab_webview(&self, id: TabId) -> Option<&WebView> {
+        self.contents.get(&id)?.webview.as_ref()
+    }
+
+    /// 生きている (休止していない) すべてのタブの content webview。
+    fn live_webviews(&self) -> impl Iterator<Item = &WebView> {
+        self.contents
+            .values()
+            .filter_map(|tab| tab.webview.as_ref())
+    }
+
+    /// タブ `tab_id` の content webview で `script` を評価する。未知・休止中の
+    /// タブでは何もせず `Ok(())` を返す (評価する webview がない)。
+    fn eval_in_tab(&self, tab_id: TabId, script: &str) -> wry::Result<()> {
+        self.tab_webview(tab_id)
+            .map_or(Ok(()), |webview| webview.evaluate_script(script))
+    }
+
     /// The active tab's content webview, if any is currently active.
     fn active_webview(&self) -> Option<&WebView> {
-        self.active
-            .and_then(|id| self.contents.get(&id))
-            .and_then(|tab| tab.webview.as_ref())
+        self.tab_webview(self.active?)
+    }
+
+    /// アクティブタブの webview に `action` を適用する。アクティブタブが
+    /// ない (または休止中の) ときは何もせず `Ok(())`。
+    fn with_active_webview(
+        &self,
+        action: impl FnOnce(&WebView) -> wry::Result<()>,
+    ) -> wry::Result<()> {
+        self.active_webview().map_or(Ok(()), action)
     }
 
     /// Load `url` in the active tab's content webview.
     pub fn navigate(&self, url: &str) -> wry::Result<()> {
-        match self.active_webview() {
-            Some(webview) => webview.load_url(url),
-            None => Ok(()),
-        }
+        self.with_active_webview(|webview| webview.load_url(url))
     }
 
     /// Go back in the active tab's session history (no-op at the oldest
     /// entry).
     pub fn go_back(&self) -> wry::Result<()> {
-        match self.active_webview() {
-            Some(webview) => webview.evaluate_script("history.back();"),
-            None => Ok(()),
-        }
+        self.with_active_webview(|webview| webview.evaluate_script("history.back();"))
     }
 
     /// Go forward in the active tab's session history (no-op at the newest
     /// entry).
     pub fn go_forward(&self) -> wry::Result<()> {
-        match self.active_webview() {
-            Some(webview) => webview.evaluate_script("history.forward();"),
-            None => Ok(()),
-        }
+        self.with_active_webview(|webview| webview.evaluate_script("history.forward();"))
     }
 
     /// Reload the active tab's current page.
     pub fn reload(&self) -> wry::Result<()> {
-        match self.active_webview() {
-            Some(webview) => webview.reload(),
-            None => Ok(()),
-        }
+        self.with_active_webview(WebView::reload)
     }
 
     /// Clear all site data (cookies, cache, local/session storage,
@@ -2060,11 +2064,8 @@ impl BrowserWindow {
             }
         };
 
-        attempt(self.toolbar.clear_all_browsing_data());
-        for tab in self.contents.values() {
-            if let Some(webview) = &tab.webview {
-                attempt(webview.clear_all_browsing_data());
-            }
+        for webview in std::iter::once(&self.toolbar).chain(self.live_webviews()) {
+            attempt(webview.clear_all_browsing_data());
         }
 
         SiteDataClearResult {
@@ -2306,13 +2307,8 @@ impl BrowserWindow {
         query: &str,
         case_sensitive: bool,
     ) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
+        let Some(webview) = self.tab_webview(tab_id) else {
+            return Ok(());
         };
         let script = find_search_script(&find_query_literal(query), case_sensitive);
         let proxy = self.proxy.clone();
@@ -2336,15 +2332,7 @@ impl BrowserWindow {
     /// previously active. Fire-and-forget — there is nothing to report
     /// back. A no-op for an unknown/suspended tab.
     pub fn highlight_find_match(&self, tab_id: TabId, index: usize) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.evaluate_script(&find_activate_script(index))
+        self.eval_in_tab(tab_id, &find_activate_script(index))
     }
 
     /// Remove every find highlight left in tab `tab_id`'s content webview
@@ -2354,15 +2342,7 @@ impl BrowserWindow {
     /// navigate away (`app::close_find_bar`). A no-op for an unknown/
     /// suspended tab — nothing to clear, e.g. the tab already closed.
     pub fn clear_find_highlights(&self, tab_id: TabId) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.evaluate_script(&find_clear_script())
+        self.eval_in_tab(tab_id, &find_clear_script())
     }
 
     // --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
@@ -2397,15 +2377,7 @@ impl BrowserWindow {
     /// for the "印刷失敗時にエラーを表示" acceptance criterion, but that
     /// criterion is only partially satisfiable through this API.
     pub fn print_tab(&self, tab_id: TabId) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.print()
+        self.tab_webview(tab_id).map_or(Ok(()), WebView::print)
     }
 
     /// Push (or clear, with `None`) the print/PDF-export status banner —
@@ -2434,13 +2406,8 @@ impl BrowserWindow {
         destination: PathBuf,
         settings: &crate::browser::print::PdfExportSettings,
     ) -> PdfExportRequest {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return PdfExportRequest::NoWebview,
+        let Some(webview) = self.tab_webview(tab_id) else {
+            return PdfExportRequest::NoWebview;
         };
         match crate::ui::webview2_print::export_as_pdf(
             webview,
@@ -2471,11 +2438,7 @@ impl BrowserWindow {
         _destination: PathBuf,
         _settings: &crate::browser::print::PdfExportSettings,
     ) -> PdfExportRequest {
-        if !self
-            .contents
-            .get(&tab_id)
-            .is_some_and(|tab| tab.webview.is_some())
-        {
+        if self.tab_webview(tab_id).is_none() {
             return PdfExportRequest::NoWebview;
         }
         PdfExportRequest::UnsupportedPlatform
@@ -2535,13 +2498,8 @@ impl BrowserWindow {
     /// simply means an older history entry's title arrives late. A blank
     /// title is dropped rather than overwriting a previously known one.
     pub fn fetch_page_title(&self, tab_id: TabId, history_id: u64) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
+        let Some(webview) = self.tab_webview(tab_id) else {
+            return Ok(());
         };
         let proxy = self.proxy.clone();
         let window_id = self.id;
@@ -2586,13 +2544,8 @@ impl BrowserWindow {
         history_id: u64,
         page_url: String,
     ) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
+        let Some(webview) = self.tab_webview(tab_id) else {
+            return Ok(());
         };
         let proxy = self.proxy.clone();
         let window_id = self.id;
@@ -2645,17 +2598,13 @@ impl BrowserWindow {
         let proxy = self.proxy.clone();
         let suggested =
             save_page::suggested_file_name(title.as_deref(), &url, save_page::MHTML_EXTENSION);
-        let Some(webview) = self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        else {
+        let Some(webview) = self.tab_webview(tab_id) else {
             report_save_page_failure(
                 &proxy,
                 window_id,
                 url,
                 suggested,
-                "ページが表示されていないため保存できません".to_owned(),
+                SAVE_PAGE_NO_WEBVIEW_MESSAGE.to_owned(),
             );
             return;
         };
@@ -2672,17 +2621,13 @@ impl BrowserWindow {
             }
         };
 
-        let file_name = destination
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or(suggested);
-        let _ = proxy.send_event(UserEvent::SavePageStarted {
+        send_save_page_started(
+            &proxy,
             window_id,
-            url: url.clone(),
-            file_name,
-            destination: destination.clone(),
-            started_at: unix_now(),
-        });
+            url.clone(),
+            file_name_or(&destination, suggested),
+            destination.clone(),
+        );
 
         crate::ui::save_dialog_windows::capture_and_write_mhtml(
             webview,
@@ -2716,17 +2661,13 @@ impl BrowserWindow {
         let proxy = self.proxy.clone();
         let suggested =
             save_page::suggested_file_name(title.as_deref(), &url, save_page::HTML_EXTENSION);
-        let Some(webview) = self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        else {
+        let Some(webview) = self.tab_webview(tab_id) else {
             report_save_page_failure(
                 &proxy,
                 window_id,
                 url,
                 suggested,
-                "ページが表示されていないため保存できません".to_owned(),
+                SAVE_PAGE_NO_WEBVIEW_MESSAGE.to_owned(),
             );
             return;
         };
@@ -2746,17 +2687,13 @@ impl BrowserWindow {
                 return;
             }
         };
-        let file_name = destination
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or(suggested);
-        let _ = proxy.send_event(UserEvent::SavePageStarted {
+        send_save_page_started(
+            &proxy,
             window_id,
-            url: url.clone(),
-            file_name,
-            destination: destination.clone(),
-            started_at: unix_now(),
-        });
+            url.clone(),
+            file_name_or(&destination, suggested),
+            destination.clone(),
+        );
 
         let finish_proxy = proxy.clone();
         let finish_destination = destination.clone();
@@ -2810,13 +2747,8 @@ impl BrowserWindow {
     /// `tab_id` (no webview to read from), the same contract every other
     /// `fetch_*`/`search_in_page` method above uses.
     pub fn fetch_page_source(&self, tab_id: TabId, page_url: String) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
+        let Some(webview) = self.tab_webview(tab_id) else {
+            return Ok(());
         };
         let proxy = self.proxy.clone();
         // Issue #29/D68: carry this window's id so the resulting View Source
@@ -2852,15 +2784,7 @@ impl BrowserWindow {
         x: f64,
         y: f64,
     ) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.evaluate_script(&context_menu_render_script(entries, x, y))
+        self.eval_in_tab(tab_id, &context_menu_render_script(entries, x, y))
     }
 
     /// Remove tab `tab_id`'s context menu overlay from the page, if one is
@@ -2871,30 +2795,14 @@ impl BrowserWindow {
     /// handling). A no-op for an unknown/suspended tab, or one with nothing
     /// to remove — the script itself checks before touching the DOM.
     pub fn hide_context_menu(&self, tab_id: TabId) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.evaluate_script(CONTEXT_MENU_HIDE_SCRIPT)
+        self.eval_in_tab(tab_id, CONTEXT_MENU_HIDE_SCRIPT)
     }
 
     /// Run the "Copy" context-menu action in tab `tab_id`'s content webview
     /// (`document.execCommand("copy")`, acting on whatever selection is
     /// still current there). A no-op for an unknown/suspended tab.
     pub fn copy_selection(&self, tab_id: TabId) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.evaluate_script("document.execCommand('copy');")
+        self.eval_in_tab(tab_id, "document.execCommand('copy');")
     }
 
     /// Run the "Paste" context-menu action in tab `tab_id`'s content webview
@@ -2907,15 +2815,7 @@ impl BrowserWindow {
     /// three of VeloX's engines, only that it does not error out. See D78's
     /// "検証できていないこと" section.
     pub fn paste_into(&self, tab_id: TabId) -> wry::Result<()> {
-        let webview = match self
-            .contents
-            .get(&tab_id)
-            .and_then(|tab| tab.webview.as_ref())
-        {
-            Some(webview) => webview,
-            None => return Ok(()),
-        };
-        webview.evaluate_script("document.execCommand('paste');")
+        self.eval_in_tab(tab_id, "document.execCommand('paste');")
     }
 
     /// This window's own id (Issue #29). Stable for the window's whole
@@ -3406,10 +3306,8 @@ fn content_webview_builder<'a>(
     let nav_proxy = proxy.clone();
     let block_proxy = proxy.clone();
     let load_proxy = proxy.clone();
-    let devtools_proxy = proxy.clone();
+    let ipc_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
-    let context_menu_proxy = proxy.clone();
-    let form_input_proxy = proxy.clone();
     // Current origin of this tab, for the permission handler below
     // (docs/decisions.md D60): `with_permission_handler`'s callback
     // receives only a `PermissionKind`, no URL/origin (see the vendored
@@ -3515,35 +3413,8 @@ fn content_webview_builder<'a>(
             let _ = load_proxy.send_event(event);
         })
         .with_ipc_handler(move |request| {
-            // Untrusted content-webview IPC channel (see OPEN_DEVTOOLS_MESSAGE
-            // and ContentShortcut's doc comment): every branch here is either
-            // one fixed exact-match string comparison, a lookup into a
-            // fixed, closed set of them, or (context menu only, see D78) a
-            // bounded, size-capped parse whose result is never trusted
-            // as-is — never a page-supplied value used directly.
-            let body = request.body().as_str();
-            if body == OPEN_DEVTOOLS_MESSAGE {
-                let _ = devtools_proxy.send_event(UserEvent::OpenDevtoolsRequested(own_id));
-            } else if let Some(shortcut) = parse_content_shortcut(body) {
-                let _ = devtools_proxy.send_event(UserEvent::ContentShortcut(own_id, shortcut));
-            } else if let Some((x, y, raw)) = parse_context_menu_open(body) {
-                let _ = context_menu_proxy.send_event(UserEvent::ContextMenuRequested {
-                    window_id: own_id,
-                    tab_id: id,
-                    x,
-                    y,
-                    raw,
-                });
-            } else if body == FORM_INPUT_MESSAGE {
-                let _ = form_input_proxy.send_event(UserEvent::FormInputDetected(own_id, id));
-            } else if body == CONTEXT_MENU_CLOSE_MESSAGE {
-                let _ = context_menu_proxy.send_event(UserEvent::ContextMenuClosed(own_id, id));
-            } else if let Some(index) = parse_context_menu_action(body) {
-                let _ = context_menu_proxy.send_event(UserEvent::ContextMenuActionSelected {
-                    window_id: own_id,
-                    tab_id: id,
-                    index,
-                });
+            if let Some(event) = content_ipc_event(own_id, id, request.body()) {
+                let _ = ipc_proxy.send_event(event);
             }
         })
         // `target="_blank"` links and `window.open()` (see docs/decisions.md
@@ -3584,6 +3455,42 @@ fn content_webview_builder<'a>(
             with_download_handlers(builder, own_id, proxy, download_dir_override)
         }
         DownloadHandlerHost::SharedContext => builder,
+    }
+}
+
+/// 信頼しない content webview の IPC メッセージ 1 件を、対応する
+/// [`UserEvent`] に変換する。認識できないものは `None` (黙って無視する)。
+/// 判定順は `with_ipc_handler` に直書きしていた頃のまま。
+///
+/// Untrusted content-webview IPC channel (see OPEN_DEVTOOLS_MESSAGE
+/// and ContentShortcut's doc comment): every branch here is either
+/// one fixed exact-match string comparison, a lookup into a
+/// fixed, closed set of them, or (context menu only, see D78) a
+/// bounded, size-capped parse whose result is never trusted
+/// as-is — never a page-supplied value used directly.
+fn content_ipc_event(own_id: WindowId, id: TabId, body: &str) -> Option<UserEvent> {
+    if body == OPEN_DEVTOOLS_MESSAGE {
+        Some(UserEvent::OpenDevtoolsRequested(own_id))
+    } else if let Some(shortcut) = parse_content_shortcut(body) {
+        Some(UserEvent::ContentShortcut(own_id, shortcut))
+    } else if let Some((x, y, raw)) = parse_context_menu_open(body) {
+        Some(UserEvent::ContextMenuRequested {
+            window_id: own_id,
+            tab_id: id,
+            x,
+            y,
+            raw,
+        })
+    } else if body == FORM_INPUT_MESSAGE {
+        Some(UserEvent::FormInputDetected(own_id, id))
+    } else if body == CONTEXT_MENU_CLOSE_MESSAGE {
+        Some(UserEvent::ContextMenuClosed(own_id, id))
+    } else {
+        parse_context_menu_action(body).map(|index| UserEvent::ContextMenuActionSelected {
+            window_id: own_id,
+            tab_id: id,
+            index,
+        })
     }
 }
 
@@ -3787,10 +3694,7 @@ fn with_download_handlers<'a>(
     let download_completed_proxy = proxy.clone();
     builder
         .with_download_started_handler(move |url, destination| {
-            let suggested_name = destination
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let suggested_name = file_name_or(destination, String::new());
             // Prefer VeloX's own directory resolution (the settings
             // screen's override, then `VELOX_DOWNLOAD_DIR`, see
             // docs/decisions.md D28/D67) over whatever default wry already
@@ -3812,10 +3716,7 @@ fn with_download_handlers<'a>(
                     return false;
                 }
             };
-            let file_name = final_path
-                .file_name()
-                .map(|name| name.to_string_lossy().into_owned())
-                .unwrap_or(suggested_name);
+            let file_name = file_name_or(&final_path, suggested_name);
             *destination = final_path.clone();
             let _ = download_started_proxy.send_event(UserEvent::DownloadStarted {
                 window_id: own_id,
@@ -3849,6 +3750,35 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// 保存対象のタブに生きた webview がないときに「名前を付けて保存」
+/// (Issue #46) が報告する理由。Windows / 非 Windows の両実装で共有する。
+const SAVE_PAGE_NO_WEBVIEW_MESSAGE: &str = "ページが表示されていないため保存できません";
+
+/// `path` のファイル名部分 (表示用の lossy 変換)。ファイル名が取れない
+/// ときは `fallback`。
+fn file_name_or(path: &Path, fallback: String) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or(fallback)
+}
+
+/// [`UserEvent::SavePageStarted`] を送る (`started_at` は現在時刻)。
+fn send_save_page_started(
+    proxy: &EventLoopProxy<UserEvent>,
+    window_id: WindowId,
+    url: String,
+    file_name: String,
+    destination: PathBuf,
+) {
+    let _ = proxy.send_event(UserEvent::SavePageStarted {
+        window_id,
+        url,
+        file_name,
+        destination,
+        started_at: unix_now(),
+    });
+}
+
 /// Report a "名前を付けて保存" (Issue #46) failure that happened *before* a
 /// real destination could ever be chosen (no live webview for the tab, the
 /// native Save-As dialog itself failing, or the fallback download directory
@@ -3871,14 +3801,7 @@ fn report_save_page_failure(
     file_name: String,
     reason: String,
 ) {
-    let now = unix_now();
-    let _ = proxy.send_event(UserEvent::SavePageStarted {
-        window_id,
-        url: url.clone(),
-        file_name,
-        destination: PathBuf::new(),
-        started_at: now,
-    });
+    send_save_page_started(proxy, window_id, url.clone(), file_name, PathBuf::new());
     let _ = proxy.send_event(UserEvent::SavePageFinished {
         window_id,
         url,
