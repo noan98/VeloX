@@ -2003,7 +2003,7 @@ fn handle_user_event(
                     // explicitly so a title that arrives just before a
                     // crash is not lost from the next restore (Issue
                     // #25/D65).
-                    persist_session(state, window_id);
+                    persist_session(state);
                 }
             }
             if state.history.update_title(history_id, title) {
@@ -3915,26 +3915,9 @@ fn spawn_automation(
                 AutomationCommand::Wait { ms } => {
                     std::thread::sleep(Duration::from_millis(ms));
                 }
-                AutomationCommand::WaitLoad { timeout_ms } => {
-                    if proxy
-                        .send_event(UserEvent::Automation(AutomationCommand::WaitLoad {
-                            timeout_ms,
-                        }))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if automation_wait_rx.recv().is_err() {
-                        return;
-                    }
-                }
-                AutomationCommand::WaitStartup { timeout_ms } => {
-                    if proxy
-                        .send_event(UserEvent::Automation(AutomationCommand::WaitStartup {
-                            timeout_ms,
-                        }))
-                        .is_err()
-                    {
+                command @ (AutomationCommand::WaitLoad { .. }
+                | AutomationCommand::WaitStartup { .. }) => {
+                    if proxy.send_event(UserEvent::Automation(command)).is_err() {
                         return;
                     }
                     if automation_wait_rx.recv().is_err() {
@@ -4044,7 +4027,7 @@ fn sync_tab_strip(window: &BrowserWindow, window_id: WindowId, state: &mut AppSt
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));
-    persist_session(state, window_id);
+    persist_session(state);
 }
 
 /// Push the active tab's blocked-navigation count to the toolbar badge.
@@ -4352,31 +4335,49 @@ fn cancel_download(state: &mut AppState, id: DownloadId) {
     }
 }
 
-fn persist_history(state: &AppState) {
+/// `persist_history`/`persist_bookmarks`/`persist_input_history` の共通部:
+/// `data_dir` があれば `save` で書き出し、書き込み時間を `kind` として
+/// 記録 (metrics 有効時のみ) し、失敗は `action` としてログに出す。
+/// `data_dir` が無ければ何もしない。
+fn persist_store(
+    state: &AppState,
+    kind: metrics::StateWriteKind,
+    action: &str,
+    save: impl FnOnce(&Path) -> std::io::Result<()>,
+) {
     if let Some(dir) = &state.data_dir {
         let started = Instant::now();
-        let result = persistence::save_history(dir, &state.history);
-        record_state_write(state, metrics::StateWriteKind::History, started);
-        log_failure("save history", result);
+        let result = save(dir);
+        record_state_write(state, kind, started);
+        log_failure(action, result);
     }
+}
+
+fn persist_history(state: &AppState) {
+    persist_store(
+        state,
+        metrics::StateWriteKind::History,
+        "save history",
+        |dir| persistence::save_history(dir, &state.history),
+    );
 }
 
 fn persist_bookmarks(state: &AppState) {
-    if let Some(dir) = &state.data_dir {
-        let started = Instant::now();
-        let result = persistence::save_bookmarks(dir, &state.bookmarks);
-        record_state_write(state, metrics::StateWriteKind::Bookmarks, started);
-        log_failure("save bookmarks", result);
-    }
+    persist_store(
+        state,
+        metrics::StateWriteKind::Bookmarks,
+        "save bookmarks",
+        |dir| persistence::save_bookmarks(dir, &state.bookmarks),
+    );
 }
 
 fn persist_input_history(state: &AppState) {
-    if let Some(dir) = &state.data_dir {
-        let started = Instant::now();
-        let result = persistence::save_input_history(dir, &state.input_history);
-        record_state_write(state, metrics::StateWriteKind::InputHistory, started);
-        log_failure("save input history", result);
-    }
+    persist_store(
+        state,
+        metrics::StateWriteKind::InputHistory,
+        "save input history",
+        |dir| persistence::save_input_history(dir, &state.input_history),
+    );
 }
 
 /// Handle `ToolbarCommand::ClearSiteData` (Issue #26, docs/decisions.md
@@ -4388,26 +4389,25 @@ fn persist_input_history(state: &AppState) {
 /// user might need to know about.
 fn clear_all_site_data(window: &BrowserWindow) {
     let result = window.clear_all_site_data();
+    let first_error = || {
+        result
+            .first_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    };
     match site_data::summarize(result.attempted, result.failed) {
         ClearOutcome::Success | ClearOutcome::Nothing => {}
         ClearOutcome::Partial => eprintln!(
             "velox: cleared site data on {}/{} webviews; first error: {}",
             result.attempted - result.failed,
             result.attempted,
-            result
-                .first_error
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default()
+            first_error()
         ),
         ClearOutcome::AllFailed => eprintln!(
             "velox: failed to clear site data on all {} webview(s): {}",
             result.attempted,
-            result
-                .first_error
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default()
+            first_error()
         ),
     }
 }
@@ -4431,10 +4431,9 @@ fn clear_all_site_data(window: &BrowserWindow) {
 ///
 /// **Multi-window (Issue #149, was the D68/D74 follow-up)**: every open
 /// window is written, in `Windows`' own order, so the next launch restores
-/// all of them. `window_id` is now only "which window's change triggered
-/// this" — the snapshot is built from all of them either way, because a
-/// change in one window (a tab closed) does not make the others' tabs any
-/// less current.
+/// all of them. The snapshot is built from all of them no matter which
+/// window's change triggered this, because a change in one window (a tab
+/// closed) does not make the others' tabs any less current.
 ///
 /// **Private windows are left out entirely**, not written as empty ones: a
 /// private window's tabs must not reach disk (D14/D74), and an empty
@@ -4457,7 +4456,7 @@ fn clear_all_site_data(window: &BrowserWindow) {
 /// entirely when nothing changed, exactly like `app::
 /// refresh_history_panel_if_open` (Issue #66) skipped a redundant
 /// `set_history` push — same shape, different layer (disk I/O, not IPC).
-fn persist_session(state: &mut AppState, _window_id: WindowId) {
+fn persist_session(state: &mut AppState) {
     let Some(dir) = state.data_dir.clone() else {
         return;
     };
@@ -4679,13 +4678,21 @@ mod tests {
     /// only needs *a* window to exist for every pre-#29 test below to keep
     /// working unchanged).
     fn state_with_history_enabled(history_enabled: bool) -> AppState {
-        let windows = Windows::new_with_privacy("https://example.com/", !history_enabled);
+        state_with_windows(Windows::new_with_privacy(
+            "https://example.com/",
+            !history_enabled,
+        ))
+    }
+
+    /// `windows` を持つ、それ以外は空の (データディレクトリ・metrics なし)
+    /// `AppState`。
+    fn state_with_windows(windows: Windows) -> AppState {
         AppState {
             windows,
             site_policies: SitePolicies {
                 blocklist: Arc::new(FilterList::built_in()),
                 site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
-                site_permissions: Arc::new(crate::browser::SitePermissionStore::new()),
+                site_permissions: Arc::new(SitePermissionStore::new()),
             },
             history: HistoryStore::new(),
             bookmarks: BookmarkStore::new(),
@@ -4770,25 +4777,7 @@ mod tests {
             "test assumes both windows share a TabId value"
         );
 
-        let mut state = AppState {
-            windows,
-            site_policies: SitePolicies {
-                blocklist: Arc::new(FilterList::built_in()),
-                site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
-                site_permissions: Arc::new(crate::browser::SitePermissionStore::new()),
-            },
-            history: HistoryStore::new(),
-            bookmarks: BookmarkStore::new(),
-            input_history: InputHistoryStore::new(),
-            data_dir: None,
-            last_persisted_session: None,
-            perf: None,
-            downloads: DownloadStore::new(),
-            pending_memory_sample: None,
-            next_memory_sample_window: None,
-            settings: Settings::default(),
-            site_permissions: Arc::new(SitePermissionStore::new()),
-        };
+        let mut state = state_with_windows(windows);
 
         let private_id = record_visit_if_enabled(
             &mut state,
@@ -4855,14 +4844,7 @@ mod tests {
     /// tests) but for a directory `persistence::save_session` can create
     /// `session.json` under.
     fn unique_temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "velox-app-test-{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        let dir = unique_temp_file(&format!("velox-app-test-{label}"));
         std::fs::create_dir_all(&dir).expect("create a temp dir for a persist_session test");
         dir
     }
@@ -4880,9 +4862,8 @@ mod tests {
         let dir = unique_temp_dir("private-session");
         let mut state = state_with_history_enabled(false); // private == true
         state.data_dir = Some(dir.clone());
-        let window_id = state.windows.ids().next().unwrap();
 
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         assert!(
             !dir.join("session.json").exists(),
             "an all-private process must never write session.json"
@@ -4892,8 +4873,7 @@ mod tests {
         // `AppState`, same shape otherwise) must write it.
         let mut normal_state = state_with_history_enabled(true);
         normal_state.data_dir = Some(dir.clone());
-        let normal_window_id = normal_state.windows.ids().next().unwrap();
-        persist_session(&mut normal_state, normal_window_id);
+        persist_session(&mut normal_state);
         assert!(
             dir.join("session.json").exists(),
             "a normal window must still write session.json"
@@ -4910,7 +4890,6 @@ mod tests {
         let dir = unique_temp_dir("multi-window-session");
         let mut state = state_with_history_enabled(true);
         state.data_dir = Some(dir.clone());
-        let first = state.windows.ids().next().unwrap();
         state
             .windows
             .open_window_with_privacy("https://second.example/".to_owned(), false);
@@ -4919,7 +4898,7 @@ mod tests {
             .open_window_with_privacy("https://secret.example/".to_owned(), true);
         assert!(state.windows.is_private(private).unwrap());
 
-        persist_session(&mut state, first);
+        persist_session(&mut state);
 
         let saved = persistence::load_session(&dir)
             .expect("session.json")
@@ -4951,7 +4930,7 @@ mod tests {
         state.data_dir = Some(dir.clone());
         let window_id = state.windows.ids().next().unwrap();
 
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         let path = dir.join("session.json");
         assert!(path.exists(), "the first call must write session.json");
         assert!(state.last_persisted_session.is_some());
@@ -4961,7 +4940,7 @@ mod tests {
         // snapshot actually re-serializes and re-writes (rather than being
         // skipped), this sentinel is what gets clobbered.
         std::fs::write(&path, "sentinel").expect("overwrite with sentinel");
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "sentinel",
@@ -4974,7 +4953,7 @@ mod tests {
             .tabs_mut(window_id)
             .unwrap()
             .open("https://second.example/");
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         assert_ne!(
             std::fs::read_to_string(&path).unwrap(),
             "sentinel",
