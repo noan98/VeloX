@@ -418,13 +418,7 @@ pub struct BrowserWindow {
     /// enough: it is only unique *within* one window's own `Tabs`).
     id: WindowId,
     window: Window,
-    #[cfg(any(
-        target_os = "linux",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-    ))]
+    #[cfg(gtk_backend)]
     host: gtk::Fixed,
     toolbar: WebView,
     toolbar_height: u32,
@@ -636,30 +630,12 @@ impl BrowserWindow {
         // On Linux/BSD every webview goes in one `gtk::Fixed` container (see
         // `engine::create_webview_host`); everywhere else wry supports true
         // child webviews directly (see `attach` below).
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-        ))]
+        #[cfg(gtk_backend)]
         let host = engine::create_webview_host(&window)?;
 
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-        ))]
+        #[cfg(gtk_backend)]
         let attach = |builder: WebViewBuilder<'_>| attach_webview(&host, builder);
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-        )))]
+        #[cfg(not(gtk_backend))]
         let attach = |builder: WebViewBuilder<'_>| attach_webview(&window, builder);
 
         let (width, height) = logical_inner_size(&window);
@@ -788,13 +764,7 @@ impl BrowserWindow {
         Ok(Self {
             id,
             window,
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "dragonfly",
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd",
-            ))]
+            #[cfg(gtk_backend)]
             host,
             toolbar,
             toolbar_height: config.toolbar_height,
@@ -929,21 +899,9 @@ impl BrowserWindow {
         // call would borrow all of `self`, conflicting with it. Passing the
         // target field directly keeps the two borrows disjoint — see
         // `engine::attach_webview`'s doc comment.
-        #[cfg(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-        ))]
+        #[cfg(gtk_backend)]
         let webview = attach_webview(&self.host, builder)?;
-        #[cfg(not(any(
-            target_os = "linux",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-        )))]
+        #[cfg(not(gtk_backend))]
         let webview = attach_webview(&self.window, builder)?;
         // Same Windows-only hook as `BrowserWindow::new` — see its call
         // site's doc comment. Covers every tab opened after startup and

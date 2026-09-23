@@ -56,13 +56,7 @@ pub(super) fn new_webview_builder(context: Option<&mut WebContext>) -> WebViewBu
 /// there (WKWebView shares its content process pool per
 /// `WKProcessPool`/configuration automatically, WebView2 per environment),
 /// and D48/D49 measured this problem on WebKitGTK only.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-))]
+#[cfg(gtk_backend)]
 pub(super) fn with_related_content_view<'a>(
     builder: WebViewBuilder<'a>,
     related: Option<&WebView>,
@@ -74,13 +68,7 @@ pub(super) fn with_related_content_view<'a>(
     }
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-)))]
+#[cfg(not(gtk_backend))]
 pub(super) fn with_related_content_view<'a>(
     builder: WebViewBuilder<'a>,
     _related: Option<&WebView>,
@@ -92,13 +80,7 @@ pub(super) fn with_related_content_view<'a>(
 /// [`BrowserWindow::is_playing_audio`](super::BrowserWindow::is_playing_audio). Guarded by `has_property` so a
 /// WebKitGTK build without the property (it has existed since 2.8, so this
 /// is purely defensive) reads as "not playing" instead of a GLib panic.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-))]
+#[cfg(gtk_backend)]
 pub(super) fn webview_is_playing_audio(webview: &WebView) -> bool {
     use gtk::glib::prelude::*;
     use wry::WebViewExtUnix;
@@ -116,14 +98,7 @@ pub(super) fn webview_is_playing_audio(webview: &WebView) -> bool {
     crate::ui::webview2_suspend::is_playing_audio(webview)
 }
 
-#[cfg(not(any(
-    windows,
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-)))]
+#[cfg(not(any(windows, gtk_backend)))]
 pub(super) fn webview_is_playing_audio(_webview: &WebView) -> bool {
     false
 }
@@ -283,13 +258,7 @@ pub(super) fn disable_default_context_menus(builder: WebViewBuilder<'_>) -> WebV
 /// `with_bounds`/`set_bounds`), created once per window and reused for
 /// every tab opened afterwards. Everywhere else wry supports true child
 /// webviews directly, so no such container exists.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-))]
+#[cfg(gtk_backend)]
 pub(super) fn create_webview_host(
     window: &Window,
 ) -> Result<gtk::Fixed, Box<dyn std::error::Error>> {
@@ -315,13 +284,7 @@ pub(super) fn create_webview_host(
 /// already hold a `&mut` borrow of `self.context` (docs/decisions.md D49);
 /// a `&self` method here would borrow the whole struct and conflict with
 /// that, whereas a disjoint `&self.host` argument does not.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-))]
+#[cfg(gtk_backend)]
 pub(super) fn attach_webview(
     host: &gtk::Fixed,
     builder: WebViewBuilder<'_>,
@@ -330,13 +293,7 @@ pub(super) fn attach_webview(
     builder.build_gtk(host)
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-)))]
+#[cfg(not(gtk_backend))]
 /// Everywhere else wry supports true child webviews directly. See the
 /// Linux/BSD `attach_webview` above for why this takes `window` explicitly.
 pub(super) fn attach_webview(window: &Window, builder: WebViewBuilder<'_>) -> wry::Result<WebView> {

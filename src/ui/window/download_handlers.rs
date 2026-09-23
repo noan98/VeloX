@@ -36,13 +36,7 @@ use crate::browser::WindowId;
 /// (*where* handlers are registered vs. *whether a flag is shared*) and
 /// happen to have the same answer today; tying them together would mean a
 /// future change to one silently moving the other.
-pub const DOWNLOAD_SUCCESS_FLAG_IS_SHARED: bool = cfg!(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-));
+pub const DOWNLOAD_SUCCESS_FLAG_IS_SHARED: bool = cfg!(gtk_backend);
 
 /// Whether wry registers a webview's download handlers on the
 /// [`WebContext`](wry::WebContext) the webview is built against rather than on the webview
@@ -53,13 +47,7 @@ pub const DOWNLOAD_SUCCESS_FLAG_IS_SHARED: bool = cfg!(any(
 /// `src/webkitgtk/mod.rs` → `webkitgtk/web_context.rs`); `false` on
 /// WKWebView (a per-webview download delegate) and WebView2 (a
 /// per-controller `add_DownloadStarting`). See docs/decisions.md D53.
-pub(super) const DOWNLOAD_HANDLERS_PER_CONTEXT: bool = cfg!(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-));
+pub(super) const DOWNLOAD_HANDLERS_PER_CONTEXT: bool = cfg!(gtk_backend);
 
 /// Which webview(s) VeloX's download handlers are registered on — the
 /// output of [`download_handler_host`].
