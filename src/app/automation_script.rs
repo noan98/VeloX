@@ -30,12 +30,12 @@ use super::*;
 /// unrelated wait resolve prematurely on a stale message still sitting in
 /// the channel).
 pub(super) struct AutomationWaitState {
-    pub(super) pending: Option<AutomationWait>,
+    pending: Option<AutomationWait>,
     /// Wakes the automation thread's blocked `recv()`. The payload carries
     /// nothing — the thread does not need to know *why* it woke, only that
     /// it may proceed; whichever resolution path fired already logged the
     /// reason to stderr on a timeout (see [`poll_automation_wait_timeout`]).
-    pub(super) notify: mpsc::Sender<()>,
+    notify: mpsc::Sender<()>,
     /// Set once `mark_startup` has written the `startup` perf record (Issue
     /// #173) — read by `handle_automation_command`'s `WaitStartup` arm so a
     /// `wait_startup` issued *after* that point resolves immediately
@@ -48,10 +48,20 @@ pub(super) struct AutomationWaitState {
     /// elsewhere in this file. Never reset back to `false`: `mark_startup`
     /// only ever writes the report once per process (it clears `startup`
     /// right after), so once true it stays true for the rest of the run.
-    pub(super) startup_reported: bool,
+    startup_reported: bool,
 }
 
 impl AutomationWaitState {
+    /// 待機なし・`startup` 未報告の状態で作る。`notify` は自動化スレッドの
+    /// `recv()` 側と対になる送信側。
+    pub(super) fn new(notify: mpsc::Sender<()>) -> Self {
+        Self {
+            pending: None,
+            notify,
+            startup_reported: false,
+        }
+    }
+
     /// 自動化スレッドの `recv()` を起こす。自動化スレッドが既に終わって
     /// いる (受信側が drop 済み) 場合の送信失敗は無視してよい。
     pub(super) fn wake(&self) {

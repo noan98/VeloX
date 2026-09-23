@@ -796,11 +796,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // half) stays on the main thread and is threaded through the event loop
     // like `page_load_timers`.
     let (automation_wait_tx, automation_wait_rx) = mpsc::channel::<()>();
-    let mut automation_wait = AutomationWaitState {
-        pending: None,
-        notify: automation_wait_tx,
-        startup_reported: false,
-    };
+    let mut automation_wait = AutomationWaitState::new(automation_wait_tx);
 
     let history = data_dir
         .as_deref()
