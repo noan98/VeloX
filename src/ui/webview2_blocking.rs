@@ -202,14 +202,17 @@ fn handle_request(
     // of this call (see `attach`'s doc comment); every call below is a
     // plain COM getter/setter.
     let (url, resource_type) = unsafe {
-        let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
-        args.ResourceContext(&mut context)?;
+        let mut resource_context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
+        args.ResourceContext(&mut resource_context)?;
 
         let request = args.Request()?;
         let mut uri = PWSTR::null();
         request.Uri(&mut uri)?;
 
-        (take_pwstr(uri), resource_type_from_context(context))
+        (
+            take_pwstr(uri),
+            resource_type_from_context(resource_context),
+        )
     };
 
     // SAFETY: same as above — `ICoreWebView2::Source` is a plain COM
@@ -268,26 +271,17 @@ unsafe fn current_page_host(core: &ICoreWebView2) -> Option<String> {
 /// sockets' handshake, ...) falls back to `ResourceType::Other`, which is
 /// still fully subject to `FilterList` — only `Document` is special-cased.
 fn resource_type_from_context(context: COREWEBVIEW2_WEB_RESOURCE_CONTEXT) -> ResourceType {
-    if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT {
-        ResourceType::Document
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_STYLESHEET {
-        ResourceType::Stylesheet
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE {
-        ResourceType::Image
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT {
-        ResourceType::Font
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT {
-        ResourceType::Script
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_XML_HTTP_REQUEST
-        || context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH
-    {
-        ResourceType::XhrOrFetch
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA {
-        ResourceType::Media
-    } else if context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET {
-        ResourceType::WebSocket
-    } else {
-        ResourceType::Other
+    match context {
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT => ResourceType::Document,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_STYLESHEET => ResourceType::Stylesheet,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE => ResourceType::Image,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT => ResourceType::Font,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT => ResourceType::Script,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_XML_HTTP_REQUEST
+        | COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH => ResourceType::XhrOrFetch,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA => ResourceType::Media,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET => ResourceType::WebSocket,
+        _ => ResourceType::Other,
     }
 }
 

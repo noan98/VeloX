@@ -550,8 +550,7 @@ pub(crate) fn escape_js_line_terminators(json: String) -> String {
 /// The URL is embedded as a JSON string literal, so arbitrary URLs cannot
 /// break out of the script.
 pub fn set_url_script(url: &str) -> String {
-    let json = serde_json::Value::String(url.to_owned()).to_string();
-    format!("veloxSetUrl({});", escape_js_line_terminators(json))
+    format!("veloxSetUrl({});", value_to_json(url))
 }
 
 /// JS snippet that toggles the loading indicator.
@@ -571,8 +570,7 @@ pub fn set_block_count_script(count: u32) -> String {
 /// (e.g. non-string map keys), so a failure falls back to an empty tab strip
 /// rather than panicking.
 pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
-    let json = serde_json::to_string(tabs).unwrap_or_else(|_| "[]".to_owned());
-    format!("veloxSetTabs({});", escape_js_line_terminators(json))
+    format!("veloxSetTabs({});", entries_to_json(tabs))
 }
 
 /// JS snippet that replaces the omnibox candidate dropdown's contents.
@@ -582,8 +580,7 @@ pub fn set_tabs_script(tabs: &[TabSummary]) -> String {
 /// a serialization failure (cannot happen for this type in practice) falls
 /// back to an empty list rather than panicking.
 pub fn set_candidates_script(candidates: &[Candidate]) -> String {
-    let json = serde_json::to_string(candidates).unwrap_or_else(|_| "[]".to_owned());
-    format!("veloxSetCandidates({});", escape_js_line_terminators(json))
+    format!("veloxSetCandidates({});", entries_to_json(candidates))
 }
 
 /// JS snippet that forces the address bar's text to `url`, focuses it, and
@@ -594,11 +591,7 @@ pub fn set_candidates_script(candidates: &[Candidate]) -> String {
 /// point here), so it is a distinct JS entry point rather than a call to
 /// `veloxSetUrl`.
 pub fn set_focus_address_bar_script(url: &str) -> String {
-    let json = serde_json::Value::String(url.to_owned()).to_string();
-    format!(
-        "veloxFocusAddressBar({});",
-        escape_js_line_terminators(json)
-    )
+    format!("veloxFocusAddressBar({});", value_to_json(url))
 }
 
 /// JS snippet that toggles the bookmark ("star") button's active state.
@@ -616,16 +609,12 @@ pub fn set_private_script(private: bool) -> String {
 
 /// JS snippet that opens the given panel, or closes whichever panel is open
 /// when `panel` is `None`.
+///
+/// The panel name is [`Panel`]'s own `snake_case` serde tag (a JSON string),
+/// and `None` serializes as `null` — the same spelling `TogglePanel`'s
+/// `panel` field is parsed from, so the two directions cannot drift apart.
 pub fn set_panel_script(panel: Option<Panel>) -> String {
-    let arg = match panel {
-        Some(Panel::History) => "\"history\"",
-        Some(Panel::Bookmarks) => "\"bookmarks\"",
-        Some(Panel::Downloads) => "\"downloads\"",
-        Some(Panel::Omnibox) => "\"omnibox\"",
-        Some(Panel::Settings) => "\"settings\"",
-        None => "null",
-    };
-    format!("veloxSetPanel({arg});")
+    format!("veloxSetPanel({});", value_to_json(&panel))
 }
 
 /// JS snippet that replaces the history panel's contents, as date-grouped
@@ -692,14 +681,10 @@ pub fn set_find_status_script(total: usize, active: Option<usize>) -> String {
 /// dynamic-text script here uses — a page title or a raw COM error string
 /// (`windows::core::Error`'s `Display`) can contain arbitrary characters and
 /// must not be able to break out of the generated script.
+///
+/// `None` serializes as JSON `null`, which hides the banner.
 pub fn set_print_status_script(message: Option<&str>) -> String {
-    match message {
-        Some(text) => {
-            let json = serde_json::Value::String(text.to_owned()).to_string();
-            format!("veloxSetPrintStatus({});", escape_js_line_terminators(json))
-        }
-        None => "veloxSetPrintStatus(null);".to_owned(),
-    }
+    format!("veloxSetPrintStatus({});", value_to_json(&message))
 }
 
 /// JS snippet that replaces the downloads panel's contents. `DownloadEntry`
@@ -711,10 +696,6 @@ pub fn set_downloads_script(entries: &[&DownloadEntry]) -> String {
     format!("veloxSetDownloads({});", entries_to_json(entries))
 }
 
-/// Serialize `entries` to a JSON array text, with the same
-/// U+2028/U+2029-escaping [`set_url_script`] applies to its own string, and
-/// the same "cannot actually fail for these types, but never panic if it
-/// somehow did" fallback every other `set_*_script` function here uses.
 /// JS snippet that replaces the settings screen's contents (Issue #30, see
 /// [`SettingsView`] and docs/decisions.md D67). Pushed on `ready` and again
 /// after every `update_settings`/`reset_settings` command, so the form
@@ -736,16 +717,34 @@ pub fn set_theme_script(theme: Theme) -> String {
     format!("veloxSetTheme(\"{}\");", theme.as_str())
 }
 
+/// Serialize `entries` to a JSON array text, with U+2028/U+2029 escaped
+/// ([`escape_js_line_terminators`]), and a "cannot actually fail for these
+/// types, but never panic if it somehow did" fallback to an empty array.
 fn entries_to_json<T: Serialize>(entries: &[T]) -> String {
     let json = serde_json::to_string(entries).unwrap_or_else(|_| "[]".to_owned());
     escape_js_line_terminators(json)
 }
 
 /// Same shape and reasoning as [`entries_to_json`], for a single (non-slice)
-/// value such as [`BookmarksView`].
-fn value_to_json<T: Serialize>(value: &T) -> String {
+/// value such as [`BookmarksView`] or a bare string (embedded as a JSON
+/// string literal), falling back to `null` instead of an empty array.
+/// `ui::window` の content webview 向けスクリプトも同じ埋め込み方をする
+/// ため `pub(crate)` にしている。
+pub(crate) fn value_to_json<T: Serialize + ?Sized>(value: &T) -> String {
     let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_owned());
     escape_js_line_terminators(json)
+}
+
+/// テスト用: U+2028/U+2029 が生のまま残らず、リテラルのエスケープ列として
+/// 埋め込まれていることを確かめる (D62)。[`escape_js_line_terminators`] を
+/// 通したスクリプトを検証する `ui::toolbar` / `ui::window` のテストで共有する。
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_line_terminators_escaped(script: &str) {
+    assert!(script.contains("\\u2028"), "{script}");
+    assert!(script.contains("\\u2029"), "{script}");
+    assert!(!script.contains('\u{2028}'), "{script}");
+    assert!(!script.contains('\u{2029}'), "{script}");
 }
 
 #[cfg(test)]
@@ -753,66 +752,69 @@ mod tests {
     use super::*;
     use crate::browser::{CandidateKind, HistoryDateBucket, HistoryEntry};
 
+    /// `body` を [`parse_command`] に通し、`expected` どおりに解釈される
+    /// ことを確かめる。失敗時にはどの IPC 本文だったかを出す。
+    #[track_caller]
+    fn assert_parses(body: &str, expected: ToolbarCommand) {
+        match parse_command(body) {
+            Ok(cmd) => assert_eq!(cmd, expected, "{body}"),
+            Err(err) => panic!("{body} のパースに失敗しました: {err}"),
+        }
+    }
+
+    /// テスト用の [`TabSummary`]。各テストは関心のあるフィールドだけを
+    /// 構造体更新構文で上書きする。
+    fn tab_summary(id: u64, url: &str) -> TabSummary {
+        TabSummary {
+            id,
+            url: url.to_owned(),
+            title: None,
+            favicon: None,
+            loading: false,
+            active: false,
+            suspended: false,
+            pinned: false,
+        }
+    }
+
     #[test]
     fn parses_navigate_command() {
-        let cmd = parse_command(r#"{"cmd":"navigate","input":"example.com"}"#).unwrap();
-        assert_eq!(
-            cmd,
+        assert_parses(
+            r#"{"cmd":"navigate","input":"example.com"}"#,
             ToolbarCommand::Navigate {
-                input: "example.com".to_owned()
-            }
+                input: "example.com".to_owned(),
+            },
         );
     }
 
     #[test]
     fn parses_plain_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"back"}"#).unwrap(),
-            ToolbarCommand::Back
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"forward"}"#).unwrap(),
-            ToolbarCommand::Forward
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"reload"}"#).unwrap(),
-            ToolbarCommand::Reload
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"new_tab"}"#).unwrap(),
-            ToolbarCommand::NewTab
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"ready"}"#).unwrap(),
-            ToolbarCommand::Ready
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"script_started"}"#).unwrap(),
-            ToolbarCommand::ScriptStarted
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"open_devtools"}"#).unwrap(),
-            ToolbarCommand::OpenDevtools
-        );
+        assert_parses(r#"{"cmd":"back"}"#, ToolbarCommand::Back);
+        assert_parses(r#"{"cmd":"forward"}"#, ToolbarCommand::Forward);
+        assert_parses(r#"{"cmd":"reload"}"#, ToolbarCommand::Reload);
+        assert_parses(r#"{"cmd":"new_tab"}"#, ToolbarCommand::NewTab);
+        assert_parses(r#"{"cmd":"ready"}"#, ToolbarCommand::Ready);
+        assert_parses(r#"{"cmd":"script_started"}"#, ToolbarCommand::ScriptStarted);
+        assert_parses(r#"{"cmd":"open_devtools"}"#, ToolbarCommand::OpenDevtools);
     }
 
     #[test]
     fn parses_tab_commands_with_ids() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"close_tab","id":3}"#).unwrap(),
-            ToolbarCommand::CloseTab { id: 3 }
+        assert_parses(
+            r#"{"cmd":"close_tab","id":3}"#,
+            ToolbarCommand::CloseTab { id: 3 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"activate_tab","id":42}"#).unwrap(),
-            ToolbarCommand::ActivateTab { id: 42 }
+        assert_parses(
+            r#"{"cmd":"activate_tab","id":42}"#,
+            ToolbarCommand::ActivateTab { id: 42 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"suspend_tab","id":7}"#).unwrap(),
-            ToolbarCommand::SuspendTab { id: 7 }
+        assert_parses(
+            r#"{"cmd":"suspend_tab","id":7}"#,
+            ToolbarCommand::SuspendTab { id: 7 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_pin_tab","id":9}"#).unwrap(),
-            ToolbarCommand::TogglePinTab { id: 9 }
+        assert_parses(
+            r#"{"cmd":"toggle_pin_tab","id":9}"#,
+            ToolbarCommand::TogglePinTab { id: 9 },
         );
     }
 
@@ -886,10 +888,7 @@ mod tests {
         let big_input = "a".repeat(MAX_IPC_PAYLOAD_BYTES / 4);
         let body = format!(r#"{{"cmd":"navigate","input":"{big_input}"}}"#);
         assert!(body.len() < MAX_IPC_PAYLOAD_BYTES);
-        assert_eq!(
-            parse_command(&body).unwrap(),
-            ToolbarCommand::Navigate { input: big_input }
-        );
+        assert_parses(&body, ToolbarCommand::Navigate { input: big_input });
     }
 
     #[test]
@@ -974,104 +973,89 @@ mod tests {
 
     #[test]
     fn parses_bookmark_and_panel_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_bookmark"}"#).unwrap(),
-            ToolbarCommand::ToggleBookmark
+        assert_parses(
+            r#"{"cmd":"toggle_bookmark"}"#,
+            ToolbarCommand::ToggleBookmark,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_panel","panel":"history"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"toggle_panel","panel":"history"}"#,
             ToolbarCommand::TogglePanel {
-                panel: Panel::History
-            }
+                panel: Panel::History,
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_panel","panel":"bookmarks"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"toggle_panel","panel":"bookmarks"}"#,
             ToolbarCommand::TogglePanel {
-                panel: Panel::Bookmarks
-            }
+                panel: Panel::Bookmarks,
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"delete_history_entry","id":42}"#).unwrap(),
-            ToolbarCommand::DeleteHistoryEntry { id: 42 }
+        assert_parses(
+            r#"{"cmd":"delete_history_entry","id":42}"#,
+            ToolbarCommand::DeleteHistoryEntry { id: 42 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"clear_history"}"#).unwrap(),
-            ToolbarCommand::ClearHistory
+        assert_parses(r#"{"cmd":"clear_history"}"#, ToolbarCommand::ClearHistory);
+        assert_parses(
+            r#"{"cmd":"clear_site_data"}"#,
+            ToolbarCommand::ClearSiteData,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"clear_site_data"}"#).unwrap(),
-            ToolbarCommand::ClearSiteData
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"search_history","query":"rust"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"search_history","query":"rust"}"#,
             ToolbarCommand::SearchHistory {
-                query: "rust".to_owned()
-            }
+                query: "rust".to_owned(),
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"search_history","query":""}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"search_history","query":""}"#,
             ToolbarCommand::SearchHistory {
-                query: String::new()
-            }
+                query: String::new(),
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"remove_bookmark","id":7}"#).unwrap(),
-            ToolbarCommand::RemoveBookmark { id: 7 }
+        assert_parses(
+            r#"{"cmd":"remove_bookmark","id":7}"#,
+            ToolbarCommand::RemoveBookmark { id: 7 },
         );
     }
 
     #[test]
     fn parses_keyboard_shortcut_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"close_active_tab"}"#).unwrap(),
-            ToolbarCommand::CloseActiveTab
+        assert_parses(
+            r#"{"cmd":"close_active_tab"}"#,
+            ToolbarCommand::CloseActiveTab,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"reopen_closed_tab"}"#).unwrap(),
-            ToolbarCommand::ReopenClosedTab
+        assert_parses(
+            r#"{"cmd":"reopen_closed_tab"}"#,
+            ToolbarCommand::ReopenClosedTab,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"next_tab"}"#).unwrap(),
-            ToolbarCommand::NextTab
+        assert_parses(r#"{"cmd":"next_tab"}"#, ToolbarCommand::NextTab);
+        assert_parses(r#"{"cmd":"prev_tab"}"#, ToolbarCommand::PrevTab);
+        assert_parses(
+            r#"{"cmd":"activate_tab_by_index","index":3}"#,
+            ToolbarCommand::ActivateTabByIndex { index: 3 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"prev_tab"}"#).unwrap(),
-            ToolbarCommand::PrevTab
+        assert_parses(
+            r#"{"cmd":"activate_last_tab"}"#,
+            ToolbarCommand::ActivateLastTab,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"activate_tab_by_index","index":3}"#).unwrap(),
-            ToolbarCommand::ActivateTabByIndex { index: 3 }
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"activate_last_tab"}"#).unwrap(),
-            ToolbarCommand::ActivateLastTab
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"new_window"}"#).unwrap(),
-            ToolbarCommand::NewWindow
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"new_private_window"}"#).unwrap(),
-            ToolbarCommand::NewPrivateWindow
+        assert_parses(r#"{"cmd":"new_window"}"#, ToolbarCommand::NewWindow);
+        assert_parses(
+            r#"{"cmd":"new_private_window"}"#,
+            ToolbarCommand::NewPrivateWindow,
         );
     }
 
     #[test]
     fn parses_omnibox_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"focus_address_bar"}"#).unwrap(),
-            ToolbarCommand::FocusAddressBar
+        assert_parses(
+            r#"{"cmd":"focus_address_bar"}"#,
+            ToolbarCommand::FocusAddressBar,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"omnibox_input","input":"rust ownership"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"omnibox_input","input":"rust ownership"}"#,
             ToolbarCommand::OmniboxInput {
-                input: "rust ownership".to_owned()
-            }
+                input: "rust ownership".to_owned(),
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"omnibox_close"}"#).unwrap(),
-            ToolbarCommand::OmniboxClose
-        );
+        assert_parses(r#"{"cmd":"omnibox_close"}"#, ToolbarCommand::OmniboxClose);
     }
 
     #[test]
@@ -1105,38 +1089,24 @@ mod tests {
         // sequence, never the raw codepoint, so the string can never end
         // early no matter which engine evaluates it (see D62).
         let script = set_url_script("https://example.com/\u{2028}payload\u{2029}");
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'));
-        assert!(!script.contains('\u{2029}'));
+        assert_line_terminators_escaped(&script);
     }
 
     #[test]
     fn focus_address_bar_script_escapes_u2028_and_u2029() {
         let script = set_focus_address_bar_script("https://example.com/\u{2028}\u{2029}");
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'));
-        assert!(!script.contains('\u{2029}'));
+        assert_line_terminators_escaped(&script);
     }
 
     #[test]
     fn tabs_script_escapes_u2028_and_u2029_in_titles() {
-        let tabs = vec![TabSummary {
-            id: 1,
-            url: "https://example.com/".to_owned(),
+        let tabs = [TabSummary {
             title: Some("line one\u{2028}line two\u{2029}line three".to_owned()),
-            favicon: None,
-            loading: false,
             active: true,
-            suspended: false,
-            pinned: false,
+            ..tab_summary(1, "https://example.com/")
         }];
         let script = set_tabs_script(&tabs);
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'));
-        assert!(!script.contains('\u{2029}'));
+        assert_line_terminators_escaped(&script);
     }
 
     #[test]
@@ -1154,10 +1124,7 @@ mod tests {
             entries: vec![&entry],
         }];
         let script = set_history_script(&groups);
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'));
-        assert!(!script.contains('\u{2029}'));
+        assert_line_terminators_escaped(&script);
     }
 
     #[test]
@@ -1174,36 +1141,20 @@ mod tests {
 
     #[test]
     fn tabs_script_embeds_a_json_array() {
-        let tabs = vec![
+        let tabs = [
             TabSummary {
-                id: 1,
-                url: "https://a.example/".to_owned(),
                 title: Some("A\"s page".to_owned()),
                 favicon: Some("https://a.example/favicon.ico".to_owned()),
-                loading: false,
                 active: true,
-                suspended: false,
-                pinned: false,
+                ..tab_summary(1, "https://a.example/")
             },
             TabSummary {
-                id: 2,
-                url: "https://b.example/?q=\"x\"".to_owned(),
-                title: None,
-                favicon: None,
                 loading: true,
-                active: false,
-                suspended: false,
-                pinned: false,
+                ..tab_summary(2, "https://b.example/?q=\"x\"")
             },
             TabSummary {
-                id: 3,
-                url: "https://c.example/".to_owned(),
-                title: None,
-                favicon: None,
-                loading: false,
-                active: false,
                 suspended: true,
-                pinned: false,
+                ..tab_summary(3, "https://c.example/")
             },
         ];
         let script = set_tabs_script(&tabs);
@@ -1226,15 +1177,9 @@ mod tests {
 
     #[test]
     fn tabs_script_embeds_the_pinned_flag() {
-        let tabs = vec![TabSummary {
-            id: 1,
-            url: "https://a.example/".to_owned(),
-            title: None,
-            favicon: None,
-            loading: false,
-            active: false,
-            suspended: false,
+        let tabs = [TabSummary {
             pinned: true,
+            ..tab_summary(1, "https://a.example/")
         }];
         let script = set_tabs_script(&tabs);
         assert!(script.contains(r#""pinned":true"#));
@@ -1431,147 +1376,117 @@ mod tests {
 
     #[test]
     fn parses_bookmark_folder_edit_and_reorder_commands() {
-        assert_eq!(
-            parse_command(
-                r#"{"cmd":"edit_bookmark","id":1,"title":"New","url":"https://example.com/","folder_id":2}"#
-            )
-            .unwrap(),
+        assert_parses(
+            r#"{"cmd":"edit_bookmark","id":1,"title":"New","url":"https://example.com/","folder_id":2}"#,
             ToolbarCommand::EditBookmark {
                 id: 1,
                 title: "New".to_owned(),
                 url: "https://example.com/".to_owned(),
                 folder_id: Some(2),
-            }
+            },
         );
-        assert_eq!(
-            parse_command(
-                r#"{"cmd":"edit_bookmark","id":1,"title":"","url":"https://example.com/","folder_id":null}"#
-            )
-            .unwrap(),
+        assert_parses(
+            r#"{"cmd":"edit_bookmark","id":1,"title":"","url":"https://example.com/","folder_id":null}"#,
             ToolbarCommand::EditBookmark {
                 id: 1,
                 title: String::new(),
                 url: "https://example.com/".to_owned(),
                 folder_id: None,
-            }
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"create_bookmark_folder","name":"仕事"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"create_bookmark_folder","name":"仕事"}"#,
             ToolbarCommand::CreateBookmarkFolder {
-                name: "仕事".to_owned()
-            }
+                name: "仕事".to_owned(),
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"rename_bookmark_folder","id":3,"name":"新名前"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"rename_bookmark_folder","id":3,"name":"新名前"}"#,
             ToolbarCommand::RenameBookmarkFolder {
                 id: 3,
-                name: "新名前".to_owned()
-            }
+                name: "新名前".to_owned(),
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"remove_bookmark_folder","id":3}"#).unwrap(),
-            ToolbarCommand::RemoveBookmarkFolder { id: 3 }
+        assert_parses(
+            r#"{"cmd":"remove_bookmark_folder","id":3}"#,
+            ToolbarCommand::RemoveBookmarkFolder { id: 3 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"move_bookmark_up","id":5}"#).unwrap(),
-            ToolbarCommand::MoveBookmarkUp { id: 5 }
+        assert_parses(
+            r#"{"cmd":"move_bookmark_up","id":5}"#,
+            ToolbarCommand::MoveBookmarkUp { id: 5 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"move_bookmark_down","id":5}"#).unwrap(),
-            ToolbarCommand::MoveBookmarkDown { id: 5 }
+        assert_parses(
+            r#"{"cmd":"move_bookmark_down","id":5}"#,
+            ToolbarCommand::MoveBookmarkDown { id: 5 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_bookmark_bar"}"#).unwrap(),
-            ToolbarCommand::ToggleBookmarkBar
+        assert_parses(
+            r#"{"cmd":"toggle_bookmark_bar"}"#,
+            ToolbarCommand::ToggleBookmarkBar,
         );
     }
 
     #[test]
     fn parses_download_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"open_download","id":9}"#).unwrap(),
-            ToolbarCommand::OpenDownload { id: 9 }
+        assert_parses(
+            r#"{"cmd":"open_download","id":9}"#,
+            ToolbarCommand::OpenDownload { id: 9 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"open_downloads_folder"}"#).unwrap(),
-            ToolbarCommand::OpenDownloadsFolder
+        assert_parses(
+            r#"{"cmd":"open_downloads_folder"}"#,
+            ToolbarCommand::OpenDownloadsFolder,
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"cancel_download","id":9}"#).unwrap(),
-            ToolbarCommand::CancelDownload { id: 9 }
+        assert_parses(
+            r#"{"cmd":"cancel_download","id":9}"#,
+            ToolbarCommand::CancelDownload { id: 9 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"remove_download_entry","id":9}"#).unwrap(),
-            ToolbarCommand::RemoveDownloadEntry { id: 9 }
+        assert_parses(
+            r#"{"cmd":"remove_download_entry","id":9}"#,
+            ToolbarCommand::RemoveDownloadEntry { id: 9 },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_panel","panel":"downloads"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"toggle_panel","panel":"downloads"}"#,
             ToolbarCommand::TogglePanel {
-                panel: Panel::Downloads
-            }
+                panel: Panel::Downloads,
+            },
         );
     }
 
     #[test]
     fn parses_find_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"open_find_bar"}"#).unwrap(),
-            ToolbarCommand::OpenFindBar
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"find_query","query":"foo","case_sensitive":false}"#).unwrap(),
+        assert_parses(r#"{"cmd":"open_find_bar"}"#, ToolbarCommand::OpenFindBar);
+        assert_parses(
+            r#"{"cmd":"find_query","query":"foo","case_sensitive":false}"#,
             ToolbarCommand::FindQuery {
                 query: "foo".to_owned(),
                 case_sensitive: false,
-            }
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"find_query","query":"","case_sensitive":true}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"find_query","query":"","case_sensitive":true}"#,
             ToolbarCommand::FindQuery {
                 query: String::new(),
                 case_sensitive: true,
-            }
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"find_next"}"#).unwrap(),
-            ToolbarCommand::FindNext
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"find_previous"}"#).unwrap(),
-            ToolbarCommand::FindPrevious
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"find_close"}"#).unwrap(),
-            ToolbarCommand::FindClose
-        );
+        assert_parses(r#"{"cmd":"find_next"}"#, ToolbarCommand::FindNext);
+        assert_parses(r#"{"cmd":"find_previous"}"#, ToolbarCommand::FindPrevious);
+        assert_parses(r#"{"cmd":"find_close"}"#, ToolbarCommand::FindClose);
     }
 
     #[test]
     fn parses_save_page_command() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"save_page"}"#).unwrap(),
-            ToolbarCommand::SavePage
-        );
+        assert_parses(r#"{"cmd":"save_page"}"#, ToolbarCommand::SavePage);
     }
 
     #[test]
     fn parses_print_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"print"}"#).unwrap(),
-            ToolbarCommand::Print
-        );
-        assert_eq!(
-            parse_command(r#"{"cmd":"save_as_pdf"}"#).unwrap(),
-            ToolbarCommand::SaveAsPdf
-        );
+        assert_parses(r#"{"cmd":"print"}"#, ToolbarCommand::Print);
+        assert_parses(r#"{"cmd":"save_as_pdf"}"#, ToolbarCommand::SaveAsPdf);
     }
 
     #[test]
     fn parses_view_source_command() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"view_source"}"#).unwrap(),
-            ToolbarCommand::ViewSource
-        );
+        assert_parses(r#"{"cmd":"view_source"}"#, ToolbarCommand::ViewSource);
     }
 
     #[test]
@@ -1596,10 +1511,7 @@ mod tests {
         // comment) — a COM error string or page title could contain either
         // character.
         let script = set_print_status_script(Some("foo\u{2028}bar\u{2029}"));
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'));
-        assert!(!script.contains('\u{2029}'));
+        assert_line_terminators_escaped(&script);
     }
 
     #[test]
@@ -1664,25 +1576,22 @@ mod tests {
 
     #[test]
     fn parses_settings_commands() {
-        assert_eq!(
-            parse_command(r#"{"cmd":"toggle_panel","panel":"settings"}"#).unwrap(),
+        assert_parses(
+            r#"{"cmd":"toggle_panel","panel":"settings"}"#,
             ToolbarCommand::TogglePanel {
-                panel: Panel::Settings
-            }
+                panel: Panel::Settings,
+            },
         );
-        assert_eq!(
-            parse_command(r#"{"cmd":"reset_settings"}"#).unwrap(),
-            ToolbarCommand::ResetSettings
-        );
+        assert_parses(r#"{"cmd":"reset_settings"}"#, ToolbarCommand::ResetSettings);
         let json = format!(
             r#"{{"cmd":"update_settings","settings":{}}}"#,
             serde_json::to_string(&crate::browser::Settings::default()).unwrap()
         );
-        assert_eq!(
-            parse_command(&json).unwrap(),
+        assert_parses(
+            &json,
             ToolbarCommand::UpdateSettings {
-                settings: Box::new(crate::browser::Settings::default())
-            }
+                settings: Box::new(crate::browser::Settings::default()),
+            },
         );
     }
 
@@ -1722,75 +1631,81 @@ mod tests {
 
     #[test]
     fn toolbar_html_declares_expected_hooks() {
-        assert!(TOOLBAR_HTML.contains("veloxSetUrl"));
-        assert!(TOOLBAR_HTML.contains("veloxSetLoading"));
-        assert!(TOOLBAR_HTML.contains("veloxSetBlockCount"));
-        assert!(TOOLBAR_HTML.contains("veloxSetTabs"));
-        assert!(TOOLBAR_HTML.contains("veloxSetBookmarkActive"));
-        assert!(TOOLBAR_HTML.contains("veloxSetPrivate"));
-        assert!(TOOLBAR_HTML.contains("veloxSetPanel"));
-        assert!(TOOLBAR_HTML.contains("veloxSetHistory"));
-        assert!(TOOLBAR_HTML.contains("veloxSetBookmarks"));
-        assert!(TOOLBAR_HTML.contains("ipc.postMessage"));
-        assert!(TOOLBAR_HTML.contains("new_tab"));
-        assert!(TOOLBAR_HTML.contains("close_tab"));
-        assert!(TOOLBAR_HTML.contains("activate_tab"));
-        assert!(TOOLBAR_HTML.contains("suspend_tab"));
-        assert!(TOOLBAR_HTML.contains("toggle_bookmark"));
-        assert!(TOOLBAR_HTML.contains("toggle_panel"));
-        assert!(TOOLBAR_HTML.contains("delete_history_entry"));
-        assert!(TOOLBAR_HTML.contains("clear_history"));
-        // Site data (cookies/cache/storage) clearing, Issue #26 (D66).
-        assert!(TOOLBAR_HTML.contains("clear_site_data"));
-        assert!(TOOLBAR_HTML.contains("search_history"));
-        assert!(TOOLBAR_HTML.contains("remove_bookmark"));
-        // Keyboard shortcuts (see docs/decisions.md D23): the toolbar's own
-        // capture-phase keydown listener, for when the address bar/panel
-        // (not the content webview) has focus.
-        assert!(TOOLBAR_HTML.contains("close_active_tab"));
-        assert!(TOOLBAR_HTML.contains("reopen_closed_tab"));
-        assert!(TOOLBAR_HTML.contains("next_tab"));
-        assert!(TOOLBAR_HTML.contains("prev_tab"));
-        assert!(TOOLBAR_HTML.contains("activate_tab_by_index"));
-        assert!(TOOLBAR_HTML.contains("activate_last_tab"));
-        // New window (Ctrl/Cmd+N, Issue #29, see docs/decisions.md D68).
-        assert!(TOOLBAR_HTML.contains("new_window"));
-        // New private window (Ctrl/Cmd+Shift+N, Issue #27, D74).
-        assert!(TOOLBAR_HTML.contains("new_private_window"));
-        // Downloads (Issue #16, see docs/decisions.md D28).
-        assert!(TOOLBAR_HTML.contains("veloxSetDownloads"));
-        assert!(TOOLBAR_HTML.contains("open_download"));
-        assert!(TOOLBAR_HTML.contains("open_downloads_folder"));
-        assert!(TOOLBAR_HTML.contains("cancel_download"));
-        assert!(TOOLBAR_HTML.contains("remove_download_entry"));
-        // Omnibox (Issue #15): Ctrl/Cmd+L, the candidate dropdown, and Esc.
-        assert!(TOOLBAR_HTML.contains("veloxSetCandidates"));
-        assert!(TOOLBAR_HTML.contains("veloxFocusAddressBar"));
-        assert!(TOOLBAR_HTML.contains("focus_address_bar"));
-        assert!(TOOLBAR_HTML.contains("omnibox_input"));
-        assert!(TOOLBAR_HTML.contains("omnibox_close"));
-        // Bookmark folders, editing, reordering, and the bookmark bar
-        // (Issue #19, see docs/decisions.md D32/D33/D34/D35).
-        assert!(TOOLBAR_HTML.contains("veloxSetBookmarkBar"));
-        assert!(TOOLBAR_HTML.contains("veloxSetBookmarkBarVisible"));
-        assert!(TOOLBAR_HTML.contains("edit_bookmark"));
-        assert!(TOOLBAR_HTML.contains("create_bookmark_folder"));
-        assert!(TOOLBAR_HTML.contains("rename_bookmark_folder"));
-        assert!(TOOLBAR_HTML.contains("remove_bookmark_folder"));
-        assert!(TOOLBAR_HTML.contains("move_bookmark_up"));
-        assert!(TOOLBAR_HTML.contains("move_bookmark_down"));
-        assert!(TOOLBAR_HTML.contains("toggle_bookmark_bar"));
-        // Settings screen (Issue #30, see docs/decisions.md D67).
-        assert!(TOOLBAR_HTML.contains("veloxSetSettings"));
-        assert!(TOOLBAR_HTML.contains("veloxSetTheme"));
-        assert!(TOOLBAR_HTML.contains("update_settings"));
-        assert!(TOOLBAR_HTML.contains("reset_settings"));
-        assert!(TOOLBAR_HTML.contains("settings-toggle"));
-
-        // Print / PDF export (Issue #40, see docs/decisions.md D75).
-        assert!(TOOLBAR_HTML.contains("veloxSetPrintStatus"));
-        assert!(TOOLBAR_HTML.contains("\"print\""));
-        assert!(TOOLBAR_HTML.contains("save_as_pdf"));
+        for hook in [
+            "veloxSetUrl",
+            "veloxSetLoading",
+            "veloxSetBlockCount",
+            "veloxSetTabs",
+            "veloxSetBookmarkActive",
+            "veloxSetPrivate",
+            "veloxSetPanel",
+            "veloxSetHistory",
+            "veloxSetBookmarks",
+            "ipc.postMessage",
+            "new_tab",
+            "close_tab",
+            "activate_tab",
+            "suspend_tab",
+            "toggle_bookmark",
+            "toggle_panel",
+            "delete_history_entry",
+            "clear_history",
+            // Site data (cookies/cache/storage) clearing, Issue #26 (D66).
+            "clear_site_data",
+            "search_history",
+            "remove_bookmark",
+            // Keyboard shortcuts (see docs/decisions.md D23): the toolbar's own
+            // capture-phase keydown listener, for when the address bar/panel
+            // (not the content webview) has focus.
+            "close_active_tab",
+            "reopen_closed_tab",
+            "next_tab",
+            "prev_tab",
+            "activate_tab_by_index",
+            "activate_last_tab",
+            // New window (Ctrl/Cmd+N, Issue #29, see docs/decisions.md D68).
+            "new_window",
+            // New private window (Ctrl/Cmd+Shift+N, Issue #27, D74).
+            "new_private_window",
+            // Downloads (Issue #16, see docs/decisions.md D28).
+            "veloxSetDownloads",
+            "open_download",
+            "open_downloads_folder",
+            "cancel_download",
+            "remove_download_entry",
+            // Omnibox (Issue #15): Ctrl/Cmd+L, the candidate dropdown, and Esc.
+            "veloxSetCandidates",
+            "veloxFocusAddressBar",
+            "focus_address_bar",
+            "omnibox_input",
+            "omnibox_close",
+            // Bookmark folders, editing, reordering, and the bookmark bar
+            // (Issue #19, see docs/decisions.md D32/D33/D34/D35).
+            "veloxSetBookmarkBar",
+            "veloxSetBookmarkBarVisible",
+            "edit_bookmark",
+            "create_bookmark_folder",
+            "rename_bookmark_folder",
+            "remove_bookmark_folder",
+            "move_bookmark_up",
+            "move_bookmark_down",
+            "toggle_bookmark_bar",
+            // Settings screen (Issue #30, see docs/decisions.md D67).
+            "veloxSetSettings",
+            "veloxSetTheme",
+            "update_settings",
+            "reset_settings",
+            "settings-toggle",
+            // Print / PDF export (Issue #40, see docs/decisions.md D75).
+            "veloxSetPrintStatus",
+            "\"print\"",
+            "save_as_pdf",
+        ] {
+            assert!(
+                TOOLBAR_HTML.contains(hook),
+                "TOOLBAR_HTML is missing {hook}"
+            );
+        }
     }
 
     /// Issue #31/D71: an explicit Light/Dark theme override must reach the
@@ -1802,16 +1717,17 @@ mod tests {
     /// explicitly picked the other one via `data-velox-theme`.
     #[test]
     fn private_theme_variables_are_overridden_by_an_explicit_light_or_dark_theme() {
-        let light_block = TOOLBAR_HTML
-            .split(":root[data-velox-theme=\"light\"] {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a data-velox-theme=\"light\" override block must exist");
-        let dark_block = TOOLBAR_HTML
-            .split(":root[data-velox-theme=\"dark\"] {")
-            .nth(1)
-            .and_then(|rest| rest.split('}').next())
-            .expect("a data-velox-theme=\"dark\" override block must exist");
+        let override_block = |theme: &str| {
+            TOOLBAR_HTML
+                .split(&format!(":root[data-velox-theme=\"{theme}\"] {{"))
+                .nth(1)
+                .and_then(|rest| rest.split('}').next())
+                .unwrap_or_else(|| {
+                    panic!("a data-velox-theme=\"{theme}\" override block must exist")
+                })
+        };
+        let light_block = override_block("light");
+        let dark_block = override_block("dark");
         for var in [
             "--private-bg",
             "--private-fg",

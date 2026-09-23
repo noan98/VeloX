@@ -42,12 +42,14 @@
 //!   single median comparison in this environment cannot distinguish a
 //!   real regression from session-to-session noise.
 
+use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
 use serde_json::Value;
 
 use velox::browser::automation;
@@ -133,13 +135,12 @@ fn cmd_list_scenarios() -> Result<i32, String> {
 /// Repeatable flags (like `aggregate`'s `--input`) accumulate; the rest
 /// keep only their last occurrence.
 struct Flags {
-    values: std::collections::HashMap<String, Vec<String>>,
+    values: HashMap<String, Vec<String>>,
 }
 
 impl Flags {
     fn parse(args: &[String]) -> Result<Self, String> {
-        let mut values: std::collections::HashMap<String, Vec<String>> =
-            std::collections::HashMap::new();
+        let mut values: HashMap<String, Vec<String>> = HashMap::new();
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let Some(name) = arg.strip_prefix("--") else {
@@ -170,6 +171,24 @@ impl Flags {
     fn many(&self, name: &str) -> Vec<String> {
         self.values.get(name).cloned().unwrap_or_default()
     }
+
+    /// 任意フラグ `--name` を `T` としてパースする。未指定なら `Ok(None)`、
+    /// 指定されていてパースできなければ `invalid` をエラーとして返す。
+    fn parsed<T: std::str::FromStr>(&self, name: &str, invalid: &str) -> Result<Option<T>, String> {
+        self.one(name)
+            .map(|raw| raw.parse::<T>().map_err(|_| invalid.to_owned()))
+            .transpose()
+    }
+
+    /// 必須の `--scenario` を [`Scenario`] として読む (`run` / `aggregate`
+    /// 共通)。ID 文字列そのものも返すのは、出力や結果ファイルにそのまま
+    /// 使うため。
+    fn scenario(&self) -> Result<(&str, Scenario), String> {
+        let scenario_id = self.required("scenario")?;
+        let scenario = Scenario::parse(scenario_id)
+            .ok_or_else(|| format!("未知のシナリオです: {scenario_id} (list-scenarios を参照)"))?;
+        Ok((scenario_id, scenario))
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -178,9 +197,7 @@ impl Flags {
 
 fn cmd_run(args: &[String]) -> Result<i32, String> {
     let flags = Flags::parse(args)?;
-    let scenario_id = flags.required("scenario")?;
-    let scenario = Scenario::parse(scenario_id)
-        .ok_or_else(|| format!("未知のシナリオです: {scenario_id} (list-scenarios を参照)"))?;
+    let (scenario_id, scenario) = flags.scenario()?;
     // As of Issue #112 every scenario is unattended (`is_unattended` always
     // returns `true` now — see its doc comment); this guard is kept so a
     // future scenario that genuinely needs a human still fails loudly here
@@ -222,20 +239,14 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     // 「上書きしたつもりで既定のまま測った」結果を同じ顔で残さないため。
     // 何を上書きしたかは結果 JSON (`script_overrides`) に残る。
     let overrides = automation::BenchScriptOverrides {
-        resume_rounds: flags
-            .one("resume-rounds")
-            .map(|raw| {
-                raw.parse::<usize>()
-                    .map_err(|_| "--resume-rounds は 0 以上の整数で指定してください".to_owned())
-            })
-            .transpose()?,
-        bounce_settle_ms: flags
-            .one("bounce-settle-ms")
-            .map(|raw| {
-                raw.parse::<u64>()
-                    .map_err(|_| "--bounce-settle-ms は正の整数 (ms) で指定してください".to_owned())
-            })
-            .transpose()?,
+        resume_rounds: flags.parsed(
+            "resume-rounds",
+            "--resume-rounds は 0 以上の整数で指定してください",
+        )?,
+        bounce_settle_ms: flags.parsed(
+            "bounce-settle-ms",
+            "--bounce-settle-ms は正の整数 (ms) で指定してください",
+        )?,
     };
     overrides.validate_for(scenario)?;
 
@@ -368,56 +379,28 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
         None => None,
     };
 
+    let launch = TrialLaunch {
+        velox_bin: &velox_bin,
+        rss_interval_ms: rss_interval_ms.as_deref(),
+        url,
+        script_path: script_path.as_deref(),
+        timeout: Duration::from_secs(warmup_secs),
+    };
     let mut trial_events = Vec::with_capacity(trials as usize);
     let mut spawn_failures = 0u32;
     for trial in 1..=trials {
-        let log_path = match &keep_logs_dir {
-            // Deterministic name: re-running into the same directory
-            // overwrites the previous run's log of the same trial, which is
-            // what a caller re-measuring the same condition wants (and what
-            // `--output` already does for the aggregated result).
-            Some(dir) => dir.join(format!("{output_stem}-trial-{trial}.jsonl")),
-            None => env::temp_dir().join(format!(
-                "velox-bench-{}-{scenario_id}-{trial}-{}.jsonl",
-                std::process::id(),
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            )),
-        };
+        let log_path = trial_log_path(keep_logs_dir.as_deref(), &output_stem, scenario_id, trial);
         // `PerfLog` appends; start from an empty file either way so a
         // leftover from an earlier run can never be counted twice.
         let _ = fs::remove_file(&log_path);
 
-        let mut command = Command::new(&velox_bin);
-        command
-            .env("VELOX_PERF_METRICS", "1")
-            .env("VELOX_PERF_FORMAT", "json")
-            .env("VELOX_PERF_OUTPUT", &log_path);
-        if let Some(interval) = &rss_interval_ms {
-            command.env("VELOX_PERF_RSS_INTERVAL_MS", interval);
-        }
-        if let Some(url) = url {
-            command.env("VELOX_HOMEPAGE", url);
-        }
-        if let Some(script_path) = &script_path {
-            command.env("VELOX_AUTOMATION_SCRIPT", script_path);
-        }
-
-        match command.spawn() {
-            Ok(mut child) => {
-                wait_for_exit_or_timeout(&mut child, Duration::from_secs(warmup_secs));
-                terminate(child);
-            }
-            Err(err) => {
-                spawn_failures += 1;
-                eprintln!(
-                    "velox-bench: 試行 {trial}/{trials}: {} の起動に失敗しました: {err} \
-                     (ヘッドレス環境では想定内です。docs/benchmarking.md 参照)",
-                    velox_bin.display()
-                );
-            }
+        if let Err(err) = launch.run(&log_path) {
+            spawn_failures += 1;
+            eprintln!(
+                "velox-bench: 試行 {trial}/{trials}: {} の起動に失敗しました: {err} \
+                 (ヘッドレス環境では想定内です。docs/benchmarking.md 参照)",
+                velox_bin.display()
+            );
         }
 
         let text = fs::read_to_string(&log_path).unwrap_or_default();
@@ -484,6 +467,70 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+/// 1 試行分の perf ログの置き場所。`keep_logs_dir` があればそこに決定的な
+/// 名前で、無ければ一時ディレクトリに衝突しない名前で置く。
+fn trial_log_path(
+    keep_logs_dir: Option<&Path>,
+    output_stem: &str,
+    scenario_id: &str,
+    trial: u32,
+) -> PathBuf {
+    match keep_logs_dir {
+        // Deterministic name: re-running into the same directory
+        // overwrites the previous run's log of the same trial, which is
+        // what a caller re-measuring the same condition wants (and what
+        // `--output` already does for the aggregated result).
+        Some(dir) => dir.join(format!("{output_stem}-trial-{trial}.jsonl")),
+        None => env::temp_dir().join(format!(
+            "velox-bench-{}-{scenario_id}-{trial}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        )),
+    }
+}
+
+/// `run` の各試行で `velox` を起動するための、試行をまたいで共通の設定。
+struct TrialLaunch<'a> {
+    velox_bin: &'a Path,
+    /// `VELOX_PERF_RSS_INTERVAL_MS` に渡す値 (`None` なら渡さない)。
+    rss_interval_ms: Option<&'a str>,
+    /// `VELOX_HOMEPAGE` に渡すページ (`None` なら渡さない)。
+    url: Option<&'a str>,
+    /// `VELOX_AUTOMATION_SCRIPT` に渡すスクリプト (`None` なら渡さない)。
+    script_path: Option<&'a Path>,
+    /// 自力で終了しなかった場合に打ち切るまでの待ち時間。
+    timeout: Duration,
+}
+
+impl TrialLaunch<'_> {
+    /// perf ログを `log_path` に JSON Lines で書かせて `velox` を 1 回
+    /// 起動し、終了 (または `timeout`) を待って確実に後始末する。起動
+    /// そのものに失敗したときだけエラーを返す。
+    fn run(&self, log_path: &Path) -> std::io::Result<()> {
+        let mut command = Command::new(self.velox_bin);
+        command
+            .env("VELOX_PERF_METRICS", "1")
+            .env("VELOX_PERF_FORMAT", "json")
+            .env("VELOX_PERF_OUTPUT", log_path);
+        if let Some(interval) = self.rss_interval_ms {
+            command.env("VELOX_PERF_RSS_INTERVAL_MS", interval);
+        }
+        if let Some(url) = self.url {
+            command.env("VELOX_HOMEPAGE", url);
+        }
+        if let Some(script_path) = self.script_path {
+            command.env("VELOX_AUTOMATION_SCRIPT", script_path);
+        }
+        let mut child = command.spawn()?;
+        wait_for_exit_or_timeout(&mut child, self.timeout);
+        terminate(child);
+        Ok(())
+    }
+}
+
 /// Check `metrics` via [`benchmark::memory_sample_confidence`] and, if
 /// insufficient, print a warning explaining why. Returns `true` when a
 /// warning was printed, so callers can fold it into their exit code exactly
@@ -493,7 +540,7 @@ fn warn_on_insufficient_memory_samples(
     scenario_id: &str,
     scenario: Scenario,
     trials: u32,
-    metrics: &std::collections::BTreeMap<String, benchmark::Stats>,
+    metrics: &BTreeMap<String, benchmark::Stats>,
 ) -> bool {
     let MemorySampleConfidence::Insufficient { observed, required } =
         benchmark::memory_sample_confidence(scenario, trials, metrics)
@@ -566,9 +613,7 @@ fn default_velox_bin_path() -> Result<PathBuf, String> {
 
 fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
     let flags = Flags::parse(args)?;
-    let scenario_id = flags.required("scenario")?;
-    let scenario = Scenario::parse(scenario_id)
-        .ok_or_else(|| format!("未知のシナリオです: {scenario_id} (list-scenarios を参照)"))?;
+    let (scenario_id, scenario) = flags.scenario()?;
     let output_path = flags.required("output")?;
     let inputs = flags.many("input");
     if inputs.is_empty() {
@@ -576,20 +621,10 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
     }
 
     let mut trial_events = Vec::with_capacity(inputs.len());
-    let mut read_failures = 0usize;
-    for input in &inputs {
-        match fs::read_to_string(input) {
-            Ok(text) => {
-                let events = benchmark::parse_jsonl(&text);
-                println!("{input}: {} 件のレコード", events.len());
-                trial_events.push(events);
-            }
-            Err(err) => {
-                read_failures += 1;
-                eprintln!("velox-bench: {input} を読み込めませんでした: {err}");
-            }
-        }
-    }
+    let read_failures = for_each_readable_input(&inputs, |input, events| {
+        println!("{input}: {} 件のレコード", events.len());
+        trial_events.push(events);
+    });
     if trial_events.is_empty() {
         return Err("読み込めた --input が 1 つもありません".to_owned());
     }
@@ -632,6 +667,27 @@ fn cmd_aggregate(args: &[String]) -> Result<i32, String> {
     Ok(0)
 }
 
+/// `inputs` の各ファイルを JSON Lines として読み、読めたものは
+/// `(パス, パース済みイベント)` として `on_events` に渡す。読めなかった
+/// ものは stderr に記録して飛ばし、その件数を返す (`aggregate` /
+/// `ipc-summary` 共通)。
+fn for_each_readable_input(
+    inputs: &[String],
+    mut on_events: impl FnMut(&str, Vec<Value>),
+) -> usize {
+    let mut read_failures = 0usize;
+    for input in inputs {
+        match fs::read_to_string(input) {
+            Ok(text) => on_events(input, benchmark::parse_jsonl(&text)),
+            Err(err) => {
+                read_failures += 1;
+                eprintln!("velox-bench: {input} を読み込めませんでした: {err}");
+            }
+        }
+    }
+    read_failures
+}
+
 // ---------------------------------------------------------------------
 // ipc-summary (Issue #66)
 // ---------------------------------------------------------------------
@@ -655,16 +711,7 @@ fn cmd_ipc_summary(args: &[String]) -> Result<i32, String> {
     }
 
     let mut events = Vec::new();
-    let mut read_failures = 0usize;
-    for input in &inputs {
-        match fs::read_to_string(input) {
-            Ok(text) => events.extend(benchmark::parse_jsonl(&text)),
-            Err(err) => {
-                read_failures += 1;
-                eprintln!("velox-bench: {input} を読み込めませんでした: {err}");
-            }
-        }
-    }
+    let read_failures = for_each_readable_input(&inputs, |_, parsed| events.extend(parsed));
     if read_failures == inputs.len() {
         return Err("読み込めた --input が 1 つもありません".to_owned());
     }
@@ -673,15 +720,7 @@ fn cmd_ipc_summary(args: &[String]) -> Result<i32, String> {
     print_ipc_summary(&rows);
 
     if let Some(output_path) = flags.one("output") {
-        let json = serde_json::to_string_pretty(&rows)
-            .map_err(|err| format!("結果のシリアライズに失敗しました: {err}"))?;
-        if let Some(parent) = Path::new(output_path).parent() {
-            if !parent.as_os_str().is_empty() {
-                let _ = fs::create_dir_all(parent);
-            }
-        }
-        fs::write(output_path, json)
-            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+        write_json_creating_parent(output_path, &rows)?;
         println!("velox-bench: {output_path} に書き込みました");
     }
 
@@ -732,12 +771,7 @@ fn cmd_compare(args: &[String]) -> Result<i32, String> {
     let baseline_path = flags.required("baseline")?;
     let candidate_path = flags.required("candidate")?;
     let threshold_pct: f64 = flags
-        .one("threshold-pct")
-        .map(|v| {
-            v.parse()
-                .map_err(|_| "--threshold-pct は数値で指定してください".to_owned())
-        })
-        .transpose()?
+        .parsed("threshold-pct", "--threshold-pct は数値で指定してください")?
         .unwrap_or(10.0);
 
     let baseline = read_result(baseline_path)?;
@@ -747,10 +781,7 @@ fn cmd_compare(args: &[String]) -> Result<i32, String> {
     print_comparison(&report);
 
     if let Some(output_path) = flags.one("output") {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|err| format!("比較結果のシリアライズに失敗しました: {err}"))?;
-        fs::write(output_path, json)
-            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+        write_file(output_path, pretty_json(&report, "比較結果")?)?;
     }
 
     Ok(if report.any_regressed { 1 } else { 0 })
@@ -773,18 +804,7 @@ fn print_comparison(report: &ComparisonReport) {
     for (name, diff) in &report.diffs {
         print_diff_row(name, diff);
     }
-    if !report.only_in_baseline.is_empty() {
-        println!(
-            "baseline のみに存在: {}",
-            report.only_in_baseline.join(", ")
-        );
-    }
-    if !report.only_in_candidate.is_empty() {
-        println!(
-            "candidate のみに存在: {}",
-            report.only_in_candidate.join(", ")
-        );
-    }
+    print_only_in(&report.only_in_baseline, &report.only_in_candidate);
     println!(
         "\n結果: {}",
         if report.any_regressed {
@@ -793,6 +813,17 @@ fn print_comparison(report: &ComparisonReport) {
             "回帰なし (ok)"
         }
     );
+}
+
+/// 片側にしか無いメトリクス名を (あれば) 1 行ずつ表示する
+/// (`compare` / `gate` 共通)。
+fn print_only_in(only_in_baseline: &[String], only_in_candidate: &[String]) {
+    if !only_in_baseline.is_empty() {
+        println!("baseline のみに存在: {}", only_in_baseline.join(", "));
+    }
+    if !only_in_candidate.is_empty() {
+        println!("candidate のみに存在: {}", only_in_candidate.join(", "));
+    }
 }
 
 fn print_diff_row(name: &str, diff: &MetricDiff) {
@@ -830,22 +861,13 @@ fn cmd_gate(args: &[String]) -> Result<i32, String> {
     if candidate_paths.is_empty() {
         return Err("--candidate を少なくとも 1 つ指定してください".to_owned());
     }
+    let defaults = GateThresholds::default();
     let warn_pct: f64 = flags
-        .one("warn-pct")
-        .map(|v| {
-            v.parse()
-                .map_err(|_| "--warn-pct は数値で指定してください".to_owned())
-        })
-        .transpose()?
-        .unwrap_or(GateThresholds::default().warn_pct);
+        .parsed("warn-pct", "--warn-pct は数値で指定してください")?
+        .unwrap_or(defaults.warn_pct);
     let fail_pct: f64 = flags
-        .one("fail-pct")
-        .map(|v| {
-            v.parse()
-                .map_err(|_| "--fail-pct は数値で指定してください".to_owned())
-        })
-        .transpose()?
-        .unwrap_or(GateThresholds::default().fail_pct);
+        .parsed("fail-pct", "--fail-pct は数値で指定してください")?
+        .unwrap_or(defaults.fail_pct);
     if fail_pct <= warn_pct {
         return Err(format!(
             "--fail-pct ({fail_pct}) は --warn-pct ({warn_pct}) より大きい必要があります"
@@ -864,15 +886,10 @@ fn cmd_gate(args: &[String]) -> Result<i32, String> {
     print_gate_report(&report);
 
     if let Some(output_path) = flags.one("output") {
-        let json = serde_json::to_string_pretty(&report)
-            .map_err(|err| format!("ゲート結果のシリアライズに失敗しました: {err}"))?;
-        fs::write(output_path, json)
-            .map_err(|err| format!("{output_path} へ書き込めませんでした: {err}"))?;
+        write_file(output_path, pretty_json(&report, "ゲート結果")?)?;
     }
     if let Some(markdown_path) = flags.one("markdown-output") {
-        let markdown = benchmark::render_gate_markdown(&report);
-        fs::write(markdown_path, markdown)
-            .map_err(|err| format!("{markdown_path} へ書き込めませんでした: {err}"))?;
+        write_file(markdown_path, benchmark::render_gate_markdown(&report))?;
     }
 
     Ok(match report.overall {
@@ -880,14 +897,6 @@ fn cmd_gate(args: &[String]) -> Result<i32, String> {
         Severity::Warn => EXIT_GATE_WARN,
         Severity::Fail => EXIT_GATE_FAIL,
     })
-}
-
-fn severity_label(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Ok => "OK",
-        Severity::Warn => "WARN",
-        Severity::Fail => "FAIL",
-    }
 }
 
 fn print_gate_report(report: &benchmark::GateReport) {
@@ -921,7 +930,7 @@ fn print_gate_report(report: &benchmark::GateReport) {
             name,
             verdict.baseline_median,
             candidates_display,
-            severity_label(verdict.severity),
+            verdict.severity.label(),
             if verdict.low_confidence {
                 "試行数不足"
             } else {
@@ -929,32 +938,17 @@ fn print_gate_report(report: &benchmark::GateReport) {
             }
         );
     }
-    if !report.only_in_baseline.is_empty() {
-        println!(
-            "baseline のみに存在: {}",
-            report.only_in_baseline.join(", ")
-        );
-    }
-    if !report.only_in_candidates.is_empty() {
-        println!(
-            "candidate のみに存在: {}",
-            report.only_in_candidates.join(", ")
-        );
-    }
+    print_only_in(&report.only_in_baseline, &report.only_in_candidates);
     // Issue #196: a precondition violation is the reason for the verdict
     // below, so print it right above that verdict — on stderr, since a
     // caller piping stdout into a report file still needs to see it.
     if !report.problems.is_empty() {
         eprintln!("\n入力の前提を満たしていません:");
         for problem in &report.problems {
-            eprintln!(
-                "  [{}] {}",
-                severity_label(problem.severity()),
-                problem.describe()
-            );
+            eprintln!("  [{}] {}", problem.severity().label(), problem.describe());
         }
     }
-    println!("\n総合判定: {}", severity_label(report.overall));
+    println!("\n総合判定: {}", report.overall.label());
 }
 
 // ---------------------------------------------------------------------
@@ -1181,24 +1175,20 @@ foreach ($p in $regPaths) {
 /// パースする純粋関数。プロセス起動を伴わないため Linux 上の `cargo test`
 /// でも検証できる。
 fn parse_windows_hardware_info_json(json: &str) -> MachineInfo {
-    let value: Value = match serde_json::from_str(json.trim()) {
-        Ok(v) => v,
-        Err(_) => return MachineInfo::default(),
+    let Ok(value) = serde_json::from_str::<Value>(json.trim()) else {
+        return MachineInfo::default();
+    };
+    let text_field = |key: &str| {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(non_empty_machine_field)
     };
     MachineInfo {
-        cpu_model: value
-            .get("cpu_model")
-            .and_then(Value::as_str)
-            .and_then(non_empty_machine_field),
+        cpu_model: text_field("cpu_model"),
         total_memory_bytes: value.get("total_memory_bytes").and_then(Value::as_u64),
-        os_version: value
-            .get("os_version")
-            .and_then(Value::as_str)
-            .and_then(non_empty_machine_field),
-        webview_runtime: value
-            .get("webview_runtime")
-            .and_then(Value::as_str)
-            .and_then(non_empty_machine_field),
+        os_version: text_field("os_version"),
+        webview_runtime: text_field("webview_runtime"),
     }
 }
 
@@ -1252,22 +1242,36 @@ fn detect_git_commit() -> Option<String> {
         return None;
     }
     let commit = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-    if commit.is_empty() {
-        None
-    } else {
-        Some(commit)
-    }
+    (!commit.is_empty()).then_some(commit)
 }
 
 fn write_result(path: &str, result: &BenchmarkResult) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(result)
-        .map_err(|err| format!("結果のシリアライズに失敗しました: {err}"))?;
+    write_json_creating_parent(path, result)
+}
+
+/// `value` を整形済み JSON として `path` に書き出す。親ディレクトリが
+/// 無ければ作る (作れなくても書き込み側のエラーとして報告される)。
+/// `run` / `aggregate` の結果ファイルと `ipc-summary --output` で共有する。
+fn write_json_creating_parent<T: Serialize + ?Sized>(path: &str, value: &T) -> Result<(), String> {
+    let json = pretty_json(value, "結果")?;
     if let Some(parent) = Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             let _ = fs::create_dir_all(parent);
         }
     }
-    fs::write(path, json).map_err(|err| format!("{path} へ書き込めませんでした: {err}"))
+    write_file(path, json)
+}
+
+/// `value` を整形済み JSON 文字列にする。失敗時のメッセージは
+/// 「`{what}`のシリアライズに失敗しました」。
+fn pretty_json<T: Serialize + ?Sized>(value: &T, what: &str) -> Result<String, String> {
+    serde_json::to_string_pretty(value)
+        .map_err(|err| format!("{what}のシリアライズに失敗しました: {err}"))
+}
+
+/// `contents` を `path` に書き出す (親ディレクトリは作らない)。
+fn write_file(path: &str, contents: String) -> Result<(), String> {
+    fs::write(path, contents).map_err(|err| format!("{path} へ書き込めませんでした: {err}"))
 }
 
 fn print_result_summary(result: &BenchmarkResult) {

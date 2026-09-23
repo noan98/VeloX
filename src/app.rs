@@ -7,9 +7,9 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use tao::event::{Event, WindowEvent};
 use tao::event_loop::{
@@ -23,6 +23,7 @@ use crate::browser::perf_log::{IpcLog, PerfLog};
 use crate::browser::suspension::{
     self, MemoryBudgetInput, MemorySample, SuspendReason, SuspensionPolicy,
 };
+use crate::browser::util::now_unix;
 use crate::browser::{
     context_menu, find, input_history, metrics, navigation, omnibox, persistence, print,
     shortcut_reference, site_data, view_source, ActivationEffect, BookmarkStore, ClearOutcome,
@@ -34,6 +35,45 @@ use crate::browser::{
 use crate::config::Config;
 use crate::ui::toolbar::{self, Panel, ToolbarCommand};
 use crate::ui::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};
+
+mod automation_script;
+mod download_actions;
+mod find_bar;
+mod page_actions;
+mod panels;
+mod perf;
+mod persist;
+mod tab_suspension;
+
+use automation_script::{
+    handle_automation_command, poll_automation_wait_timeout, resolve_automation_wait_for_startup,
+    resolve_automation_wait_if_matching, spawn_automation, AutomationWaitState,
+};
+use download_actions::{
+    cancel_download, open_download, open_downloads_folder, record_download_completion,
+    record_save_page_completion,
+};
+use find_bar::{
+    apply_find_matches, close_find_bar, open_find_bar, step_find, update_find_query, FindDirection,
+};
+use page_actions::{
+    open_view_source_tab, print_active_tab, request_save_page, request_view_source,
+    save_active_tab_as_pdf, show_print_status,
+};
+use panels::{
+    apply_updated_settings, refresh_bookmarks_panel, refresh_downloads_panel,
+    refresh_history_panel, refresh_history_panel_if_open, refresh_settings_panel,
+    search_history_panel,
+};
+use perf::{
+    build_perf_log, record_perf_event, record_state_write, record_tab_latency, record_tab_suspend,
+    spawn_rss_sampler, PageLoadTimers, PerfContext,
+};
+use persist::{persist_bookmarks, persist_history, persist_input_history, persist_session};
+use tab_suspension::{
+    choose_memory_sample_window, handle_tab_freeze_finished, spawn_memory_pressure_sampler,
+    suspend_tab, sweep_tabs,
+};
 
 /// Events forwarded from webview callbacks into the main event loop.
 ///
@@ -477,115 +517,6 @@ fn tabs_of(state: &mut AppState, window_id: WindowId) -> &mut Tabs {
         .expect("window_id was just resolved against the same ui_windows/state.windows pair")
 }
 
-/// What tab-latency logging needs: where to write records, and the epoch
-/// (`process_start`) their `ts_ms` timestamps are relative to. Kept
-/// separate from `PerfLog` itself so a `None` here (metrics off) costs
-/// nothing beyond the `Option`.
-struct PerfContext {
-    process_start: Instant,
-    log: Arc<PerfLog>,
-}
-
-impl PerfContext {
-    /// Adapt this context to the shape `ui::window::BrowserWindow` needs
-    /// for its own Rust → JS IPC instrumentation (Issue #66) — same
-    /// `(Arc<PerfLog>, Instant)` pair, wrapped in the `pub` type `ui::window`
-    /// can actually depend on (see `IpcLog`'s doc comment for why this is
-    /// not just `PerfContext` reused directly). Called from
-    /// `open_new_window`, which only has `state.perf` (not the `ipc_log`
-    /// local `run` built before `state` existed) to build a new window's
-    /// own `ipc_log` from.
-    fn to_ipc_log(&self) -> IpcLog {
-        IpcLog::new(Arc::clone(&self.log), self.process_start)
-    }
-}
-
-/// In-flight page-load timers, one per open tab across every window
-/// (`NavigationStarted` inserts/restarts an entry, `LoadStarted` marks its
-/// mid-checkpoint — Issue #69 — `LoadFinished` consumes and removes it) —
-/// keyed by `(WindowId, TabId)`, not `TabId` alone, since a `TabId` is only
-/// unique within its own window (Issue #29/D68).
-///
-/// **Lifetime (Issue #62).** Every entry must be removed once it stops being
-/// useful, or this map grows without bound for the life of the process: both
-/// `WindowId` and `TabId` are monotonically increasing counters that are
-/// never reused (`browser::tabs::Tabs::take_id`,
-/// `browser::windows::Windows::push_window`), so a stale entry left behind
-/// by a closed tab is never overwritten by a later one — it just sits there
-/// forever. `record_perf_event` removes the entry as soon as its load
-/// finishes (the common case); `close_tab`/`close_window_by_tao_id` also
-/// remove it on tab/window close so a load abandoned mid-flight (the tab is
-/// closed before `LoadFinished` ever arrives) does not leave an orphaned
-/// entry either. See docs/decisions.md D79 for the audit that found this.
-type PageLoadTimers = HashMap<(WindowId, TabId), metrics::PageLoadTimer>;
-
-/// State for `AutomationCommand::WaitLoad`/`WaitStartup` (Issue #169/#173,
-/// docs/decisions.md D84/D85): at most one wait is ever in flight at a time
-/// — the automation thread blocks on each `wait_load`/`wait_startup` (see
-/// [`spawn_automation`]) before sending the next command — so a single
-/// `Option` slot is enough for either kind. Threaded through the event loop
-/// the same way [`PageLoadTimers`] is.
-///
-/// `pending`, when `Some`, is resolved from exactly two places (per
-/// [`AutomationWaitKind`]): `LoadFinished` for the tab a `wait_load` is
-/// waiting on ([`resolve_automation_wait_if_matching`], called from
-/// [`handle_user_event`]) or `mark_startup` writing the `startup` perf
-/// record for a `wait_startup` ([`resolve_automation_wait_for_startup`],
-/// called from `run`'s event loop right after `record_perf_event`) — or,
-/// regardless of kind, the deadline passing with no such event
-/// ([`poll_automation_wait_timeout`], called once per pass through `run`'s
-/// event loop, right alongside the existing tab-suspension sweep). Every
-/// path clears `pending` before notifying, so the automation thread's
-/// blocked `recv()` (in [`spawn_automation`]) always receives exactly one
-/// notification per wait — never zero (which would hang it forever) and
-/// never more than one for the same command (which would let a later,
-/// unrelated wait resolve prematurely on a stale message still sitting in
-/// the channel).
-struct AutomationWaitState {
-    pending: Option<AutomationWait>,
-    /// Wakes the automation thread's blocked `recv()`. The payload carries
-    /// nothing — the thread does not need to know *why* it woke, only that
-    /// it may proceed; whichever resolution path fired already logged the
-    /// reason to stderr on a timeout (see [`poll_automation_wait_timeout`]).
-    notify: mpsc::Sender<()>,
-    /// Set once `mark_startup` has written the `startup` perf record (Issue
-    /// #173) — read by `handle_automation_command`'s `WaitStartup` arm so a
-    /// `wait_startup` issued *after* that point resolves immediately
-    /// instead of registering a pending wait nothing will ever notify again
-    /// (mirroring `WaitLoad`'s "already not loading" case). Set from
-    /// `run`'s event loop (see [`resolve_automation_wait_for_startup`]),
-    /// not from `mark_startup` itself — `mark_startup` lives in
-    /// `record_perf_event`, which stays free of any dependency on the
-    /// automation machinery, matching how `Wait`/`Mark` are handled
-    /// elsewhere in this file. Never reset back to `false`: `mark_startup`
-    /// only ever writes the report once per process (it clears `startup`
-    /// right after), so once true it stays true for the rest of the run.
-    startup_reported: bool,
-}
-
-/// What a pending [`AutomationWait`] is waiting for.
-enum AutomationWaitKind {
-    /// `wait_load` (Issue #169): `tab_id` (in `window_id`) to finish its
-    /// current page load.
-    Load { window_id: WindowId, tab_id: TabId },
-    /// `wait_startup` (Issue #173): the `startup` perf record to be
-    /// written — a broader condition than one tab's `LoadFinished`, since
-    /// `mark_startup` requires every `metrics::StartupTimestamps`
-    /// checkpoint (including the toolbar webview's independent `ready`
-    /// handshake) to have landed first.
-    Startup,
-}
-
-/// One `wait_load`/`wait_startup` currently blocking the automation thread.
-struct AutomationWait {
-    kind: AutomationWaitKind,
-    /// When to give up and unblock the automation thread anyway (Issue
-    /// #169's "must never hang" requirement) if the awaited event never
-    /// arrives — the tab or window closed, the load/startup genuinely never
-    /// completes, or any other case a script did not anticipate.
-    deadline: Instant,
-}
-
 /// Build the window and run the event loop. Only returns on setup failure;
 /// once running, the process exits with the event loop.
 ///
@@ -632,8 +563,10 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // docs/decisions.md D67 for the bug this fixed during development
     // (VELOX_* env vars going silently inert the moment this feature
     // landed, caught by this project's own integration test suite).
-    let settings_dir = persistence::default_data_dir();
-    let settings = match settings_dir.as_deref().and_then(persistence::load_settings) {
+    // 環境変数を読むだけの純粋な解決なので一度だけ行い、`settings.json`・
+    // サイト権限・セッション復元・履歴類のすべてで共有する。
+    let data_dir = persistence::default_data_dir();
+    let settings = match data_dir.as_deref().and_then(persistence::load_settings) {
         Some(loaded) => {
             let sanitized = loaded.sanitize();
             config.apply_settings(&sanitized);
@@ -666,18 +599,26 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     let blocklist = Arc::new(build_blocklist(&config));
     let site_exceptions = Arc::new(build_site_exceptions(&config));
 
-    // Resolved here (rather than down with `history`/`bookmarks`/
+    // Loaded here (rather than down with `history`/`bookmarks`/
     // `input_history` below) because `site_permissions` — unlike those
     // three — must exist before `BrowserWindow::new` builds the first
     // tab's content webview: its `with_permission_handler` wiring
     // (docs/decisions.md D60) needs the store from the very first
     // permission request, not just from whenever `AppState` gets around to
-    // loading it.
-    let data_dir = persistence::default_data_dir();
+    // loading it. Session restore (Issue #25, see docs/decisions.md D65)
+    // likewise needs `data_dir` before `Tabs`/`BrowserWindow` are built,
+    // since it decides what the *first* `Tabs` looks like.
+    //
+    // 以前は用途ごとに別々に解決して 1 行ずつ警告していたため、ログの
+    // 互換性を保つよう 2 行とも出す。
     if data_dir.is_none() {
         eprintln!(
             "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
              history, bookmarks, and site permissions will not be saved this session"
+        );
+        eprintln!(
+            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
+             history, bookmarks, and session restore will not be saved this session"
         );
     }
     let site_permissions = Arc::new(
@@ -690,18 +631,6 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // see docs/decisions.md D67): a read-only view, cloned before the
     // original moves into `SitePolicies` below.
     let site_permissions_for_state = Arc::clone(&site_permissions);
-
-    // Resolved before `Tabs`/`BrowserWindow` are built (unlike the
-    // history/bookmarks/input-history loads below, which only need it once
-    // `AppState` exists) because session restore (Issue #25, see
-    // docs/decisions.md D65) decides what the *first* `Tabs` looks like.
-    let data_dir = persistence::default_data_dir();
-    if data_dir.is_none() {
-        eprintln!(
-            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
-             history, bookmarks, and session restore will not be saved this session"
-        );
-    }
 
     // Issue #25 (D65): restore the previous session's tabs when the setting
     // is on and a usable snapshot exists; otherwise (setting off, no data
@@ -981,7 +910,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 }
             }
             Event::UserEvent(user_event) => {
-                if std::env::var_os("VELOX_DEBUG").is_some() {
+                if debug_logging_enabled() {
                     eprintln!("velox[debug]: {user_event:?}");
                 }
                 if let Some(log) = perf_log.as_deref() {
@@ -1065,11 +994,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 None
             };
             for window_id in window_ids {
-                let memory = if Some(window_id) == served_window {
-                    memory_sample
-                } else {
-                    None
-                };
+                let memory = memory_sample.filter(|_| Some(window_id) == served_window);
                 if let Some(wake) = sweep_tabs(
                     &mut ui_windows,
                     &mut state,
@@ -1078,10 +1003,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                     memory,
                     Instant::now(),
                 ) {
-                    next_wake = Some(match next_wake {
-                        Some(existing) => existing.min(wake),
-                        None => wake,
-                    });
+                    next_wake = earliest(next_wake, wake);
                 }
             }
             // Issue #169: give `wait_load`'s deadline (if one is pending) a
@@ -1093,16 +1015,18 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
             if let Some(wake) =
                 poll_automation_wait_timeout(&mut automation_wait, &state, Instant::now())
             {
-                next_wake = Some(match next_wake {
-                    Some(existing) => existing.min(wake),
-                    None => wake,
-                });
+                next_wake = earliest(next_wake, wake);
             }
             if let Some(next_wake) = next_wake {
                 *control_flow = ControlFlow::WaitUntil(next_wake);
             }
         }
     });
+}
+
+/// `current` (まだ無ければ `None`) と `candidate` のうち早い方の起床時刻。
+fn earliest(current: Option<Instant>, candidate: Instant) -> Option<Instant> {
+    Some(current.map_or(candidate, |existing| existing.min(candidate)))
 }
 
 /// Find the `BrowserWindow` whose native window is `tao_id`, if any is still
@@ -1140,11 +1064,7 @@ fn close_window_by_tao_id(
     tao_id: tao::window::WindowId,
     control_flow: &mut ControlFlow,
 ) {
-    let Some(id) = ui_windows
-        .iter()
-        .find(|(_, window)| window.tao_id() == tao_id)
-        .map(|(id, _)| *id)
-    else {
+    let Some(id) = window_by_tao_id_mut(ui_windows, tao_id).map(|window| window.id()) else {
         return;
     };
     ui_windows.remove(&id);
@@ -1174,585 +1094,6 @@ fn build_blocklist(config: &Config) -> FilterList {
 /// `Config::content_blocking_site_exceptions`.
 fn build_site_exceptions(config: &Config) -> SiteExceptions {
     SiteExceptions::from_hosts(&config.content_blocking_site_exceptions)
-}
-
-/// Build the [`PerfLog`] performance events are written through: a file at
-/// `config.perf_output_path` if one was requested and could be opened,
-/// stderr otherwise. Only called when `config.perf_metrics` is on.
-fn build_perf_log(config: &Config) -> Arc<PerfLog> {
-    match &config.perf_output_path {
-        Some(path) => match PerfLog::to_file(config.perf_format, Path::new(path)) {
-            Ok(log) => Arc::new(log),
-            Err(err) => {
-                eprintln!(
-                    "velox: failed to open perf output file {path:?}: {err}; \
-                     falling back to stderr"
-                );
-                Arc::new(PerfLog::stderr(config.perf_format))
-            }
-        },
-        None => Arc::new(PerfLog::stderr(config.perf_format)),
-    }
-}
-
-/// Update startup/page-load metrics state for one [`UserEvent`], writing a
-/// [`metrics::PerfRecord`] through `perf_log` whenever a measurement
-/// completes. Only called when `config.perf_metrics` is on (see `run`'s
-/// event loop), so every branch here is allowed a clock read — the off-path
-/// never reaches this function at all.
-fn record_perf_event(
-    startup: &mut Option<metrics::StartupTimestamps>,
-    page_load_timers: &mut PageLoadTimers,
-    perf_log: &PerfLog,
-    process_start: Instant,
-    event: &UserEvent,
-) {
-    match event {
-        UserEvent::ToolbarMessage(_, body) => {
-            // Issue #66: every toolbar IPC message (JS → Rust), regardless
-            // of what it is, is counted/sized/timed here — the one choke
-            // point every `window.ipc.postMessage` call already funnels
-            // through (`UserEvent::ToolbarMessage`), so this needs no new
-            // call site anywhere else. `command_name` is a second, shallow
-            // parse of `body` (see its doc comment for why it is not just
-            // `parse_command(body).ok().map(...)`): it still labels a
-            // message that fails the real parse below, which a metrics
-            // consumer wants to see rather than silently lose. Gated by the
-            // same `perf_log.is_some()` check every other branch below
-            // already runs under (`app::run`'s event loop), so this never
-            // reads a clock or allocates on the metrics-off path.
-            let started = Instant::now();
-            let name = toolbar::command_name(body);
-            let parsed = toolbar::parse_command(body);
-            // `PerfRecord::ipc`'s `Instant::elapsed()` call happens here,
-            // after both the shallow tag read above and the real parse
-            // below — so `duration` reflects the full Rust-side cost of
-            // turning this message into a `ToolbarCommand`, matching
-            // `PerfRecord::Ipc`'s doc comment.
-            perf_log.write(
-                &metrics::PerfRecord::ipc(metrics::IpcDirection::In, name, body.len(), started),
-                started.saturating_duration_since(process_start),
-            );
-            match parsed {
-                Ok(ToolbarCommand::ScriptStarted) => {
-                    mark_startup(
-                        startup,
-                        perf_log,
-                        process_start,
-                        metrics::StartupTimestamps::mark_toolbar_script_started,
-                    );
-                }
-                Ok(ToolbarCommand::Ready) => {
-                    mark_startup(
-                        startup,
-                        perf_log,
-                        process_start,
-                        metrics::StartupTimestamps::mark_toolbar_ready,
-                    );
-                }
-                _ => {}
-            }
-        }
-        UserEvent::NavigationStarted(window_id, id, _) => {
-            page_load_timers
-                .entry((*window_id, *id))
-                .or_default()
-                .start(Instant::now());
-        }
-        // Issue #69: the mid-checkpoint that splits `page_load_ms` into a
-        // VeloX-side dispatch portion and an engine (black-box, Epic #57
-        // rule 3) portion — see `metrics::PageLoadTimer`'s doc comment.
-        // Listed before the catch-all arm below, which used to cover this
-        // variant as a no-op.
-        UserEvent::LoadStarted(window_id, id, _) => {
-            if let Some(timer) = page_load_timers.get_mut(&(*window_id, *id)) {
-                timer.mark_load_started(Instant::now());
-            }
-        }
-        UserEvent::LoadFinished(window_id, id, url) => {
-            let now = Instant::now();
-            // Removed, not just looked up (Issue #62/D79): once this load
-            // has finished there is nothing left in the entry worth keeping
-            // — a later navigation of the same tab recreates it fresh via
-            // `NavigationStarted`'s `.entry().or_default()`. Leaving a
-            // "finished" entry behind here was the dominant leak this map
-            // had: `WindowId`/`TabId` never repeat, so every tab that ever
-            // finished loading a page left one entry behind forever.
-            if let Some(outcome) = page_load_timers
-                .remove(&(*window_id, *id))
-                .and_then(|mut timer| timer.finish(now))
-            {
-                let elapsed = now.saturating_duration_since(process_start);
-                perf_log.write(
-                    &metrics::PerfRecord::page_load(url.as_str(), outcome.total, outcome.engine),
-                    elapsed,
-                );
-            }
-            // The first page to finish anywhere is time-to-first-page; a
-            // background tab cannot beat the initial one to it, since it
-            // can only be opened after the window is up.
-            mark_startup(
-                startup,
-                perf_log,
-                process_start,
-                metrics::StartupTimestamps::mark_first_load_finished,
-            );
-        }
-        // The `mark` command (Issue #60) is the one automation command
-        // that *is* a perf event of its own: it writes the `measure_start`
-        // marker `benchmark::aggregate_trials` cuts each trial at. Listed
-        // before the catch-all arm below, which still covers every other
-        // `Automation` variant.
-        UserEvent::Automation(AutomationCommand::Mark) => {
-            let elapsed = Instant::now().saturating_duration_since(process_start);
-            perf_log.write(&metrics::PerfRecord::measure_start(), elapsed);
-        }
-        UserEvent::NavigationBlocked(..)
-        | UserEvent::SubresourceBlocked(..)
-        | UserEvent::PageTitleResolved { .. }
-        | UserEvent::FaviconResolved { .. }
-        | UserEvent::OpenDevtoolsRequested(_)
-        | UserEvent::ContentShortcut(..)
-        | UserEvent::NewTabRequested(..)
-        | UserEvent::DownloadStarted { .. }
-        | UserEvent::DownloadCompleted { .. }
-        // Issue #46's save-page flow is not a perf-tracked operation either
-        // (same reasoning as `FindMatchesUpdated` below) — nothing to log
-        // here.
-        | UserEvent::SavePageStarted { .. }
-        | UserEvent::SavePageFinished { .. }
-        // `handle_automation_command` calls the same tab-management
-        // functions the toolbar path does, which already call
-        // `record_tab_latency` themselves — nothing extra to log here.
-        | UserEvent::Automation(_)
-        // Suspensions the sample leads to are logged by `sweep_tabs`
-        // (`record_tab_suspend`); the sample itself is not a perf event
-        // (the perf RSS sampler already logs `rss` on its own schedule).
-        | UserEvent::MemorySampled(_)
-        // Issue #272: fires on every keystroke in a form, so logging it
-        // would both flood the perf log and measure the user's typing
-        // rate rather than anything VeloX does. `Tab::mark_form_input`
-        // is a bool store; there is no duration worth recording.
-        | UserEvent::FormInputDetected(..)
-        // Issue #43's in-page find is not a perf-tracked operation (no
-        // `docs/performance-targets.md` budget calls for it) — nothing to
-        // log here.
-        | UserEvent::FindMatchesUpdated { .. }
-        // Same for Issue #40's PDF export — no performance budget calls
-        // for it either.
-        | UserEvent::PdfExportFinished { .. }
-        // Issue #243's freeze result is not perf-tracked either: what the
-        // measurement wants is the RSS and `tab_resume_ms` the existing
-        // events already carry, not a timestamp for the COM round-trip.
-        | UserEvent::TabFreezeFinished { .. }
-        // Same for Issue #45's View Source: no performance budget calls for
-        // it either.
-        | UserEvent::ViewSourceReady { .. }
-        // Issue #39's context menu is not a perf-tracked operation either.
-        | UserEvent::ContextMenuRequested { .. }
-        | UserEvent::ContextMenuActionSelected { .. }
-        | UserEvent::ContextMenuClosed(..)
-        // Issue #149: reopening the previous session's extra windows is not
-        // a perf-tracked operation. `process_start` → `window_created`
-        // (#182) is about the *first* window only, and these deliberately
-        // sit outside it (see `UserEvent::RestoreWindows`).
-        | UserEvent::RestoreWindows(..) => {}
-    }
-}
-
-/// Apply one startup-checkpoint mark and, once the full report is
-/// available, write it through `perf_log` and clear `startup` so it is only
-/// reported once.
-fn mark_startup(
-    startup: &mut Option<metrics::StartupTimestamps>,
-    perf_log: &PerfLog,
-    process_start: Instant,
-    mark: fn(&mut metrics::StartupTimestamps, Instant),
-) {
-    let Some(timestamps) = startup.as_mut() else {
-        return;
-    };
-    let now = Instant::now();
-    mark(timestamps, now);
-    if let Some(report) = timestamps.report() {
-        let elapsed = now.saturating_duration_since(process_start);
-        perf_log.write(&metrics::PerfRecord::startup(report), elapsed);
-        *startup = None;
-    }
-}
-
-/// Log a tab-create/switch latency record if performance metrics are on
-/// (`state.perf` is `Some`); a single `Option::is_none` check with no
-/// `Instant::now()` call otherwise. `started` is the timestamp the caller
-/// captured right before the operation it is timing.
-fn record_tab_latency(
-    state: &AppState,
-    kind: metrics::TabLatencyKind,
-    id: TabId,
-    started: Instant,
-) {
-    let Some(perf) = &state.perf else {
-        return;
-    };
-    let now = Instant::now();
-    let duration = now.saturating_duration_since(started);
-    let elapsed = now.saturating_duration_since(perf.process_start);
-    perf.log.write(
-        &metrics::PerfRecord::tab_latency(kind, id.get(), duration),
-        elapsed,
-    );
-}
-
-/// Log a `persistence::save_*` disk-write record if performance metrics
-/// are on — Issue #67's counterpart to [`record_tab_latency`], same
-/// "single `Option::is_none` check when metrics are off" shape. `started`
-/// is the timestamp the caller captured right before the `save_*` call
-/// (never around the dedup check that may skip it — a skipped write has no
-/// disk-I/O cost worth recording).
-fn record_state_write(state: &AppState, kind: metrics::StateWriteKind, started: Instant) {
-    let Some(perf) = &state.perf else {
-        return;
-    };
-    let now = Instant::now();
-    let duration = now.saturating_duration_since(started);
-    let elapsed = now.saturating_duration_since(perf.process_start);
-    perf.log
-        .write(&metrics::PerfRecord::state_write(kind, duration), elapsed);
-}
-
-/// Spawn a background thread that periodically samples this process's
-/// (and its descendants') RSS and writes it through `log`. Runs for the
-/// lifetime of the process; only ever spawned when `config.perf_metrics`
-/// and `config.perf_rss_interval` are both set, so it costs nothing
-/// otherwise.
-fn spawn_rss_sampler(interval: Duration, log: Arc<PerfLog>, process_start: Instant) {
-    let pid = std::process::id();
-    std::thread::spawn(move || {
-        // The previous sample and when it was taken, so each pass can turn
-        // two cumulative CPU readings into a rate over the interval that
-        // actually elapsed (Issue #64). The real elapsed time is used
-        // rather than `interval`, because a loaded machine can stretch the
-        // sleep and a fixed divisor would then overstate CPU use.
-        let mut previous: Option<(metrics::RssSample, Instant)> = None;
-        loop {
-            match metrics::sample_process_tree_rss(pid) {
-                Ok(sample) => {
-                    let now = Instant::now();
-                    let elapsed = now.saturating_duration_since(process_start);
-                    if let Some((prev_sample, prev_at)) = &previous {
-                        if let Some(percent) = metrics::PerfRecord::cpu_percent_between(
-                            prev_sample,
-                            &sample,
-                            now.saturating_duration_since(*prev_at),
-                        ) {
-                            log.write(&metrics::PerfRecord::cpu(percent), elapsed);
-                        }
-                    }
-                    log.write(&metrics::PerfRecord::rss(sample), elapsed);
-                    previous = Some((sample, now));
-                }
-                Err(err) => eprintln!("velox: rss sampling failed: {err}"),
-            }
-            std::thread::sleep(interval);
-        }
-    });
-}
-
-/// Spawn the background thread that feeds the automatic suspension
-/// policy's memory signal (Issue #63): every `interval`, sample the whole
-/// process tree's memory (`metrics::sample_process_tree_rss`, the same
-/// `/proc` walk the perf RSS sampler uses) and send it to the main thread
-/// as `UserEvent::MemorySampled`. Only ever spawned when
-/// `Config::suspension.memory_budget_bytes` is set.
-///
-/// Which of the sample's totals is compared against the budget is
-/// `input`'s call (`MemoryBudgetInput::pick`, Issue #176 Stage 3 /
-/// D151 / D152). With the default (`PrivateCommit`, since D152): on
-/// Windows the private commit (`PagefileUsage`, D150) is compared, not
-/// the working set — §47.9/§47.10 found the working set of a young
-/// renderer growing for ~75 s without any allocation, and the budget
-/// discarding tabs to pay for that residency. Elsewhere `PrivateCommit`
-/// and `Resident` read the same figure: PSS when the platform can read it
-/// (Linux with `smaps_rollup`), because that is what the budget is meant
-/// to be compared against (`docs/performance-targets.md` §3.1: RSS
-/// double-counts shared pages once per process and would put a
-/// multi-process browser "over budget" on shared library pages alone),
-/// and the RSS total where PSS is unavailable — an over-estimate, so a
-/// budget tuned for PSS will suspend slightly earlier there; documented
-/// in D56 (the non-Linux Unix `ps` fallback; PSS has no Windows
-/// equivalent either, Issue #136 / D88). `VELOX_MEMORY_BUDGET_INPUT=
-/// resident` restores the pre-D151 reading — on Windows the working set
-/// via `GetProcessMemoryInfo`. On a platform where RSS itself cannot be
-/// read either (`RssError::Unsupported` — today, any OS other than Linux,
-/// other Unix, or Windows), the failure is logged once and the thread
-/// exits: the memory signal is simply inert, and the idle/tab-count
-/// signals keep working.
-///
-/// Exits when the event loop is gone (`send_event` fails), like
-/// `spawn_automation`.
-fn spawn_memory_pressure_sampler(
-    interval: Duration,
-    input: MemoryBudgetInput,
-    proxy: EventLoopProxy<UserEvent>,
-) {
-    let pid = std::process::id();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(interval);
-        let sample = match metrics::sample_process_tree_rss(pid) {
-            Ok(sample) => sample,
-            Err(err) => {
-                eprintln!("velox: memory sampling for tab suspension stopped: {err}");
-                return;
-            }
-        };
-        let total_bytes = input.pick(
-            sample.total_private_bytes,
-            sample.total_pss_bytes,
-            sample.total_rss_bytes,
-        );
-        if proxy
-            .send_event(UserEvent::MemorySampled(MemorySample { total_bytes }))
-            .is_err()
-        {
-            return;
-        }
-    });
-}
-
-/// Give up on the pending `wait_load` (Issue #169), if any, once its
-/// deadline has passed: log why (mirroring the `log_failure` pattern — this
-/// is never fatal, the automation thread simply moves on to its next
-/// command) and unblock the automation thread. Returns `Some(deadline)`
-/// when a wait is still pending and its deadline has *not* yet passed, so
-/// the caller (`run`'s event loop tail) can fold it into `next_wake` the
-/// same way [`sweep_tabs`]'s return value already is — otherwise the loop
-/// would only notice the timeout whenever some unrelated event next woke
-/// it, rather than promptly. Returns `None` when nothing is pending, or
-/// once this call has just resolved a timed-out one.
-///
-/// Looking up the tab's current URL for the log line is best-effort: the
-/// tab (or its window) may already be gone by the time this fires, in
-/// which case the message simply omits it rather than treating a missing
-/// tab as its own error.
-fn poll_automation_wait_timeout(
-    automation_wait: &mut AutomationWaitState,
-    state: &AppState,
-    now: Instant,
-) -> Option<Instant> {
-    let pending = automation_wait.pending.as_ref()?;
-    if now < pending.deadline {
-        return Some(pending.deadline);
-    }
-    match pending.kind {
-        AutomationWaitKind::Load { window_id, tab_id } => {
-            let url = state
-                .windows
-                .tabs(window_id)
-                .and_then(|tabs| tabs.get(tab_id))
-                .map(|tab| tab.current_url().to_owned());
-            eprintln!(
-                "velox: automation: wait_load はタイムアウトしました \
-                 (window={window_id:?}, tab={tab_id:?}, url={url:?})"
-            );
-        }
-        AutomationWaitKind::Startup => {
-            eprintln!(
-                "velox: automation: wait_startup はタイムアウトしました \
-                 (startup perf レコードがまだ書き込まれていません — \
-                 VELOX_PERF_METRICS が有効か確認してください)"
-            );
-        }
-    }
-    automation_wait.pending = None;
-    let _ = automation_wait.notify.send(());
-    None
-}
-
-/// If `wait_load` (Issue #169) is currently blocked waiting on tab `tab_id`
-/// in window `window_id`, unblock it: clear the pending wait and notify the
-/// automation thread. A no-op when nothing is pending, when a `wait_startup`
-/// is pending instead, or when this `LoadFinished` belongs to some other tab
-/// — matching the "exactly one notification per wait" invariant
-/// [`AutomationWaitState`]'s doc comment describes.
-fn resolve_automation_wait_if_matching(
-    automation_wait: &mut AutomationWaitState,
-    window_id: WindowId,
-    tab_id: TabId,
-) {
-    let matches = automation_wait.pending.as_ref().is_some_and(|pending| {
-        matches!(
-            pending.kind,
-            AutomationWaitKind::Load { window_id: w, tab_id: t } if w == window_id && t == tab_id
-        )
-    });
-    if matches {
-        automation_wait.pending = None;
-        let _ = automation_wait.notify.send(());
-    }
-}
-
-/// Mark the `startup` perf record as written (Issue #173) and, if a
-/// `wait_startup` is currently blocked waiting for exactly that, unblock it:
-/// clear the pending wait and notify the automation thread. Called from
-/// `run`'s event loop the moment it observes `startup` transition from
-/// `Some` to `None` (i.e. `mark_startup` just wrote the record) — see that
-/// call site's comment for why the transition is detected there rather than
-/// threading `automation_wait` into `record_perf_event`/`mark_startup`.
-/// `startup_reported` is set unconditionally (even when nothing is
-/// currently pending) so a `wait_startup` issued later in the script still
-/// resolves immediately in `handle_automation_command` instead of
-/// registering a wait nothing will ever notify again.
-fn resolve_automation_wait_for_startup(automation_wait: &mut AutomationWaitState) {
-    automation_wait.startup_reported = true;
-    let matches = matches!(
-        automation_wait
-            .pending
-            .as_ref()
-            .map(|pending| &pending.kind),
-        Some(AutomationWaitKind::Startup)
-    );
-    if matches {
-        automation_wait.pending = None;
-        let _ = automation_wait.notify.send(());
-    }
-}
-
-/// Decide which open window's `sweep_tabs` call should consume this pass's
-/// fresh memory sample, and what `AppState::next_memory_sample_window`
-/// should become for the *next* one (Issue #186, docs/decisions.md D90).
-/// Pure and window/webview-independent — `ids` is whatever `Windows::ids()`
-/// currently returns (creation order) and `next` is `AppState::
-/// next_memory_sample_window` going in — so the round-robin fairness
-/// itself is unit-tested without a real window, matching D20's rule for
-/// everything else `browser::`/`app.rs`'s policy logic can keep pure.
-///
-/// Round-robin, not "hand the same sample to every window" and not
-/// "always the first window in `ids`": the former would multiply a single
-/// over-budget reading into simultaneous suspensions across every open
-/// window (over-reclaim — D56's sawtooth behavior amplified by the window
-/// count); the latter is the bug this issue fixes — a window with nothing
-/// eligible to suspend (a single always-active tab, say) would silently
-/// discard every sample forever, starving every *other* window's memory
-/// signal no matter how far over budget the whole process tree was, since
-/// it is always first. Round-robin guarantees, by construction, both that
-/// **at most one window's tabs are suspended per sample** (the caller only
-/// ever passes the sample to the one window this returns) and that no
-/// window can be permanently skipped (the cursor always advances past
-/// whichever window was just served).
-///
-/// Returns `(served, next_cursor)`. `served` is `None` only when `ids` is
-/// empty (cannot happen while the event loop is running — the app exits
-/// once `Windows` is empty — handled defensively rather than assumed
-/// away); `next_cursor` is left as `next` unchanged in that case (nothing
-/// to advance from). Otherwise `served` is the window at `next`'s position
-/// in `ids` (or the first window if `next` is `None` or no longer present
-/// — self-healing when the previously-served window has since closed),
-/// and `next_cursor` is whichever window comes right after it, wrapping
-/// around to the front.
-fn choose_memory_sample_window(
-    ids: &[WindowId],
-    next: Option<WindowId>,
-) -> (Option<WindowId>, Option<WindowId>) {
-    if ids.is_empty() {
-        return (None, next);
-    }
-    let start = next
-        .and_then(|id| ids.iter().position(|&w| w == id))
-        .unwrap_or(0);
-    let served = ids[start];
-    let next_index = (start + 1) % ids.len();
-    (Some(served), Some(ids[next_index]))
-}
-
-/// Run the automatic suspension policy once (Issue #63): suspend every
-/// background tab [`suspension::plan`] picks as of `now`, then return when
-/// the loop should next check again (the soonest a still-awake background
-/// tab would cross `idle_after`). Returns `None` when the policy is fully
-/// off, the idle signal is off, or there is no background tab to watch —
-/// the caller leaves `control_flow` as `Wait` (the tab-count signal is
-/// re-evaluated on the next event anyway, and the memory signal wakes the
-/// loop itself via `UserEvent::MemorySampled`).
-///
-/// `memory` is the fresh sample for *this* window's sweep, or `None` when
-/// there is no new sample or (Issue #186) this pass's sample was handed to
-/// a different window's sweep instead — the caller (`run`'s event loop)
-/// decides that once per pass, round-robin, before calling this for every
-/// open window; see `AppState::next_memory_sample_window`'s doc comment. A
-/// sample never suspends more than one sweep's worth of tabs, in exactly
-/// one window.
-fn sweep_tabs(
-    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
-    state: &mut AppState,
-    window_id: WindowId,
-    policy: &SuspensionPolicy,
-    memory: Option<MemorySample>,
-    now: Instant,
-) -> Option<Instant> {
-    if !policy.is_enabled() {
-        return None;
-    }
-    let window = ui_windows.get_mut(&window_id)?;
-    let tabs = state.windows.tabs(window_id)?;
-    let candidates = tabs.suspension_candidates(
-        now,
-        |id| window.is_playing_audio(id),
-        |id| window.process_group_of(id),
-    );
-    // 機構は「設定値」ではなく「このウィンドウが実際に使うもの」を渡す
-    // (D138 決定3)。メモリ信号の算術は、その休止がメモリを返すかどうかに
-    // 依存しているため。
-    let planned = suspension::plan(policy, &candidates, memory, window.suspend_mechanism());
-    if !planned.is_empty() {
-        for (id, reason) in planned {
-            if suspend_tab(window, window_id, state, id) {
-                record_tab_suspend(state, id, reason);
-            }
-        }
-        sync_tab_strip(window, window_id, state);
-    }
-    let idle_after = policy.idle_after?;
-    state
-        .windows
-        .tabs(window_id)
-        .and_then(|tabs| tabs.next_idle_deadline(idle_after))
-}
-
-/// Suspend tab `id` on both sides — `Tabs` state first, then the webview
-/// (`BrowserWindow::suspend_tab`) — without touching the tab strip; the
-/// caller redraws it once it is done (it may be suspending several tabs).
-/// Returns whether the tab was actually suspended: `false` for an unknown
-/// id, the active tab, an already-suspended tab, or a pinned tab
-/// (`Tabs::suspend`'s guards — Issue #277, D144 added the last one), in
-/// which case nothing changed. The one implementation behind the tab
-/// strip's suspend button (`ToolbarCommand::SuspendTab`), the
-/// `suspend <index>` automation command, and [`sweep_tabs`] — so all three
-/// inherit the pinned guard from `Tabs::suspend` itself rather than each
-/// needing their own check.
-fn suspend_tab(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    id: TabId,
-) -> bool {
-    let Some(tabs) = state.windows.tabs_mut(window_id) else {
-        return false;
-    };
-    if !tabs.suspend(id) {
-        return false;
-    }
-    log_failure("suspend tab", window.suspend_tab(id));
-    true
-}
-
-/// Log a `tab_suspend` perf event (Issue #63) — a no-op when metrics are
-/// off, like [`record_tab_latency`].
-fn record_tab_suspend(state: &AppState, id: TabId, reason: SuspendReason) {
-    let Some(perf) = &state.perf else {
-        return;
-    };
-    let elapsed = Instant::now().saturating_duration_since(perf.process_start);
-    perf.log
-        .write(&metrics::PerfRecord::tab_suspend(id.get(), reason), elapsed);
 }
 
 /// Dispatch one [`UserEvent`]. UI failures are logged, never fatal.
@@ -1795,7 +1136,12 @@ fn handle_user_event(
         UserEvent::ToolbarMessage(window_id, body) => match toolbar::parse_command(&body) {
             // See this function's doc comment: intercepted before resolving
             // `window_id` to a `&mut BrowserWindow`.
-            Ok(ToolbarCommand::NewWindow) => {
+            //
+            // Issue #27/D74: `NewPrivateWindow` passes `true` instead of
+            // `config.private` — a private window is opened regardless of
+            // whether the process itself was launched private.
+            Ok(command @ (ToolbarCommand::NewWindow | ToolbarCommand::NewPrivateWindow)) => {
+                let private = config.private || matches!(command, ToolbarCommand::NewPrivateWindow);
                 open_new_window(
                     target,
                     window_event_proxy,
@@ -1803,22 +1149,7 @@ fn handle_user_event(
                     state,
                     config,
                     homepage,
-                    config.private,
-                );
-            }
-            // Issue #27/D74: same interception as `NewWindow` above, `true`
-            // instead of `config.private` — a private window is opened
-            // regardless of whether the process itself was launched
-            // private.
-            Ok(ToolbarCommand::NewPrivateWindow) => {
-                open_new_window(
-                    target,
-                    window_event_proxy,
-                    ui_windows,
-                    state,
-                    config,
-                    homepage,
-                    true,
+                    private,
                 );
             }
             // See this function's doc comment, and `apply_updated_settings`'s:
@@ -1855,16 +1186,12 @@ fn handle_user_event(
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            let is_active = state
-                .windows
-                .tabs_mut(window_id)
-                .map(|tabs| {
-                    if let Some(tab) = tabs.get_mut(id) {
-                        tab.on_navigation_started(&url);
-                    }
-                    tabs.active_id() == id
-                })
-                .unwrap_or(false);
+            let is_active = state.windows.tabs_mut(window_id).is_some_and(|tabs| {
+                if let Some(tab) = tabs.get_mut(id) {
+                    tab.on_navigation_started(&url);
+                }
+                tabs.active_id() == id
+            });
             // Issue #43/D69, integrated with multi-window in D68: the page
             // under an open find session is about to change, so its
             // matches/highlights are about to become stale — close it
@@ -1888,11 +1215,7 @@ fn handle_user_event(
             // the new page will eventually replace it anyway, but a slow
             // load could otherwise leave the stale menu visible in the
             // meantime.
-            if state
-                .windows
-                .context_menu(window_id)
-                .is_some_and(|menu| menu.tab_id() == id)
-            {
+            if context_menu_is_for(state, window_id, id) {
                 state.windows.take_context_menu(window_id);
                 log_failure("hide context menu", window.hide_context_menu(id));
             }
@@ -1905,22 +1228,9 @@ fn handle_user_event(
         }
         UserEvent::NavigationBlocked(window_id, id, url) => {
             eprintln!("velox: blocked navigation to {url} in tab {id:?} (window {window_id:?})");
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
-            let Some(tabs) = state.windows.tabs_mut(window_id) else {
-                return;
-            };
-            if let Some(tab) = tabs.get_mut(id) {
-                tab.on_navigation_blocked(&url);
-            }
-            // Only the active tab's badge is visible right now; a blocked
-            // navigation in a background tab still updates its own
-            // `Tab::blocked_count` above and is picked up the moment that
-            // tab becomes active (see `activate_and_refresh`).
-            if id == tabs.active_id() {
-                sync_block_count(window, tabs);
-            }
+            record_blocked_request(ui_windows, state, window_id, id, |tab| {
+                tab.on_navigation_blocked(&url)
+            });
         }
         UserEvent::SubresourceBlocked(window_id, id, url) => {
             // Deliberately no `eprintln!` here unlike `NavigationBlocked`
@@ -1928,19 +1238,9 @@ fn handle_user_event(
             // second (every blocked ad/tracker image, script, XHR...), and
             // spamming stderr at that rate would drown out every other
             // `log_failure` line this file relies on for diagnostics.
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
-            let Some(tabs) = state.windows.tabs_mut(window_id) else {
-                return;
-            };
-            if let Some(tab) = tabs.get_mut(id) {
-                tab.on_subresource_blocked(&url);
-            }
-            // Same badge-visibility reasoning as `NavigationBlocked` above.
-            if id == tabs.active_id() {
-                sync_block_count(window, tabs);
-            }
+            record_blocked_request(ui_windows, state, window_id, id, |tab| {
+                tab.on_subresource_blocked(&url)
+            });
         }
         UserEvent::LoadFinished(window_id, id, url) => {
             // Issue #169: resolve a pending `wait_load` before anything
@@ -1952,22 +1252,18 @@ fn handle_user_event(
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            let is_active = state
-                .windows
-                .tabs_mut(window_id)
-                .map(|tabs| {
-                    // A failed load reports an empty URL; keep showing the
-                    // URL the tab tried to reach instead of blanking it out.
-                    if let Some(tab) = tabs.get_mut(id) {
-                        if url.is_empty() {
-                            tab.on_load_failed();
-                        } else {
-                            tab.on_load_finished(&url);
-                        }
+            let is_active = state.windows.tabs_mut(window_id).is_some_and(|tabs| {
+                // A failed load reports an empty URL; keep showing the URL
+                // the tab tried to reach instead of blanking it out.
+                if let Some(tab) = tabs.get_mut(id) {
+                    if url.is_empty() {
+                        tab.on_load_failed();
+                    } else {
+                        tab.on_load_finished(&url);
                     }
-                    tabs.active_id() == id
-                })
-                .unwrap_or(false);
+                }
+                tabs.active_id() == id
+            });
             if !url.is_empty() {
                 // Recorded for whichever tab just finished loading, not only
                 // the active one: a background tab finishing a load is a
@@ -1998,13 +1294,11 @@ fn handle_user_event(
                 // `history_id` when there is none: `HistoryStore` ids start
                 // at 1, so `HistoryStore::update_title` simply finds nothing
                 // to update rather than touching an unrelated entry.
-                log_failure(
-                    "fetch page title",
-                    window.fetch_page_title(id, history_id.unwrap_or(0)),
-                );
+                let history_id = history_id.unwrap_or(0);
+                log_failure("fetch page title", window.fetch_page_title(id, history_id));
                 log_failure(
                     "fetch favicon",
-                    window.fetch_favicon(id, history_id.unwrap_or(0), url.clone()),
+                    window.fetch_favicon(id, history_id, url.clone()),
                 );
             }
             if is_active {
@@ -2034,7 +1328,7 @@ fn handle_user_event(
                     // explicitly so a title that arrives just before a
                     // crash is not lost from the next restore (Issue
                     // #25/D65).
-                    persist_session(state, window_id);
+                    persist_session(state);
                 }
             }
             if state.history.update_title(history_id, title) {
@@ -2085,8 +1379,14 @@ fn handle_user_event(
                 window.open_devtools();
             }
         }
-        UserEvent::ContentShortcut(window_id, ContentShortcut::NewWindow) => {
-            // See this function's doc comment.
+        // See this function's doc comment. The source window is unused:
+        // opening a window needs no source tab. Issue #27/D74:
+        // `NewPrivateWindow` passes `true` instead of `config.private`.
+        UserEvent::ContentShortcut(
+            _,
+            shortcut @ (ContentShortcut::NewWindow | ContentShortcut::NewPrivateWindow),
+        ) => {
+            let private = config.private || matches!(shortcut, ContentShortcut::NewPrivateWindow);
             open_new_window(
                 target,
                 window_event_proxy,
@@ -2094,23 +1394,8 @@ fn handle_user_event(
                 state,
                 config,
                 homepage,
-                config.private,
+                private,
             );
-            let _ = window_id; // Unused: opening a window needs no source tab.
-        }
-        // Issue #27/D74: same interception as `NewWindow` above, `true`
-        // instead of `config.private`.
-        UserEvent::ContentShortcut(window_id, ContentShortcut::NewPrivateWindow) => {
-            open_new_window(
-                target,
-                window_event_proxy,
-                ui_windows,
-                state,
-                config,
-                homepage,
-                true,
-            );
-            let _ = window_id; // Unused: opening a window needs no source tab.
         }
         UserEvent::ContentShortcut(window_id, shortcut) => {
             if let Some(window) = ui_windows.get_mut(&window_id) {
@@ -2130,7 +1415,16 @@ fn handle_user_event(
                 open_new_tab(window, window_id, state, &url);
             }
         }
+        // Issue #46: a page save registers exactly like a real download,
+        // so both show up in the same Downloads panel.
         UserEvent::DownloadStarted {
+            window_id,
+            url,
+            file_name,
+            destination,
+            started_at,
+        }
+        | UserEvent::SavePageStarted {
             window_id,
             url,
             file_name,
@@ -2162,81 +1456,7 @@ fn handle_user_event(
             path,
             success,
         } => {
-            let now = now_unix();
-            // Issue #128 / D140. The `success` flag alone is not reliable on
-            // Linux: wry 0.56 shares one set-only `failed` flag across every
-            // download of a registration, and D53 made that registration
-            // session-wide — so after any single failure every later
-            // download is reported failed (and with `path: None`) even
-            // though its file lands correctly. Reproduced end to end.
-            //
-            // The destination this entry recorded when it *started* is the
-            // check: on a real failure WebKitGTK removes the partial file,
-            // so a file that is there means the download finished. See
-            // `downloads::completion_succeeded` for the truth table and why
-            // presence — not size — is the signal.
-            //
-            // **Gated to the backend that actually has the bug**
-            // (`DOWNLOAD_SUCCESS_FLAG_IS_SHARED`, D140 決定5). WebView2 and
-            // WKWebView answer per download, so their `false` is real and
-            // overruling it would misreport a genuine failure as a success
-            // — on Windows, the priority OS, on the strength of behavior
-            // nobody has measured there.
-            //
-            // Reading the filesystem is why this lives here and not in
-            // `browser::downloads`, which stays pure (D20): that module
-            // gets the two booleans and decides.
-            let resolved = state.downloads.resolve_completion(&url, path.as_deref());
-            let succeeded = resolved.is_some_and(|id| {
-                // Only the poisoned backend gets its verdict second-guessed,
-                // and only then is the filesystem touched at all.
-                let exists = crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED
-                    && state
-                        .downloads
-                        .get(id)
-                        .is_some_and(|entry| entry.destination.exists());
-                downloads::completion_succeeded(
-                    success,
-                    exists,
-                    crate::ui::window::DOWNLOAD_SUCCESS_FLAG_IS_SHARED,
-                )
-            });
-            if std::env::var_os("VELOX_DEBUG").is_some() {
-                eprintln!(
-                    "velox: download completion url={url:?} path={path:?} \
-reported_success={success} recorded_as_success={succeeded}"
-                );
-            }
-            match resolved {
-                Some(id) if succeeded => {
-                    state.downloads.complete(id, now);
-                }
-                Some(id) => {
-                    state
-                        .downloads
-                        .fail(id, "ダウンロードに失敗しました".to_owned(), now);
-                }
-                None => {
-                    eprintln!(
-                        "velox: could not correlate download completion for {url:?} \
-                         (path={path:?}, success={success})"
-                    );
-                }
-            }
-            if let Some(window) = ui_windows.get(&window_id) {
-                refresh_downloads_panel(window, state);
-            }
-        }
-        UserEvent::SavePageStarted {
-            window_id,
-            url,
-            file_name,
-            destination,
-            started_at,
-        } => {
-            state
-                .downloads
-                .start(url, file_name, destination, started_at);
+            record_download_completion(state, &url, path.as_deref(), success);
             if let Some(window) = ui_windows.get(&window_id) {
                 refresh_downloads_panel(window, state);
             }
@@ -2247,28 +1467,18 @@ reported_success={success} recorded_as_success={succeeded}"
             destination,
             error,
         } => {
-            let now = now_unix();
-            match state.downloads.resolve_completion(&url, Some(&destination)) {
-                Some(id) => match error {
-                    Some(reason) => {
-                        state.downloads.fail(id, reason, now);
-                    }
-                    None => {
-                        state.downloads.complete(id, now);
-                    }
-                },
-                None => {
-                    eprintln!(
-                        "velox: could not correlate page-save completion for {url:?} \
-                         (destination={destination:?}, error={error:?})"
-                    );
-                }
-            }
+            record_save_page_completion(state, &url, &destination, error);
             if let Some(window) = ui_windows.get(&window_id) {
                 refresh_downloads_panel(window, state);
             }
         }
-        UserEvent::Automation(AutomationCommand::NewWindow) => {
+        // Issue #27/D74: `NewPrivateWindow` passes `true` instead of
+        // `config.private` — lets an automation script (and this crate's
+        // integration tests) drive the private-window path.
+        UserEvent::Automation(
+            command @ (AutomationCommand::NewWindow | AutomationCommand::NewPrivateWindow),
+        ) => {
+            let private = config.private || matches!(command, AutomationCommand::NewPrivateWindow);
             if let Some(new_id) = open_new_window(
                 target,
                 window_event_proxy,
@@ -2276,23 +1486,7 @@ reported_success={success} recorded_as_success={succeeded}"
                 state,
                 config,
                 homepage,
-                config.private,
-            ) {
-                *automation_window = new_id;
-            }
-        }
-        // Issue #27/D74: same interception as `NewWindow` above, `true`
-        // instead of `config.private` — lets an automation script (and this
-        // crate's integration tests) drive the private-window path.
-        UserEvent::Automation(AutomationCommand::NewPrivateWindow) => {
-            if let Some(new_id) = open_new_window(
-                target,
-                window_event_proxy,
-                ui_windows,
-                state,
-                config,
-                homepage,
-                true,
+                private,
             ) {
                 *automation_window = new_id;
             }
@@ -2320,7 +1514,7 @@ reported_success={success} recorded_as_success={succeeded}"
                 // this same `ui_windows.get_mut(automation_window)` gate as
                 // every other automation command, so it needs the same
                 // guard here.)
-                let _ = automation_wait.notify.send(());
+                automation_wait.wake();
             }
         }
         UserEvent::MemorySampled(sample) => {
@@ -2334,30 +1528,8 @@ reported_success={success} recorded_as_success={succeeded}"
             tab_id,
             total,
         } => {
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
-            // A session for a *different* tab (the find bar moved on, or
-            // closed, while this DOM search was still running) means this
-            // result is stale — see this variant's doc comment. Scoped to
-            // `window_id`'s own find session (`Windows::find_mut`) — a
-            // result meant for one window's find bar can never update
-            // another window's, even one whose active tab happens to share
-            // this `tab_id` value (Issue #29/D68).
-            if let Some(session) = state
-                .windows
-                .find_mut(window_id)
-                .filter(|session| session.tab_id() == tab_id)
-            {
-                session.set_total(total);
-                let active = session.active();
-                log_failure("update find status", window.set_find_status(total, active));
-                if let Some(index) = active {
-                    log_failure(
-                        "highlight find match",
-                        window.highlight_find_match(tab_id, index),
-                    );
-                }
+            if let Some(window) = ui_windows.get(&window_id) {
+                apply_find_matches(window, window_id, state, tab_id, total);
             }
         }
         UserEvent::PdfExportFinished {
@@ -2370,15 +1542,12 @@ reported_success={success} recorded_as_success={succeeded}"
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            let message = if success {
-                format!("PDFとして保存しました: {}", destination.display())
-            } else {
-                match error {
-                    Some(reason) => format!("PDFの書き出しに失敗しました: {reason}"),
-                    None => "PDFの書き出しに失敗しました".to_owned(),
-                }
+            let message = match (success, error) {
+                (true, _) => format!("PDFとして保存しました: {}", destination.display()),
+                (false, Some(reason)) => format!("PDFの書き出しに失敗しました: {reason}"),
+                (false, None) => "PDFの書き出しに失敗しました".to_owned(),
             };
-            log_failure("show print status", window.set_print_status(Some(&message)));
+            show_print_status(window, &message);
         }
         UserEvent::TabFreezeFinished {
             window_id,
@@ -2399,63 +1568,7 @@ reported_success={success} recorded_as_success={succeeded}"
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            // The freeze is asynchronous, so by now the tab may have stopped
-            // being suspended: the user can click straight back to it
-            // between the `TrySuspend` call and its answer, which resumes it
-            // in place — and the engine then reports failure *because* the
-            // tab became visible again. Decide once, and let both branches
-            // below read it, so neither acts on a stale answer.
-            let still_suspended = suspension::late_freeze_failure_may_discard(
-                tabs_of(state, window_id).get(tab_id).map(Tab::state),
-            );
-            if !still_suspended {
-                // Nothing to do either way, but say so rather than claiming
-                // a freeze that no longer describes the tab: these lines are
-                // what a measurement reads to tell whether the `freeze` arm
-                // actually froze anything (docs/performance-targets.md §37).
-                eprintln!(
-                    "velox: tab {tab_id:?} の freeze 結果 (success={success}) は届いたが、既に休止が解けている (#243)"
-                );
-                return;
-            }
-            if success {
-                // Logged, not silent: this is the only positive evidence
-                // that the `freeze` arm of a measurement actually froze
-                // anything. Suspensions are rare enough (tens per
-                // benchmark run) that one line each is not noise.
-                eprintln!("velox: tab {tab_id:?} を freeze しました (#243)");
-                // The engine's own answer, for runs that are debugging the
-                // mechanism rather than measuring it — see
-                // `BrowserWindow::engine_reports_tab_suspended` for why this
-                // is not asked unconditionally.
-                if std::env::var_os("VELOX_DEBUG").is_some() {
-                    match window.engine_reports_tab_suspended(tab_id) {
-                        Some(engine_state) => eprintln!(
-                            "velox: tab {tab_id:?} engine IsSuspended={engine_state} (#243)"
-                        ),
-                        None => eprintln!(
-                            "velox: tab {tab_id:?} engine IsSuspended は取得できません (#243)"
-                        ),
-                    }
-                }
-                return;
-            }
-            // WebView2 declined and the tab really is still suspended, so it
-            // is marked suspended while holding a live webview. Fall back to
-            // what `Discard` would have done rather than leaving it awake —
-            // see the variant's docs.
-            match error {
-                Some(reason) => eprintln!(
-                    "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243): {reason}"
-                ),
-                None => eprintln!(
-                    "velox: tab {tab_id:?} の freeze に失敗したため webview を破棄します (#243)"
-                ),
-            }
-            log_failure(
-                "discard frozen tab webview",
-                window.discard_tab_webview(tab_id),
-            );
+            handle_tab_freeze_finished(window, window_id, state, tab_id, success, error);
         }
         UserEvent::ViewSourceReady {
             window_id,
@@ -2508,19 +1621,16 @@ reported_success={success} recorded_as_success={succeeded}"
             // window) must never touch the new one. Checked before
             // `take_context_menu` so a mismatch never discards a menu that
             // is not actually the one this click belongs to.
-            let matches = state
-                .windows
-                .context_menu(window_id)
-                .is_some_and(|menu| menu.tab_id() == tab_id);
-            if !matches {
+            if !context_menu_is_for(state, window_id, tab_id) {
                 return;
             }
-            let Some(menu) = state.windows.take_context_menu(window_id) else {
-                return;
-            };
             // `resolve` also re-checks `enabled` — a hostile page dispatching
             // a fake click on a greyed-out row cannot run it anyway.
-            let Some(action) = menu.resolve(index) else {
+            let Some(action) = state
+                .windows
+                .take_context_menu(window_id)
+                .and_then(|menu| menu.resolve(index))
+            else {
                 return;
             };
             match action {
@@ -2577,15 +1687,50 @@ reported_success={success} recorded_as_success={succeeded}"
             }
         }
         UserEvent::ContextMenuClosed(window_id, tab_id) => {
-            let matches = state
-                .windows
-                .context_menu(window_id)
-                .is_some_and(|menu| menu.tab_id() == tab_id);
-            if matches {
+            if context_menu_is_for(state, window_id, tab_id) {
                 state.windows.take_context_menu(window_id);
             }
         }
     }
+}
+
+/// ブロックしたリクエストを `window_id` のタブ `id` に記録する
+/// (`NavigationBlocked`/`SubresourceBlocked` 共通)。`record` がタブ側の
+/// カウンタを更新し、そのタブがアクティブならバッジも更新する。閉じた
+/// ウィンドウ宛ての遅れて届いたイベントは何もしない。
+fn record_blocked_request(
+    ui_windows: &HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    window_id: WindowId,
+    id: TabId,
+    record: impl FnOnce(&mut Tab),
+) {
+    let Some(window) = ui_windows.get(&window_id) else {
+        return;
+    };
+    let Some(tabs) = state.windows.tabs_mut(window_id) else {
+        return;
+    };
+    if let Some(tab) = tabs.get_mut(id) {
+        record(tab);
+    }
+    // Only the active tab's badge is visible right now; a blocked request in
+    // a background tab still updates its own `Tab::blocked_count` above and
+    // is picked up the moment that tab becomes active (see
+    // `activate_and_refresh`).
+    if id == tabs.active_id() {
+        sync_block_count(window, tabs);
+    }
+}
+
+/// `window_id` で開いているコンテキストメニューが、タブ `tab_id` に対して
+/// 開かれたものか (Issue #39/D78)。別タブ向けのメニューや、既に閉じた
+/// メニューに対する遅れたイベントを弾くための共通チェック。
+fn context_menu_is_for(state: &AppState, window_id: WindowId, tab_id: TabId) -> bool {
+    state
+        .windows
+        .context_menu(window_id)
+        .is_some_and(|menu| menu.tab_id() == tab_id)
 }
 
 /// Open a brand new window (Ctrl/Cmd+N) with a single tab at `url`. The one
@@ -2803,37 +1948,31 @@ fn handle_toolbar_command(
             close_tab(window, window_id, state, page_load_timers, TabId::from(id))
         }
         ToolbarCommand::ActivateTab { id } => {
-            let id = TabId::from(id);
-            let started = Instant::now();
-            if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
-                activate_and_refresh(window, window_id, state, id, effect);
-                record_tab_latency(state, switch_latency_kind(effect), id, started);
-            }
+            activate_tab(window, window_id, state, TabId::from(id))
         }
         ToolbarCommand::CloseActiveTab => {
-            let id = tabs_of(state, window_id).active_id();
-            close_tab(window, window_id, state, page_load_timers, id);
+            close_active_tab(window, window_id, state, page_load_timers)
         }
         ToolbarCommand::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ToolbarCommand::NextTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(1, now)
+            });
         }
         ToolbarCommand::PrevTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(-1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(-1, now)
+            });
         }
         ToolbarCommand::ActivateTabByIndex { index } => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_by_position(index as usize, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_by_position(index as usize, now)
+            });
         }
         ToolbarCommand::ActivateLastTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_last(started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_last(now)
+            });
         }
         ToolbarCommand::SuspendTab { id } => {
             if suspend_tab(window, window_id, state, TabId::from(id)) {
@@ -2888,8 +2027,7 @@ fn handle_toolbar_command(
                 window.set_theme(state.settings.appearance.theme),
             );
             sync_block_count(window, tabs_of(state, window_id));
-            let url = tabs_of(state, window_id).active().current_url().to_owned();
-            sync_bookmark_star(window, state, &url);
+            sync_active_bookmark_star(window, window_id, state);
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
             refresh_downloads_panel(window, state);
@@ -2898,11 +2036,7 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
         ToolbarCommand::TogglePanel { panel } => {
-            let next = if window.open_panel() == Some(panel) {
-                None
-            } else {
-                Some(panel)
-            };
+            let next = (window.open_panel() != Some(panel)).then_some(panel);
             log_failure("toggle panel", window.set_panel(next));
             match next {
                 Some(Panel::History) => refresh_history_panel(window, state, config),
@@ -2948,8 +2082,7 @@ fn handle_toolbar_command(
             if state.bookmarks.remove(id) {
                 persist_bookmarks(state);
                 refresh_bookmarks_panel(window, state);
-                let url = tabs_of(state, window_id).active().current_url().to_owned();
-                sync_bookmark_star(window, state, &url);
+                sync_active_bookmark_star(window, window_id, state);
             }
         }
         ToolbarCommand::OpenDownload { id } => open_download(state, DownloadId::from(id)),
@@ -3016,11 +2149,7 @@ fn handle_toolbar_command(
                 &sources,
                 omnibox::DEFAULT_CANDIDATE_LIMIT,
             );
-            let open = if candidates.is_empty() {
-                None
-            } else {
-                Some(Panel::Omnibox)
-            };
+            let open = (!candidates.is_empty()).then_some(Panel::Omnibox);
             log_failure("toggle omnibox panel", window.set_panel(open));
             log_failure(
                 "update omnibox candidates",
@@ -3064,8 +2193,7 @@ fn handle_toolbar_command(
             // edit form closes and shows the entry's actual (possibly
             // unchanged) state either way.
             refresh_bookmarks_panel(window, state);
-            let active_url = tabs_of(state, window_id).active().current_url().to_owned();
-            sync_bookmark_star(window, state, &active_url);
+            sync_active_bookmark_star(window, window_id, state);
         }
         ToolbarCommand::CreateBookmarkFolder { name } => {
             let name = name.trim();
@@ -3142,7 +2270,7 @@ fn handle_toolbar_command(
 /// `ToolbarCommand::ToggleBookmark`, and Ctrl/Cmd+D from either the toolbar
 /// or a content webview — `ContentShortcut::ToggleBookmark` — all funnel
 /// through here).
-fn toggle_current_bookmark(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+fn toggle_current_bookmark(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
     let url = tabs_of(state, window_id).active().current_url().to_owned();
     let title = known_title_for(&state.history, &url);
     let now = now_unix();
@@ -3155,322 +2283,9 @@ fn toggle_current_bookmark(window: &mut BrowserWindow, window_id: WindowId, stat
 /// Show/hide the bookmark bar (Ctrl/Cmd+Shift+B from either the toolbar or a
 /// content webview, and the toolbar's own bar-toggle button all funnel
 /// through here).
-fn toggle_bookmark_bar(window: &mut BrowserWindow) {
+fn toggle_bookmark_bar(window: &BrowserWindow) {
     let next = !window.bookmark_bar_visible();
     log_failure("toggle bookmark bar", window.set_bookmark_bar_visible(next));
-}
-
-// --- In-page find (Issue #43, Ctrl/Cmd+F), see docs/decisions.md D69 ---
-//
-// `ToolbarCommand::OpenFindBar`/`ContentShortcut::OpenFindBar` (D18/D23's
-// usual dual-channel shortcut delivery — Ctrl/Cmd+F assigned directly here
-// for now rather than through a keybinding-config layer, since Issue #38
-// (keyboard shortcut management) has not landed yet; see this issue's PR for
-// what makes this easy to move under #38 later) both call `open_find_bar`.
-// `FindQuery`/`FindNext`/`FindPrevious`/`FindClose` call the other three
-// helpers below; `UserEvent::FindMatchesUpdated` (the DOM search's async
-// result) is handled directly in `handle_user_event`.
-
-/// Open the find bar for `window_id`'s active tab: starts a fresh
-/// `browser::find::FindState` session for *that window* (discarding any
-/// previous one it had open — e.g. re-pressing Ctrl/Cmd+F while already open
-/// just resets to an empty query, matching mainstream browsers), shows the
-/// bar, and resets the "N/M" counter to blank. The bar's own JS
-/// focuses/selects its input as soon as it becomes visible
-/// (`veloxSetFindBarVisible`), so nothing else to do here.
-///
-/// Multi-window (Issue #29/D68): the session is stored on `window_id`'s own
-/// `WindowEntry` (`Windows::set_find`), never a single global slot — opening
-/// find in one window must never disturb another window's independent
-/// search.
-fn open_find_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
-    let tab_id = tabs_of(state, window_id).active_id();
-    state
-        .windows
-        .set_find(window_id, find::FindState::new(tab_id));
-    log_failure("show find bar", window.set_find_bar_visible(true));
-    log_failure("reset find status", window.set_find_status(0, None));
-}
-
-/// Close `window_id`'s find bar: clears any DOM highlight left in the
-/// session's tab (a no-op if that tab has since closed —
-/// `clear_find_highlights` already handles an unknown id), drops the
-/// session, and hides the bar. A no-op if that window's find bar was not
-/// open (see `Windows::take_find`).
-fn close_find_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
-    let Some(session) = state.windows.take_find(window_id) else {
-        return;
-    };
-    log_failure(
-        "clear find highlights",
-        window.clear_find_highlights(session.tab_id()),
-    );
-    log_failure("hide find bar", window.set_find_bar_visible(false));
-}
-
-/// `window_id`'s find bar input changed, or its case-sensitivity toggle
-/// flipped (`ToolbarCommand::FindQuery`). A no-op if that window's find bar
-/// is not open (the bar's own JS should never send this then, but a
-/// stray/racy message must not panic). An empty/whitespace-only `query`
-/// (`browser::find::normalize_query` returns `None`) clears any existing
-/// highlight instead of asking the DOM to search for nothing.
-fn update_find_query(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    query: String,
-    case_sensitive: bool,
-) {
-    let Some(session) = state.windows.find_mut(window_id) else {
-        return;
-    };
-    let tab_id = session.tab_id();
-    match find::normalize_query(&query) {
-        Some(normalized) => {
-            session.set_query(normalized.clone(), case_sensitive);
-            log_failure("reset find status", window.set_find_status(0, None));
-            log_failure(
-                "search in page",
-                window.search_in_page(tab_id, &normalized, case_sensitive),
-            );
-        }
-        None => {
-            session.set_query(String::new(), case_sensitive);
-            log_failure(
-                "clear find highlights",
-                window.clear_find_highlights(tab_id),
-            );
-            log_failure("reset find status", window.set_find_status(0, None));
-        }
-    }
-}
-
-/// Which direction `step_find` moves — kept as a tiny enum rather than a
-/// `bool` so the two `ToolbarCommand` call sites below read as `Next`/
-/// `Previous`, not `true`/`false`.
-enum FindDirection {
-    Next,
-    Previous,
-}
-
-/// "▼"/"▲" in `window_id`'s find bar, or Enter/Shift+Enter in its input
-/// (`ToolbarCommand::FindNext`/`FindPrevious`). A no-op if that window's
-/// find bar is not open or its query is empty (nothing searched for yet).
-fn step_find(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    direction: FindDirection,
-) {
-    let Some(session) = state.windows.find_mut(window_id) else {
-        return;
-    };
-    if session.query().is_empty() {
-        return;
-    }
-    let tab_id = session.tab_id();
-    let active = match direction {
-        FindDirection::Next => session.next_match(),
-        FindDirection::Previous => session.previous_match(),
-    };
-    let total = session.total();
-    log_failure("update find status", window.set_find_status(total, active));
-    if let Some(index) = active {
-        log_failure(
-            "highlight find match",
-            window.highlight_find_match(tab_id, index),
-        );
-    }
-}
-
-// --- Print / PDF export (Issue #40), see docs/decisions.md D75 ---
-//
-// `ToolbarCommand::Print`/`ContentShortcut::Print` (Ctrl/Cmd+P, D18/D23's
-// usual dual-channel shortcut delivery, assigned directly here for now
-// rather than through a keybinding-config layer — same "not blocked on
-// Issue #38 yet" reasoning D69 already used for Ctrl/Cmd+F) both call
-// `print_active_tab`. `ToolbarCommand::SaveAsPdf` (a toolbar button only —
-// no keyboard shortcut, see D75) calls `save_active_tab_as_pdf`.
-
-/// Print the active tab's page (Ctrl/Cmd+P, or the toolbar's print button)
-/// via the OS's native print UI — see
-/// `ui::window::BrowserWindow::print_tab`'s doc comment for exactly what
-/// that means on each platform and its one caveat (a real print-job
-/// failure is invisible to wry's `Result`, only a failure to even dispatch
-/// the call is not).
-fn print_active_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
-    let tab_id = tabs_of(state, window_id).active_id();
-    if let Err(err) = window.print_tab(tab_id) {
-        eprintln!("velox: failed to print the active tab: {err}");
-        log_failure(
-            "show print status",
-            window.set_print_status(Some(&format!("印刷を開始できませんでした: {err}"))),
-        );
-    }
-}
-
-/// Export the active tab's page straight to a PDF file with no dialog (the
-/// toolbar's "PDFとして保存" button) — Windows-only
-/// (`ui::window::BrowserWindow::export_tab_as_pdf`, see docs/decisions.md
-/// D75); macOS/Linux answer with a status message pointing at
-/// [`print_active_tab`]'s dialog instead, which itself offers a "save as
-/// PDF" destination on every platform VeloX ships on.
-///
-/// The destination directory reuses `browser::downloads`' existing assets
-/// wholesale — `resolve_download_dir_with_override` (the same
-/// `Config::download_dir_override`/`VELOX_DOWNLOAD_DIR`/platform-default
-/// resolution downloads already use, Issue #16/#30) and
-/// `prepare_destination` (sanitizes the suggested filename, creates the
-/// directory if missing, and avoids clobbering an existing file the same
-/// `report (1).pdf` way a same-named download would) — rather than
-/// re-deriving either.
-fn save_active_tab_as_pdf(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    config: &Config,
-) {
-    let tab_id = tabs_of(state, window_id).active_id();
-    let tab = tabs_of(state, window_id).active();
-    let url = tab.current_url().to_owned();
-    let title = tab.title().map(str::to_owned);
-
-    let Some(dir) =
-        downloads::resolve_download_dir_with_override(config.download_dir_override.as_deref())
-    else {
-        log_failure(
-            "show print status",
-            window.set_print_status(Some("PDF の保存先フォルダを特定できませんでした")),
-        );
-        return;
-    };
-    let raw_name = print::suggest_pdf_filename(title.as_deref(), &url);
-    let destination = match downloads::prepare_destination(&dir, &raw_name) {
-        Ok(path) => path,
-        Err(err) => {
-            eprintln!("velox: failed to prepare the PDF export destination: {err}");
-            log_failure(
-                "show print status",
-                window
-                    .set_print_status(Some(&format!("PDF の保存先を準備できませんでした: {err}"))),
-            );
-            return;
-        }
-    };
-
-    let settings = print::PdfExportSettings::default().sanitize();
-    match window.export_tab_as_pdf(tab_id, destination, &settings) {
-        PdfExportRequest::Started => {
-            // The real result arrives later as `UserEvent::PdfExportFinished`.
-        }
-        PdfExportRequest::NoWebview => {
-            log_failure(
-                "show print status",
-                window.set_print_status(Some("このタブは休止中のため PDF に保存できません")),
-            );
-        }
-        PdfExportRequest::UnsupportedPlatform => {
-            log_failure(
-                "show print status",
-                window.set_print_status(Some(
-                    "この OS では PDF への直接保存に対応していません。印刷 (Ctrl/Cmd+P) \
-                     のダイアログから PDF に保存してください。",
-                )),
-            );
-        }
-        PdfExportRequest::Failed { message } => {
-            log_failure(
-                "show print status",
-                window.set_print_status(Some(&format!("PDF の書き出しに失敗しました: {message}"))),
-            );
-        }
-    }
-}
-
-// --- Save page (Issue #46, "名前を付けて保存"), see docs/decisions.md D76 ---
-
-/// Save the active tab's current page (Ctrl/Cmd+S from either the toolbar —
-/// `ToolbarCommand::SavePage` — or a content webview —
-/// `ContentShortcut::SavePage`, D18/D23's usual dual-channel shortcut
-/// delivery). Resolves the active tab's URL/title from `state` (the same
-/// `Tab::current_url`/`Tab::title` the tab strip already shows) and the
-/// configured download-directory override (Issue #30/D67 — only consulted
-/// by `BrowserWindow::request_save_page`'s non-Windows fallback), then hands
-/// the rest to that method: it decides the save format/destination itself
-/// (platform-specific, see D76) and reports the outcome asynchronously via
-/// [`UserEvent::SavePageStarted`]/[`UserEvent::SavePageFinished`] —
-/// nothing further to do here.
-fn request_save_page(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    config: &Config,
-) {
-    let tabs = tabs_of(state, window_id);
-    let tab_id = tabs.active_id();
-    let tab = tabs.active();
-    let url = tab.current_url().to_owned();
-    let title = tab.title().map(str::to_owned);
-    window.request_save_page(tab_id, url, title, config.download_dir_override.clone());
-}
-
-// --- View Source (Issue #45, Ctrl/Cmd+U), see docs/decisions.md D72 ---
-//
-// `ToolbarCommand::ViewSource`/`ContentShortcut::ViewSource` (D18/D23's usual
-// dual-channel shortcut delivery — Ctrl/Cmd+U assigned directly here rather
-// than through a keybinding-config layer, since Issue #38 (keyboard shortcut
-// management) has not landed yet, exactly like D69's Ctrl/Cmd+F before it)
-// both call `request_view_source`. The actual tab only gets built once the
-// asynchronous source fetch comes back as `UserEvent::ViewSourceReady`,
-// handled by `open_view_source_tab` below.
-
-/// Kick off View Source for the active tab: ask its content webview for its
-/// current markup (`BrowserWindow::fetch_page_source`); `open_view_source_tab`
-/// finishes the job once `UserEvent::ViewSourceReady` reports the result.
-///
-/// `page_url` is captured *now*, from `Tabs`' own state — not re-read later
-/// from the webview — so the source that eventually comes back is always
-/// correctly labeled with the page it was actually requested for, even if
-/// the user switches tabs or that tab navigates again while the (async)
-/// fetch is in flight (see `BrowserWindow::fetch_page_source`'s doc comment).
-/// A no-op — not a crash — when the active tab has no live webview
-/// (suspended): the same "nothing to read from yet" contract every other
-/// `fetch_*` call in this file already uses.
-fn request_view_source(window: &BrowserWindow, window_id: WindowId, state: &AppState) {
-    // Issue #29/D68: read the active tab of *this* window, not a
-    // process-global "the tabs". A window that is already gone is a no-op.
-    let Some(tabs) = state.windows.tabs(window_id) else {
-        return;
-    };
-    let tab = tabs.active();
-    let page_url = tab.current_url().to_owned();
-    log_failure(
-        "fetch page source",
-        window.fetch_page_source(tab.id(), page_url),
-    );
-}
-
-/// Finish View Source once the requested page's markup has come back
-/// (`UserEvent::ViewSourceReady`): escape/number/truncate it into a safe
-/// document (`browser::view_source::build_view_source_document` — see its
-/// doc comment and docs/decisions.md D72 for why escaping here is what
-/// keeps this feature from being an XSS vector), encode that document as a
-/// `data:` URL, and open it exactly the way every other new tab opens
-/// (`open_new_tab` — the toolbar's "+" button, Ctrl/Cmd+T,
-/// `target="_blank"`, ...), so it inherits the same process-placement,
-/// activation, and latency-logging behavior as any other new tab, and never
-/// touches the tab the source was read from.
-fn open_view_source_tab(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    page_url: &str,
-    html: &str,
-) {
-    let document =
-        view_source::build_view_source_document(page_url, html, view_source::MAX_SOURCE_BYTES);
-    let data_url = view_source::to_data_url(&document);
-    open_new_tab(window, window_id, state, &data_url);
 }
 
 /// Resolve an already-classified [`Intent`] to a loadable URL: a URL intent
@@ -3500,7 +2315,7 @@ fn resolve_intent(config: &Config, intent: Option<Intent>) -> Option<String> {
 /// toolbar), `ContentShortcut::FocusAddressBar` (Ctrl/Cmd+L from a content
 /// webview), and `ToolbarCommand::OmniboxClose` (Esc, which also needs the
 /// address bar restored to the real current URL).
-fn focus_address_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState) {
+fn focus_address_bar(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
     log_failure(
         "focus address bar",
         window.focus_address_bar(tabs_of(state, window_id).active().current_url()),
@@ -3516,7 +2331,7 @@ fn focus_address_bar(window: &mut BrowserWindow, window_id: WindowId, state: &mu
 /// `browser::automation::parse_script`'s `navigation::normalize_input`
 /// call).
 fn navigate_active_tab(
-    window: &mut BrowserWindow,
+    window: &BrowserWindow,
     window_id: WindowId,
     state: &mut AppState,
     url: &str,
@@ -3611,6 +2426,45 @@ fn reopen_closed_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mu
     record_tab_latency(state, metrics::TabLatencyKind::Create, id, started);
 }
 
+/// Close `window_id`'s active tab (Ctrl/Cmd+W from either the toolbar —
+/// `ToolbarCommand::CloseActiveTab` — or a content webview —
+/// `ContentShortcut::CloseTab`) via [`close_tab`].
+fn close_active_tab(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    page_load_timers: &mut PageLoadTimers,
+) {
+    let id = tabs_of(state, window_id).active_id();
+    close_tab(window, window_id, state, page_load_timers, id);
+}
+
+/// Make tab `id` active (a tab-strip click, `ToolbarCommand::ActivateTab`,
+/// or the `switch <index>` automation command) and log the switch latency.
+/// A no-op for an unknown id (`Tabs::activate_at` returns `None`).
+fn activate_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState, id: TabId) {
+    let started = Instant::now();
+    if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
+        activate_and_refresh(window, window_id, state, id, effect);
+        record_tab_latency(state, switch_latency_kind(effect), id, started);
+    }
+}
+
+/// `activate` (`Tabs` の相対/位置指定アクティベーションのいずれか) を
+/// 計測開始時刻つきで実行し、結果を [`apply_activation`] で反映する —
+/// ツールバーとコンテンツ側ショートカットの Next/Prev/位置指定/最後のタブ
+/// がすべて通る共通経路。
+fn activate_with(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    activate: impl FnOnce(&mut Tabs, Instant) -> Option<ActivationEffect>,
+) {
+    let started = Instant::now();
+    let effect = activate(tabs_of(state, window_id), started);
+    apply_activation(window, window_id, state, effect, started);
+}
+
 /// Apply an activation `effect` already resolved by one of `Tabs`'
 /// relative/positional activation methods (`activate_relative`,
 /// `activate_by_position`, `activate_last`) against the tab that is now
@@ -3657,30 +2511,27 @@ fn handle_content_shortcut(
 ) {
     match shortcut {
         ContentShortcut::NewTab => open_new_tab(window, window_id, state, homepage),
-        ContentShortcut::CloseTab => {
-            let id = tabs_of(state, window_id).active_id();
-            close_tab(window, window_id, state, page_load_timers, id);
-        }
+        ContentShortcut::CloseTab => close_active_tab(window, window_id, state, page_load_timers),
         ContentShortcut::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ContentShortcut::NextTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(1, now)
+            });
         }
         ContentShortcut::PrevTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(-1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(-1, now)
+            });
         }
         ContentShortcut::ActivateTabAt(position) => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_by_position(position as usize, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_by_position(position as usize, now)
+            });
         }
         ContentShortcut::ActivateLastTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_last(started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_last(now)
+            });
         }
         ContentShortcut::FocusAddressBar => focus_address_bar(window, window_id, state),
         ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
@@ -3763,209 +2614,6 @@ fn handle_context_menu_action(
         // See this function's doc comment.
         context_menu::MenuAction::OpenLinkInNewWindow(_) => {}
     }
-}
-
-/// Dispatch one step of a `VELOX_AUTOMATION_SCRIPT` (Issue #112, see
-/// docs/decisions.md D44 and `browser::automation`) to the same tab
-/// operations `handle_toolbar_command`/`handle_content_shortcut` already
-/// use — every branch here mirrors an existing `ToolbarCommand`/
-/// `ContentShortcut` arm, exactly like `handle_content_shortcut` itself
-/// mirrors `handle_toolbar_command`. `Open`/`Close`/`Switch` address a tab
-/// by its position in the tab strip (0-based, matching what a benchmark
-/// script author sees on screen), resolved against `window_id`'s `Tabs`
-/// (see `tab_id_at`) right here — since by the time this runs, tabs may
-/// have been opened/closed
-/// since the script was parsed, resolving late (rather than up front) is
-/// the only way position `2` reliably means "the third tab, right now".
-/// An out-of-range position is a silent no-op (eprintln'd), never a panic
-/// or a crash — matching every other `Tabs`/`BrowserWindow` guard in this
-/// file.
-///
-/// `AutomationCommand::Wait` never reaches here (the automation thread
-/// sleeps locally instead of sending an event — see `spawn_automation`)
-/// and `AutomationCommand::Quit` is intercepted in `run`'s event loop
-/// before dispatch (it needs `ControlFlow`, which this function does not
-/// have); both arms are still written out explicitly, rather than folded
-/// into a wildcard, so a future new `AutomationCommand` variant fails to
-/// compile here instead of silently doing nothing.
-///
-/// `AutomationCommand::WaitLoad` (Issue #169) *does* reach here, unlike
-/// `Wait` — see its own match arm and `AutomationWaitState`'s doc comment
-/// for why it needs a round trip through the main thread's state instead of
-/// a local sleep: whether the active tab is still loading is state only the
-/// main thread has (`Tab::is_loading`), and the automation thread must
-/// itself stay blocked (via `automation_wait_rx.recv()` in
-/// `spawn_automation`) rather than racing ahead — which is also exactly why
-/// this cannot become a synchronous, blocking wait *inside* this function:
-/// this function runs on the main thread, the same one that would have to
-/// deliver the `LoadFinished` this wait is waiting on, so blocking it here
-/// would deadlock. `AutomationCommand::WaitStartup` (Issue #173) is the same
-/// shape, checking `automation_wait.startup_reported` (set elsewhere, from
-/// `run`'s event loop — see `resolve_automation_wait_for_startup`) instead
-/// of `Tab::is_loading`.
-fn handle_automation_command(
-    window: &mut BrowserWindow,
-    window_id: WindowId,
-    state: &mut AppState,
-    page_load_timers: &mut PageLoadTimers,
-    automation_wait: &mut AutomationWaitState,
-    command: AutomationCommand,
-) {
-    match command {
-        AutomationCommand::Open { url } => open_new_tab(window, window_id, state, &url),
-        AutomationCommand::Navigate { url } => navigate_active_tab(window, window_id, state, &url),
-        AutomationCommand::Switch { index } => match tab_id_at(state, window_id, index) {
-            Some(id) => {
-                let started = Instant::now();
-                if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
-                    activate_and_refresh(window, window_id, state, id, effect);
-                    record_tab_latency(state, switch_latency_kind(effect), id, started);
-                }
-            }
-            None => eprintln!("velox: automation: switch {index} は範囲外です"),
-        },
-        AutomationCommand::Close { index } => match tab_id_at(state, window_id, index) {
-            Some(id) => close_tab(window, window_id, state, page_load_timers, id),
-            None => eprintln!("velox: automation: close {index} は範囲外です"),
-        },
-        AutomationCommand::Suspend { index } => match tab_id_at(state, window_id, index) {
-            Some(id) => {
-                if suspend_tab(window, window_id, state, id) {
-                    sync_tab_strip(window, window_id, state);
-                }
-                // Otherwise the active or an already-suspended tab: a
-                // no-op, exactly like `ToolbarCommand::SuspendTab`.
-            }
-            None => eprintln!("velox: automation: suspend {index} は範囲外です"),
-        },
-        // Issue #169: register (or immediately resolve) the wait — see
-        // `AutomationWaitState`'s doc comment for how this gets unblocked
-        // again. `Tabs::active()` is always `Some`-equivalent (a `Tabs`
-        // always has at least one tab), so there is no "no tab" case to
-        // handle here, unlike `Switch`/`Close`/`Suspend` above.
-        AutomationCommand::WaitLoad { timeout_ms } => {
-            let tab_id = tabs_of(state, window_id).active_id();
-            if tabs_of(state, window_id).active().is_loading() {
-                automation_wait.pending = Some(AutomationWait {
-                    kind: AutomationWaitKind::Load { window_id, tab_id },
-                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                });
-            } else {
-                // Already finished (or never started) loading — resolve
-                // immediately, matching the issue's "already loaded ->
-                // proceed at once" requirement.
-                let _ = automation_wait.notify.send(());
-            }
-        }
-        // Issue #173: same shape as `WaitLoad` above, but the condition it
-        // polls is `automation_wait.startup_reported` (set from `run`'s
-        // event loop the moment `mark_startup` writes the `startup` record
-        // — see `resolve_automation_wait_for_startup`) rather than
-        // `Tab::is_loading` — there is no single tab/window this wait is
-        // scoped to, unlike `WaitLoad`.
-        AutomationCommand::WaitStartup { timeout_ms } => {
-            if automation_wait.startup_reported {
-                let _ = automation_wait.notify.send(());
-            } else {
-                automation_wait.pending = Some(AutomationWait {
-                    kind: AutomationWaitKind::Startup,
-                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                });
-            }
-        }
-        // The marker is a perf-log record only (`record_perf_event` has
-        // already written it by the time dispatch gets here); there is no
-        // browser state to change.
-        AutomationCommand::Mark => {}
-        AutomationCommand::Wait { .. } | AutomationCommand::Quit => {}
-        // Intercepted in `handle_user_event` before it ever reaches here —
-        // opening a window (unlike every other automation command) is not
-        // scoped to "the current window" in the first place, and changes
-        // *which* window `automation_window` points at afterwards. See
-        // `browser::AutomationCommand::NewWindow`'s doc comment.
-        AutomationCommand::NewWindow | AutomationCommand::NewPrivateWindow => {}
-    }
-}
-
-/// The [`TabId`] currently at tab-strip position `index` (0-based) in window
-/// `window_id`, or `None` if `index` is out of range — the shared lookup
-/// `handle_automation_command`'s `Switch`/`Close`/`Suspend` arms use to turn
-/// a script's positional index into the `TabId` every other tab operation
-/// in this file addresses tabs by.
-fn tab_id_at(state: &mut AppState, window_id: WindowId, index: usize) -> Option<TabId> {
-    tabs_of(state, window_id)
-        .iter()
-        .nth(index)
-        .map(|tab| tab.id())
-}
-
-/// Spawn the background thread that drives one parsed
-/// `VELOX_AUTOMATION_SCRIPT` (Issue #112). Walks `commands` in order:
-/// `AutomationCommand::Wait` sleeps this thread (never blocking the main
-/// thread, which keeps servicing the webview/UI the whole time);
-/// `AutomationCommand::WaitLoad`/`WaitStartup` (Issue #169/#173) send their
-/// event exactly like every other command below, then additionally block
-/// this thread on `automation_wait_rx` until the main thread resolves them
-/// (see `AutomationWaitState`'s doc comment) — still never the main thread,
-/// so the webview/UI keeps being serviced while a script waits on a load or
-/// on startup; every other command is proxied into the event loop as
-/// `UserEvent::Automation`, processed on the main thread exactly like any
-/// other `UserEvent` (see docs/decisions.md D44). `EventLoopProxy::send_event`
-/// is the same fire-and-forget channel every webview callback already uses
-/// to reach the main thread (`ui/window.rs`) — nothing new is introduced
-/// here beyond one more sender.
-///
-/// If the event loop has already gone away (the window was closed before
-/// the script finished), `send_event` starts failing and this thread exits
-/// early rather than spinning forever. The same is true of
-/// `automation_wait_rx.recv()`: once the main thread drops its `Sender`
-/// (the event loop is gone), `recv()` returns an error immediately instead
-/// of blocking forever.
-fn spawn_automation(
-    proxy: EventLoopProxy<UserEvent>,
-    commands: Vec<AutomationCommand>,
-    automation_wait_rx: mpsc::Receiver<()>,
-) {
-    std::thread::spawn(move || {
-        for command in commands {
-            match command {
-                AutomationCommand::Wait { ms } => {
-                    std::thread::sleep(Duration::from_millis(ms));
-                }
-                AutomationCommand::WaitLoad { timeout_ms } => {
-                    if proxy
-                        .send_event(UserEvent::Automation(AutomationCommand::WaitLoad {
-                            timeout_ms,
-                        }))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if automation_wait_rx.recv().is_err() {
-                        return;
-                    }
-                }
-                AutomationCommand::WaitStartup { timeout_ms } => {
-                    if proxy
-                        .send_event(UserEvent::Automation(AutomationCommand::WaitStartup {
-                            timeout_ms,
-                        }))
-                        .is_err()
-                    {
-                        return;
-                    }
-                    if automation_wait_rx.recv().is_err() {
-                        return;
-                    }
-                }
-                other => {
-                    if proxy.send_event(UserEvent::Automation(other)).is_err() {
-                        return;
-                    }
-                }
-            }
-        }
-    });
 }
 
 /// Show `id` in the window, then bring the toolbar (address bar, loading
@@ -4061,7 +2709,7 @@ fn sync_tab_strip(window: &BrowserWindow, window_id: WindowId, state: &mut AppSt
         })
         .collect();
     log_failure("update tab strip", window.set_tabs(&summaries));
-    persist_session(state, window_id);
+    persist_session(state);
 }
 
 /// Push the active tab's blocked-navigation count to the toolbar badge.
@@ -4153,241 +2801,10 @@ fn sync_bookmark_star(window: &BrowserWindow, state: &AppState, url: &str) {
     );
 }
 
-/// [`refresh_history_panel`], but only when the history panel is actually
-/// open (Issue #66).
-///
-/// `refresh_history_panel` always builds and pushes the full
-/// (`config.history_panel_limit`-capped, up to 200 entries by default)
-/// history list — exactly right while the panel is open, where it is what
-/// makes a newly recorded visit show up live, but the panel is closed the
-/// overwhelming majority of a browsing session, and every one of
-/// `LoadFinished`/`PageTitleResolved`/`FaviconResolved` (each firing at
-/// least once per page visit, sometimes all three for one visit) called it
-/// unconditionally regardless — real IPC traffic measured with `velox-bench
-/// ipc-summary` showed `set_history` among the largest Rust → JS payloads
-/// in an ordinary session even though the panel was never opened (see
-/// docs/performance-targets.md §18). This is the one place this issue found
-/// real, safe-to-cut redundant traffic (the tab strip's equally frequent
-/// `set_tabs` push is *not* gated this way — see §18 for why that one is
-/// intentional: the tab strip, unlike this panel, is always visible).
-///
-/// Opening the panel (`ToolbarCommand::TogglePanel`) already refreshes it
-/// immediately on its own (see that handler below), so skipping the push
-/// while closed changes no visible behavior: a closed panel was never
-/// rendering these pushes to begin with, and the moment it opens it gets
-/// current data regardless of how long it had been closed.
-fn refresh_history_panel_if_open(window: &BrowserWindow, state: &AppState, config: &Config) {
-    if window.open_panel() == Some(Panel::History) {
-        refresh_history_panel(window, state, config);
-    }
-}
-
-/// Push the most recent `config.history_panel_limit` history entries to the
-/// toolbar, newest first, grouped into date sections (see
-/// `browser::history::group_by_date` / docs/decisions.md D29) relative to
-/// "now". Also the fallback the panel returns to when the search box is
-/// cleared (see `ToolbarCommand::SearchHistory` below). Unconditional —
-/// callers on the "closed the overwhelming majority of the time" path
-/// (`LoadFinished`/`PageTitleResolved`/`FaviconResolved`) go through
-/// [`refresh_history_panel_if_open`] instead; every other caller here
-/// (`Ready`, `TogglePanel` opening the panel, an edit made *through* the
-/// open panel itself) is a point where a push is always correct.
-fn refresh_history_panel(window: &BrowserWindow, state: &AppState, config: &Config) {
-    let entries: Vec<&HistoryEntry> = state
-        .history
-        .entries_newest_first()
-        .take(config.history_panel_limit)
-        .collect();
-    log_failure(
-        "update history panel",
-        window.set_history(&entries, now_unix()),
-    );
-}
-
-/// Push the history entries matching `query` (see
-/// `browser::history::HistoryStore::search` / docs/decisions.md D30) to the
-/// toolbar, capped to `config.history_panel_limit` like the normal panel.
-fn search_history_panel(window: &BrowserWindow, state: &AppState, config: &Config, query: &str) {
-    let entries: Vec<&HistoryEntry> = state
-        .history
-        .search(query)
-        .into_iter()
-        .take(config.history_panel_limit)
-        .collect();
-    log_failure(
-        "update history panel (search)",
-        window.set_history(&entries, now_unix()),
-    );
-}
-
-/// Push the current bookmark tree (root entries + folders, each in manual
-/// display order — see docs/decisions.md D32/D34) to both the bookmarks
-/// panel and the always-visible bookmark bar. The two surfaces render the
-/// exact same [`toolbar::BookmarksView`], built once here, so they can never
-/// show a different bookmark set from each other.
-fn refresh_bookmarks_panel(window: &BrowserWindow, state: &AppState) {
-    let view = toolbar::BookmarksView::from_store(&state.bookmarks);
-    log_failure("update bookmarks panel", window.set_bookmarks(&view));
-    log_failure("update bookmark bar", window.set_bookmark_bar(&view));
-}
-
-/// Push the download list to the toolbar, most recently started first.
-fn refresh_downloads_panel(window: &BrowserWindow, state: &AppState) {
-    let entries: Vec<&DownloadEntry> = state.downloads.entries_newest_first().collect();
-    log_failure("update downloads panel", window.set_downloads(&entries));
-}
-
-/// Push the settings screen's full contents (Issue #30, see
-/// docs/decisions.md D67): the persisted, editable `Settings` document plus
-/// the two read-only reference views (Shortcuts, Security) — see
-/// [`toolbar::SettingsView`]. Called on `ready` (so the screen has data the
-/// moment it is first opened) and again after every successful
-/// `update_settings`/`reset_settings`, so the form always echoes back what
-/// was actually persisted.
-fn refresh_settings_panel(window: &BrowserWindow, state: &AppState) {
-    // `shortcut_reference` now renders each row's key label for the current
-    // platform (Issue #38, docs/decisions.md D77) and so returns an owned
-    // `Vec` rather than a `&'static` slice — kept alive in this local for
-    // `SettingsView` to borrow.
-    let shortcuts = shortcut_reference();
-    let view = toolbar::SettingsView {
-        settings: &state.settings,
-        shortcuts: &shortcuts,
-        site_permissions: state.site_permissions.records(),
-    };
-    log_failure("update settings panel", window.set_settings(&view));
-}
-
-/// Apply a new settings document from the settings screen
-/// (`ToolbarCommand::UpdateSettings`/`ResetSettings`, Issue #30): sanitize
-/// it (the same hardening `persistence::load_settings` + `sanitize` already
-/// give a `settings.json` loaded at startup — an IPC payload is external
-/// input the same way, see docs/decisions.md D67), persist it, replace
-/// `state.settings`, and apply the two fields that take effect immediately
-/// (`ui::window::BrowserWindow::set_theme`/`set_bookmark_bar_visible` —
-/// Appearance) before re-rendering the panel. Every other field only takes
-/// effect on the next restart, via `Config::apply_settings` in `run`.
-///
-/// **Multi-window (Issue #29/D68)**: `state.settings` is whole-process, the
-/// same way `history`/`bookmarks` are (see `AppState::settings`'s doc
-/// comment) — a change made from *any* window's settings screen must be
-/// reflected in the chrome of *every* open window immediately, not just the
-/// one that made it, and every open window's own settings screen (if it
-/// happens to be open there too) must echo the same saved value back. This
-/// is why the function takes `ui_windows: &mut HashMap<WindowId,
-/// BrowserWindow>` as a whole and loops over every entry, rather than the
-/// single already-resolved `window: &mut BrowserWindow` most other
-/// `ToolbarCommand` handlers take — see `handle_user_event`'s doc comment
-/// for why `UpdateSettings`/`ResetSettings` are intercepted there, before a
-/// single window is resolved, the same way `NewWindow` is.
-fn apply_updated_settings(
-    ui_windows: &mut HashMap<WindowId, BrowserWindow>,
-    state: &mut AppState,
-    settings: Settings,
-) {
-    let sanitized = settings.sanitize();
-    state.settings = sanitized.clone();
-    if let Some(dir) = &state.data_dir {
-        log_io_failure("save settings", persistence::save_settings(dir, &sanitized));
-    }
-    for window in ui_windows.values() {
-        log_failure("apply theme", window.set_theme(sanitized.appearance.theme));
-        log_failure(
-            "apply bookmark bar visibility",
-            window.set_bookmark_bar_visible(sanitized.appearance.show_bookmark_bar),
-        );
-        refresh_settings_panel(window, state);
-    }
-}
-
-/// Open a completed download's file with the OS's default handler
-/// (`ToolbarCommand::OpenDownload`). A no-op — logged, not an error — for
-/// an unknown id or a download that has not reached
-/// `DownloadState::Completed`; opening an in-progress/failed/cancelled
-/// download's (possibly partial or nonexistent) file would be misleading.
-fn open_download(state: &AppState, id: DownloadId) {
-    match state.downloads.get(id) {
-        Some(entry) if entry.state == crate::browser::DownloadState::Completed => {
-            log_spawn_failure("open download", downloads::spawn_open(&entry.destination));
-        }
-        Some(_) => eprintln!("velox: open_download: {id:?} has not completed yet"),
-        None => eprintln!("velox: open_download: unknown download {id:?}"),
-    }
-}
-
-/// Open the downloads directory with the OS's default file manager
-/// (`ToolbarCommand::OpenDownloadsFolder`). Creates the directory first
-/// (best-effort) so opening it before anything has ever been downloaded
-/// does not fail with a confusing "no such directory" error.
-fn open_downloads_folder(download_dir_override: Option<&str>) {
-    let Some(dir) = downloads::resolve_download_dir_with_override(download_dir_override) else {
-        eprintln!(
-            "velox: open_downloads_folder: could not resolve a downloads directory \
-             (no VELOX_DOWNLOAD_DIR/HOME/USERPROFILE)"
-        );
-        return;
-    };
-    if let Err(err) = std::fs::create_dir_all(&dir) {
-        eprintln!("velox: failed to create downloads directory {dir:?}: {err}");
-    }
-    log_spawn_failure("open downloads folder", downloads::spawn_open(&dir));
-}
-
-/// Best-effort cancel of an in-progress download (`ToolbarCommand::CancelDownload`):
-/// marks it `DownloadState::Cancelled` and attempts to delete whatever
-/// partial file exists at its destination. Does **not** stop the underlying
-/// engine transfer — wry 0.56 exposes no API to do that; see
-/// docs/decisions.md D28. A no-op for an unknown id or a download that has
-/// already reached a terminal state.
-fn cancel_download(state: &mut AppState, id: DownloadId) {
-    let Some(destination) = state
-        .downloads
-        .get(id)
-        .map(|entry| entry.destination.clone())
-    else {
-        return;
-    };
-    if state.downloads.cancel(id, now_unix()) {
-        // Best-effort only: if the engine is still writing to this path, it
-        // may recreate the file (or fail silently) after this runs — see
-        // docs/decisions.md D28's "what's unverified"/limitation note.
-        match std::fs::remove_file(&destination) {
-            Ok(()) => {}
-            // Already gone (never actually started writing, or the engine
-            // had not created the file yet) — not an error worth logging.
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => eprintln!(
-                "velox: failed to remove cancelled download's partial file {destination:?}: {err}"
-            ),
-        }
-    }
-}
-
-fn persist_history(state: &AppState) {
-    if let Some(dir) = &state.data_dir {
-        let started = Instant::now();
-        let result = persistence::save_history(dir, &state.history);
-        record_state_write(state, metrics::StateWriteKind::History, started);
-        log_io_failure("save history", result);
-    }
-}
-
-fn persist_bookmarks(state: &AppState) {
-    if let Some(dir) = &state.data_dir {
-        let started = Instant::now();
-        let result = persistence::save_bookmarks(dir, &state.bookmarks);
-        record_state_write(state, metrics::StateWriteKind::Bookmarks, started);
-        log_io_failure("save bookmarks", result);
-    }
-}
-
-fn persist_input_history(state: &AppState) {
-    if let Some(dir) = &state.data_dir {
-        let started = Instant::now();
-        let result = persistence::save_input_history(dir, &state.input_history);
-        record_state_write(state, metrics::StateWriteKind::InputHistory, started);
-        log_io_failure("save input history", result);
-    }
+/// [`sync_bookmark_star`] for `window_id`'s active tab's current URL.
+fn sync_active_bookmark_star(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let url = tabs_of(state, window_id).active().current_url().to_owned();
+    sync_bookmark_star(window, state, &url);
 }
 
 /// Handle `ToolbarCommand::ClearSiteData` (Issue #26, docs/decisions.md
@@ -4395,114 +2812,36 @@ fn persist_input_history(state: &AppState) {
 /// outcome. Never returns an error to the caller — a failed clear is not
 /// fatal (the acceptance condition "削除失敗時に安全にエラー処理される") —
 /// and stays silent on full success the same way `persist_*`'s
-/// `log_io_failure` calls do, only speaking up when there is something the
+/// `log_failure` calls do, only speaking up when there is something the
 /// user might need to know about.
 fn clear_all_site_data(window: &BrowserWindow) {
     let result = window.clear_all_site_data();
+    let first_error = || {
+        result
+            .first_error
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default()
+    };
     match site_data::summarize(result.attempted, result.failed) {
         ClearOutcome::Success | ClearOutcome::Nothing => {}
         ClearOutcome::Partial => eprintln!(
             "velox: cleared site data on {}/{} webviews; first error: {}",
             result.attempted - result.failed,
             result.attempted,
-            result
-                .first_error
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default()
+            first_error()
         ),
         ClearOutcome::AllFailed => eprintln!(
             "velox: failed to clear site data on all {} webview(s): {}",
             result.attempted,
-            result
-                .first_error
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default()
+            first_error()
         ),
     }
 }
 
-/// Persist the current tab session (Issue #25 — see docs/decisions.md D65).
-///
-/// Called from [`sync_tab_strip`] — the one place nearly every
-/// tab-affecting change already routes through — rather than only at exit:
-/// an exit-only save would never run for exactly the case session restore
-/// is meant to help with (a crash, `kill -9`, a power loss), so this saves
-/// eagerly, the same "every mutation writes back to disk" pattern
-/// `persist_history`/`persist_bookmarks` already follow.
-///
-/// Gated by [`window_is_private`] — the same per-window choke point
-/// `record_visit_if_enabled` uses (docs/decisions.md D13/D14/D74) — so a
-/// private window never writes what tabs it had open to disk, regardless of
-/// whether `Config::restore_previous_session` is even on; saving is
-/// unconditional otherwise, so turning the setting on later always has a
-/// recent session to restore from. A missing `data_dir` is a silent no-op,
-/// like every other `persist_*` function here.
-///
-/// **Multi-window (Issue #149, was the D68/D74 follow-up)**: every open
-/// window is written, in `Windows`' own order, so the next launch restores
-/// all of them. `window_id` is now only "which window's change triggered
-/// this" — the snapshot is built from all of them either way, because a
-/// change in one window (a tab closed) does not make the others' tabs any
-/// less current.
-///
-/// **Private windows are left out entirely**, not written as empty ones: a
-/// private window's tabs must not reach disk (D14/D74), and an empty
-/// placeholder would restore as a window the user never gets their tabs
-/// back in. The filter lives here rather than in `browser::session`, which
-/// never learns what privacy is (D20).
-///
-/// A launch that is private as a whole (`--private`/`VELOX_PRIVATE`, D74)
-/// therefore has no non-private window at all and writes nothing, exactly
-/// as before.
-///
-/// **Redundant-write skip (Issue #67, D86)**: `sync_tab_strip` — the only
-/// caller — runs this after nearly every tab-affecting event, but
-/// `SessionSnapshot` only carries url/title/favicon, so a burst of events
-/// from a single navigation (`NavigationStarted`/`LoadFinished`/
-/// `PageTitleResolved`/`FaviconResolved`) mostly produces the *same*
-/// snapshot content more than once (the loading flag they actually
-/// differ on isn't part of it). This compares the freshly-built snapshot
-/// against `state.last_persisted_session` and skips the disk write
-/// entirely when nothing changed, exactly like `app::
-/// refresh_history_panel_if_open` (Issue #66) skipped a redundant
-/// `set_history` push — same shape, different layer (disk I/O, not IPC).
-fn persist_session(state: &mut AppState, _window_id: WindowId) {
-    let Some(dir) = state.data_dir.clone() else {
-        return;
-    };
-    let restorable: Vec<&Tabs> = state
-        .windows
-        .ids()
-        .filter(|id| !state.windows.is_private(*id).unwrap_or(true))
-        .filter_map(|id| state.windows.tabs(id))
-        .collect();
-    if restorable.is_empty() {
-        return;
-    }
-    let snapshot = SessionSnapshot::from_windows(restorable);
-    if state.last_persisted_session.as_ref() == Some(&snapshot) {
-        return;
-    }
-    let started = Instant::now();
-    let result = persistence::save_session(&dir, &snapshot);
-    record_state_write(state, metrics::StateWriteKind::Session, started);
-    let succeeded = result.is_ok();
-    log_io_failure("save session", result);
-    if succeeded {
-        state.last_persisted_session = Some(snapshot);
-    }
-}
-
-/// Current time as a unix timestamp (seconds). Falls back to `0` on a clock
-/// set before 1970, which should never happen in practice; kept infallible
-/// so callers never need to thread a `Result` through for it.
-fn now_unix() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// `VELOX_DEBUG` が設定されていれば、診断用の詳細ログを stderr に出す。
+fn debug_logging_enabled() -> bool {
+    std::env::var_os("VELOX_DEBUG").is_some()
 }
 
 /// Maximum number of `char`s of a malformed/oversized IPC body ever printed
@@ -4528,25 +2867,13 @@ fn log_preview(text: &str) -> String {
 
 /// A failed UI call (e.g. a script that could not be evaluated) should not
 /// crash the browser; surface it on stderr instead.
-fn log_failure(action: &str, result: wry::Result<()>) {
-    if let Err(err) = result {
-        eprintln!("velox: failed to {action}: {err}");
-    }
-}
-
-/// Same as `log_failure`, for the IO errors persistence returns.
-fn log_io_failure(action: &str, result: std::io::Result<()>) {
-    if let Err(err) = result {
-        eprintln!("velox: failed to {action}: {err}");
-    }
-}
-
-/// Same as `log_failure`, for `downloads::spawn_open`'s launch-a-process
-/// result. The spawned child is intentionally not waited on or otherwise
-/// tracked — "open this file/folder in some other application" is a
-/// fire-and-forget action, the same as a real desktop browser's own
-/// "show in folder" / "open file" menu entries.
-fn log_spawn_failure(action: &str, result: std::io::Result<std::process::Child>) {
+///
+/// 結果型についてジェネリックにしてあり、永続化が返す IO エラーや
+/// `downloads::spawn_open` のプロセス起動結果にも同じヘルパーを使う。
+/// 後者で起動した子プロセス (`Ok` 側の値) を待たず追跡もしないのは意図的 —
+/// 「このファイル/フォルダを別アプリで開く」は投げっぱなしの操作で、実際の
+/// デスクトップブラウザの「フォルダに表示」「ファイルを開く」と同じ扱い。
+fn log_failure<T, E: std::fmt::Display>(action: &str, result: Result<T, E>) {
     if let Err(err) = result {
         eprintln!("velox: failed to {action}: {err}");
     }
@@ -4555,6 +2882,8 @@ fn log_spawn_failure(action: &str, result: std::io::Result<std::process::Child>)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::util::unique_temp_path;
+    use std::path::Path;
 
     // --- log_preview (Issue #35): a malformed/oversized IPC body must
     // never be dumped to stderr in full. ---
@@ -4600,98 +2929,6 @@ mod tests {
         WindowId::from(0)
     }
 
-    // --- choose_memory_sample_window (Issue #186): round-robin fairness,
-    // and the "no window is ever skipped forever" / "at most one window
-    // per sample" guarantees it exists for. ---
-
-    #[test]
-    fn one_window_is_always_served_regardless_of_cursor() {
-        let ids = [WindowId::from(0)];
-        assert_eq!(
-            choose_memory_sample_window(&ids, None),
-            (Some(WindowId::from(0)), Some(WindowId::from(0)))
-        );
-        // Even a stale/unknown cursor (e.g. a since-closed window's id)
-        // still serves the only window that exists.
-        assert_eq!(
-            choose_memory_sample_window(&ids, Some(WindowId::from(99))),
-            (Some(WindowId::from(0)), Some(WindowId::from(0)))
-        );
-    }
-
-    #[test]
-    fn no_windows_serves_nothing_and_leaves_the_cursor_untouched() {
-        // Defensive only — the event loop never calls this with an empty
-        // `Windows` in practice (the app exits first), but must not panic
-        // or silently invent a window id if it ever did.
-        assert_eq!(choose_memory_sample_window(&[], None), (None, None));
-        let stale = Some(WindowId::from(7));
-        assert_eq!(choose_memory_sample_window(&[], stale), (None, stale));
-    }
-
-    #[test]
-    fn repeated_calls_round_robin_through_every_window_in_order() {
-        // Issue #186's core fairness property: starting from "no
-        // preference yet" (`None`, e.g. right after startup), successive
-        // samples visit every window in turn and cycle back to the start —
-        // no window is served twice before every other window has had its
-        // turn, and (equally important) every window under budget-pressure
-        // eventually gets a sample rather than being starved forever by
-        // whichever window happens to be first.
-        let ids = [WindowId::from(0), WindowId::from(1), WindowId::from(2)];
-        let mut cursor = None;
-        let mut served_order = Vec::new();
-        for _ in 0..7 {
-            let (served, next) = choose_memory_sample_window(&ids, cursor);
-            served_order.push(served.expect("non-empty ids always serves someone"));
-            cursor = next;
-        }
-        assert_eq!(
-            served_order,
-            vec![
-                WindowId::from(0),
-                WindowId::from(1),
-                WindowId::from(2),
-                WindowId::from(0),
-                WindowId::from(1),
-                WindowId::from(2),
-                WindowId::from(0),
-            ],
-            "7 calls over 3 windows must complete two full round-robin \
-             cycles plus one extra, in the same fixed order every time"
-        );
-    }
-
-    #[test]
-    fn a_single_call_never_serves_more_than_one_window() {
-        // The structural half of "no over-reclaim": whatever `ids` looks
-        // like, exactly one window (never zero-with-panic, never more than
-        // one) is named per call — the caller passes the sample to that
-        // window's `sweep_tabs` alone, so a single over-budget sample can
-        // never suspend more than one window's worth of tabs in one pass.
-        for window_count in 1..=5 {
-            let ids: Vec<WindowId> = (0..window_count).map(WindowId::from).collect();
-            let (served, _) = choose_memory_sample_window(&ids, None);
-            assert!(
-                served.is_some(),
-                "{window_count} window(s) must serve exactly one, got None"
-            );
-        }
-    }
-
-    #[test]
-    fn a_served_windows_cursor_survives_closing_a_different_window() {
-        // Self-healing when the *previously* served window has since
-        // closed: the stored cursor no longer appears in `ids`, so the
-        // lookup falls back to the front rather than serving no one or
-        // panicking.
-        let ids = [WindowId::from(0), WindowId::from(2)]; // window 1 closed
-        assert_eq!(
-            choose_memory_sample_window(&ids, Some(WindowId::from(1))),
-            (Some(WindowId::from(0)), Some(WindowId::from(2)))
-        );
-    }
-
     /// Build an `AppState` the way `run()` would for a fresh tab, with its
     /// one window's history recording set to `history_enabled` (i.e. its
     /// privacy is `!history_enabled` — what `Config::private` drove at
@@ -4702,13 +2939,21 @@ mod tests {
     /// only needs *a* window to exist for every pre-#29 test below to keep
     /// working unchanged).
     fn state_with_history_enabled(history_enabled: bool) -> AppState {
-        let windows = Windows::new_with_privacy("https://example.com/", !history_enabled);
+        state_with_windows(Windows::new_with_privacy(
+            "https://example.com/",
+            !history_enabled,
+        ))
+    }
+
+    /// `windows` を持つ、それ以外は空の (データディレクトリ・metrics なし)
+    /// `AppState`。
+    fn state_with_windows(windows: Windows) -> AppState {
         AppState {
             windows,
             site_policies: SitePolicies {
                 blocklist: Arc::new(FilterList::built_in()),
                 site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
-                site_permissions: Arc::new(crate::browser::SitePermissionStore::new()),
+                site_permissions: Arc::new(SitePermissionStore::new()),
             },
             history: HistoryStore::new(),
             bookmarks: BookmarkStore::new(),
@@ -4793,25 +3038,7 @@ mod tests {
             "test assumes both windows share a TabId value"
         );
 
-        let mut state = AppState {
-            windows,
-            site_policies: SitePolicies {
-                blocklist: Arc::new(FilterList::built_in()),
-                site_exceptions: Arc::new(SiteExceptions::from_hosts(Vec::<String>::new())),
-                site_permissions: Arc::new(crate::browser::SitePermissionStore::new()),
-            },
-            history: HistoryStore::new(),
-            bookmarks: BookmarkStore::new(),
-            input_history: InputHistoryStore::new(),
-            data_dir: None,
-            last_persisted_session: None,
-            perf: None,
-            downloads: DownloadStore::new(),
-            pending_memory_sample: None,
-            next_memory_sample_window: None,
-            settings: Settings::default(),
-            site_permissions: Arc::new(SitePermissionStore::new()),
-        };
+        let mut state = state_with_windows(windows);
 
         let private_id = record_visit_if_enabled(
             &mut state,
@@ -4874,18 +3101,11 @@ mod tests {
     }
 
     /// A fresh, unique temp directory for a `persist_session` test to write
-    /// into — mirrors `unique_temp_file` below (added for the download
+    /// into — built on `unique_temp_path` (also used by the download
     /// tests) but for a directory `persistence::save_session` can create
     /// `session.json` under.
     fn unique_temp_dir(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "velox-app-test-{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        ));
+        let dir = unique_temp_path(&format!("velox-app-test-{label}"));
         std::fs::create_dir_all(&dir).expect("create a temp dir for a persist_session test");
         dir
     }
@@ -4903,9 +3123,8 @@ mod tests {
         let dir = unique_temp_dir("private-session");
         let mut state = state_with_history_enabled(false); // private == true
         state.data_dir = Some(dir.clone());
-        let window_id = state.windows.ids().next().unwrap();
 
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         assert!(
             !dir.join("session.json").exists(),
             "an all-private process must never write session.json"
@@ -4915,8 +3134,7 @@ mod tests {
         // `AppState`, same shape otherwise) must write it.
         let mut normal_state = state_with_history_enabled(true);
         normal_state.data_dir = Some(dir.clone());
-        let normal_window_id = normal_state.windows.ids().next().unwrap();
-        persist_session(&mut normal_state, normal_window_id);
+        persist_session(&mut normal_state);
         assert!(
             dir.join("session.json").exists(),
             "a normal window must still write session.json"
@@ -4933,7 +3151,6 @@ mod tests {
         let dir = unique_temp_dir("multi-window-session");
         let mut state = state_with_history_enabled(true);
         state.data_dir = Some(dir.clone());
-        let first = state.windows.ids().next().unwrap();
         state
             .windows
             .open_window_with_privacy("https://second.example/".to_owned(), false);
@@ -4942,7 +3159,7 @@ mod tests {
             .open_window_with_privacy("https://secret.example/".to_owned(), true);
         assert!(state.windows.is_private(private).unwrap());
 
-        persist_session(&mut state, first);
+        persist_session(&mut state);
 
         let saved = persistence::load_session(&dir)
             .expect("session.json")
@@ -4974,7 +3191,7 @@ mod tests {
         state.data_dir = Some(dir.clone());
         let window_id = state.windows.ids().next().unwrap();
 
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         let path = dir.join("session.json");
         assert!(path.exists(), "the first call must write session.json");
         assert!(state.last_persisted_session.is_some());
@@ -4984,7 +3201,7 @@ mod tests {
         // snapshot actually re-serializes and re-writes (rather than being
         // skipped), this sentinel is what gets clobbered.
         std::fs::write(&path, "sentinel").expect("overwrite with sentinel");
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "sentinel",
@@ -4997,7 +3214,7 @@ mod tests {
             .tabs_mut(window_id)
             .unwrap()
             .open("https://second.example/");
-        persist_session(&mut state, window_id);
+        persist_session(&mut state);
         assert_ne!(
             std::fs::read_to_string(&path).unwrap(),
             "sentinel",
@@ -5090,7 +3307,7 @@ mod tests {
         // `velox-bench` trial would parse.
         let mut page_load_timers: PageLoadTimers = HashMap::new();
         let mut startup = None;
-        let path = unique_temp_file("velox-app-page-load-stages");
+        let path = unique_temp_path("velox-app-page-load-stages");
         let _ = std::fs::remove_file(&path);
         let log = PerfLog::to_file(metrics::PerfFormat::Json, &path).expect("open perf log file");
         let process_start = Instant::now();
@@ -5188,22 +3405,10 @@ mod tests {
 
     // --- Downloads (Issue #16, see docs/decisions.md D28) ---
 
-    fn unique_temp_file(label: &str) -> PathBuf {
-        let unique = format!(
-            "{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
-    }
-
     #[test]
     fn cancel_download_marks_the_entry_cancelled_and_removes_the_partial_file() {
         let mut state = state_with_history_enabled(true);
-        let path = unique_temp_file("velox-app-cancel");
+        let path = unique_temp_path("velox-app-cancel");
         std::fs::write(&path, b"partial").unwrap();
 
         let id = state.downloads.start(
@@ -5231,7 +3436,7 @@ mod tests {
     #[test]
     fn cancel_download_on_an_already_completed_entry_is_a_noop() {
         let mut state = state_with_history_enabled(true);
-        let path = unique_temp_file("velox-app-cancel-completed");
+        let path = unique_temp_path("velox-app-cancel-completed");
         std::fs::write(&path, b"done").unwrap();
 
         let id = state.downloads.start(

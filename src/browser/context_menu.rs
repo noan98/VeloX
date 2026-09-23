@@ -84,17 +84,16 @@ pub struct MenuContext {
 /// selection.
 fn strip_control_chars(text: &str) -> String {
     text.chars()
-        .filter(|c| !c.is_control() || *c == ' ' || *c == '\t' || *c == '\n')
+        .filter(|&c| !c.is_control() || matches!(c, ' ' | '\t' | '\n'))
         .collect()
 }
 
 /// Truncate `text` to at most `max_chars` `char`s (never splitting a
 /// multi-byte character), returning the possibly-shortened string.
-fn truncate_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_owned()
-    } else {
-        text.chars().take(max_chars).collect()
+fn truncate_chars(text: &str, max_chars: usize) -> &str {
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => &text[..end],
+        None => text,
     }
 }
 
@@ -126,7 +125,7 @@ pub fn sanitize(raw: RawMenuContext) -> MenuContext {
         .selection_text
         .as_deref()
         .map(strip_control_chars)
-        .map(|text| truncate_chars(text.trim(), MAX_SELECTION_LEN))
+        .map(|text| truncate_chars(text.trim(), MAX_SELECTION_LEN).to_owned())
         .filter(|text| !text.is_empty());
     MenuContext {
         link_url: sanitize_menu_url(raw.link_href.as_deref()),
@@ -188,25 +187,29 @@ impl MenuAction {
     /// serialized (see `ui::window::context_menu_render_script`). See
     /// docs/decisions.md D78.
     pub fn label(&self) -> String {
-        match self {
-            MenuAction::Back => "戻る".to_owned(),
-            MenuAction::Forward => "進む".to_owned(),
-            MenuAction::Reload => "再読み込み".to_owned(),
-            MenuAction::Copy => "コピー".to_owned(),
-            MenuAction::Paste => "貼り付け".to_owned(),
+        let fixed = match self {
+            MenuAction::Back => "戻る",
+            MenuAction::Forward => "進む",
+            MenuAction::Reload => "再読み込み",
+            MenuAction::Copy => "コピー",
+            MenuAction::Paste => "貼り付け",
             MenuAction::SearchSelection(text) => {
                 let preview = truncate_chars(text, SELECTION_PREVIEW_CHARS);
-                let truncated = preview.chars().count() < text.chars().count();
-                let ellipsis = if truncated { "…" } else { "" };
-                format!("「{preview}{ellipsis}」を検索")
+                let ellipsis = if preview.len() < text.len() {
+                    "…"
+                } else {
+                    ""
+                };
+                return format!("「{preview}{ellipsis}」を検索");
             }
-            MenuAction::OpenLinkInNewTab(_) => "リンクを新しいタブで開く".to_owned(),
-            MenuAction::OpenLinkInNewWindow(_) => "リンクを新しいウィンドウで開く".to_owned(),
-            MenuAction::OpenImageInNewTab(_) => "画像を新しいタブで開く".to_owned(),
-            MenuAction::SavePage => "名前を付けて保存…".to_owned(),
-            MenuAction::Print => "印刷…".to_owned(),
-            MenuAction::Inspect => "検証".to_owned(),
-        }
+            MenuAction::OpenLinkInNewTab(_) => "リンクを新しいタブで開く",
+            MenuAction::OpenLinkInNewWindow(_) => "リンクを新しいウィンドウで開く",
+            MenuAction::OpenImageInNewTab(_) => "画像を新しいタブで開く",
+            MenuAction::SavePage => "名前を付けて保存…",
+            MenuAction::Print => "印刷…",
+            MenuAction::Inspect => "検証",
+        };
+        fixed.to_owned()
     }
 }
 
@@ -237,19 +240,11 @@ pub struct MenuEntry {
 /// against — they are always enabled here, exactly like the toolbar's own
 /// Back/Forward buttons already are.
 pub fn build_menu(context: &MenuContext) -> Vec<MenuEntry> {
+    let entry = |action, enabled| MenuEntry { action, enabled };
     let mut entries = vec![
-        MenuEntry {
-            action: MenuAction::Back,
-            enabled: true,
-        },
-        MenuEntry {
-            action: MenuAction::Forward,
-            enabled: true,
-        },
-        MenuEntry {
-            action: MenuAction::Reload,
-            enabled: true,
-        },
+        entry(MenuAction::Back, true),
+        entry(MenuAction::Forward, true),
+        entry(MenuAction::Reload, true),
         // Issue #161. **Page-level actions, so they sit with the navigation
         // group and appear for every click** — including a click on a link
         // or an image, where they still mean "this page", exactly as they
@@ -257,52 +252,25 @@ pub fn build_menu(context: &MenuContext) -> Vec<MenuEntry> {
         // the menu was opened on, which by construction has a live webview
         // (a background tab's is hidden and cannot be right-clicked), and
         // neither depends on the click landing on anything in particular.
-        MenuEntry {
-            action: MenuAction::SavePage,
-            enabled: true,
-        },
-        MenuEntry {
-            action: MenuAction::Print,
-            enabled: true,
-        },
+        entry(MenuAction::SavePage, true),
+        entry(MenuAction::Print, true),
     ];
 
     if let Some(url) = &context.link_url {
-        entries.push(MenuEntry {
-            action: MenuAction::OpenLinkInNewTab(url.clone()),
-            enabled: true,
-        });
-        entries.push(MenuEntry {
-            action: MenuAction::OpenLinkInNewWindow(url.clone()),
-            enabled: true,
-        });
+        entries.push(entry(MenuAction::OpenLinkInNewTab(url.clone()), true));
+        entries.push(entry(MenuAction::OpenLinkInNewWindow(url.clone()), true));
     }
     if let Some(url) = &context.image_url {
-        entries.push(MenuEntry {
-            action: MenuAction::OpenImageInNewTab(url.clone()),
-            enabled: true,
-        });
+        entries.push(entry(MenuAction::OpenImageInNewTab(url.clone()), true));
     }
 
-    entries.push(MenuEntry {
-        action: MenuAction::Copy,
-        enabled: context.selection_text.is_some(),
-    });
-    entries.push(MenuEntry {
-        action: MenuAction::Paste,
-        enabled: context.is_editable,
-    });
+    entries.push(entry(MenuAction::Copy, context.selection_text.is_some()));
+    entries.push(entry(MenuAction::Paste, context.is_editable));
     if let Some(text) = &context.selection_text {
-        entries.push(MenuEntry {
-            action: MenuAction::SearchSelection(text.clone()),
-            enabled: true,
-        });
+        entries.push(entry(MenuAction::SearchSelection(text.clone()), true));
     }
 
-    entries.push(MenuEntry {
-        action: MenuAction::Inspect,
-        enabled: true,
-    });
+    entries.push(entry(MenuAction::Inspect, true));
 
     entries
 }
@@ -357,29 +325,41 @@ mod tests {
         RawMenuContext::default()
     }
 
+    fn link(href: &str) -> RawMenuContext {
+        RawMenuContext {
+            link_href: Some(href.to_owned()),
+            ..ctx()
+        }
+    }
+
+    fn selection(text: &str) -> RawMenuContext {
+        RawMenuContext {
+            selection_text: Some(text.to_owned()),
+            ..ctx()
+        }
+    }
+
+    fn entry_for<'a>(entries: &'a [MenuEntry], action: &MenuAction) -> &'a MenuEntry {
+        entries
+            .iter()
+            .find(|e| e.action == *action)
+            .unwrap_or_else(|| panic!("{action:?} が無い: {entries:?}"))
+    }
+
     // --- sanitize: URL scheme validation (the core threat model) ---
 
     #[test]
     fn sanitize_accepts_http_and_https_links() {
-        let out = sanitize(RawMenuContext {
-            link_href: Some("https://example.com/page".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(link("https://example.com/page"));
         assert_eq!(out.link_url.as_deref(), Some("https://example.com/page"));
 
-        let out = sanitize(RawMenuContext {
-            link_href: Some("http://example.com/page".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(link("http://example.com/page"));
         assert_eq!(out.link_url.as_deref(), Some("http://example.com/page"));
     }
 
     #[test]
     fn sanitize_rejects_javascript_scheme_link() {
-        let out = sanitize(RawMenuContext {
-            link_href: Some("javascript:alert(document.cookie)".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(link("javascript:alert(document.cookie)"));
         assert_eq!(out.link_url, None);
     }
 
@@ -391,35 +371,23 @@ mod tests {
             "javascript:alert(1)//",
             "\tJAVASCRIPT:alert(1)",
         ] {
-            let out = sanitize(RawMenuContext {
-                link_href: Some(raw.to_owned()),
-                ..ctx()
-            });
+            let out = sanitize(link(raw));
             assert_eq!(out.link_url, None, "should reject {raw:?}");
         }
     }
 
     #[test]
     fn sanitize_rejects_data_and_file_scheme_links() {
-        let out = sanitize(RawMenuContext {
-            link_href: Some("data:text/html,<script>alert(1)</script>".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(link("data:text/html,<script>alert(1)</script>"));
         assert_eq!(out.link_url, None);
 
-        let out = sanitize(RawMenuContext {
-            link_href: Some("file:///etc/passwd".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(link("file:///etc/passwd"));
         assert_eq!(out.link_url, None);
     }
 
     #[test]
     fn sanitize_rejects_vbscript_scheme_link() {
-        let out = sanitize(RawMenuContext {
-            link_href: Some("vbscript:msgbox(1)".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(link("vbscript:msgbox(1)"));
         assert_eq!(out.link_url, None);
     }
 
@@ -469,28 +437,19 @@ mod tests {
 
     #[test]
     fn sanitize_trims_and_keeps_non_empty_selection() {
-        let out = sanitize(RawMenuContext {
-            selection_text: Some("  hello world  ".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(selection("  hello world  "));
         assert_eq!(out.selection_text.as_deref(), Some("hello world"));
     }
 
     #[test]
     fn sanitize_drops_whitespace_only_selection() {
-        let out = sanitize(RawMenuContext {
-            selection_text: Some("   \n\t  ".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(selection("   \n\t  "));
         assert_eq!(out.selection_text, None);
     }
 
     #[test]
     fn sanitize_strips_control_characters_from_selection_but_keeps_ordinary_text() {
-        let out = sanitize(RawMenuContext {
-            selection_text: Some("a\u{0}b\u{7}c<script>d".to_owned()),
-            ..ctx()
-        });
+        let out = sanitize(selection("a\u{0}b\u{7}c<script>d"));
         // Control characters are gone, but ordinary punctuation/markup-like
         // text (which is just *text*, never interpreted as HTML — see
         // `MenuAction::label`'s doc comment) is preserved verbatim.
@@ -500,10 +459,7 @@ mod tests {
     #[test]
     fn sanitize_caps_selection_length() {
         let long = "a".repeat(MAX_SELECTION_LEN + 500);
-        let out = sanitize(RawMenuContext {
-            selection_text: Some(long),
-            ..ctx()
-        });
+        let out = sanitize(selection(&long));
         assert_eq!(
             out.selection_text.unwrap().chars().count(),
             MAX_SELECTION_LEN
@@ -513,10 +469,7 @@ mod tests {
     #[test]
     fn sanitize_never_splits_a_multibyte_character_when_truncating_selection() {
         let long = "あ".repeat(MAX_SELECTION_LEN + 10);
-        let out = sanitize(RawMenuContext {
-            selection_text: Some(long),
-            ..ctx()
-        });
+        let out = sanitize(selection(&long));
         let text = out.selection_text.unwrap();
         assert_eq!(text.chars().count(), MAX_SELECTION_LEN);
         // Would panic on a byte-boundary split; getting here at all proves
@@ -543,15 +496,9 @@ mod tests {
             .iter()
             .any(|a| matches!(a, MenuAction::SearchSelection(_))));
 
-        let copy = entries
-            .iter()
-            .find(|e| e.action == MenuAction::Copy)
-            .unwrap();
+        let copy = entry_for(&entries, &MenuAction::Copy);
         assert!(!copy.enabled);
-        let paste = entries
-            .iter()
-            .find(|e| e.action == MenuAction::Paste)
-            .unwrap();
+        let paste = entry_for(&entries, &MenuAction::Paste);
         assert!(!paste.enabled);
 
         // Always present regardless of target.
@@ -609,13 +556,7 @@ mod tests {
             ..MenuContext::default()
         };
         let entries = build_menu(&context);
-        assert!(
-            entries
-                .iter()
-                .find(|e| e.action == MenuAction::Copy)
-                .unwrap()
-                .enabled
-        );
+        assert!(entry_for(&entries, &MenuAction::Copy).enabled);
         let search = entries
             .iter()
             .find(|e| matches!(e.action, MenuAction::SearchSelection(_)))
@@ -634,20 +575,8 @@ mod tests {
             ..MenuContext::default()
         };
         let entries = build_menu(&context);
-        assert!(
-            entries
-                .iter()
-                .find(|e| e.action == MenuAction::Paste)
-                .unwrap()
-                .enabled
-        );
-        assert!(
-            !entries
-                .iter()
-                .find(|e| e.action == MenuAction::Copy)
-                .unwrap()
-                .enabled
-        );
+        assert!(entry_for(&entries, &MenuAction::Paste).enabled);
+        assert!(!entry_for(&entries, &MenuAction::Copy).enabled);
     }
 
     // --- MenuAction::label: preview truncation, no dependence on escaping ---

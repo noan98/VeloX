@@ -39,6 +39,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
+use super::suspension::SuspendReason;
+
 // ---------------------------------------------------------------------
 // Startup timestamps
 // ---------------------------------------------------------------------
@@ -211,13 +213,11 @@ impl StartupTimestamps {
             to_pre_window_setup_done: elapsed(self.pre_window_setup_done),
             to_native_window_built: elapsed(self.native_window_built),
             to_toolbar_webview_built: elapsed(self.toolbar_webview_built),
-            to_window_created: self.window_created?.duration_since(self.process_start),
-            to_rust_setup_done: self.rust_setup_done?.duration_since(self.process_start),
-            to_toolbar_script_started: self
-                .toolbar_script_started?
-                .duration_since(self.process_start),
-            to_toolbar_ready: self.toolbar_ready?.duration_since(self.process_start),
-            to_first_load_finished: self.first_load_finished?.duration_since(self.process_start),
+            to_window_created: elapsed(self.window_created)?,
+            to_rust_setup_done: elapsed(self.rust_setup_done)?,
+            to_toolbar_script_started: elapsed(self.toolbar_script_started)?,
+            to_toolbar_ready: elapsed(self.toolbar_ready)?,
+            to_first_load_finished: elapsed(self.first_load_finished)?,
         })
     }
 }
@@ -246,10 +246,7 @@ impl fmt::Display for StartupReport {
         // rather than being dropped, so the field list of this line stays
         // the same shape every time — a human diffing two `VELOX_PERF_OUTPUT`
         // files (the `text` format's only consumer) can line them up.
-        let optional = |at: Option<Duration>| match at {
-            Some(at) => format_duration(at),
-            None => "-".to_owned(),
-        };
+        let optional = |at: Option<Duration>| at.map_or_else(|| "-".to_owned(), format_duration);
         write!(
             f,
             "startup event_loop={} pre_window_setup={} native_window={} toolbar_webview={} ",
@@ -514,12 +511,12 @@ impl fmt::Display for RssSample {
             "rss pid={} processes={} total_mib={:.1} pss_processes={}/{}",
             self.root_pid,
             self.process_count,
-            self.total_rss_bytes as f64 / (1024.0 * 1024.0),
+            bytes_to_mib(self.total_rss_bytes),
             self.pss_process_count,
             self.process_count,
         )?;
         match self.total_pss_bytes {
-            Some(bytes) => write!(f, " pss_mib={:.1}", bytes as f64 / (1024.0 * 1024.0))?,
+            Some(bytes) => write!(f, " pss_mib={:.1}", bytes_to_mib(bytes))?,
             None => write!(f, " pss_mib=n/a")?,
         }
         // Appended, never inserted — same rule D42 followed for the PSS
@@ -530,10 +527,15 @@ impl fmt::Display for RssSample {
         }
         // Appended after `cpu_s` for the same reason (D150).
         match self.total_private_bytes {
-            Some(bytes) => write!(f, " private_mib={:.1}", bytes as f64 / (1024.0 * 1024.0)),
+            Some(bytes) => write!(f, " private_mib={:.1}", bytes_to_mib(bytes)),
             None => write!(f, " private_mib=n/a"),
         }
     }
+}
+
+/// バイト数を MiB (小数) に換算する。[`RssSample`] の text 表示専用。
+fn bytes_to_mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
 }
 
 /// Failure modes for [`sample_process_tree_rss`].
@@ -921,7 +923,7 @@ pub enum PerfRecord {
     /// samples that follow.
     TabSuspend {
         tab_id: u64,
-        reason: crate::browser::suspension::SuspendReason,
+        reason: SuspendReason,
     },
     Rss(RssSample),
     /// CPU utilization of the whole process tree over the interval between
@@ -988,6 +990,10 @@ impl PerfRecord {
         PerfRecord::Rss(sample)
     }
 
+    pub fn cpu(percent: f64) -> Self {
+        PerfRecord::Cpu { percent }
+    }
+
     /// Average CPU utilization of the whole process tree between two
     /// samples, as a percentage of one core (Issue #64): 100 means one core
     /// fully busy, 400 means four. `None` when either sample lacks CPU
@@ -999,10 +1005,6 @@ impl PerfRecord {
     /// of both samples and of the clock: the sampler already knows the wall
     /// time between its own two reads, and nothing here should read a clock
     /// of its own.
-    pub fn cpu(percent: f64) -> Self {
-        PerfRecord::Cpu { percent }
-    }
-
     pub fn cpu_percent_between(
         previous: &RssSample,
         current: &RssSample,
@@ -1017,7 +1019,7 @@ impl PerfRecord {
         Some((after - before) / elapsed * 100.0)
     }
 
-    pub fn tab_suspend(tab_id: u64, reason: crate::browser::suspension::SuspendReason) -> Self {
+    pub fn tab_suspend(tab_id: u64, reason: SuspendReason) -> Self {
         PerfRecord::TabSuspend { tab_id, reason }
     }
 
@@ -1091,13 +1093,13 @@ impl PerfRecord {
                 engine,
             } => {
                 let base = format_page_load(url, *duration);
-                match (engine, engine.map(|e| duration.saturating_sub(e))) {
-                    (Some(engine), Some(dispatch)) => format!(
+                match engine {
+                    Some(engine) => format!(
                         "{base} engine_duration={} dispatch_duration={}",
                         format_duration(*engine),
-                        format_duration(dispatch)
+                        format_duration(duration.saturating_sub(*engine))
                     ),
-                    _ => base,
+                    None => base,
                 }
             }
             PerfRecord::TabLatency {
@@ -1139,8 +1141,11 @@ impl PerfRecord {
     /// [`Instant`]), plus event-specific numeric/string fields.
     pub fn to_json(&self, elapsed: Duration) -> serde_json::Value {
         let mut fields = serde_json::Map::new();
-        fields.insert("event".to_owned(), json!(self.event_name()));
-        fields.insert("ts_ms".to_owned(), json!(ms(elapsed)));
+        let mut put = |key: &str, value: serde_json::Value| {
+            fields.insert(key.to_owned(), value);
+        };
+        put("event", json!(self.event_name()));
+        put("ts_ms", json!(ms(elapsed)));
         match self {
             PerfRecord::Startup(report) => {
                 // Issue #182: like `engine_duration_ms`/`dispatch_duration_ms`
@@ -1152,117 +1157,86 @@ impl PerfRecord {
                 // entirely, i.e. a pre-#182 result file) apart from "this
                 // run did not reach it" (key present, `null`).
                 // `MetricKey::extract`'s `as_f64` drops both alike.
-                let optional_ms = |at: Option<Duration>| match at {
-                    Some(at) => json!(ms(at)),
-                    None => serde_json::Value::Null,
-                };
-                fields.insert(
-                    "event_loop_ms".to_owned(),
-                    optional_ms(report.to_event_loop_built),
+                put("event_loop_ms", json!(report.to_event_loop_built.map(ms)));
+                put(
+                    "pre_window_setup_ms",
+                    json!(report.to_pre_window_setup_done.map(ms)),
                 );
-                fields.insert(
-                    "pre_window_setup_ms".to_owned(),
-                    optional_ms(report.to_pre_window_setup_done),
+                put(
+                    "native_window_ms",
+                    json!(report.to_native_window_built.map(ms)),
                 );
-                fields.insert(
-                    "native_window_ms".to_owned(),
-                    optional_ms(report.to_native_window_built),
+                put(
+                    "toolbar_webview_ms",
+                    json!(report.to_toolbar_webview_built.map(ms)),
                 );
-                fields.insert(
-                    "toolbar_webview_ms".to_owned(),
-                    optional_ms(report.to_toolbar_webview_built),
-                );
-                fields.insert(
-                    "window_created_ms".to_owned(),
-                    json!(ms(report.to_window_created)),
-                );
-                fields.insert(
-                    "rust_setup_done_ms".to_owned(),
-                    json!(ms(report.to_rust_setup_done)),
-                );
-                fields.insert(
-                    "toolbar_script_started_ms".to_owned(),
+                put("window_created_ms", json!(ms(report.to_window_created)));
+                put("rust_setup_done_ms", json!(ms(report.to_rust_setup_done)));
+                put(
+                    "toolbar_script_started_ms",
                     json!(ms(report.to_toolbar_script_started)),
                 );
-                fields.insert(
-                    "toolbar_ready_ms".to_owned(),
-                    json!(ms(report.to_toolbar_ready)),
-                );
-                fields.insert(
-                    "first_load_ms".to_owned(),
-                    json!(ms(report.to_first_load_finished)),
-                );
+                put("toolbar_ready_ms", json!(ms(report.to_toolbar_ready)));
+                put("first_load_ms", json!(ms(report.to_first_load_finished)));
             }
             PerfRecord::PageLoad {
                 url,
                 duration,
                 engine,
             } => {
-                fields.insert("url".to_owned(), json!(url));
-                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+                put("url", json!(url));
+                put("duration_ms", json!(ms(*duration)));
                 // Issue #69: `engine_duration_ms`/`dispatch_duration_ms`
                 // always appear (never an absent key), serializing to JSON
                 // `null` when `LoadStarted` never fired — same convention
                 // as `total_pss_bytes` (Issue #108/D42), so a consumer
                 // always sees the key and cannot mistake "unmeasured" for
                 // "0ms".
-                fields.insert("engine_duration_ms".to_owned(), json!(engine.map(ms)));
-                fields.insert(
-                    "dispatch_duration_ms".to_owned(),
+                put("engine_duration_ms", json!(engine.map(ms)));
+                put(
+                    "dispatch_duration_ms",
                     json!(engine.map(|e| ms(duration.saturating_sub(e)))),
                 );
             }
             PerfRecord::TabLatency {
                 tab_id, duration, ..
             } => {
-                fields.insert("tab_id".to_owned(), json!(tab_id));
-                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+                put("tab_id", json!(tab_id));
+                put("duration_ms", json!(ms(*duration)));
             }
             PerfRecord::TabSuspend { tab_id, reason } => {
-                fields.insert("tab_id".to_owned(), json!(tab_id));
-                fields.insert("reason".to_owned(), json!(reason.as_str()));
+                put("tab_id", json!(tab_id));
+                put("reason", json!(reason.as_str()));
             }
             // Only `event`/`ts_ms` — the marker's whole content is where it
             // sits in the log.
             PerfRecord::MeasureStart => {}
             PerfRecord::Cpu { percent } => {
-                fields.insert("percent".to_owned(), json!(percent));
+                put("percent", json!(percent));
             }
             PerfRecord::Rss(sample) => {
-                fields.insert("pid".to_owned(), json!(sample.root_pid));
-                fields.insert("process_count".to_owned(), json!(sample.process_count));
-                fields.insert("total_rss_bytes".to_owned(), json!(sample.total_rss_bytes));
+                put("pid", json!(sample.root_pid));
+                put("process_count", json!(sample.process_count));
+                put("total_rss_bytes", json!(sample.total_rss_bytes));
                 // `total_pss_bytes` serializes to JSON `null` (not an
                 // absent key) when `None`, so a consumer parsing this field
                 // always sees it and cannot mistake "unmeasured" for "0
                 // bytes". `pss_process_count` lets it tell a full PSS total
                 // from a partial one even when `total_pss_bytes` is `Some`.
-                fields.insert("total_pss_bytes".to_owned(), json!(sample.total_pss_bytes));
-                fields.insert(
-                    "pss_process_count".to_owned(),
-                    json!(sample.pss_process_count),
-                );
+                put("total_pss_bytes", json!(sample.total_pss_bytes));
+                put("pss_process_count", json!(sample.pss_process_count));
                 // Cumulative CPU time; `cpu_percent` (the rate a benchmark
                 // actually compares) is added by the sampler, which is the
                 // only caller that knows the interval between two samples.
-                fields.insert(
-                    "total_cpu_seconds".to_owned(),
-                    json!(sample.total_cpu_seconds),
-                );
+                put("total_cpu_seconds", json!(sample.total_cpu_seconds));
                 // Issue #176 Stage 1. Appended after the existing keys, never
                 // inserted among them — same rule D42 followed when it added
                 // the PSS fields, so a consumer matching the old shape keeps
                 // working. Both are plain `u64` (not `Option`): the split is
                 // exact whenever the tree could be walked at all, because it
                 // keys on the root pid rather than on a process name.
-                fields.insert(
-                    "browser_rss_bytes".to_owned(),
-                    json!(sample.browser_rss_bytes),
-                );
-                fields.insert(
-                    "engine_rss_bytes".to_owned(),
-                    json!(sample.engine_rss_bytes),
-                );
+                put("browser_rss_bytes", json!(sample.browser_rss_bytes));
+                put("engine_rss_bytes", json!(sample.engine_rss_bytes));
                 // Issue #176 Stage 3 (D150): private commit, appended after
                 // the Stage 1 keys under the same rule. `total_private_bytes`
                 // / `browser_private_bytes` / `engine_private_bytes` are
@@ -1271,22 +1245,10 @@ impl PerfRecord {
                 // mistake "unmeasured" for "0 bytes", exactly like
                 // `total_pss_bytes`; `private_process_count` tells a
                 // partial sum from a complete one.
-                fields.insert(
-                    "total_private_bytes".to_owned(),
-                    json!(sample.total_private_bytes),
-                );
-                fields.insert(
-                    "private_process_count".to_owned(),
-                    json!(sample.private_process_count),
-                );
-                fields.insert(
-                    "browser_private_bytes".to_owned(),
-                    json!(sample.browser_private_bytes),
-                );
-                fields.insert(
-                    "engine_private_bytes".to_owned(),
-                    json!(sample.engine_private_bytes),
-                );
+                put("total_private_bytes", json!(sample.total_private_bytes));
+                put("private_process_count", json!(sample.private_process_count));
+                put("browser_private_bytes", json!(sample.browser_private_bytes));
+                put("engine_private_bytes", json!(sample.engine_private_bytes));
             }
             PerfRecord::Ipc {
                 direction,
@@ -1294,14 +1256,14 @@ impl PerfRecord {
                 bytes,
                 duration,
             } => {
-                fields.insert("direction".to_owned(), json!(direction.as_str()));
-                fields.insert("name".to_owned(), json!(name));
-                fields.insert("bytes".to_owned(), json!(bytes));
-                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+                put("direction", json!(direction.as_str()));
+                put("name", json!(name));
+                put("bytes", json!(bytes));
+                put("duration_ms", json!(ms(*duration)));
             }
             PerfRecord::StateWrite { kind, duration } => {
-                fields.insert("name".to_owned(), json!(kind.as_str()));
-                fields.insert("duration_ms".to_owned(), json!(ms(*duration)));
+                put("name", json!(kind.as_str()));
+                put("duration_ms", json!(ms(*duration)));
             }
         }
         serde_json::Value::Object(fields)
@@ -1384,9 +1346,8 @@ mod imp {
     pub(super) fn process_map(root_pid: u32) -> Result<HashMap<u32, ProcInfo>, super::RssError> {
         let mut map = HashMap::new();
         for entry in fs::read_dir("/proc").map_err(super::RssError::Io)? {
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(_) => continue,
+            let Ok(entry) = entry else {
+                continue;
             };
             let Some(pid) = entry
                 .file_name()
@@ -1483,15 +1444,14 @@ mod imp {
     /// the process having exited, or unexpected content) — this mirrors
     /// `scripts/bench/compare_browsers.py`'s `_pss_bytes`, the reference
     /// implementation this logic follows, so the two measurements agree.
-    fn read_pss_bytes(pid_path: &std::path::Path) -> Option<u64> {
+    fn read_pss_bytes(pid_path: &Path) -> Option<u64> {
         let contents = fs::read_to_string(pid_path.join("smaps_rollup")).ok()?;
-        for line in contents.lines() {
-            if let Some(rest) = line.strip_prefix("Pss:") {
-                let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-                return Some(kb * 1024);
-            }
-        }
-        None
+        // 最初の `Pss:` 行だけを見る (値が読めなければ後続行は探さない)。
+        let rest = contents
+            .lines()
+            .find_map(|line| line.strip_prefix("Pss:"))?;
+        let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
+        Some(kb * 1024)
     }
 
     #[cfg(test)]
@@ -1520,13 +1480,15 @@ mod imp {
             assert_eq!(info.rss_bytes, 0);
         }
 
+        /// このテスト固有の一時ディレクトリ (`util::unique_temp_path`)。
+        /// 並列に走る `cargo test` 同士で衝突しないようにする。
+        fn pss_test_dir(suffix: &str) -> std::path::PathBuf {
+            crate::browser::util::unique_temp_path(&format!("velox-pss-test-{suffix}"))
+        }
+
         #[test]
         fn read_pss_bytes_parses_the_pss_line() {
-            let dir = std::env::temp_dir().join(format!(
-                "velox-pss-test-{}-{:?}-ok",
-                std::process::id(),
-                std::thread::current().id()
-            ));
+            let dir = pss_test_dir("ok");
             fs::create_dir_all(&dir).expect("create temp dir");
             fs::write(
                 dir.join("smaps_rollup"),
@@ -1541,22 +1503,14 @@ mod imp {
 
         #[test]
         fn read_pss_bytes_missing_file_is_none() {
-            let dir = std::env::temp_dir().join(format!(
-                "velox-pss-test-{}-{:?}-missing",
-                std::process::id(),
-                std::thread::current().id()
-            ));
+            let dir = pss_test_dir("missing");
             let _ = fs::remove_dir_all(&dir); // ensure it does not exist
             assert_eq!(read_pss_bytes(&dir), None);
         }
 
         #[test]
         fn read_pss_bytes_without_pss_line_is_none() {
-            let dir = std::env::temp_dir().join(format!(
-                "velox-pss-test-{}-{:?}-nopss",
-                std::process::id(),
-                std::thread::current().id()
-            ));
+            let dir = pss_test_dir("nopss");
             fs::create_dir_all(&dir).expect("create temp dir");
             fs::write(dir.join("smaps_rollup"), "Rss:            1234 kB\n")
                 .expect("write fake smaps_rollup");
@@ -1765,6 +1719,7 @@ mod imp {
     /// What [`query_process`] could read for one process; each field is
     /// `None` when its API call failed (or the process could not be opened
     /// at all, in which case all three are).
+    #[derive(Default)]
     struct QueriedProcess {
         /// `PROCESS_MEMORY_COUNTERS::WorkingSetSize` — RSS.
         working_set_bytes: Option<u64>,
@@ -1803,13 +1758,7 @@ mod imp {
             )
         } {
             Ok(handle) => OwnedHandle(handle),
-            Err(_) => {
-                return QueriedProcess {
-                    working_set_bytes: None,
-                    private_bytes: None,
-                    cpu_seconds: None,
-                }
-            }
+            Err(_) => return QueriedProcess::default(),
         };
 
         let memory = {
@@ -2057,6 +2006,25 @@ MemAvailable:    8901234 kB
                 PLAUSIBLE.contains(&bytes),
                 "搭載 RAM が {bytes} バイトはあり得ない"
             );
+        }
+    }
+
+    /// 全フィールドが「未計測 / 0」の [`RssSample`]。各テストは struct
+    /// update 構文で関心のあるフィールドだけを上書きする。
+    fn empty_sample() -> RssSample {
+        RssSample {
+            root_pid: 0,
+            process_count: 0,
+            total_rss_bytes: 0,
+            total_pss_bytes: None,
+            pss_process_count: 0,
+            total_cpu_seconds: None,
+            browser_rss_bytes: 0,
+            engine_rss_bytes: 0,
+            total_private_bytes: None,
+            private_process_count: 0,
+            browser_private_bytes: None,
+            engine_private_bytes: None,
         }
     }
 
@@ -2345,46 +2313,10 @@ MemAvailable:    8901234 kB
     #[test]
     fn build_sample_sums_rss_over_whole_subtree() {
         let mut processes = HashMap::new();
-        processes.insert(
-            1,
-            ProcInfo {
-                ppid: 0,
-                rss_bytes: 1000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
-        processes.insert(
-            2,
-            ProcInfo {
-                ppid: 1,
-                rss_bytes: 2000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        ); // child of 1
-        processes.insert(
-            3,
-            ProcInfo {
-                ppid: 2,
-                rss_bytes: 3000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        ); // grandchild
-        processes.insert(
-            4,
-            ProcInfo {
-                ppid: 0,
-                rss_bytes: 4000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        ); // unrelated
+        processes.insert(1, proc_with_rss(0, 1000));
+        processes.insert(2, proc_with_rss(1, 2000)); // child of 1
+        processes.insert(3, proc_with_rss(2, 3000)); // grandchild
+        processes.insert(4, proc_with_rss(0, 4000)); // unrelated
 
         let sample = build_sample(1, &processes).unwrap();
         assert_eq!(sample.root_pid, 1);
@@ -2395,16 +2327,7 @@ MemAvailable:    8901234 kB
     #[test]
     fn build_sample_root_with_no_children_counts_only_itself() {
         let mut processes = HashMap::new();
-        processes.insert(
-            5,
-            ProcInfo {
-                ppid: 0,
-                rss_bytes: 999,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
+        processes.insert(5, proc_with_rss(0, 999));
         let sample = build_sample(5, &processes).unwrap();
         assert_eq!(sample.process_count, 1);
         assert_eq!(sample.total_rss_bytes, 999);
@@ -2414,10 +2337,16 @@ MemAvailable:    8901234 kB
 
     /// `ProcInfo` を短く書くための補助。RSS 以外は本節の主題ではない。
     fn proc_with_rss(ppid: u32, rss_bytes: u64) -> ProcInfo {
+        proc_with_pss(ppid, rss_bytes, None)
+    }
+
+    /// `ProcInfo` を RSS と PSS だけ指定して作る補助 (CPU / 私的コミットは
+    /// 読めなかった扱い)。
+    fn proc_with_pss(ppid: u32, rss_bytes: u64, pss_bytes: Option<u64>) -> ProcInfo {
         ProcInfo {
             ppid,
             rss_bytes,
-            pss_bytes: None,
+            pss_bytes,
             cpu_seconds: None,
             private_bytes: None,
         }
@@ -2502,26 +2431,8 @@ MemAvailable:    8901234 kB
     #[test]
     fn build_sample_sums_pss_when_every_process_has_it() {
         let mut processes = HashMap::new();
-        processes.insert(
-            1,
-            ProcInfo {
-                ppid: 0,
-                rss_bytes: 1000,
-                pss_bytes: Some(400),
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
-        processes.insert(
-            2,
-            ProcInfo {
-                ppid: 1,
-                rss_bytes: 2000,
-                pss_bytes: Some(600),
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
+        processes.insert(1, proc_with_pss(0, 1000, Some(400)));
+        processes.insert(2, proc_with_pss(1, 2000, Some(600)));
 
         let sample = build_sample(1, &processes).unwrap();
         assert_eq!(sample.process_count, 2);
@@ -2532,26 +2443,8 @@ MemAvailable:    8901234 kB
     #[test]
     fn build_sample_pss_is_none_when_no_process_has_it() {
         let mut processes = HashMap::new();
-        processes.insert(
-            1,
-            ProcInfo {
-                ppid: 0,
-                rss_bytes: 1000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
-        processes.insert(
-            2,
-            ProcInfo {
-                ppid: 1,
-                rss_bytes: 2000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
+        processes.insert(1, proc_with_rss(0, 1000));
+        processes.insert(2, proc_with_rss(1, 2000));
 
         let sample = build_sample(1, &processes).unwrap();
         // RSS is unaffected — it never depends on PSS being readable.
@@ -2567,36 +2460,9 @@ MemAvailable:    8901234 kB
         // instead of silently dropping to `None`, and `pss_process_count`
         // must say the total is incomplete (2 readable out of 3 processes).
         let mut processes = HashMap::new();
-        processes.insert(
-            1,
-            ProcInfo {
-                ppid: 0,
-                rss_bytes: 1000,
-                pss_bytes: Some(300),
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
-        processes.insert(
-            2,
-            ProcInfo {
-                ppid: 1,
-                rss_bytes: 2000,
-                pss_bytes: None,
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
-        processes.insert(
-            3,
-            ProcInfo {
-                ppid: 1,
-                rss_bytes: 500,
-                pss_bytes: Some(150),
-                cpu_seconds: None,
-                private_bytes: None,
-            },
-        );
+        processes.insert(1, proc_with_pss(0, 1000, Some(300)));
+        processes.insert(2, proc_with_rss(1, 2000));
+        processes.insert(3, proc_with_pss(1, 500, Some(150)));
 
         let sample = build_sample(1, &processes).unwrap();
         assert_eq!(sample.process_count, 3);
@@ -2675,13 +2541,7 @@ MemAvailable:    8901234 kB
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 3,
-            total_cpu_seconds: None,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
-            total_private_bytes: None,
-            private_process_count: 0,
-            browser_private_bytes: None,
-            engine_private_bytes: None,
+            ..empty_sample()
         };
         assert_eq!(
             sample.to_string(),
@@ -2695,15 +2555,7 @@ MemAvailable:    8901234 kB
             root_pid: 42,
             process_count: 3,
             total_rss_bytes: 2 * 1024 * 1024,
-            total_pss_bytes: None,
-            pss_process_count: 0,
-            total_cpu_seconds: None,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
-            total_private_bytes: None,
-            private_process_count: 0,
-            browser_private_bytes: None,
-            engine_private_bytes: None,
+            ..empty_sample()
         };
         assert_eq!(
             sample.to_string(),
@@ -2834,13 +2686,7 @@ MemAvailable:    8901234 kB
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 3,
-            total_cpu_seconds: None,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
-            total_private_bytes: None,
-            private_process_count: 0,
-            browser_private_bytes: None,
-            engine_private_bytes: None,
+            ..empty_sample()
         };
         let expected = sample.to_string();
         assert_eq!(PerfRecord::rss(sample).to_text(), expected);
@@ -2868,16 +2714,8 @@ MemAvailable:    8901234 kB
         let sample = |cpu: Option<f64>| RssSample {
             root_pid: 1,
             process_count: 2,
-            total_rss_bytes: 0,
-            total_pss_bytes: None,
-            pss_process_count: 0,
             total_cpu_seconds: cpu,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
-            total_private_bytes: None,
-            private_process_count: 0,
-            browser_private_bytes: None,
-            engine_private_bytes: None,
+            ..empty_sample()
         };
         // 2 CPU-seconds over 1 second of wall time = two cores busy.
         let percent = PerfRecord::cpu_percent_between(
@@ -2952,7 +2790,6 @@ MemAvailable:    8901234 kB
 
     #[test]
     fn perf_record_tab_suspend_carries_the_reason_in_both_formats() {
-        use crate::browser::suspension::SuspendReason;
         let record = PerfRecord::tab_suspend(9, SuspendReason::Memory);
         assert_eq!(record.event_name(), "tab_suspend");
         assert_eq!(record.to_text(), "tab_suspend id=9 reason=memory");
@@ -3064,13 +2901,7 @@ MemAvailable:    8901234 kB
             total_rss_bytes: 2 * 1024 * 1024,
             total_pss_bytes: Some(1024 * 1024),
             pss_process_count: 2,
-            total_cpu_seconds: None,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
-            total_private_bytes: None,
-            private_process_count: 0,
-            browser_private_bytes: None,
-            engine_private_bytes: None,
+            ..empty_sample()
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         assert_eq!(value["pid"], 42);
@@ -3086,15 +2917,7 @@ MemAvailable:    8901234 kB
             root_pid: 42,
             process_count: 3,
             total_rss_bytes: 2 * 1024 * 1024,
-            total_pss_bytes: None,
-            pss_process_count: 0,
-            total_cpu_seconds: None,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
-            total_private_bytes: None,
-            private_process_count: 0,
-            browser_private_bytes: None,
-            engine_private_bytes: None,
+            ..empty_sample()
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         // `null`, not an absent key — a consumer must be able to tell
@@ -3120,15 +2943,11 @@ MemAvailable:    8901234 kB
             root_pid: 42,
             process_count: 3,
             total_rss_bytes: 2 * 1024 * 1024,
-            total_pss_bytes: None,
-            pss_process_count: 0,
-            total_cpu_seconds: None,
-            browser_rss_bytes: 0,
-            engine_rss_bytes: 0,
             total_private_bytes: Some(1_500_000),
             private_process_count: 3,
             browser_private_bytes: Some(500_000),
             engine_private_bytes: Some(1_000_000),
+            ..empty_sample()
         };
         let value = PerfRecord::rss(sample).to_json(Duration::ZERO);
         assert_eq!(value["total_private_bytes"], 1_500_000);

@@ -41,6 +41,7 @@ use super::context_menu::OpenContextMenu;
 use super::find::FindState;
 use super::session::SavedTab;
 use super::tabs::Tabs;
+use super::util::remove_where;
 use super::window_id::WindowId;
 
 /// One open window's worth of state this layer tracks: its id, its own
@@ -120,6 +121,17 @@ impl Windows {
         id
     }
 
+    /// ウィンドウ `id` のエントリ。未知の id は `None` (本モジュール共通の
+    /// 「古い id は安全に無視する」規約の土台)。
+    fn entry(&self, id: WindowId) -> Option<&WindowEntry> {
+        self.entries.iter().find(|entry| entry.id == id)
+    }
+
+    /// [`Self::entry`] の可変版。
+    fn entry_mut(&mut self, id: WindowId) -> Option<&mut WindowEntry> {
+        self.entries.iter_mut().find(|entry| entry.id == id)
+    }
+
     fn push_window(&mut self, tabs: Tabs, private: bool) -> WindowId {
         let id = self.take_id();
         self.entries.push(WindowEntry {
@@ -185,10 +197,7 @@ impl Windows {
     /// to know *this* window's own privacy, since two windows can now
     /// disagree.
     pub fn is_private(&self, id: WindowId) -> Option<bool> {
-        self.entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .map(|entry| entry.private)
+        self.entry(id).map(|entry| entry.private)
     }
 
     /// Close window `id`, dropping its `Tabs` (and every tab in it) along
@@ -200,26 +209,18 @@ impl Windows {
     /// Removing the *last* window is allowed and leaves `Windows` empty —
     /// see the struct doc comment for why that differs from `Tabs::close`.
     pub fn close_window(&mut self, id: WindowId) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        remove_where(&mut self.entries, |entry| entry.id == id)
     }
 
     /// The tabs belonging to window `id`, or `None` if no such window is
     /// open (already closed, or never existed).
     pub fn tabs(&self, id: WindowId) -> Option<&Tabs> {
-        self.entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .map(|entry| &entry.tabs)
+        self.entry(id).map(|entry| &entry.tabs)
     }
 
     /// Mutable version of [`Self::tabs`].
     pub fn tabs_mut(&mut self, id: WindowId) -> Option<&mut Tabs> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .map(|entry| &mut entry.tabs)
+        self.entry_mut(id).map(|entry| &mut entry.tabs)
     }
 
     /// Window `id`'s in-page find session (Issue #43), if it currently has
@@ -227,18 +228,12 @@ impl Windows {
     /// callers that need to tell the two apart already know whether `id` is
     /// open (see `tabs`/`contains`).
     pub fn find(&self, id: WindowId) -> Option<&FindState> {
-        self.entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| entry.find.as_ref())
+        self.entry(id).and_then(|entry| entry.find.as_ref())
     }
 
     /// Mutable version of [`Self::find`].
     pub fn find_mut(&mut self, id: WindowId) -> Option<&mut FindState> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| entry.find.as_mut())
+        self.entry_mut(id).and_then(|entry| entry.find.as_mut())
     }
 
     /// Open (or replace) window `id`'s find session — `app::open_find_bar`
@@ -247,7 +242,7 @@ impl Windows {
     /// safe no-op" convention every other id-addressed operation here
     /// follows.
     pub fn set_find(&mut self, id: WindowId, session: FindState) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self.entry_mut(id) {
             entry.find = Some(session);
         }
     }
@@ -256,20 +251,14 @@ impl Windows {
     /// (`None` for an unknown window id *or* one with no session open —
     /// same shape as `Tabs::reopen_closed`'s `Option`-returning "take").
     pub fn take_find(&mut self, id: WindowId) -> Option<FindState> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| entry.find.take())
+        self.entry_mut(id).and_then(|entry| entry.find.take())
     }
 
     /// Window `id`'s currently-open context menu (Issue #39), if any. `None`
     /// for a closed menu *or* an unknown window id, same convention as
     /// [`Self::find`].
     pub fn context_menu(&self, id: WindowId) -> Option<&OpenContextMenu> {
-        self.entries
-            .iter()
-            .find(|entry| entry.id == id)
-            .and_then(|entry| entry.context_menu.as_ref())
+        self.entry(id).and_then(|entry| entry.context_menu.as_ref())
     }
 
     /// Open (or replace) window `id`'s context menu — a fresh right-click
@@ -277,7 +266,7 @@ impl Windows {
     /// can sensibly be on screen at a time). A no-op for an unknown window
     /// id.
     pub fn set_context_menu(&mut self, id: WindowId, menu: OpenContextMenu) {
-        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.id == id) {
+        if let Some(entry) = self.entry_mut(id) {
             entry.context_menu = Some(menu);
         }
     }
@@ -287,15 +276,13 @@ impl Windows {
     /// item is actually clicked (resolve the action, then discard the
     /// menu) and when it is dismissed with no selection (discard only).
     pub fn take_context_menu(&mut self, id: WindowId) -> Option<OpenContextMenu> {
-        self.entries
-            .iter_mut()
-            .find(|entry| entry.id == id)
+        self.entry_mut(id)
             .and_then(|entry| entry.context_menu.take())
     }
 
     /// Whether `id` refers to a currently open window.
     pub fn contains(&self, id: WindowId) -> bool {
-        self.entries.iter().any(|entry| entry.id == id)
+        self.entry(id).is_some()
     }
 
     /// Every currently open window's id, in the order the windows were
@@ -319,13 +306,42 @@ impl Windows {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::context_menu::{build_menu, MenuContext};
+    use crate::browser::tab::TabId;
     use crate::browser::tabs::ActivationEffect;
+
+    /// 最初に開かれたウィンドウの id。
+    fn first_window(windows: &Windows) -> WindowId {
+        windows.ids().next().unwrap()
+    }
+
+    /// `a.example` と `b.example` のウィンドウを 1 つずつ (この順に) 開いた状態。
+    fn two_windows() -> (Windows, WindowId, WindowId) {
+        let mut windows = Windows::new("https://a.example/");
+        let first = first_window(&windows);
+        let second = windows.open_window("https://b.example/");
+        (windows, first, second)
+    }
+
+    /// タブ `tab` で開いた、項目が既定の右クリックメニュー。
+    fn empty_menu(tab: TabId) -> OpenContextMenu {
+        OpenContextMenu::new(tab, build_menu(&MenuContext::default()))
+    }
+
+    fn saved_tab(url: &str) -> SavedTab {
+        SavedTab {
+            url: url.to_owned(),
+            title: None,
+            favicon: None,
+            pinned: false,
+        }
+    }
 
     #[test]
     fn new_starts_with_exactly_one_window_and_one_tab() {
         let windows = Windows::new("https://example.com/");
         assert_eq!(windows.len(), 1);
-        let id = windows.ids().next().unwrap();
+        let id = first_window(&windows);
         assert_eq!(windows.tabs(id).unwrap().len(), 1);
         assert_eq!(
             windows.tabs(id).unwrap().active().current_url(),
@@ -335,9 +351,7 @@ mod tests {
 
     #[test]
     fn open_window_returns_unique_ids_never_reused() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let third = windows.open_window("https://c.example/");
         assert_ne!(first, second);
         assert_ne!(second, third);
@@ -359,9 +373,7 @@ mod tests {
         // windows' `Tabs` both start their own tab ids at 0, so the very
         // same `TabId` value legitimately refers to two different tabs in
         // two different windows.
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
 
         let first_tab_id = windows.tabs(first).unwrap().active_id();
         let second_tab_id = windows.tabs(second).unwrap().active_id();
@@ -386,9 +398,7 @@ mod tests {
 
     #[test]
     fn close_window_removes_only_that_windows_tabs() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let third = windows.open_window("https://c.example/");
 
         assert!(windows.close_window(second));
@@ -428,7 +438,7 @@ mod tests {
         // `Windows` has no "always keep one" rule — the caller decides what
         // an empty `Windows` means (ending the process).
         let mut windows = Windows::new("https://example.com/");
-        let only = windows.ids().next().unwrap();
+        let only = first_window(&windows);
         assert!(windows.close_window(only));
         assert!(windows.is_empty());
         assert_eq!(windows.len(), 0);
@@ -436,9 +446,7 @@ mod tests {
 
     #[test]
     fn ids_lists_every_open_window_oldest_first() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let third = windows.open_window("https://c.example/");
         assert_eq!(
             windows.ids().collect::<Vec<_>>(),
@@ -450,18 +458,8 @@ mod tests {
     fn open_restored_window_rebuilds_tabs_from_a_snapshot() {
         let mut windows = Windows::new("https://home.example/");
         let saved = vec![
-            SavedTab {
-                url: "https://a.example/".to_owned(),
-                title: None,
-                favicon: None,
-                pinned: false,
-            },
-            SavedTab {
-                url: "https://b.example/".to_owned(),
-                title: None,
-                favicon: None,
-                pinned: false,
-            },
+            saved_tab("https://a.example/"),
+            saved_tab("https://b.example/"),
         ];
         let restored = windows.open_restored_window(&saved, 1);
         assert_eq!(windows.len(), 2);
@@ -472,9 +470,7 @@ mod tests {
 
     #[test]
     fn mutating_one_windows_tabs_never_leaks_into_another() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
 
         // Activity in `second` (open, close, activate, suspend) must never
         // change what `first` reports.
@@ -502,7 +498,7 @@ mod tests {
     #[test]
     fn a_new_window_has_no_find_session() {
         let windows = Windows::new("https://example.com/");
-        let id = windows.ids().next().unwrap();
+        let id = first_window(&windows);
         assert!(windows.find(id).is_none());
     }
 
@@ -513,9 +509,7 @@ mod tests {
         // `TabId` (see `each_window_has_its_own_independent_tab_id_space`)
         // each get their own find session, keyed by `WindowId`, not by the
         // `TabId` alone.
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let first_tab = windows.tabs(first).unwrap().active_id();
         let second_tab = windows.tabs(second).unwrap().active_id();
         assert_eq!(
@@ -547,9 +541,7 @@ mod tests {
 
     #[test]
     fn taking_one_windows_find_session_never_closes_anothers() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let first_tab = windows.tabs(first).unwrap().active_id();
         let second_tab = windows.tabs(second).unwrap().active_id();
 
@@ -570,9 +562,7 @@ mod tests {
 
     #[test]
     fn find_mut_edits_only_the_targeted_windows_session() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let first_tab = windows.tabs(first).unwrap().active_id();
         let second_tab = windows.tabs(second).unwrap().active_id();
 
@@ -591,8 +581,8 @@ mod tests {
     #[test]
     fn set_find_take_find_and_find_mut_are_noops_for_an_unknown_window() {
         let mut windows = Windows::new("https://example.com/");
-        let existing_tab = windows.ids().next().unwrap();
-        let tab_id = windows.tabs(existing_tab).unwrap().active_id();
+        let existing = first_window(&windows);
+        let tab_id = windows.tabs(existing).unwrap().active_id();
         let unknown = WindowId::from(9999);
         windows.set_find(unknown, FindState::new(tab_id));
         assert!(windows.find(unknown).is_none());
@@ -603,7 +593,7 @@ mod tests {
     #[test]
     fn closing_a_window_drops_its_find_session_without_a_panic() {
         let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
+        let first = first_window(&windows);
         let tab = windows.tabs(first).unwrap().active_id();
         windows.set_find(first, FindState::new(tab));
         assert!(windows.close_window(first));
@@ -618,15 +608,13 @@ mod tests {
     #[test]
     fn a_new_window_has_no_context_menu() {
         let windows = Windows::new("https://example.com/");
-        let id = windows.ids().next().unwrap();
+        let id = first_window(&windows);
         assert!(windows.context_menu(id).is_none());
     }
 
     #[test]
     fn context_menus_are_independent_per_window() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let first_tab = windows.tabs(first).unwrap().active_id();
         let second_tab = windows.tabs(second).unwrap().active_id();
         assert_eq!(
@@ -634,15 +622,7 @@ mod tests {
             "test assumes both windows share a TabId value"
         );
 
-        windows.set_context_menu(
-            first,
-            crate::browser::context_menu::OpenContextMenu::new(
-                first_tab,
-                crate::browser::context_menu::build_menu(
-                    &crate::browser::context_menu::MenuContext::default(),
-                ),
-            ),
-        );
+        windows.set_context_menu(first, empty_menu(first_tab));
 
         assert!(windows.context_menu(first).is_some());
         assert!(
@@ -653,30 +633,11 @@ mod tests {
 
     #[test]
     fn taking_one_windows_context_menu_never_closes_anothers() {
-        let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
-        let second = windows.open_window("https://b.example/");
+        let (mut windows, first, second) = two_windows();
         let first_tab = windows.tabs(first).unwrap().active_id();
         let second_tab = windows.tabs(second).unwrap().active_id();
-
-        let empty_menu = || {
-            crate::browser::context_menu::OpenContextMenu::new(
-                first_tab,
-                crate::browser::context_menu::build_menu(
-                    &crate::browser::context_menu::MenuContext::default(),
-                ),
-            )
-        };
-        windows.set_context_menu(first, empty_menu());
-        windows.set_context_menu(
-            second,
-            crate::browser::context_menu::OpenContextMenu::new(
-                second_tab,
-                crate::browser::context_menu::build_menu(
-                    &crate::browser::context_menu::MenuContext::default(),
-                ),
-            ),
-        );
+        windows.set_context_menu(first, empty_menu(first_tab));
+        windows.set_context_menu(second, empty_menu(second_tab));
 
         let taken = windows.take_context_menu(first);
         assert!(taken.is_some());
@@ -690,18 +651,10 @@ mod tests {
     #[test]
     fn context_menu_helpers_are_noops_for_an_unknown_window() {
         let mut windows = Windows::new("https://example.com/");
-        let existing = windows.ids().next().unwrap();
+        let existing = first_window(&windows);
         let tab_id = windows.tabs(existing).unwrap().active_id();
         let unknown = WindowId::from(9999);
-        windows.set_context_menu(
-            unknown,
-            crate::browser::context_menu::OpenContextMenu::new(
-                tab_id,
-                crate::browser::context_menu::build_menu(
-                    &crate::browser::context_menu::MenuContext::default(),
-                ),
-            ),
-        );
+        windows.set_context_menu(unknown, empty_menu(tab_id));
         assert!(windows.context_menu(unknown).is_none());
         assert!(windows.take_context_menu(unknown).is_none());
     }
@@ -709,17 +662,9 @@ mod tests {
     #[test]
     fn closing_a_window_drops_its_context_menu_without_a_panic() {
         let mut windows = Windows::new("https://a.example/");
-        let first = windows.ids().next().unwrap();
+        let first = first_window(&windows);
         let tab = windows.tabs(first).unwrap().active_id();
-        windows.set_context_menu(
-            first,
-            crate::browser::context_menu::OpenContextMenu::new(
-                tab,
-                crate::browser::context_menu::build_menu(
-                    &crate::browser::context_menu::MenuContext::default(),
-                ),
-            ),
-        );
+        windows.set_context_menu(first, empty_menu(tab));
         assert!(windows.close_window(first));
         assert!(windows.context_menu(first).is_none());
     }
@@ -729,14 +674,14 @@ mod tests {
     #[test]
     fn a_window_opened_by_new_is_not_private() {
         let windows = Windows::new("https://example.com/");
-        let id = windows.ids().next().unwrap();
+        let id = first_window(&windows);
         assert_eq!(windows.is_private(id), Some(false));
     }
 
     #[test]
     fn new_with_privacy_marks_the_first_window_private() {
         let windows = Windows::new_with_privacy("https://example.com/", true);
-        let id = windows.ids().next().unwrap();
+        let id = first_window(&windows);
         assert_eq!(windows.is_private(id), Some(true));
     }
 
@@ -763,12 +708,7 @@ mod tests {
     #[test]
     fn open_restored_window_is_never_private() {
         let mut windows = Windows::new("https://home.example/");
-        let saved = vec![SavedTab {
-            url: "https://a.example/".to_owned(),
-            title: None,
-            favicon: None,
-            pinned: false,
-        }];
+        let saved = vec![saved_tab("https://a.example/")];
         let restored = windows.open_restored_window(&saved, 0);
         assert_eq!(windows.is_private(restored), Some(false));
     }
@@ -782,7 +722,7 @@ mod tests {
         // would confuse the two. `Windows` keys it off `WindowId` instead,
         // so this must never happen.
         let mut windows = Windows::new("https://normal.example/");
-        let normal = windows.ids().next().unwrap();
+        let normal = first_window(&windows);
         let private = windows.open_window_with_privacy("https://private.example/", true);
 
         let normal_tab = windows.tabs(normal).unwrap().active_id();

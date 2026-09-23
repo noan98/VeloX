@@ -112,14 +112,8 @@ pub fn build_candidates(
 ) -> Vec<Candidate> {
     let mut candidates = Vec::new();
 
-    let build_search_candidate = |query: &str| -> Option<Candidate> {
-        navigation::build_search_url(search_query_template, query).map(|target_url| Candidate {
-            kind: CandidateKind::Search,
-            target_url,
-            label: query.to_owned(),
-            detail: Some(format!("{search_engine_name} で検索")),
-        })
-    };
+    let build_search_candidate =
+        |query: &str| search_candidate(search_engine_name, search_query_template, query);
 
     match navigation::classify_input(input) {
         Some(Intent::Url(url)) => {
@@ -129,16 +123,9 @@ pub fn build_candidates(
                 label: url,
                 detail: None,
             });
-            let raw = input.trim();
-            if let Some(candidate) = build_search_candidate(raw) {
-                candidates.push(candidate);
-            }
+            candidates.extend(build_search_candidate(input.trim()));
         }
-        Some(Intent::Search(query)) => {
-            if let Some(candidate) = build_search_candidate(&query) {
-                candidates.push(candidate);
-            }
-        }
+        Some(Intent::Search(query)) => candidates.extend(build_search_candidate(&query)),
         None => {}
     }
 
@@ -152,6 +139,23 @@ pub fn build_candidates(
 
     candidates.truncate(limit);
     candidates
+}
+
+/// `query` を検索エンジンに投げる [`CandidateKind::Search`] 候補。
+/// `search_query_template` から検索 URL を組み立てられなければ `None`。
+/// 組み込みの検索候補と入力履歴由来の候補
+/// (`omnibox_candidates::InputHistorySource`) で見た目を揃えるための共通処理。
+pub(crate) fn search_candidate(
+    search_engine_name: &str,
+    search_query_template: &str,
+    query: &str,
+) -> Option<Candidate> {
+    navigation::build_search_url(search_query_template, query).map(|target_url| Candidate {
+        kind: CandidateKind::Search,
+        target_url,
+        label: query.to_owned(),
+        detail: Some(format!("{search_engine_name} で検索")),
+    })
 }
 
 #[cfg(test)]
