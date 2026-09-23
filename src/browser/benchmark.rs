@@ -706,13 +706,11 @@ impl MetricKey {
                     .filter(|&(_, event)| is_event(event, "tab_suspend"))
                     .filter_map(|(index, event)| {
                         let suspend_ts = event.get("ts_ms").and_then(Value::as_f64)?;
-                        let resume_ts = phase[..index].iter().rev().find_map(|prior| {
-                            if is_event(prior, "tab_resume") {
-                                prior.get("ts_ms").and_then(Value::as_f64)
-                            } else {
-                                None
-                            }
-                        })?;
+                        let resume_ts = phase[..index]
+                            .iter()
+                            .rev()
+                            .filter(|prior| is_event(prior, "tab_resume"))
+                            .find_map(|prior| prior.get("ts_ms").and_then(Value::as_f64))?;
                         Some(suspend_ts - resume_ts)
                     })
                     .collect()
