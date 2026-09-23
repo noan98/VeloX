@@ -130,11 +130,9 @@ impl HistoryStore {
             visit_count: 1,
         });
 
-        if max_entries > 0 {
-            let overflow = self.entries.len().saturating_sub(max_entries);
-            if overflow > 0 {
-                self.entries.drain(0..overflow);
-            }
+        if max_entries > 0 && self.entries.len() > max_entries {
+            let overflow = self.entries.len() - max_entries;
+            self.entries.drain(..overflow);
         }
 
         id
@@ -143,13 +141,11 @@ impl HistoryStore {
     /// Update the title of the entry with the given `id`, if it still
     /// exists. Returns `true` when an entry was updated.
     pub fn update_title(&mut self, id: u64, title: String) -> bool {
-        match self.entries.iter_mut().find(|entry| entry.id == id) {
-            Some(entry) => {
-                entry.title = Some(title);
-                true
-            }
-            None => false,
-        }
+        let Some(entry) = self.entry_mut(id) else {
+            return false;
+        };
+        entry.title = Some(title);
+        true
     }
 
     /// Update the favicon URL of the entry with the given `id`, if it still
@@ -157,13 +153,16 @@ impl HistoryStore {
     /// [`Self::update_title`] — `app::UserEvent::FaviconResolved` calls this
     /// the same way `PageTitleResolved` calls `update_title`.
     pub fn update_favicon(&mut self, id: u64, url: String) -> bool {
-        match self.entries.iter_mut().find(|entry| entry.id == id) {
-            Some(entry) => {
-                entry.favicon = Some(url);
-                true
-            }
-            None => false,
-        }
+        let Some(entry) = self.entry_mut(id) else {
+            return false;
+        };
+        entry.favicon = Some(url);
+        true
+    }
+
+    /// `id` のエントリへの可変参照 (もう存在しなければ `None`)。
+    fn entry_mut(&mut self, id: u64) -> Option<&mut HistoryEntry> {
+        self.entries.iter_mut().find(|entry| entry.id == id)
     }
 
     /// Entries whose URL or title contains `query` (case-insensitive),
