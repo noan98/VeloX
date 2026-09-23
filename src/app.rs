@@ -664,8 +664,10 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // docs/decisions.md D67 for the bug this fixed during development
     // (VELOX_* env vars going silently inert the moment this feature
     // landed, caught by this project's own integration test suite).
-    let settings_dir = persistence::default_data_dir();
-    let settings = match settings_dir.as_deref().and_then(persistence::load_settings) {
+    // 環境変数を読むだけの純粋な解決なので一度だけ行い、`settings.json`・
+    // サイト権限・セッション復元・履歴類のすべてで共有する。
+    let data_dir = persistence::default_data_dir();
+    let settings = match data_dir.as_deref().and_then(persistence::load_settings) {
         Some(loaded) => {
             let sanitized = loaded.sanitize();
             config.apply_settings(&sanitized);
@@ -698,18 +700,26 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     let blocklist = Arc::new(build_blocklist(&config));
     let site_exceptions = Arc::new(build_site_exceptions(&config));
 
-    // Resolved here (rather than down with `history`/`bookmarks`/
+    // Loaded here (rather than down with `history`/`bookmarks`/
     // `input_history` below) because `site_permissions` — unlike those
     // three — must exist before `BrowserWindow::new` builds the first
     // tab's content webview: its `with_permission_handler` wiring
     // (docs/decisions.md D60) needs the store from the very first
     // permission request, not just from whenever `AppState` gets around to
-    // loading it.
-    let data_dir = persistence::default_data_dir();
+    // loading it. Session restore (Issue #25, see docs/decisions.md D65)
+    // likewise needs `data_dir` before `Tabs`/`BrowserWindow` are built,
+    // since it decides what the *first* `Tabs` looks like.
+    //
+    // 以前は用途ごとに別々に解決して 1 行ずつ警告していたため、ログの
+    // 互換性を保つよう 2 行とも出す。
     if data_dir.is_none() {
         eprintln!(
             "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
              history, bookmarks, and site permissions will not be saved this session"
+        );
+        eprintln!(
+            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
+             history, bookmarks, and session restore will not be saved this session"
         );
     }
     let site_permissions = Arc::new(
@@ -722,18 +732,6 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // see docs/decisions.md D67): a read-only view, cloned before the
     // original moves into `SitePolicies` below.
     let site_permissions_for_state = Arc::clone(&site_permissions);
-
-    // Resolved before `Tabs`/`BrowserWindow` are built (unlike the
-    // history/bookmarks/input-history loads below, which only need it once
-    // `AppState` exists) because session restore (Issue #25, see
-    // docs/decisions.md D65) decides what the *first* `Tabs` looks like.
-    let data_dir = persistence::default_data_dir();
-    if data_dir.is_none() {
-        eprintln!(
-            "velox: could not resolve a data directory (no VELOX_DATA_DIR/HOME/APPDATA); \
-             history, bookmarks, and session restore will not be saved this session"
-        );
-    }
 
     // Issue #25 (D65): restore the previous session's tabs when the setting
     // is on and a usable snapshot exists; otherwise (setting off, no data
@@ -1097,11 +1095,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                 None
             };
             for window_id in window_ids {
-                let memory = if Some(window_id) == served_window {
-                    memory_sample
-                } else {
-                    None
-                };
+                let memory = memory_sample.filter(|_| Some(window_id) == served_window);
                 if let Some(wake) = sweep_tabs(
                     &mut ui_windows,
                     &mut state,
@@ -1110,10 +1104,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
                     memory,
                     Instant::now(),
                 ) {
-                    next_wake = Some(match next_wake {
-                        Some(existing) => existing.min(wake),
-                        None => wake,
-                    });
+                    next_wake = earliest(next_wake, wake);
                 }
             }
             // Issue #169: give `wait_load`'s deadline (if one is pending) a
@@ -1125,16 +1116,18 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
             if let Some(wake) =
                 poll_automation_wait_timeout(&mut automation_wait, &state, Instant::now())
             {
-                next_wake = Some(match next_wake {
-                    Some(existing) => existing.min(wake),
-                    None => wake,
-                });
+                next_wake = earliest(next_wake, wake);
             }
             if let Some(next_wake) = next_wake {
                 *control_flow = ControlFlow::WaitUntil(next_wake);
             }
         }
     });
+}
+
+/// `current` (まだ無ければ `None`) と `candidate` のうち早い方の起床時刻。
+fn earliest(current: Option<Instant>, candidate: Instant) -> Option<Instant> {
+    Some(current.map_or(candidate, |existing| existing.min(candidate)))
 }
 
 /// Find the `BrowserWindow` whose native window is `tao_id`, if any is still
@@ -1172,11 +1165,7 @@ fn close_window_by_tao_id(
     tao_id: tao::window::WindowId,
     control_flow: &mut ControlFlow,
 ) {
-    let Some(id) = ui_windows
-        .iter()
-        .find(|(_, window)| window.tao_id() == tao_id)
-        .map(|(id, _)| *id)
-    else {
+    let Some(id) = window_by_tao_id_mut(ui_windows, tao_id).map(|window| window.id()) else {
         return;
     };
     ui_windows.remove(&id);
@@ -1822,7 +1811,12 @@ fn handle_user_event(
         UserEvent::ToolbarMessage(window_id, body) => match toolbar::parse_command(&body) {
             // See this function's doc comment: intercepted before resolving
             // `window_id` to a `&mut BrowserWindow`.
-            Ok(ToolbarCommand::NewWindow) => {
+            //
+            // Issue #27/D74: `NewPrivateWindow` passes `true` instead of
+            // `config.private` — a private window is opened regardless of
+            // whether the process itself was launched private.
+            Ok(command @ (ToolbarCommand::NewWindow | ToolbarCommand::NewPrivateWindow)) => {
+                let private = config.private || matches!(command, ToolbarCommand::NewPrivateWindow);
                 open_new_window(
                     target,
                     window_event_proxy,
@@ -1830,22 +1824,7 @@ fn handle_user_event(
                     state,
                     config,
                     homepage,
-                    config.private,
-                );
-            }
-            // Issue #27/D74: same interception as `NewWindow` above, `true`
-            // instead of `config.private` — a private window is opened
-            // regardless of whether the process itself was launched
-            // private.
-            Ok(ToolbarCommand::NewPrivateWindow) => {
-                open_new_window(
-                    target,
-                    window_event_proxy,
-                    ui_windows,
-                    state,
-                    config,
-                    homepage,
-                    true,
+                    private,
                 );
             }
             // See this function's doc comment, and `apply_updated_settings`'s:
@@ -1882,16 +1861,12 @@ fn handle_user_event(
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            let is_active = state
-                .windows
-                .tabs_mut(window_id)
-                .map(|tabs| {
-                    if let Some(tab) = tabs.get_mut(id) {
-                        tab.on_navigation_started(&url);
-                    }
-                    tabs.active_id() == id
-                })
-                .unwrap_or(false);
+            let is_active = state.windows.tabs_mut(window_id).is_some_and(|tabs| {
+                if let Some(tab) = tabs.get_mut(id) {
+                    tab.on_navigation_started(&url);
+                }
+                tabs.active_id() == id
+            });
             // Issue #43/D69, integrated with multi-window in D68: the page
             // under an open find session is about to change, so its
             // matches/highlights are about to become stale — close it
@@ -1915,11 +1890,7 @@ fn handle_user_event(
             // the new page will eventually replace it anyway, but a slow
             // load could otherwise leave the stale menu visible in the
             // meantime.
-            if state
-                .windows
-                .context_menu(window_id)
-                .is_some_and(|menu| menu.tab_id() == id)
-            {
+            if context_menu_is_for(state, window_id, id) {
                 state.windows.take_context_menu(window_id);
                 log_failure("hide context menu", window.hide_context_menu(id));
             }
@@ -1932,22 +1903,9 @@ fn handle_user_event(
         }
         UserEvent::NavigationBlocked(window_id, id, url) => {
             eprintln!("velox: blocked navigation to {url} in tab {id:?} (window {window_id:?})");
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
-            let Some(tabs) = state.windows.tabs_mut(window_id) else {
-                return;
-            };
-            if let Some(tab) = tabs.get_mut(id) {
-                tab.on_navigation_blocked(&url);
-            }
-            // Only the active tab's badge is visible right now; a blocked
-            // navigation in a background tab still updates its own
-            // `Tab::blocked_count` above and is picked up the moment that
-            // tab becomes active (see `activate_and_refresh`).
-            if id == tabs.active_id() {
-                sync_block_count(window, tabs);
-            }
+            record_blocked_request(ui_windows, state, window_id, id, |tab| {
+                tab.on_navigation_blocked(&url)
+            });
         }
         UserEvent::SubresourceBlocked(window_id, id, url) => {
             // Deliberately no `eprintln!` here unlike `NavigationBlocked`
@@ -1955,19 +1913,9 @@ fn handle_user_event(
             // second (every blocked ad/tracker image, script, XHR...), and
             // spamming stderr at that rate would drown out every other
             // `log_failure` line this file relies on for diagnostics.
-            let Some(window) = ui_windows.get_mut(&window_id) else {
-                return;
-            };
-            let Some(tabs) = state.windows.tabs_mut(window_id) else {
-                return;
-            };
-            if let Some(tab) = tabs.get_mut(id) {
-                tab.on_subresource_blocked(&url);
-            }
-            // Same badge-visibility reasoning as `NavigationBlocked` above.
-            if id == tabs.active_id() {
-                sync_block_count(window, tabs);
-            }
+            record_blocked_request(ui_windows, state, window_id, id, |tab| {
+                tab.on_subresource_blocked(&url)
+            });
         }
         UserEvent::LoadFinished(window_id, id, url) => {
             // Issue #169: resolve a pending `wait_load` before anything
@@ -1979,22 +1927,18 @@ fn handle_user_event(
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            let is_active = state
-                .windows
-                .tabs_mut(window_id)
-                .map(|tabs| {
-                    // A failed load reports an empty URL; keep showing the
-                    // URL the tab tried to reach instead of blanking it out.
-                    if let Some(tab) = tabs.get_mut(id) {
-                        if url.is_empty() {
-                            tab.on_load_failed();
-                        } else {
-                            tab.on_load_finished(&url);
-                        }
+            let is_active = state.windows.tabs_mut(window_id).is_some_and(|tabs| {
+                // A failed load reports an empty URL; keep showing the URL
+                // the tab tried to reach instead of blanking it out.
+                if let Some(tab) = tabs.get_mut(id) {
+                    if url.is_empty() {
+                        tab.on_load_failed();
+                    } else {
+                        tab.on_load_finished(&url);
                     }
-                    tabs.active_id() == id
-                })
-                .unwrap_or(false);
+                }
+                tabs.active_id() == id
+            });
             if !url.is_empty() {
                 // Recorded for whichever tab just finished loading, not only
                 // the active one: a background tab finishing a load is a
@@ -2025,13 +1969,11 @@ fn handle_user_event(
                 // `history_id` when there is none: `HistoryStore` ids start
                 // at 1, so `HistoryStore::update_title` simply finds nothing
                 // to update rather than touching an unrelated entry.
-                log_failure(
-                    "fetch page title",
-                    window.fetch_page_title(id, history_id.unwrap_or(0)),
-                );
+                let history_id = history_id.unwrap_or(0);
+                log_failure("fetch page title", window.fetch_page_title(id, history_id));
                 log_failure(
                     "fetch favicon",
-                    window.fetch_favicon(id, history_id.unwrap_or(0), url.clone()),
+                    window.fetch_favicon(id, history_id, url.clone()),
                 );
             }
             if is_active {
@@ -2112,8 +2054,14 @@ fn handle_user_event(
                 window.open_devtools();
             }
         }
-        UserEvent::ContentShortcut(window_id, ContentShortcut::NewWindow) => {
-            // See this function's doc comment.
+        // See this function's doc comment. The source window is unused:
+        // opening a window needs no source tab. Issue #27/D74:
+        // `NewPrivateWindow` passes `true` instead of `config.private`.
+        UserEvent::ContentShortcut(
+            _,
+            shortcut @ (ContentShortcut::NewWindow | ContentShortcut::NewPrivateWindow),
+        ) => {
+            let private = config.private || matches!(shortcut, ContentShortcut::NewPrivateWindow);
             open_new_window(
                 target,
                 window_event_proxy,
@@ -2121,23 +2069,8 @@ fn handle_user_event(
                 state,
                 config,
                 homepage,
-                config.private,
+                private,
             );
-            let _ = window_id; // Unused: opening a window needs no source tab.
-        }
-        // Issue #27/D74: same interception as `NewWindow` above, `true`
-        // instead of `config.private`.
-        UserEvent::ContentShortcut(window_id, ContentShortcut::NewPrivateWindow) => {
-            open_new_window(
-                target,
-                window_event_proxy,
-                ui_windows,
-                state,
-                config,
-                homepage,
-                true,
-            );
-            let _ = window_id; // Unused: opening a window needs no source tab.
         }
         UserEvent::ContentShortcut(window_id, shortcut) => {
             if let Some(window) = ui_windows.get_mut(&window_id) {
@@ -2157,7 +2090,16 @@ fn handle_user_event(
                 open_new_tab(window, window_id, state, &url);
             }
         }
+        // Issue #46: a page save registers exactly like a real download,
+        // so both show up in the same Downloads panel.
         UserEvent::DownloadStarted {
+            window_id,
+            url,
+            file_name,
+            destination,
+            started_at,
+        }
+        | UserEvent::SavePageStarted {
             window_id,
             url,
             file_name,
@@ -2254,20 +2196,6 @@ reported_success={success} recorded_as_success={succeeded}"
                 refresh_downloads_panel(window, state);
             }
         }
-        UserEvent::SavePageStarted {
-            window_id,
-            url,
-            file_name,
-            destination,
-            started_at,
-        } => {
-            state
-                .downloads
-                .start(url, file_name, destination, started_at);
-            if let Some(window) = ui_windows.get(&window_id) {
-                refresh_downloads_panel(window, state);
-            }
-        }
         UserEvent::SavePageFinished {
             window_id,
             url,
@@ -2295,7 +2223,13 @@ reported_success={success} recorded_as_success={succeeded}"
                 refresh_downloads_panel(window, state);
             }
         }
-        UserEvent::Automation(AutomationCommand::NewWindow) => {
+        // Issue #27/D74: `NewPrivateWindow` passes `true` instead of
+        // `config.private` — lets an automation script (and this crate's
+        // integration tests) drive the private-window path.
+        UserEvent::Automation(
+            command @ (AutomationCommand::NewWindow | AutomationCommand::NewPrivateWindow),
+        ) => {
+            let private = config.private || matches!(command, AutomationCommand::NewPrivateWindow);
             if let Some(new_id) = open_new_window(
                 target,
                 window_event_proxy,
@@ -2303,23 +2237,7 @@ reported_success={success} recorded_as_success={succeeded}"
                 state,
                 config,
                 homepage,
-                config.private,
-            ) {
-                *automation_window = new_id;
-            }
-        }
-        // Issue #27/D74: same interception as `NewWindow` above, `true`
-        // instead of `config.private` — lets an automation script (and this
-        // crate's integration tests) drive the private-window path.
-        UserEvent::Automation(AutomationCommand::NewPrivateWindow) => {
-            if let Some(new_id) = open_new_window(
-                target,
-                window_event_proxy,
-                ui_windows,
-                state,
-                config,
-                homepage,
-                true,
+                private,
             ) {
                 *automation_window = new_id;
             }
@@ -2405,7 +2323,7 @@ reported_success={success} recorded_as_success={succeeded}"
                     None => "PDFの書き出しに失敗しました".to_owned(),
                 }
             };
-            log_failure("show print status", window.set_print_status(Some(&message)));
+            show_print_status(window, &message);
         }
         UserEvent::TabFreezeFinished {
             window_id,
@@ -2535,19 +2453,16 @@ reported_success={success} recorded_as_success={succeeded}"
             // window) must never touch the new one. Checked before
             // `take_context_menu` so a mismatch never discards a menu that
             // is not actually the one this click belongs to.
-            let matches = state
-                .windows
-                .context_menu(window_id)
-                .is_some_and(|menu| menu.tab_id() == tab_id);
-            if !matches {
+            if !context_menu_is_for(state, window_id, tab_id) {
                 return;
             }
-            let Some(menu) = state.windows.take_context_menu(window_id) else {
-                return;
-            };
             // `resolve` also re-checks `enabled` — a hostile page dispatching
             // a fake click on a greyed-out row cannot run it anyway.
-            let Some(action) = menu.resolve(index) else {
+            let Some(action) = state
+                .windows
+                .take_context_menu(window_id)
+                .and_then(|menu| menu.resolve(index))
+            else {
                 return;
             };
             match action {
@@ -2604,15 +2519,50 @@ reported_success={success} recorded_as_success={succeeded}"
             }
         }
         UserEvent::ContextMenuClosed(window_id, tab_id) => {
-            let matches = state
-                .windows
-                .context_menu(window_id)
-                .is_some_and(|menu| menu.tab_id() == tab_id);
-            if matches {
+            if context_menu_is_for(state, window_id, tab_id) {
                 state.windows.take_context_menu(window_id);
             }
         }
     }
+}
+
+/// ブロックしたリクエストを `window_id` のタブ `id` に記録する
+/// (`NavigationBlocked`/`SubresourceBlocked` 共通)。`record` がタブ側の
+/// カウンタを更新し、そのタブがアクティブならバッジも更新する。閉じた
+/// ウィンドウ宛ての遅れて届いたイベントは何もしない。
+fn record_blocked_request(
+    ui_windows: &HashMap<WindowId, BrowserWindow>,
+    state: &mut AppState,
+    window_id: WindowId,
+    id: TabId,
+    record: impl FnOnce(&mut Tab),
+) {
+    let Some(window) = ui_windows.get(&window_id) else {
+        return;
+    };
+    let Some(tabs) = state.windows.tabs_mut(window_id) else {
+        return;
+    };
+    if let Some(tab) = tabs.get_mut(id) {
+        record(tab);
+    }
+    // Only the active tab's badge is visible right now; a blocked request in
+    // a background tab still updates its own `Tab::blocked_count` above and
+    // is picked up the moment that tab becomes active (see
+    // `activate_and_refresh`).
+    if id == tabs.active_id() {
+        sync_block_count(window, tabs);
+    }
+}
+
+/// `window_id` で開いているコンテキストメニューが、タブ `tab_id` に対して
+/// 開かれたものか (Issue #39/D78)。別タブ向けのメニューや、既に閉じた
+/// メニューに対する遅れたイベントを弾くための共通チェック。
+fn context_menu_is_for(state: &AppState, window_id: WindowId, tab_id: TabId) -> bool {
+    state
+        .windows
+        .context_menu(window_id)
+        .is_some_and(|menu| menu.tab_id() == tab_id)
 }
 
 /// Open a brand new window (Ctrl/Cmd+N) with a single tab at `url`. The one
@@ -2830,37 +2780,31 @@ fn handle_toolbar_command(
             close_tab(window, window_id, state, page_load_timers, TabId::from(id))
         }
         ToolbarCommand::ActivateTab { id } => {
-            let id = TabId::from(id);
-            let started = Instant::now();
-            if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
-                activate_and_refresh(window, window_id, state, id, effect);
-                record_tab_latency(state, switch_latency_kind(effect), id, started);
-            }
+            activate_tab(window, window_id, state, TabId::from(id))
         }
         ToolbarCommand::CloseActiveTab => {
-            let id = tabs_of(state, window_id).active_id();
-            close_tab(window, window_id, state, page_load_timers, id);
+            close_active_tab(window, window_id, state, page_load_timers)
         }
         ToolbarCommand::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ToolbarCommand::NextTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(1, now)
+            });
         }
         ToolbarCommand::PrevTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(-1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(-1, now)
+            });
         }
         ToolbarCommand::ActivateTabByIndex { index } => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_by_position(index as usize, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_by_position(index as usize, now)
+            });
         }
         ToolbarCommand::ActivateLastTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_last(started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_last(now)
+            });
         }
         ToolbarCommand::SuspendTab { id } => {
             if suspend_tab(window, window_id, state, TabId::from(id)) {
@@ -2915,8 +2859,7 @@ fn handle_toolbar_command(
                 window.set_theme(state.settings.appearance.theme),
             );
             sync_block_count(window, tabs_of(state, window_id));
-            let url = tabs_of(state, window_id).active().current_url().to_owned();
-            sync_bookmark_star(window, state, &url);
+            sync_active_bookmark_star(window, window_id, state);
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
             refresh_downloads_panel(window, state);
@@ -2975,8 +2918,7 @@ fn handle_toolbar_command(
             if state.bookmarks.remove(id) {
                 persist_bookmarks(state);
                 refresh_bookmarks_panel(window, state);
-                let url = tabs_of(state, window_id).active().current_url().to_owned();
-                sync_bookmark_star(window, state, &url);
+                sync_active_bookmark_star(window, window_id, state);
             }
         }
         ToolbarCommand::OpenDownload { id } => open_download(state, DownloadId::from(id)),
@@ -3091,8 +3033,7 @@ fn handle_toolbar_command(
             // edit form closes and shows the entry's actual (possibly
             // unchanged) state either way.
             refresh_bookmarks_panel(window, state);
-            let active_url = tabs_of(state, window_id).active().current_url().to_owned();
-            sync_bookmark_star(window, state, &active_url);
+            sync_active_bookmark_star(window, window_id, state);
         }
         ToolbarCommand::CreateBookmarkFolder { name } => {
             let name = name.trim();
@@ -3319,6 +3260,11 @@ fn step_find(
 // `print_active_tab`. `ToolbarCommand::SaveAsPdf` (a toolbar button only —
 // no keyboard shortcut, see D75) calls `save_active_tab_as_pdf`.
 
+/// 印刷/PDF 書き出しの結果を、そのウィンドウの共有ステータス表示に出す。
+fn show_print_status(window: &BrowserWindow, message: &str) {
+    log_failure("show print status", window.set_print_status(Some(message)));
+}
+
 /// Print the active tab's page (Ctrl/Cmd+P, or the toolbar's print button)
 /// via the OS's native print UI — see
 /// `ui::window::BrowserWindow::print_tab`'s doc comment for exactly what
@@ -3329,10 +3275,7 @@ fn print_active_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut
     let tab_id = tabs_of(state, window_id).active_id();
     if let Err(err) = window.print_tab(tab_id) {
         eprintln!("velox: failed to print the active tab: {err}");
-        log_failure(
-            "show print status",
-            window.set_print_status(Some(&format!("印刷を開始できませんでした: {err}"))),
-        );
+        show_print_status(window, &format!("印刷を開始できませんでした: {err}"));
     }
 }
 
@@ -3357,18 +3300,15 @@ fn save_active_tab_as_pdf(
     state: &mut AppState,
     config: &Config,
 ) {
-    let tab_id = tabs_of(state, window_id).active_id();
     let tab = tabs_of(state, window_id).active();
+    let tab_id = tab.id();
     let url = tab.current_url().to_owned();
     let title = tab.title().map(str::to_owned);
 
     let Some(dir) =
         downloads::resolve_download_dir_with_override(config.download_dir_override.as_deref())
     else {
-        log_failure(
-            "show print status",
-            window.set_print_status(Some("PDF の保存先フォルダを特定できませんでした")),
-        );
+        show_print_status(window, "PDF の保存先フォルダを特定できませんでした");
         return;
     };
     let raw_name = print::suggest_pdf_filename(title.as_deref(), &url);
@@ -3376,10 +3316,9 @@ fn save_active_tab_as_pdf(
         Ok(path) => path,
         Err(err) => {
             eprintln!("velox: failed to prepare the PDF export destination: {err}");
-            log_failure(
-                "show print status",
-                window
-                    .set_print_status(Some(&format!("PDF の保存先を準備できませんでした: {err}"))),
+            show_print_status(
+                window,
+                &format!("PDF の保存先を準備できませんでした: {err}"),
             );
             return;
         }
@@ -3391,25 +3330,17 @@ fn save_active_tab_as_pdf(
             // The real result arrives later as `UserEvent::PdfExportFinished`.
         }
         PdfExportRequest::NoWebview => {
-            log_failure(
-                "show print status",
-                window.set_print_status(Some("このタブは休止中のため PDF に保存できません")),
-            );
+            show_print_status(window, "このタブは休止中のため PDF に保存できません");
         }
         PdfExportRequest::UnsupportedPlatform => {
-            log_failure(
-                "show print status",
-                window.set_print_status(Some(
-                    "この OS では PDF への直接保存に対応していません。印刷 (Ctrl/Cmd+P) \
+            show_print_status(
+                window,
+                "この OS では PDF への直接保存に対応していません。印刷 (Ctrl/Cmd+P) \
                      のダイアログから PDF に保存してください。",
-                )),
             );
         }
         PdfExportRequest::Failed { message } => {
-            log_failure(
-                "show print status",
-                window.set_print_status(Some(&format!("PDF の書き出しに失敗しました: {message}"))),
-            );
+            show_print_status(window, &format!("PDF の書き出しに失敗しました: {message}"));
         }
     }
 }
@@ -3638,6 +3569,45 @@ fn reopen_closed_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mu
     record_tab_latency(state, metrics::TabLatencyKind::Create, id, started);
 }
 
+/// Close `window_id`'s active tab (Ctrl/Cmd+W from either the toolbar —
+/// `ToolbarCommand::CloseActiveTab` — or a content webview —
+/// `ContentShortcut::CloseTab`) via [`close_tab`].
+fn close_active_tab(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    page_load_timers: &mut PageLoadTimers,
+) {
+    let id = tabs_of(state, window_id).active_id();
+    close_tab(window, window_id, state, page_load_timers, id);
+}
+
+/// Make tab `id` active (a tab-strip click, `ToolbarCommand::ActivateTab`,
+/// or the `switch <index>` automation command) and log the switch latency.
+/// A no-op for an unknown id (`Tabs::activate_at` returns `None`).
+fn activate_tab(window: &mut BrowserWindow, window_id: WindowId, state: &mut AppState, id: TabId) {
+    let started = Instant::now();
+    if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
+        activate_and_refresh(window, window_id, state, id, effect);
+        record_tab_latency(state, switch_latency_kind(effect), id, started);
+    }
+}
+
+/// `activate` (`Tabs` の相対/位置指定アクティベーションのいずれか) を
+/// 計測開始時刻つきで実行し、結果を [`apply_activation`] で反映する —
+/// ツールバーとコンテンツ側ショートカットの Next/Prev/位置指定/最後のタブ
+/// がすべて通る共通経路。
+fn activate_with(
+    window: &mut BrowserWindow,
+    window_id: WindowId,
+    state: &mut AppState,
+    activate: impl FnOnce(&mut Tabs, Instant) -> Option<ActivationEffect>,
+) {
+    let started = Instant::now();
+    let effect = activate(tabs_of(state, window_id), started);
+    apply_activation(window, window_id, state, effect, started);
+}
+
 /// Apply an activation `effect` already resolved by one of `Tabs`'
 /// relative/positional activation methods (`activate_relative`,
 /// `activate_by_position`, `activate_last`) against the tab that is now
@@ -3684,30 +3654,27 @@ fn handle_content_shortcut(
 ) {
     match shortcut {
         ContentShortcut::NewTab => open_new_tab(window, window_id, state, homepage),
-        ContentShortcut::CloseTab => {
-            let id = tabs_of(state, window_id).active_id();
-            close_tab(window, window_id, state, page_load_timers, id);
-        }
+        ContentShortcut::CloseTab => close_active_tab(window, window_id, state, page_load_timers),
         ContentShortcut::ReopenClosedTab => reopen_closed_tab(window, window_id, state),
         ContentShortcut::NextTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(1, now)
+            });
         }
         ContentShortcut::PrevTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_relative(-1, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_relative(-1, now)
+            });
         }
         ContentShortcut::ActivateTabAt(position) => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_by_position(position as usize, started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_by_position(position as usize, now)
+            });
         }
         ContentShortcut::ActivateLastTab => {
-            let started = Instant::now();
-            let effect = tabs_of(state, window_id).activate_last(started);
-            apply_activation(window, window_id, state, effect, started);
+            activate_with(window, window_id, state, |tabs, now| {
+                tabs.activate_last(now)
+            });
         }
         ContentShortcut::FocusAddressBar => focus_address_bar(window, window_id, state),
         ContentShortcut::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
@@ -3842,13 +3809,7 @@ fn handle_automation_command(
         AutomationCommand::Open { url } => open_new_tab(window, window_id, state, &url),
         AutomationCommand::Navigate { url } => navigate_active_tab(window, window_id, state, &url),
         AutomationCommand::Switch { index } => match tab_id_at(state, window_id, index) {
-            Some(id) => {
-                let started = Instant::now();
-                if let Some(effect) = tabs_of(state, window_id).activate_at(id, started) {
-                    activate_and_refresh(window, window_id, state, id, effect);
-                    record_tab_latency(state, switch_latency_kind(effect), id, started);
-                }
-            }
+            Some(id) => activate_tab(window, window_id, state, id),
             None => eprintln!("velox: automation: switch {index} は範囲外です"),
         },
         AutomationCommand::Close { index } => match tab_id_at(state, window_id, index) {
@@ -4173,6 +4134,12 @@ fn sync_bookmark_star(window: &BrowserWindow, state: &AppState, url: &str) {
         "update bookmark star",
         window.set_bookmark_active(state.bookmarks.is_bookmarked(url)),
     );
+}
+
+/// [`sync_bookmark_star`] for `window_id`'s active tab's current URL.
+fn sync_active_bookmark_star(window: &BrowserWindow, window_id: WindowId, state: &mut AppState) {
+    let url = tabs_of(state, window_id).active().current_url().to_owned();
+    sync_bookmark_star(window, state, &url);
 }
 
 /// [`refresh_history_panel`], but only when the history panel is actually
