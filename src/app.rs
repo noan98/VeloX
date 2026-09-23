@@ -498,6 +498,14 @@ impl PerfContext {
     fn to_ipc_log(&self) -> IpcLog {
         IpcLog::new(Arc::clone(&self.log), self.process_start)
     }
+
+    /// `record` を、`now` を `process_start` 起点の経過時間に直して書き出す。
+    /// `record_tab_latency`/`record_state_write`/`record_tab_suspend` が
+    /// 共通で使う。
+    fn write_at(&self, record: &metrics::PerfRecord, now: Instant) {
+        self.log
+            .write(record, now.saturating_duration_since(self.process_start));
+    }
 }
 
 /// In-flight page-load timers, one per open tab across every window
@@ -561,6 +569,30 @@ struct AutomationWaitState {
     /// only ever writes the report once per process (it clears `startup`
     /// right after), so once true it stays true for the rest of the run.
     startup_reported: bool,
+}
+
+impl AutomationWaitState {
+    /// 自動化スレッドの `recv()` を起こす。自動化スレッドが既に終わって
+    /// いる (受信側が drop 済み) 場合の送信失敗は無視してよい。
+    fn wake(&self) {
+        let _ = self.notify.send(());
+    }
+
+    /// 保留中の待機を片付けてから自動化スレッドを起こす — 「待機 1 つに
+    /// つき通知はちょうど 1 回」(上記 doc コメント) を守るため、必ず
+    /// `pending` を先に消す。
+    fn resolve(&mut self) {
+        self.pending = None;
+        self.wake();
+    }
+
+    /// `kind` の待機を、今から `timeout_ms` 後を期限として登録する。
+    fn register(&mut self, kind: AutomationWaitKind, timeout_ms: u64) {
+        self.pending = Some(AutomationWait {
+            kind,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms),
+        });
+    }
 }
 
 /// What a pending [`AutomationWait`] is waiting for.
@@ -1396,10 +1428,9 @@ fn record_tab_latency(
     };
     let now = Instant::now();
     let duration = now.saturating_duration_since(started);
-    let elapsed = now.saturating_duration_since(perf.process_start);
-    perf.log.write(
+    perf.write_at(
         &metrics::PerfRecord::tab_latency(kind, id.get(), duration),
-        elapsed,
+        now,
     );
 }
 
@@ -1415,9 +1446,7 @@ fn record_state_write(state: &AppState, kind: metrics::StateWriteKind, started: 
     };
     let now = Instant::now();
     let duration = now.saturating_duration_since(started);
-    let elapsed = now.saturating_duration_since(perf.process_start);
-    perf.log
-        .write(&metrics::PerfRecord::state_write(kind, duration), elapsed);
+    perf.write_at(&metrics::PerfRecord::state_write(kind, duration), now);
 }
 
 /// Spawn a background thread that periodically samples this process's
@@ -1563,8 +1592,7 @@ fn poll_automation_wait_timeout(
             );
         }
     }
-    automation_wait.pending = None;
-    let _ = automation_wait.notify.send(());
+    automation_wait.resolve();
     None
 }
 
@@ -1586,8 +1614,7 @@ fn resolve_automation_wait_if_matching(
         )
     });
     if matches {
-        automation_wait.pending = None;
-        let _ = automation_wait.notify.send(());
+        automation_wait.resolve();
     }
 }
 
@@ -1612,8 +1639,7 @@ fn resolve_automation_wait_for_startup(automation_wait: &mut AutomationWaitState
         Some(AutomationWaitKind::Startup)
     );
     if matches {
-        automation_wait.pending = None;
-        let _ = automation_wait.notify.send(());
+        automation_wait.resolve();
     }
 }
 
@@ -1750,9 +1776,10 @@ fn record_tab_suspend(state: &AppState, id: TabId, reason: SuspendReason) {
     let Some(perf) = &state.perf else {
         return;
     };
-    let elapsed = Instant::now().saturating_duration_since(perf.process_start);
-    perf.log
-        .write(&metrics::PerfRecord::tab_suspend(id.get(), reason), elapsed);
+    perf.write_at(
+        &metrics::PerfRecord::tab_suspend(id.get(), reason),
+        Instant::now(),
+    );
 }
 
 /// Dispatch one [`UserEvent`]. UI failures are logged, never fatal.
@@ -2320,7 +2347,7 @@ reported_success={success} recorded_as_success={succeeded}"
                 // this same `ui_windows.get_mut(automation_window)` gate as
                 // every other automation command, so it needs the same
                 // guard here.)
-                let _ = automation_wait.notify.send(());
+                automation_wait.wake();
             }
         }
         UserEvent::MemorySampled(sample) => {
@@ -3846,15 +3873,13 @@ fn handle_automation_command(
         AutomationCommand::WaitLoad { timeout_ms } => {
             let tab_id = tabs_of(state, window_id).active_id();
             if tabs_of(state, window_id).active().is_loading() {
-                automation_wait.pending = Some(AutomationWait {
-                    kind: AutomationWaitKind::Load { window_id, tab_id },
-                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                });
+                automation_wait
+                    .register(AutomationWaitKind::Load { window_id, tab_id }, timeout_ms);
             } else {
                 // Already finished (or never started) loading — resolve
                 // immediately, matching the issue's "already loaded ->
                 // proceed at once" requirement.
-                let _ = automation_wait.notify.send(());
+                automation_wait.wake();
             }
         }
         // Issue #173: same shape as `WaitLoad` above, but the condition it
@@ -3865,12 +3890,9 @@ fn handle_automation_command(
         // scoped to, unlike `WaitLoad`.
         AutomationCommand::WaitStartup { timeout_ms } => {
             if automation_wait.startup_reported {
-                let _ = automation_wait.notify.send(());
+                automation_wait.wake();
             } else {
-                automation_wait.pending = Some(AutomationWait {
-                    kind: AutomationWaitKind::Startup,
-                    deadline: Instant::now() + Duration::from_millis(timeout_ms),
-                });
+                automation_wait.register(AutomationWaitKind::Startup, timeout_ms);
             }
         }
         // The marker is a perf-log record only (`record_perf_event` has
@@ -4288,7 +4310,7 @@ fn apply_updated_settings(
     let sanitized = settings.sanitize();
     state.settings = sanitized.clone();
     if let Some(dir) = &state.data_dir {
-        log_io_failure("save settings", persistence::save_settings(dir, &sanitized));
+        log_failure("save settings", persistence::save_settings(dir, &sanitized));
     }
     for window in ui_windows.values() {
         log_failure("apply theme", window.set_theme(sanitized.appearance.theme));
@@ -4308,7 +4330,7 @@ fn apply_updated_settings(
 fn open_download(state: &AppState, id: DownloadId) {
     match state.downloads.get(id) {
         Some(entry) if entry.state == crate::browser::DownloadState::Completed => {
-            log_spawn_failure("open download", downloads::spawn_open(&entry.destination));
+            log_failure("open download", downloads::spawn_open(&entry.destination));
         }
         Some(_) => eprintln!("velox: open_download: {id:?} has not completed yet"),
         None => eprintln!("velox: open_download: unknown download {id:?}"),
@@ -4330,7 +4352,7 @@ fn open_downloads_folder(download_dir_override: Option<&str>) {
     if let Err(err) = std::fs::create_dir_all(&dir) {
         eprintln!("velox: failed to create downloads directory {dir:?}: {err}");
     }
-    log_spawn_failure("open downloads folder", downloads::spawn_open(&dir));
+    log_failure("open downloads folder", downloads::spawn_open(&dir));
 }
 
 /// Best-effort cancel of an in-progress download (`ToolbarCommand::CancelDownload`):
@@ -4368,7 +4390,7 @@ fn persist_history(state: &AppState) {
         let started = Instant::now();
         let result = persistence::save_history(dir, &state.history);
         record_state_write(state, metrics::StateWriteKind::History, started);
-        log_io_failure("save history", result);
+        log_failure("save history", result);
     }
 }
 
@@ -4377,7 +4399,7 @@ fn persist_bookmarks(state: &AppState) {
         let started = Instant::now();
         let result = persistence::save_bookmarks(dir, &state.bookmarks);
         record_state_write(state, metrics::StateWriteKind::Bookmarks, started);
-        log_io_failure("save bookmarks", result);
+        log_failure("save bookmarks", result);
     }
 }
 
@@ -4386,7 +4408,7 @@ fn persist_input_history(state: &AppState) {
         let started = Instant::now();
         let result = persistence::save_input_history(dir, &state.input_history);
         record_state_write(state, metrics::StateWriteKind::InputHistory, started);
-        log_io_failure("save input history", result);
+        log_failure("save input history", result);
     }
 }
 
@@ -4395,7 +4417,7 @@ fn persist_input_history(state: &AppState) {
 /// outcome. Never returns an error to the caller — a failed clear is not
 /// fatal (the acceptance condition "削除失敗時に安全にエラー処理される") —
 /// and stays silent on full success the same way `persist_*`'s
-/// `log_io_failure` calls do, only speaking up when there is something the
+/// `log_failure` calls do, only speaking up when there is something the
 /// user might need to know about.
 fn clear_all_site_data(window: &BrowserWindow) {
     let result = window.clear_all_site_data();
@@ -4489,7 +4511,7 @@ fn persist_session(state: &mut AppState, _window_id: WindowId) {
     let result = persistence::save_session(&dir, &snapshot);
     record_state_write(state, metrics::StateWriteKind::Session, started);
     let succeeded = result.is_ok();
-    log_io_failure("save session", result);
+    log_failure("save session", result);
     if succeeded {
         state.last_persisted_session = Some(snapshot);
     }
@@ -4528,25 +4550,13 @@ fn log_preview(text: &str) -> String {
 
 /// A failed UI call (e.g. a script that could not be evaluated) should not
 /// crash the browser; surface it on stderr instead.
-fn log_failure(action: &str, result: wry::Result<()>) {
-    if let Err(err) = result {
-        eprintln!("velox: failed to {action}: {err}");
-    }
-}
-
-/// Same as `log_failure`, for the IO errors persistence returns.
-fn log_io_failure(action: &str, result: std::io::Result<()>) {
-    if let Err(err) = result {
-        eprintln!("velox: failed to {action}: {err}");
-    }
-}
-
-/// Same as `log_failure`, for `downloads::spawn_open`'s launch-a-process
-/// result. The spawned child is intentionally not waited on or otherwise
-/// tracked — "open this file/folder in some other application" is a
-/// fire-and-forget action, the same as a real desktop browser's own
-/// "show in folder" / "open file" menu entries.
-fn log_spawn_failure(action: &str, result: std::io::Result<std::process::Child>) {
+///
+/// 結果型についてジェネリックにしてあり、永続化が返す IO エラーや
+/// `downloads::spawn_open` のプロセス起動結果にも同じヘルパーを使う。
+/// 後者で起動した子プロセス (`Ok` 側の値) を待たず追跡もしないのは意図的 —
+/// 「このファイル/フォルダを別アプリで開く」は投げっぱなしの操作で、実際の
+/// デスクトップブラウザの「フォルダに表示」「ファイルを開く」と同じ扱い。
+fn log_failure<T, E: std::fmt::Display>(action: &str, result: Result<T, E>) {
     if let Err(err) = result {
         eprintln!("velox: failed to {action}: {err}");
     }
