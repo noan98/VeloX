@@ -31,9 +31,9 @@
 use std::path::PathBuf;
 
 use tao::event_loop::EventLoopProxy;
-use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
-use windows::core::{HRESULT, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use webview2_com::{take_pwstr, CallDevToolsProtocolMethodCompletedHandler};
+use windows::core::{HRESULT, HSTRING, PCWSTR};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FileSaveDialog, IFileSaveDialog, IShellItem, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
@@ -130,29 +130,10 @@ pub fn show_save_dialog(default_file_name: &str) -> Result<Option<PathBuf>, Stri
         let display_name = item
             .GetDisplayName(SIGDN_FILESYSPATH)
             .map_err(|err| format!("保存先のパスを取得できませんでした: {err}"))?;
-        let path = pwstr_to_string(display_name);
-        CoTaskMemFree(Some(display_name.0 as *const _));
-        Ok(Some(PathBuf::from(path)))
+        // `take_pwstr` は文字列へコピーしたうえで `CoTaskMemFree` で解放する
+        // (`webview2_blocking` と同じ `webview2-com` のヘルパー)。
+        Ok(Some(PathBuf::from(take_pwstr(display_name))))
     }
-}
-
-/// Read a COM-owned, null-terminated UTF-16 string pointed to by `pwstr`
-/// (e.g. `IShellItem::GetDisplayName`'s result) without transferring
-/// ownership — the caller is still responsible for freeing `pwstr` itself
-/// (via `CoTaskMemFree`) once this returns.
-///
-/// # Safety
-/// `pwstr` must be null, or point to a valid null-terminated UTF-16 buffer
-/// that stays valid for the duration of this call (true for a COM
-/// allocator's out-parameter that has not been freed yet).
-unsafe fn pwstr_to_string(pwstr: PWSTR) -> String {
-    if pwstr.is_null() {
-        return String::new();
-    }
-    // SAFETY: caller guarantees `pwstr` points at a valid null-terminated
-    // UTF-16 buffer, which is exactly `PWSTR::as_wide`'s requirement (it
-    // measures up to the terminator and never reads past it).
-    String::from_utf16_lossy(unsafe { pwstr.as_wide() })
 }
 
 /// Capture `webview`'s current page as MHTML (via Chromium DevTools
