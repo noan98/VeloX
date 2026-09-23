@@ -11,12 +11,15 @@ pub struct SearchEngine {
     pub query_template: String,
 }
 
+/// 組み込みプリセット 1 つを組み立てる関数 ([`SearchEngine::duckduckgo`] など)。
+type PresetBuilder = fn() -> SearchEngine;
+
 /// 組み込みプリセットの一覧: `settings.json` の `engine_preset` に保存される
 /// キー名と、そのプリセットを組み立てる関数の対応表。名前からの引き当て
 /// ([`SearchEngine::preset`]) と値からの逆引き ([`SearchEngine::preset_key`])
 /// の両方がこの 1 つの表を見るので、プリセットを足すときに片方だけ
 /// 更新し忘れることがない。
-const PRESETS: [(&str, fn() -> SearchEngine); 5] = [
+const PRESETS: [(&str, PresetBuilder); 5] = [
     ("duckduckgo", SearchEngine::duckduckgo),
     ("google", SearchEngine::google),
     ("bing", SearchEngine::bing),
