@@ -56,15 +56,7 @@ pub const HTML_EXTENSION: &str = "html";
 const FORBIDDEN_FILENAME_CHARS: [char; 9] = ['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
 
 fn replace_forbidden_filename_chars(raw: &str) -> String {
-    raw.chars()
-        .map(|c| {
-            if FORBIDDEN_FILENAME_CHARS.contains(&c) {
-                '_'
-            } else {
-                c
-            }
-        })
-        .collect()
+    raw.replace(FORBIDDEN_FILENAME_CHARS, "_")
 }
 
 /// The base name (no extension) to suggest for `title`/`url`: the page
@@ -72,20 +64,16 @@ fn replace_forbidden_filename_chars(raw: &str) -> String {
 /// otherwise a fixed fallback. Not itself guaranteed to be a safe file
 /// name — see [`suggested_file_name`], which every real caller uses.
 fn default_file_stem(title: Option<&str>, url: &str) -> String {
-    if let Some(title) = title {
-        let trimmed = title.trim();
-        if !trimmed.is_empty() {
-            return trimmed.to_owned();
-        }
-    }
-    if let Ok(parsed) = url::Url::parse(url) {
-        if let Some(host) = parsed.host_str() {
-            if !host.is_empty() {
-                return host.to_owned();
-            }
-        }
-    }
-    "page".to_owned()
+    let non_blank = |s: &&str| !s.is_empty();
+    title
+        .map(str::trim)
+        .filter(non_blank)
+        .map(str::to_owned)
+        .or_else(|| {
+            let parsed = url::Url::parse(url).ok()?;
+            parsed.host_str().filter(non_blank).map(str::to_owned)
+        })
+        .unwrap_or_else(|| "page".to_owned())
 }
 
 /// A safe, bare (no directory component) file name to suggest for saving
@@ -164,6 +152,11 @@ pub fn extract_mhtml(result_json: &str) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// `https://example.com/` のページを `title` で保存するときの推奨名。
+    fn name_for(title: &str, extension: &str) -> String {
+        suggested_file_name(Some(title), "https://example.com/", extension)
+    }
+
     // --- default_file_stem (exercised indirectly through suggested_file_name
     // below too, but tested directly here for the title/url fallback chain
     // itself) ---
@@ -202,47 +195,26 @@ mod tests {
 
     #[test]
     fn appends_the_requested_extension() {
-        assert_eq!(
-            suggested_file_name(Some("Example"), "https://example.com/", MHTML_EXTENSION),
-            "Example.mhtml"
-        );
-        assert_eq!(
-            suggested_file_name(Some("Example"), "https://example.com/", HTML_EXTENSION),
-            "Example.html"
-        );
+        assert_eq!(name_for("Example", MHTML_EXTENSION), "Example.mhtml");
+        assert_eq!(name_for("Example", HTML_EXTENSION), "Example.html");
     }
 
     #[test]
     fn replaces_windows_forbidden_characters_in_the_title() {
         assert_eq!(
-            suggested_file_name(
-                Some("Breaking: Top Story"),
-                "https://example.com/",
-                HTML_EXTENSION
-            ),
+            name_for("Breaking: Top Story", HTML_EXTENSION),
             "Breaking_ Top Story.html"
         );
+        assert_eq!(name_for("A/B Testing", HTML_EXTENSION), "A_B Testing.html");
         assert_eq!(
-            suggested_file_name(Some("A/B Testing"), "https://example.com/", HTML_EXTENSION),
-            "A_B Testing.html"
-        );
-        assert_eq!(
-            suggested_file_name(
-                Some("Weird \"Title\" <here> | *?"),
-                "https://example.com/",
-                HTML_EXTENSION
-            ),
+            name_for("Weird \"Title\" <here> | *?", HTML_EXTENSION),
             "Weird _Title_ _here_ _ __.html"
         );
     }
 
     #[test]
     fn neutralizes_path_traversal_in_the_title() {
-        let name = suggested_file_name(
-            Some("../../etc/passwd"),
-            "https://example.com/",
-            HTML_EXTENSION,
-        );
+        let name = name_for("../../etc/passwd", HTML_EXTENSION);
         assert!(!name.contains('/'));
         assert!(!name.contains('\\'));
         // No directory component survives at all - this is always a single
@@ -252,11 +224,7 @@ mod tests {
 
     #[test]
     fn neutralizes_an_absolute_windows_path_in_the_title() {
-        let name = suggested_file_name(
-            Some(r"C:\Windows\System32\evil.exe"),
-            "https://example.com/",
-            HTML_EXTENSION,
-        );
+        let name = name_for(r"C:\Windows\System32\evil.exe", HTML_EXTENSION);
         assert!(!name.contains('/'));
         assert!(!name.contains('\\'));
         assert!(!name.contains(':'));
@@ -265,62 +233,35 @@ mod tests {
 
     #[test]
     fn escapes_a_windows_reserved_device_name_title() {
-        assert_eq!(
-            suggested_file_name(Some("CON"), "https://example.com/", HTML_EXTENSION),
-            "_CON.html"
-        );
-        assert_eq!(
-            suggested_file_name(Some("con"), "https://example.com/", MHTML_EXTENSION),
-            "_con.mhtml"
-        );
-        assert_eq!(
-            suggested_file_name(Some("LPT9"), "https://example.com/", HTML_EXTENSION),
-            "_LPT9.html"
-        );
+        assert_eq!(name_for("CON", HTML_EXTENSION), "_CON.html");
+        assert_eq!(name_for("con", MHTML_EXTENSION), "_con.mhtml");
+        assert_eq!(name_for("LPT9", HTML_EXTENSION), "_LPT9.html");
     }
 
     #[test]
     fn does_not_flag_a_title_that_merely_starts_with_a_reserved_prefix() {
         assert_eq!(
-            suggested_file_name(Some("CONSTITUTION"), "https://example.com/", HTML_EXTENSION),
+            name_for("CONSTITUTION", HTML_EXTENSION),
             "CONSTITUTION.html"
         );
     }
 
     #[test]
     fn trims_trailing_dots_and_spaces_from_the_title() {
-        assert_eq!(
-            suggested_file_name(Some("Example..."), "https://example.com/", HTML_EXTENSION),
-            "Example.html"
-        );
-        assert_eq!(
-            suggested_file_name(Some("Example   "), "https://example.com/", HTML_EXTENSION),
-            "Example.html"
-        );
+        assert_eq!(name_for("Example...", HTML_EXTENSION), "Example.html");
+        assert_eq!(name_for("Example   ", HTML_EXTENSION), "Example.html");
     }
 
     #[test]
     fn strips_control_characters_from_the_title() {
-        assert_eq!(
-            suggested_file_name(Some("evil\0title"), "https://example.com/", HTML_EXTENSION),
-            "eviltitle.html"
-        );
-        assert_eq!(
-            suggested_file_name(Some("a\nb\tc"), "https://example.com/", HTML_EXTENSION),
-            "abc.html"
-        );
+        assert_eq!(name_for("evil\0title", HTML_EXTENSION), "eviltitle.html");
+        assert_eq!(name_for("a\nb\tc", HTML_EXTENSION), "abc.html");
     }
 
     #[test]
     fn falls_back_to_a_safe_name_when_the_title_is_only_dot_or_dotdot() {
-        assert_eq!(
-            suggested_file_name(Some("."), "https://example.com/", HTML_EXTENSION),
-            "download.html"
-        );
-        assert_eq!(
-            suggested_file_name(Some(".."), "https://example.com/", HTML_EXTENSION),
-            "download.html"
-        );
+        assert_eq!(name_for(".", HTML_EXTENSION), "download.html");
+        assert_eq!(name_for("..", HTML_EXTENSION), "download.html");
     }
 
     #[test]
@@ -330,10 +271,7 @@ mod tests {
         // it should stay a valid (if ugly) name rather than silently
         // becoming "download.html" and risking collision with an unrelated
         // save.
-        assert_eq!(
-            suggested_file_name(Some(":::"), "https://example.com/", HTML_EXTENSION),
-            "___.html"
-        );
+        assert_eq!(name_for(":::", HTML_EXTENSION), "___.html");
     }
 
     #[test]
@@ -347,7 +285,7 @@ mod tests {
     #[test]
     fn truncates_an_extremely_long_title() {
         let long_title = "a".repeat(500);
-        let name = suggested_file_name(Some(&long_title), "https://example.com/", HTML_EXTENSION);
+        let name = name_for(&long_title, HTML_EXTENSION);
         // Generous ceiling: `sanitize_filename`'s own 200-byte cap plus the
         // ".html" this function appends afterwards.
         assert!(name.len() <= 210);
@@ -357,11 +295,7 @@ mod tests {
     #[test]
     fn keeps_unicode_titles_intact() {
         assert_eq!(
-            suggested_file_name(
-                Some("日本語のタイトル"),
-                "https://example.com/",
-                HTML_EXTENSION
-            ),
+            name_for("日本語のタイトル", HTML_EXTENSION),
             "日本語のタイトル.html"
         );
     }
