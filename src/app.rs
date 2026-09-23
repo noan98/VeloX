@@ -1541,13 +1541,10 @@ fn handle_user_event(
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
-            let message = if success {
-                format!("PDFとして保存しました: {}", destination.display())
-            } else {
-                match error {
-                    Some(reason) => format!("PDFの書き出しに失敗しました: {reason}"),
-                    None => "PDFの書き出しに失敗しました".to_owned(),
-                }
+            let message = match (success, error) {
+                (true, _) => format!("PDFとして保存しました: {}", destination.display()),
+                (false, Some(reason)) => format!("PDFの書き出しに失敗しました: {reason}"),
+                (false, None) => "PDFの書き出しに失敗しました".to_owned(),
             };
             show_print_status(window, &message);
         }
@@ -2038,11 +2035,7 @@ fn handle_toolbar_command(
         }
         ToolbarCommand::ToggleBookmark => toggle_current_bookmark(window, window_id, state),
         ToolbarCommand::TogglePanel { panel } => {
-            let next = if window.open_panel() == Some(panel) {
-                None
-            } else {
-                Some(panel)
-            };
+            let next = (window.open_panel() != Some(panel)).then_some(panel);
             log_failure("toggle panel", window.set_panel(next));
             match next {
                 Some(Panel::History) => refresh_history_panel(window, state, config),
@@ -2155,11 +2148,7 @@ fn handle_toolbar_command(
                 &sources,
                 omnibox::DEFAULT_CANDIDATE_LIMIT,
             );
-            let open = if candidates.is_empty() {
-                None
-            } else {
-                Some(Panel::Omnibox)
-            };
+            let open = (!candidates.is_empty()).then_some(Panel::Omnibox);
             log_failure("toggle omnibox panel", window.set_panel(open));
             log_failure(
                 "update omnibox candidates",
