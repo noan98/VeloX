@@ -1091,40 +1091,22 @@ mod tests {
     }
 
     #[test]
-    fn parses_new_window_and_rejects_arguments_on_it() {
-        assert_eq!(
-            parse_script("new_window\n").unwrap(),
-            vec![AutomationCommand::NewWindow]
-        );
-        let err = parse_script("new_window 3\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("new_window"), "{}", err.message);
-    }
-
-    #[test]
-    fn parses_new_private_window_and_rejects_arguments_on_it() {
-        assert_eq!(
-            parse_script("new_private_window\n").unwrap(),
-            vec![AutomationCommand::NewPrivateWindow]
-        );
-        let err = parse_script("new_private_window 3\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(
-            err.message.contains("new_private_window"),
-            "{}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn parses_mark_and_rejects_arguments_on_it() {
-        assert_eq!(
-            parse_script("mark\n").unwrap(),
-            vec![AutomationCommand::Mark]
-        );
-        let err = parse_script("mark 3\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("mark"), "{}", err.message);
+    fn parses_argumentless_commands_and_rejects_arguments_on_them() {
+        for (keyword, command) in [
+            ("new_window", AutomationCommand::NewWindow),
+            ("new_private_window", AutomationCommand::NewPrivateWindow),
+            ("mark", AutomationCommand::Mark),
+            ("quit", AutomationCommand::Quit),
+        ] {
+            assert_eq!(
+                parse_script(&format!("{keyword}\n")).unwrap(),
+                vec![command],
+                "{keyword}"
+            );
+            let err = parse_script(&format!("{keyword} 3\n")).unwrap_err();
+            assert_eq!(err.line, 1);
+            assert!(err.message.contains(keyword), "{}", err.message);
+        }
     }
 
     #[test]
@@ -1704,110 +1686,81 @@ mod tests {
         assert_eq!(commands, vec![AutomationCommand::Wait { ms: MAX_WAIT_MS }]);
     }
 
-    // -- wait_load (Issue #169) -------------------------------------------
+    // -- wait_load (Issue #169) / wait_startup (Issue #173) ------------------
+    //
+    // 2 つは引数の扱い (省略可・既定値・上限) が同じなので、同じ検査を
+    // キーワードごとに回す。
+
+    /// timeout_ms からコマンドを作る関数。
+    type WaitCommand = fn(u64) -> AutomationCommand;
+
+    /// `(キーワード, コマンドを作る関数)` の組。
+    const OPTIONAL_WAIT_COMMANDS: [(&str, WaitCommand); 2] = [
+        ("wait_load", |timeout_ms| AutomationCommand::WaitLoad {
+            timeout_ms,
+        }),
+        ("wait_startup", |timeout_ms| {
+            AutomationCommand::WaitStartup { timeout_ms }
+        }),
+    ];
 
     #[test]
-    fn wait_load_without_an_argument_uses_the_default_timeout() {
-        let commands = parse_script("wait_load\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitLoad {
-                timeout_ms: DEFAULT_WAIT_LOAD_TIMEOUT_MS
-            }]
-        );
+    fn optional_wait_without_an_argument_uses_the_default_timeout() {
+        for (keyword, command) in OPTIONAL_WAIT_COMMANDS {
+            assert_eq!(
+                parse_script(&format!("{keyword}\n")).unwrap(),
+                vec![command(DEFAULT_WAIT_LOAD_TIMEOUT_MS)],
+                "{keyword}"
+            );
+        }
     }
 
     #[test]
-    fn wait_load_with_an_argument_uses_it() {
-        let commands = parse_script("wait_load 2500\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitLoad { timeout_ms: 2500 }]
-        );
+    fn optional_wait_with_an_argument_uses_it() {
+        for (keyword, command) in OPTIONAL_WAIT_COMMANDS {
+            assert_eq!(
+                parse_script(&format!("{keyword} 2500\n")).unwrap(),
+                vec![command(2500)],
+                "{keyword}"
+            );
+        }
     }
 
     #[test]
-    fn wait_load_with_a_non_numeric_argument_is_rejected() {
-        let err = parse_script("wait_load abc\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("wait_load"), "{}", err.message);
+    fn optional_wait_with_a_non_numeric_argument_is_rejected() {
+        for (keyword, _) in OPTIONAL_WAIT_COMMANDS {
+            let err = parse_script(&format!("{keyword} abc\n")).unwrap_err();
+            assert_eq!(err.line, 1);
+            assert!(err.message.contains(keyword), "{}", err.message);
+        }
     }
 
     #[test]
-    fn wait_load_with_a_negative_argument_is_rejected() {
-        let err = parse_script("wait_load -1\n").unwrap_err();
-        assert_eq!(err.line, 1);
+    fn optional_wait_with_a_negative_argument_is_rejected() {
+        for (keyword, _) in OPTIONAL_WAIT_COMMANDS {
+            let err = parse_script(&format!("{keyword} -1\n")).unwrap_err();
+            assert_eq!(err.line, 1, "{keyword}");
+        }
     }
 
     #[test]
-    fn wait_load_beyond_the_cap_is_rejected() {
-        let err = parse_script(&format!("wait_load {}\n", MAX_WAIT_MS + 1)).unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
+    fn optional_wait_beyond_the_cap_is_rejected() {
+        for (keyword, _) in OPTIONAL_WAIT_COMMANDS {
+            let err = parse_script(&format!("{keyword} {}\n", MAX_WAIT_MS + 1)).unwrap_err();
+            assert_eq!(err.line, 1, "{keyword}");
+            assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
+        }
     }
 
     #[test]
-    fn wait_load_exactly_at_the_cap_is_accepted() {
-        let commands = parse_script(&format!("wait_load {MAX_WAIT_MS}\n")).unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitLoad {
-                timeout_ms: MAX_WAIT_MS
-            }]
-        );
-    }
-
-    // -- wait_startup (Issue #173) -----------------------------------------
-
-    #[test]
-    fn wait_startup_without_an_argument_uses_the_default_timeout() {
-        let commands = parse_script("wait_startup\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitStartup {
-                timeout_ms: DEFAULT_WAIT_LOAD_TIMEOUT_MS
-            }]
-        );
-    }
-
-    #[test]
-    fn wait_startup_with_an_argument_uses_it() {
-        let commands = parse_script("wait_startup 2500\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitStartup { timeout_ms: 2500 }]
-        );
-    }
-
-    #[test]
-    fn wait_startup_with_a_non_numeric_argument_is_rejected() {
-        let err = parse_script("wait_startup abc\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("wait_startup"), "{}", err.message);
-    }
-
-    #[test]
-    fn wait_startup_with_a_negative_argument_is_rejected() {
-        let err = parse_script("wait_startup -1\n").unwrap_err();
-        assert_eq!(err.line, 1);
-    }
-
-    #[test]
-    fn wait_startup_beyond_the_cap_is_rejected() {
-        let err = parse_script(&format!("wait_startup {}\n", MAX_WAIT_MS + 1)).unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
-    }
-
-    #[test]
-    fn wait_startup_exactly_at_the_cap_is_accepted() {
-        let commands = parse_script(&format!("wait_startup {MAX_WAIT_MS}\n")).unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitStartup {
-                timeout_ms: MAX_WAIT_MS
-            }]
-        );
+    fn optional_wait_exactly_at_the_cap_is_accepted() {
+        for (keyword, command) in OPTIONAL_WAIT_COMMANDS {
+            assert_eq!(
+                parse_script(&format!("{keyword} {MAX_WAIT_MS}\n")).unwrap(),
+                vec![command(MAX_WAIT_MS)],
+                "{keyword}"
+            );
+        }
     }
 
     #[test]
