@@ -1049,10 +1049,7 @@ mod tests {
         // Same D62 hardening `ui::toolbar`'s `set_*_script` functions apply,
         // reused here (not duplicated) via `toolbar::escape_js_line_terminators`.
         let literal = find_query_literal("foo\u{2028}bar\u{2029}");
-        assert!(literal.contains("\\u2028"), "{literal}");
-        assert!(literal.contains("\\u2029"), "{literal}");
-        assert!(!literal.contains('\u{2028}'));
-        assert!(!literal.contains('\u{2029}'));
+        toolbar::assert_line_terminators_escaped(&literal);
     }
 
     #[test]
@@ -1453,10 +1450,7 @@ mod tests {
             0.0,
             0.0,
         );
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'));
-        assert!(!script.contains('\u{2029}'));
+        toolbar::assert_line_terminators_escaped(&script);
     }
 
     #[test]

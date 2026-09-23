@@ -733,6 +733,18 @@ fn value_to_json<T: Serialize + ?Sized>(value: &T) -> String {
     escape_js_line_terminators(json)
 }
 
+/// テスト用: U+2028/U+2029 が生のまま残らず、リテラルのエスケープ列として
+/// 埋め込まれていることを確かめる (D62)。[`escape_js_line_terminators`] を
+/// 通したスクリプトを検証する `ui::toolbar` / `ui::window` のテストで共有する。
+#[cfg(test)]
+#[track_caller]
+pub(crate) fn assert_line_terminators_escaped(script: &str) {
+    assert!(script.contains("\\u2028"), "{script}");
+    assert!(script.contains("\\u2029"), "{script}");
+    assert!(!script.contains('\u{2028}'), "{script}");
+    assert!(!script.contains('\u{2029}'), "{script}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -746,16 +758,6 @@ mod tests {
             Ok(cmd) => assert_eq!(cmd, expected, "{body}"),
             Err(err) => panic!("{body} のパースに失敗しました: {err}"),
         }
-    }
-
-    /// U+2028/U+2029 が生のまま残らず、リテラルのエスケープ列として
-    /// 埋め込まれていることを確かめる (D62)。
-    #[track_caller]
-    fn assert_line_terminators_escaped(script: &str) {
-        assert!(script.contains("\\u2028"), "{script}");
-        assert!(script.contains("\\u2029"), "{script}");
-        assert!(!script.contains('\u{2028}'), "{script}");
-        assert!(!script.contains('\u{2029}'), "{script}");
     }
 
     /// テスト用の [`TabSummary`]。各テストは関心のあるフィールドだけを
