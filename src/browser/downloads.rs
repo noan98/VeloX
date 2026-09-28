@@ -19,6 +19,8 @@
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
+use super::util::{remove_where, truncate_utf8};
+
 /// Opaque, stable identifier for one download, issued by [`DownloadStore`]
 /// and never reused — same shape and reasoning as `browser::TabId` (a stale
 /// id, e.g. a `cancel_download` message racing a completion, simply misses
@@ -80,33 +82,12 @@ impl DownloadState {
         !matches!(self, DownloadState::InProgress)
     }
 
-    fn complete(self) -> Result<Self, InvalidDownloadTransition> {
+    /// `InProgress -> to` (`to` は 3 つの終端状態のいずれか)。定義された辺は
+    /// `InProgress` から出るものだけなので、それ以外の状態からは常に `Err`。
+    fn finish_as(self, to: DownloadState) -> Result<Self, InvalidDownloadTransition> {
         match self {
-            DownloadState::InProgress => Ok(DownloadState::Completed),
-            _ => Err(InvalidDownloadTransition {
-                from: self,
-                to: DownloadState::Completed,
-            }),
-        }
-    }
-
-    fn fail(self) -> Result<Self, InvalidDownloadTransition> {
-        match self {
-            DownloadState::InProgress => Ok(DownloadState::Failed),
-            _ => Err(InvalidDownloadTransition {
-                from: self,
-                to: DownloadState::Failed,
-            }),
-        }
-    }
-
-    fn cancel(self) -> Result<Self, InvalidDownloadTransition> {
-        match self {
-            DownloadState::InProgress => Ok(DownloadState::Cancelled),
-            _ => Err(InvalidDownloadTransition {
-                from: self,
-                to: DownloadState::Cancelled,
-            }),
+            DownloadState::InProgress => Ok(to),
+            _ => Err(InvalidDownloadTransition { from: self, to }),
         }
     }
 }
@@ -157,21 +138,14 @@ fn serialize_path_lossy<S: serde::Serializer>(path: &Path, s: S) -> Result<S::Ok
 }
 
 impl DownloadEntry {
-    fn complete(&mut self, finished_at: u64) -> Result<(), InvalidDownloadTransition> {
-        self.state = self.state.complete()?;
-        self.finished_at = Some(finished_at);
-        Ok(())
-    }
-
-    fn fail(&mut self, reason: String, finished_at: u64) -> Result<(), InvalidDownloadTransition> {
-        self.state = self.state.fail()?;
-        self.finished_at = Some(finished_at);
-        self.error = Some(reason);
-        Ok(())
-    }
-
-    fn cancel(&mut self, finished_at: u64) -> Result<(), InvalidDownloadTransition> {
-        self.state = self.state.cancel()?;
+    /// 終端状態 `to` へ遷移し、`finished_at` を記録する。遷移できなければ
+    /// 何も書き換えずに `Err`。
+    fn finish_as(
+        &mut self,
+        to: DownloadState,
+        finished_at: u64,
+    ) -> Result<(), InvalidDownloadTransition> {
+        self.state = self.state.finish_as(to)?;
         self.finished_at = Some(finished_at);
         Ok(())
     }
@@ -250,15 +224,16 @@ impl DownloadStore {
     /// `InProgress -> Completed`. Returns `false` (no-op) for an unknown id
     /// or an entry that is not currently `InProgress`.
     pub fn complete(&mut self, id: DownloadId, finished_at: u64) -> bool {
-        self.get_mut(id)
-            .is_some_and(|entry| entry.complete(finished_at).is_ok())
+        self.finish_as(id, DownloadState::Completed, finished_at)
+            .is_some()
     }
 
     /// `InProgress -> Failed`, recording `reason`. Returns `false` (no-op)
     /// the same way [`Self::complete`] does.
     pub fn fail(&mut self, id: DownloadId, reason: String, finished_at: u64) -> bool {
-        self.get_mut(id)
-            .is_some_and(|entry| entry.fail(reason, finished_at).is_ok())
+        self.finish_as(id, DownloadState::Failed, finished_at)
+            .map(|entry| entry.error = Some(reason))
+            .is_some()
     }
 
     /// `InProgress -> Cancelled`. Returns `false` (no-op) the same way
@@ -266,17 +241,28 @@ impl DownloadStore {
     /// already reached a terminal state (a late completion racing a cancel
     /// request must not be un-cancelled).
     pub fn cancel(&mut self, id: DownloadId, finished_at: u64) -> bool {
-        self.get_mut(id)
-            .is_some_and(|entry| entry.cancel(finished_at).is_ok())
+        self.finish_as(id, DownloadState::Cancelled, finished_at)
+            .is_some()
+    }
+
+    /// `id` のエントリを終端状態 `to` へ遷移させ、成功したらそのエントリを
+    /// 返す。未知の id や遷移できない状態なら `None` (何も書き換えない)。
+    fn finish_as(
+        &mut self,
+        id: DownloadId,
+        to: DownloadState,
+        finished_at: u64,
+    ) -> Option<&mut DownloadEntry> {
+        let entry = self.get_mut(id)?;
+        entry.finish_as(to, finished_at).ok()?;
+        Some(entry)
     }
 
     /// Drop one entry from the list entirely (the panel's "remove" button —
     /// never touches the file on disk). Returns `true` if an entry with
     /// this id existed.
     pub fn remove(&mut self, id: DownloadId) -> bool {
-        let before = self.entries.len();
-        self.entries.retain(|entry| entry.id != id);
-        self.entries.len() != before
+        remove_where(&mut self.entries, |entry| entry.id == id)
     }
 
     /// Find the id of the `InProgress` entry that wry's
@@ -293,18 +279,14 @@ impl DownloadStore {
     /// ambiguous only if the same URL is downloaded twice concurrently,
     /// documented as a known limitation).
     pub fn resolve_completion(&self, url: &str, destination: Option<&Path>) -> Option<DownloadId> {
-        if let Some(destination) = destination {
-            if let Some(entry) = self.entries.iter().find(|entry| {
-                entry.state == DownloadState::InProgress
-                    && entry.url == url
-                    && entry.destination == destination
-            }) {
-                return Some(entry.id);
-            }
-        }
-        self.entries
-            .iter()
-            .find(|entry| entry.state == DownloadState::InProgress && entry.url == url)
+        let candidates = || {
+            self.entries
+                .iter()
+                .filter(|entry| entry.state == DownloadState::InProgress && entry.url == url)
+        };
+        destination
+            .and_then(|destination| candidates().find(|entry| entry.destination == destination))
+            .or_else(|| candidates().next())
             .map(|entry| entry.id)
     }
 }
@@ -401,27 +383,18 @@ const MAX_FILENAME_BYTES: usize = 200;
 pub fn sanitize_filename(raw: &str) -> String {
     let basename = raw.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = basename.chars().filter(|c| !c.is_control()).collect();
-    let trimmed = cleaned.trim();
-
-    let mut name = if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        String::new()
-    } else {
-        trimmed.to_owned()
-    };
-
-    while name.ends_with('.') || name.ends_with(' ') {
-        name.pop();
-    }
+    // `.` / `..` だけの名前もここで空になる (末尾のドットを削るため)。
+    let name = cleaned.trim().trim_end_matches(['.', ' ']);
 
     if name.is_empty() {
         return FALLBACK_FILENAME.to_owned();
     }
 
-    if is_windows_reserved_name(&name) {
-        name = format!("_{name}");
-    }
-
-    name = truncate_filename(&name, MAX_FILENAME_BYTES);
+    let name = if is_windows_reserved_name(name) {
+        truncate_filename(&format!("_{name}"), MAX_FILENAME_BYTES)
+    } else {
+        truncate_filename(name, MAX_FILENAME_BYTES)
+    };
 
     if name.is_empty() {
         FALLBACK_FILENAME.to_owned()
@@ -431,17 +404,17 @@ pub fn sanitize_filename(raw: &str) -> String {
 }
 
 fn is_windows_reserved_name(name: &str) -> bool {
-    let base = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
-    if matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
-        return true;
+    let base = name
+        .split_once('.')
+        .map_or(name, |(base, _)| base)
+        .to_ascii_uppercase();
+    match base.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => base
+            .strip_prefix("COM")
+            .or_else(|| base.strip_prefix("LPT"))
+            .is_some_and(|rest| matches!(rest.as_bytes(), [b'1'..=b'9'])),
     }
-    if let Some(rest) = base
-        .strip_prefix("COM")
-        .or_else(|| base.strip_prefix("LPT"))
-    {
-        return rest.len() == 1 && rest.starts_with(|c: char| c.is_ascii_digit() && c != '0');
-    }
-    false
 }
 
 /// Split `filename` into `(stem, extension)`, taking the extension to be
@@ -456,10 +429,18 @@ fn is_windows_reserved_name(name: &str) -> bool {
 /// A leading-dot name with no other `.` (`.gitignore`) or a name with no `.`
 /// at all (`README`) has no stem to split off, so the whole name is kept as
 /// the stem with no extension.
-fn split_stem_and_ext(filename: &str) -> (String, Option<String>) {
+fn split_stem_and_ext(filename: &str) -> (&str, Option<&str>) {
     match filename.split_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => (stem.to_owned(), Some(ext.to_owned())),
-        _ => (filename.to_owned(), None),
+        Some((stem, ext)) if !stem.is_empty() => (stem, Some(ext)),
+        _ => (filename, None),
+    }
+}
+
+/// `stem` に `ext` (あれば `.` 付きで) を付けたファイル名。
+fn join_stem_and_ext(stem: &str, ext: Option<&str>) -> String {
+    match ext {
+        Some(ext) => format!("{stem}.{ext}"),
+        None => stem.to_owned(),
     }
 }
 
@@ -467,25 +448,13 @@ fn truncate_filename(name: &str, max_bytes: usize) -> String {
     if name.len() <= max_bytes {
         return name.to_owned();
     }
-    let (stem, ext) = split_stem_and_ext(name);
-    match ext {
-        Some(ext) if ext.len() + 1 < max_bytes => {
+    match split_stem_and_ext(name) {
+        (stem, Some(ext)) if ext.len() + 1 < max_bytes => {
             let budget = max_bytes - ext.len() - 1;
-            format!("{}.{ext}", truncate_at_char_boundary(&stem, budget))
+            join_stem_and_ext(truncate_utf8(stem, budget), Some(ext))
         }
-        _ => truncate_at_char_boundary(name, max_bytes),
+        _ => truncate_utf8(name, max_bytes).to_owned(),
     }
-}
-
-fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> String {
-    if s.len() <= max_bytes {
-        return s.to_owned();
-    }
-    let mut end = max_bytes;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_owned()
 }
 
 /// Given a predicate telling whether a candidate name is already taken,
@@ -509,23 +478,18 @@ pub fn unique_filename(filename: &str, exists: impl Fn(&str) -> bool) -> String 
     // test) looping forever. Past the bound, a timestamp-based suffix
     // guarantees termination without ever repeating a previous guess.
     const MAX_ATTEMPTS: u32 = 10_000;
-    for counter in 1..=MAX_ATTEMPTS {
-        let candidate = match &ext {
-            Some(ext) => format!("{stem} ({counter}).{ext}"),
-            None => format!("{stem} ({counter})"),
-        };
-        if !exists(&candidate) {
-            return candidate;
-        }
+    let with_suffix = |suffix: u128| join_stem_and_ext(&format!("{stem} ({suffix})"), ext);
+    if let Some(candidate) = (1..=MAX_ATTEMPTS)
+        .map(|counter| with_suffix(u128::from(counter)))
+        .find(|candidate| !exists(candidate))
+    {
+        return candidate;
     }
     let suffix = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or_default();
-    match &ext {
-        Some(ext) => format!("{stem} ({suffix}).{ext}"),
-        None => format!("{stem} ({suffix})"),
-    }
+    with_suffix(suffix)
 }
 
 /// Sanitize `raw_filename` and resolve a collision-free absolute path inside
@@ -580,11 +544,11 @@ pub fn resolve_download_dir() -> Option<PathBuf> {
 /// so a change here takes effect after the next restart, same as every
 /// other Performance/Privacy/Advanced setting (D67).
 pub fn resolve_download_dir_with_override(override_dir: Option<&str>) -> Option<PathBuf> {
-    let trimmed = override_dir.map(str::trim).filter(|dir| !dir.is_empty());
-    match trimmed {
-        Some(dir) => Some(PathBuf::from(dir)),
-        None => resolve_download_dir(),
-    }
+    override_dir
+        .map(str::trim)
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+        .or_else(resolve_download_dir)
 }
 
 #[cfg(target_os = "macos")]
@@ -618,10 +582,9 @@ fn resolve_unix_download_dir(
     xdg_download_dir: Option<&str>,
     home: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(xdg) = xdg_download_dir {
-        return Some(PathBuf::from(xdg));
-    }
-    home.map(|home| PathBuf::from(home).join("Downloads"))
+    xdg_download_dir
+        .map(PathBuf::from)
+        .or_else(|| home.map(|home| PathBuf::from(home).join("Downloads")))
 }
 
 // --- Opening a completed file / the downloads folder ---
@@ -641,20 +604,17 @@ fn resolve_unix_download_dir(
 /// server-supplied file name; passing it as a single argument to the OS
 /// launcher directly (not interpolated into a shell command string) means
 /// there is no shell metacharacter for it to be misinterpreted as.
+pub fn open_path_command(path: &Path) -> (&'static str, Vec<String>) {
+    (OPEN_PROGRAM, vec![path.to_string_lossy().into_owned()])
+}
+
+/// 各 OS の「既定のアプリで開く」ランチャ。[`open_path_command`] が使う。
 #[cfg(target_os = "macos")]
-pub fn open_path_command(path: &Path) -> (&'static str, Vec<String>) {
-    ("open", vec![path.to_string_lossy().into_owned()])
-}
-
+const OPEN_PROGRAM: &str = "open";
 #[cfg(target_os = "windows")]
-pub fn open_path_command(path: &Path) -> (&'static str, Vec<String>) {
-    ("explorer", vec![path.to_string_lossy().into_owned()])
-}
-
+const OPEN_PROGRAM: &str = "explorer";
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn open_path_command(path: &Path) -> (&'static str, Vec<String>) {
-    ("xdg-open", vec![path.to_string_lossy().into_owned()])
-}
+const OPEN_PROGRAM: &str = "xdg-open";
 
 /// Spawn [`open_path_command`] for `path` and detach — VeloX never waits on
 /// or otherwise tracks the launched process, the same "fire and forget" a
@@ -672,6 +632,17 @@ pub fn spawn_open(path: &Path) -> std::io::Result<Child> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::util::unique_temp_path;
+
+    /// `/tmp/{file_name}` を保存先としてダウンロードを 1 件開始する。
+    fn start(store: &mut DownloadStore, url: &str, file_name: &str, started_at: u64) -> DownloadId {
+        store.start(
+            url.to_owned(),
+            file_name.to_owned(),
+            PathBuf::from(format!("/tmp/{file_name}")),
+            started_at,
+        )
+    }
 
     // --- Issue #128 / D140: wry の `failed` フラグ汚染への備え ---
 
@@ -731,7 +702,7 @@ mod tests {
     #[test]
     fn complete_transitions_from_in_progress_and_sets_finished_at() {
         let mut store = DownloadStore::new();
-        let id = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        let id = start(&mut store, "u", "f", 1);
         assert!(store.complete(id, 5));
         let entry = store.get(id).unwrap();
         assert_eq!(entry.state, DownloadState::Completed);
@@ -741,7 +712,7 @@ mod tests {
     #[test]
     fn fail_transitions_from_in_progress_and_records_reason() {
         let mut store = DownloadStore::new();
-        let id = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        let id = start(&mut store, "u", "f", 1);
         assert!(store.fail(id, "network error".to_owned(), 9));
         let entry = store.get(id).unwrap();
         assert_eq!(entry.state, DownloadState::Failed);
@@ -752,7 +723,7 @@ mod tests {
     #[test]
     fn cancel_transitions_from_in_progress() {
         let mut store = DownloadStore::new();
-        let id = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        let id = start(&mut store, "u", "f", 1);
         assert!(store.cancel(id, 3));
         assert_eq!(store.get(id).unwrap().state, DownloadState::Cancelled);
     }
@@ -760,7 +731,7 @@ mod tests {
     #[test]
     fn terminal_states_reject_every_further_transition() {
         let mut store = DownloadStore::new();
-        let id = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        let id = start(&mut store, "u", "f", 1);
         assert!(store.complete(id, 2));
         // Already Completed: every further transition is a no-op, not a
         // state change — this is exactly the "a late completion must not
@@ -793,19 +764,19 @@ mod tests {
     #[test]
     fn remove_drops_an_entry_and_ids_stay_unique_afterwards() {
         let mut store = DownloadStore::new();
-        let first = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        let first = start(&mut store, "u", "f", 1);
         assert!(store.remove(first));
         assert!(store.get(first).is_none());
         assert!(!store.remove(first));
-        let second = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 2);
+        let second = start(&mut store, "u", "f", 2);
         assert_ne!(first, second);
     }
 
     #[test]
     fn entries_newest_first_reverses_start_order() {
         let mut store = DownloadStore::new();
-        store.start("a".into(), "a".into(), PathBuf::from("/tmp/a"), 1);
-        store.start("b".into(), "b".into(), PathBuf::from("/tmp/b"), 2);
+        start(&mut store, "a", "a", 1);
+        start(&mut store, "b", "b", 2);
         let urls: Vec<&str> = store
             .entries_newest_first()
             .map(|e| e.url.as_str())
@@ -818,12 +789,7 @@ mod tests {
     #[test]
     fn resolve_completion_matches_by_url_when_only_one_is_in_progress() {
         let mut store = DownloadStore::new();
-        let id = store.start(
-            "https://example.com/f".to_owned(),
-            "f".into(),
-            PathBuf::from("/tmp/f"),
-            1,
-        );
+        let id = start(&mut store, "https://example.com/f", "f", 1);
         assert_eq!(
             store.resolve_completion("https://example.com/f", None),
             Some(id)
@@ -833,18 +799,8 @@ mod tests {
     #[test]
     fn resolve_completion_prefers_exact_destination_match() {
         let mut store = DownloadStore::new();
-        let first = store.start(
-            "https://example.com/f".to_owned(),
-            "f".into(),
-            PathBuf::from("/tmp/f"),
-            1,
-        );
-        let second = store.start(
-            "https://example.com/f".to_owned(),
-            "f (1)".into(),
-            PathBuf::from("/tmp/f (1)"),
-            2,
-        );
+        let first = start(&mut store, "https://example.com/f", "f", 1);
+        let second = start(&mut store, "https://example.com/f", "f (1)", 2);
         assert_eq!(
             store.resolve_completion("https://example.com/f", Some(Path::new("/tmp/f (1)"))),
             Some(second)
@@ -858,18 +814,8 @@ mod tests {
     #[test]
     fn resolve_completion_falls_back_to_oldest_in_progress_for_the_url_without_a_path() {
         let mut store = DownloadStore::new();
-        let first = store.start(
-            "https://example.com/f".to_owned(),
-            "f".into(),
-            PathBuf::from("/tmp/f"),
-            1,
-        );
-        store.start(
-            "https://example.com/f".to_owned(),
-            "f (1)".into(),
-            PathBuf::from("/tmp/f (1)"),
-            2,
-        );
+        let first = start(&mut store, "https://example.com/f", "f", 1);
+        start(&mut store, "https://example.com/f", "f (1)", 2);
         // macOS never hands back a path (see docs/decisions.md D28) — the
         // FIFO fallback is what runs there.
         assert_eq!(
@@ -881,7 +827,7 @@ mod tests {
     #[test]
     fn resolve_completion_ignores_completed_entries() {
         let mut store = DownloadStore::new();
-        let id = store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        let id = start(&mut store, "u", "f", 1);
         store.complete(id, 2);
         assert_eq!(store.resolve_completion("u", None), None);
     }
@@ -889,7 +835,7 @@ mod tests {
     #[test]
     fn resolve_completion_returns_none_for_an_unrelated_url() {
         let mut store = DownloadStore::new();
-        store.start("u".into(), "f".into(), PathBuf::from("/tmp/f"), 1);
+        start(&mut store, "u", "f", 1);
         assert_eq!(store.resolve_completion("other", None), None);
     }
 
@@ -1069,7 +1015,7 @@ mod tests {
 
     #[test]
     fn build_destination_sanitizes_then_avoids_collisions_on_a_real_directory() {
-        let dir = unique_temp_dir("velox-downloads-collision");
+        let dir = unique_temp_path("velox-downloads-collision");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("report.pdf"), b"existing").unwrap();
 
@@ -1081,7 +1027,7 @@ mod tests {
 
     #[test]
     fn prepare_destination_creates_missing_directories() {
-        let dir = unique_temp_dir("velox-downloads-mkdir")
+        let dir = unique_temp_path("velox-downloads-mkdir")
             .join("nested")
             .join("downloads");
         assert!(!dir.exists());
@@ -1174,20 +1120,5 @@ mod tests {
     fn open_path_command_uses_xdg_open_on_linux() {
         let (program, _) = open_path_command(Path::new("/tmp/x"));
         assert_eq!(program, "xdg-open");
-    }
-
-    /// A per-test temp directory under the OS temp dir, distinguished by
-    /// `label` plus the current thread so parallel tests never collide —
-    /// same helper shape as `persistence`'s tests.
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let unique = format!(
-            "{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
     }
 }

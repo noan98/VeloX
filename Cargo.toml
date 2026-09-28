@@ -38,6 +38,8 @@ wry = "0.57"
 
 # wry's gtk backend exposes raw gtk containers; we need the gtk crate to place
 # two webviews (toolbar + content) inside one window on Linux/BSD.
+# This target list must match `GTK_TARGET_OSES` in build.rs, which exposes
+# it to the source as the `cfg(gtk_backend)` alias.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 gtk = "0.18"
 

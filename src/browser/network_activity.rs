@@ -199,7 +199,17 @@ mod tests {
     // -- is_polling ------------------------------------------------------
 
     fn secs(values: &[u64]) -> Vec<Duration> {
-        values.iter().map(|s| Duration::from_secs(*s)).collect()
+        values.iter().copied().map(Duration::from_secs).collect()
+    }
+
+    /// 周期 10 秒前後で ±200ms ほど揺れる `setInterval` 相当のタイムスタンプ。
+    fn jittered_10s_poll() -> [Duration; 4] {
+        [
+            Duration::from_millis(0),
+            Duration::from_millis(9_800),
+            Duration::from_millis(20_100),
+            Duration::from_millis(29_900),
+        ]
     }
 
     #[test]
@@ -233,26 +243,14 @@ mod tests {
     fn small_jitter_within_tolerance_is_still_polling() {
         // A real setInterval loop is never exactly on the millisecond;
         // +/-1 out of a 10s period is comfortably inside a 15% tolerance.
-        let jittered = [
-            Duration::from_millis(0),
-            Duration::from_millis(9_800),
-            Duration::from_millis(20_100),
-            Duration::from_millis(29_900),
-        ];
-        assert!(is_polling(&jittered, 0.15));
+        assert!(is_polling(&jittered_10s_poll(), 0.15));
     }
 
     #[test]
     fn a_stricter_tolerance_can_reject_the_same_jitter() {
-        let jittered = [
-            Duration::from_millis(0),
-            Duration::from_millis(9_800),
-            Duration::from_millis(20_100),
-            Duration::from_millis(29_900),
-        ];
         // Same data as the test above, but a caller asking for near-exact
         // regularity (1%) should not get a pass.
-        assert!(!is_polling(&jittered, 0.01));
+        assert!(!is_polling(&jittered_10s_poll(), 0.01));
     }
 
     #[test]

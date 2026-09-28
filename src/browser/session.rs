@@ -14,7 +14,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::navigation;
-use super::tab::Favicon;
+use super::tab::{Favicon, Tab};
 use super::tabs::Tabs;
 
 /// One tab's persisted state: just enough to show a tab strip and reload the
@@ -89,6 +89,21 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
+impl SavedTab {
+    /// 1 つの [`Tab`] の、タブストリップに見えているままの状態を写し取る。
+    fn from_tab(tab: &Tab) -> Self {
+        Self {
+            url: tab.current_url().to_owned(),
+            title: tab.title().map(str::to_owned),
+            favicon: match tab.favicon() {
+                Favicon::Url(url) => Some(url.clone()),
+                Favicon::Unknown => None,
+            },
+            pinned: tab.is_pinned(),
+        }
+    }
+}
+
 impl SavedWindow {
     /// Capture one window's tab set, in display order. Pure — reads only
     /// `Tabs`'/`Tab`'s existing public getters, the same state the tab strip
@@ -96,28 +111,12 @@ impl SavedWindow {
     /// gets saved is exactly what the user currently sees.
     pub fn from_tabs(tabs: &Tabs) -> Self {
         let active_id = tabs.active_id();
-        let mut active_index = 0;
-        let saved = tabs
-            .iter()
-            .enumerate()
-            .map(|(index, tab)| {
-                if tab.id() == active_id {
-                    active_index = index;
-                }
-                SavedTab {
-                    url: tab.current_url().to_owned(),
-                    title: tab.title().map(str::to_owned),
-                    favicon: match tab.favicon() {
-                        Favicon::Url(url) => Some(url.clone()),
-                        Favicon::Unknown => None,
-                    },
-                    pinned: tab.is_pinned(),
-                }
-            })
-            .collect();
         Self {
-            tabs: saved,
-            active_index,
+            tabs: tabs.iter().map(SavedTab::from_tab).collect(),
+            active_index: tabs
+                .iter()
+                .position(|tab| tab.id() == active_id)
+                .unwrap_or(0),
         }
     }
 
@@ -205,10 +204,7 @@ impl SessionSnapshot {
             .into_iter()
             .filter_map(SavedWindow::sanitize)
             .collect();
-        if self.windows.is_empty() {
-            return None;
-        }
-        Some(self)
+        (!self.windows.is_empty()).then_some(self)
     }
 
     /// The first window's tabs — what `app::run` restores the primary
@@ -590,10 +586,8 @@ mod tests {
         let snapshot = snapshot(vec![window(
             vec![
                 SavedTab {
-                    url: "https://a.example/".to_owned(),
-                    title: None,
-                    favicon: None,
                     pinned: true,
+                    ..saved("https://a.example/")
                 },
                 saved("https://b.example/"),
             ],

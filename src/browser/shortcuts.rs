@@ -165,17 +165,15 @@ impl Modifiers {
     /// this directly to build the grouped "Ctrl+1〜8" row for
     /// `ActivateTabAt`, which has no single key to append.
     pub fn label(&self, platform: Platform) -> String {
-        let mut parts = Vec::with_capacity(3);
-        if self.primary {
-            parts.push(platform.primary_label().to_owned());
-        }
-        if self.alt {
-            parts.push(platform.alt_label().to_owned());
-        }
-        if self.shift {
-            parts.push("Shift".to_owned());
-        }
-        parts.join("+")
+        [
+            (self.primary, platform.primary_label()),
+            (self.alt, platform.alt_label()),
+            (self.shift, "Shift"),
+        ]
+        .into_iter()
+        .filter_map(|(held, label)| held.then_some(label))
+        .collect::<Vec<_>>()
+        .join("+")
     }
 }
 
@@ -717,14 +715,13 @@ mod tests {
 
     #[test]
     fn table_ids_are_unique() {
-        let mut ids: Vec<String> = SHORTCUT_TABLE
-            .iter()
-            .map(|d| format!("{:?}", d.id))
-            .collect();
-        let before = ids.len();
-        ids.sort();
-        ids.dedup();
-        assert_eq!(ids.len(), before, "duplicate ShortcutId in SHORTCUT_TABLE");
+        let ids: std::collections::HashSet<ShortcutId> =
+            SHORTCUT_TABLE.iter().map(|d| d.id).collect();
+        assert_eq!(
+            ids.len(),
+            SHORTCUT_TABLE.len(),
+            "duplicate ShortcutId in SHORTCUT_TABLE"
+        );
     }
 
     #[test]

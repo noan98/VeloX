@@ -99,8 +99,14 @@ impl Margins {
 }
 
 fn sanitize_margin(value: f64, fallback: f64) -> f64 {
+    clamp_finite(value, MIN_MARGIN_IN, MAX_MARGIN_IN, fallback)
+}
+
+/// `value` を `[min, max]` に丸める。非有限値 (`NaN`/`inf`) には「最も近い
+/// 有限値」が無いので、丸めずに `fallback` を返す。
+fn clamp_finite(value: f64, min: f64, max: f64, fallback: f64) -> f64 {
     if value.is_finite() {
-        value.clamp(MIN_MARGIN_IN, MAX_MARGIN_IN)
+        value.clamp(min, max)
     } else {
         fallback
     }
@@ -150,16 +156,11 @@ impl PdfExportSettings {
     /// back to `1.0` (100%), the same "no meaningful closest value" reasoning
     /// [`Margins::sanitize`] uses.
     pub fn sanitize(&self) -> PdfExportSettings {
-        let scale = if self.scale.is_finite() {
-            self.scale.clamp(MIN_SCALE, MAX_SCALE)
-        } else {
-            1.0
-        };
         PdfExportSettings {
             paper: self.paper,
             orientation: self.orientation,
             margins: self.margins.sanitize(),
-            scale,
+            scale: clamp_finite(self.scale, MIN_SCALE, MAX_SCALE, 1.0),
             print_backgrounds: self.print_backgrounds,
         }
     }

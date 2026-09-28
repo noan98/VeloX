@@ -20,6 +20,8 @@
 //! fetches the raw source (`document.documentElement.outerHTML`) and
 //! `app.rs` calls into here to turn it into something displayable.
 
+use super::util::truncate_utf8;
+
 /// Maximum number of UTF-8 bytes of raw page source rendered before
 /// truncating (see [`truncate_source_utf8`]).
 ///
@@ -72,14 +74,8 @@ pub fn escape_html(input: &str) -> String {
 /// panic on the slice below), returning the possibly-shortened source and
 /// whether truncation actually happened (`false` when `source` already fit).
 pub fn truncate_source_utf8(source: &str, max_bytes: usize) -> (&str, bool) {
-    if source.len() <= max_bytes {
-        return (source, false);
-    }
-    let mut end = max_bytes;
-    while end > 0 && !source.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&source[..end], true)
+    let visible = truncate_utf8(source, max_bytes);
+    (visible, visible.len() != source.len())
 }
 
 /// Build the full HTML document View Source shows: a header naming
@@ -104,11 +100,9 @@ pub fn truncate_source_utf8(source: &str, max_bytes: usize) -> (&str, bool) {
 pub fn build_view_source_document(page_url: &str, source: &str, max_bytes: usize) -> String {
     let (visible, truncated) = truncate_source_utf8(source, max_bytes);
     let mut body = String::with_capacity(visible.len() + visible.len() / 4 + 64);
-    let mut line_count: u64 = 0;
-    for line in visible.lines() {
-        line_count += 1;
+    for (index, line) in visible.lines().enumerate() {
         body.push_str("<span class=\"ln\">");
-        body.push_str(&line_count.to_string());
+        body.push_str(&(index + 1).to_string());
         body.push_str("</span><span class=\"src\">");
         body.push_str(&escape_html(line));
         body.push_str("</span>\n");
@@ -116,7 +110,7 @@ pub fn build_view_source_document(page_url: &str, source: &str, max_bytes: usize
     // An empty page (or a page whose source is exactly one blank line) still
     // gets one visible (empty) row rather than a completely blank `<pre>`,
     // matching what `str::lines` would otherwise silently drop.
-    if line_count == 0 {
+    if body.is_empty() {
         body.push_str("<span class=\"ln\">1</span><span class=\"src\"></span>\n");
     }
     let notice = if truncated {
@@ -182,19 +176,14 @@ pub fn base64_encode(bytes: &[u8]) -> String {
         let b0 = chunk[0];
         let b1 = chunk.get(1).copied().unwrap_or(0);
         let b2 = chunk.get(2).copied().unwrap_or(0);
-        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | (b2 as u32);
-        out.push(BASE64_TABLE[((n >> 18) & 0x3F) as usize] as char);
-        out.push(BASE64_TABLE[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            BASE64_TABLE[((n >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            BASE64_TABLE[(n & 0x3F) as usize] as char
-        } else {
-            '='
-        });
+        let n = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
+        // 24 ビットを上位から 6 ビットずつ 4 文字に割り当てる。入力が 3 バイト
+        // に満たないチャンクでは、存在しないバイトの分を `=` で埋める。
+        let sextet = |shift: u32| BASE64_TABLE[((n >> shift) & 0x3F) as usize] as char;
+        out.push(sextet(18));
+        out.push(sextet(12));
+        out.push(if chunk.len() > 1 { sextet(6) } else { '=' });
+        out.push(if chunk.len() > 2 { sextet(0) } else { '=' });
     }
     out
 }

@@ -66,6 +66,7 @@
 
 use std::fmt;
 
+use crate::browser::benchmark::scenario::Scenario;
 use crate::browser::navigation;
 
 /// Hard cap on a single `wait <ms>` command, so a typo (or a hostile script,
@@ -222,9 +223,8 @@ pub fn parse_script(text: &str) -> Result<Vec<AutomationCommand>, AutomationErro
 }
 
 fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationError> {
-    let mut parts = text.splitn(2, char::is_whitespace);
-    let keyword = parts.next().unwrap_or("");
-    let rest = parts.next().unwrap_or("").trim();
+    let (keyword, rest) = text.split_once(char::is_whitespace).unwrap_or((text, ""));
+    let rest = rest.trim();
 
     match keyword {
         "open" => Ok(AutomationCommand::Open {
@@ -242,51 +242,41 @@ fn parse_line(line: usize, text: &str) -> Result<AutomationCommand, AutomationEr
         "suspend" => Ok(AutomationCommand::Suspend {
             index: parse_index(line, "suspend", rest)?,
         }),
-        "new_window" => {
+        "new_window" => no_args(line, keyword, rest, AutomationCommand::NewWindow),
+        "new_private_window" => no_args(line, keyword, rest, AutomationCommand::NewPrivateWindow),
+        "wait" => {
             if rest.is_empty() {
-                Ok(AutomationCommand::NewWindow)
-            } else {
-                Err(err(
-                    line,
-                    format!("new_window は引数を取りません: {rest:?}"),
-                ))
+                return Err(err(line, "wait には ms 引数が必要です".to_owned()));
             }
+            Ok(AutomationCommand::Wait {
+                ms: parse_capped_ms(line, "wait", "ms", rest)?,
+            })
         }
-        "new_private_window" => {
-            if rest.is_empty() {
-                Ok(AutomationCommand::NewPrivateWindow)
-            } else {
-                Err(err(
-                    line,
-                    format!("new_private_window は引数を取りません: {rest:?}"),
-                ))
-            }
-        }
-        "wait" => Ok(AutomationCommand::Wait {
-            ms: parse_wait(line, rest)?,
-        }),
         "wait_load" => Ok(AutomationCommand::WaitLoad {
             timeout_ms: parse_optional_wait(line, "wait_load", rest)?,
         }),
         "wait_startup" => Ok(AutomationCommand::WaitStartup {
             timeout_ms: parse_optional_wait(line, "wait_startup", rest)?,
         }),
-        "mark" => {
-            if rest.is_empty() {
-                Ok(AutomationCommand::Mark)
-            } else {
-                Err(err(line, format!("mark は引数を取りません: {rest:?}")))
-            }
-        }
-        "quit" => {
-            if rest.is_empty() {
-                Ok(AutomationCommand::Quit)
-            } else {
-                Err(err(line, format!("quit は引数を取りません: {rest:?}")))
-            }
-        }
+        "mark" => no_args(line, keyword, rest, AutomationCommand::Mark),
+        "quit" => no_args(line, keyword, rest, AutomationCommand::Quit),
         "" => Err(err(line, "空のコマンドです".to_owned())),
         other => Err(err(line, format!("未知のコマンドです: {other:?}"))),
+    }
+}
+
+/// 引数を取らないコマンド (`new_window` / `mark` / `quit` など) の共通処理。
+/// 引数が付いていたら `keyword` を名指ししたエラーにする。
+fn no_args(
+    line: usize,
+    keyword: &str,
+    rest: &str,
+    command: AutomationCommand,
+) -> Result<AutomationCommand, AutomationError> {
+    if rest.is_empty() {
+        Ok(command)
+    } else {
+        Err(err(line, format!("{keyword} は引数を取りません: {rest:?}")))
     }
 }
 
@@ -310,25 +300,6 @@ fn parse_index(line: usize, keyword: &str, rest: &str) -> Result<usize, Automati
     })
 }
 
-fn parse_wait(line: usize, rest: &str) -> Result<u64, AutomationError> {
-    if rest.is_empty() {
-        return Err(err(line, "wait には ms 引数が必要です".to_owned()));
-    }
-    let ms: u64 = rest.parse().map_err(|_| {
-        err(
-            line,
-            format!("wait の ms は非負整数で指定してください: {rest:?}"),
-        )
-    })?;
-    if ms > MAX_WAIT_MS {
-        return Err(err(
-            line,
-            format!("wait は最大 {MAX_WAIT_MS}ms までです (指定値: {ms}ms)"),
-        ));
-    }
-    Ok(ms)
-}
-
 /// `wait_load`/`wait_startup`'s argument is optional, unlike `wait`'s — an
 /// empty `rest` means "use [`DEFAULT_WAIT_LOAD_TIMEOUT_MS`]", not an error.
 /// When given, it is validated exactly like `wait`'s `ms` (non-negative
@@ -340,10 +311,23 @@ fn parse_optional_wait(line: usize, keyword: &str, rest: &str) -> Result<u64, Au
     if rest.is_empty() {
         return Ok(DEFAULT_WAIT_LOAD_TIMEOUT_MS);
     }
+    parse_capped_ms(line, keyword, "timeout_ms", rest)
+}
+
+/// `wait` / `wait_load` / `wait_startup` に共通の ms 引数の検査 — 非負整数で
+/// [`MAX_WAIT_MS`] 以下であること。`keyword` と `arg_name` はエラーメッセージ
+/// にだけ使う。`rest` は空でない前提 (空の扱いはコマンドごとに違うので、
+/// 呼び出し側で済ませる)。
+fn parse_capped_ms(
+    line: usize,
+    keyword: &str,
+    arg_name: &str,
+    rest: &str,
+) -> Result<u64, AutomationError> {
     let ms: u64 = rest.parse().map_err(|_| {
         err(
             line,
-            format!("{keyword} の timeout_ms は非負整数で指定してください: {rest:?}"),
+            format!("{keyword} の {arg_name} は非負整数で指定してください: {rest:?}"),
         )
     })?;
     if ms > MAX_WAIT_MS {
@@ -558,11 +542,7 @@ impl BenchScriptOverrides {
     /// `scenario` に対してこの上書きが意味を持つかを検査する。**効かない
     /// シナリオに指定されたら黙って無視せず `Err`** — 「上書きしたつもりで
     /// 既定のまま測った」結果が同じ顔で残るのを防ぐため。
-    pub fn validate_for(
-        &self,
-        scenario: crate::browser::benchmark::scenario::Scenario,
-    ) -> Result<(), String> {
-        use crate::browser::benchmark::scenario::Scenario;
+    pub fn validate_for(&self, scenario: Scenario) -> Result<(), String> {
         let has_rounds = matches!(
             scenario,
             Scenario::TabCountMemoryResume(_) | Scenario::TabCountMemoryBounce(_)
@@ -625,10 +605,7 @@ fn memory_hold_setup_lines(tab_count: u32, url: &str) -> Vec<String> {
     //   3. そのあとに `mark` を打つ — ここから先のサンプルだけが
     //      集計されるので、得られる値は**落ち着いた後**のものになる。
     //      開いている最中の値は混ざらない。
-    let extra_tabs = tab_count.saturating_sub(1);
-    let mut lines: Vec<String> = (0..extra_tabs)
-        .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-        .collect();
+    let mut lines = open_with_settle_lines(extra_tab_count(tab_count), url);
     lines.push(format!("wait {MEMORY_HOLD_SETTLE_MS}"));
     lines.push("mark".to_owned());
     lines
@@ -645,12 +622,28 @@ fn memory_hold_setup_lines(tab_count: u32, url: &str) -> Vec<String> {
 /// `tabs_hold_bounce_matches_tabs_hold_resume_up_to_its_final_wait` が
 /// これを検査する)。
 fn memory_resume_rounds_lines(rounds: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for index in 0..rounds {
-        lines.push(format!("switch {index}"));
-        lines.push(format!("wait {RESUME_SETTLE_MS}"));
-    }
-    lines
+    (0..rounds)
+        .flat_map(|index| {
+            [
+                format!("switch {index}"),
+                format!("wait {RESUME_SETTLE_MS}"),
+            ]
+        })
+        .collect()
+}
+
+/// `open <url>` と `wait STEP_SETTLE_MS` の組を `count` 回並べる — 開いた
+/// タブが読み込みを始めてから次へ進む、複数シナリオに共通の「1 枚ずつ開く」
+/// 準備部分。
+fn open_with_settle_lines(count: usize, url: &str) -> Vec<String> {
+    (0..count)
+        .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
+        .collect()
+}
+
+/// `tab_count` 枚の状態にするために、起動時の 1 枚に加えて開くタブの数。
+fn extra_tab_count(tab_count: u32) -> usize {
+    tab_count.saturating_sub(1) as usize
 }
 
 /// Build the automation script text for `scenario`, given the fixed page
@@ -664,22 +657,17 @@ fn memory_resume_rounds_lines(rounds: usize) -> Vec<String> {
 /// VeloX with `VELOX_AUTOMATION_SCRIPT` set to this script's contents can
 /// wait for the child to exit on its own instead of killing it after a
 /// fixed timeout.
-pub fn generate_bench_script(
-    scenario: crate::browser::benchmark::scenario::Scenario,
-    url: &str,
-) -> Option<String> {
+pub fn generate_bench_script(scenario: Scenario, url: &str) -> Option<String> {
     generate_bench_script_with(scenario, url, BenchScriptOverrides::default())
 }
 
 /// [`generate_bench_script`] に計測用の上書き ([`BenchScriptOverrides`]) を
 /// 渡す版。既定値を渡せば引数なし版と同じ文字列になる。
 pub fn generate_bench_script_with(
-    scenario: crate::browser::benchmark::scenario::Scenario,
+    scenario: Scenario,
     url: &str,
     overrides: BenchScriptOverrides,
 ) -> Option<String> {
-    use crate::browser::benchmark::scenario::Scenario;
-
     let mut lines: Vec<String> = match scenario {
         Scenario::ColdStartup | Scenario::WarmStartup | Scenario::FirstPageLoad => return None,
         Scenario::Navigation => (1..=NAVIGATION_STEPS)
@@ -690,9 +678,7 @@ pub fn generate_bench_script_with(
                 ]
             })
             .collect(),
-        Scenario::TabCreate => (0..TAB_CREATE_COUNT)
-            .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-            .collect(),
+        Scenario::TabCreate => open_with_settle_lines(TAB_CREATE_COUNT, url),
         Scenario::TabSwitch => {
             let mut lines: Vec<String> = (0..TAB_SWITCH_EXTRA_TABS)
                 .map(|_| format!("open {url}"))
@@ -714,9 +700,7 @@ pub fn generate_bench_script_with(
             // never the active tab: after `switch k` tab `k` is active,
             // and the next round's target is `k + 1` (mod `extra`), which
             // is a different tab for any `extra >= 2`.
-            let mut lines: Vec<String> = (0..TAB_RESUME_EXTRA_TABS)
-                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-                .collect();
+            let mut lines = open_with_settle_lines(TAB_RESUME_EXTRA_TABS, url);
             for i in 0..TAB_RESUME_REPEATS {
                 let index = i % TAB_RESUME_EXTRA_TABS;
                 lines.push(format!("suspend {index}"));
@@ -745,9 +729,7 @@ pub fn generate_bench_script_with(
             // that is still loading). Then `mark`, and repeatedly open one
             // more tab and close it again — every measured `tab_create`
             // therefore happens with exactly `tab_count` tabs already open.
-            let mut lines: Vec<String> = (1..tab_count)
-                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-                .collect();
+            let mut lines = open_with_settle_lines(extra_tab_count(tab_count), url);
             lines.push("mark".to_owned());
             for _ in 0..TAB_CREATE_AT_ROUNDS {
                 lines.push(format!("open {url}"));
@@ -760,9 +742,7 @@ pub fn generate_bench_script_with(
             lines
         }
         Scenario::TabSwitchAt(tab_count) => {
-            let mut lines: Vec<String> = (1..tab_count)
-                .flat_map(|_| [format!("open {url}"), format!("wait {STEP_SETTLE_MS}")])
-                .collect();
+            let mut lines = open_with_settle_lines(extra_tab_count(tab_count), url);
             lines.push("mark".to_owned());
             for i in 0..TAB_SWITCH_AT_REPEATS {
                 lines.push(format!("switch {}", i % tab_count as usize));
@@ -771,8 +751,9 @@ pub fn generate_bench_script_with(
             lines
         }
         Scenario::TabCountMemory(tab_count) => {
-            let extra_tabs = tab_count.saturating_sub(1);
-            let mut lines: Vec<String> = (0..extra_tabs).map(|_| format!("open {url}")).collect();
+            let mut lines: Vec<String> = (0..extra_tab_count(tab_count))
+                .map(|_| format!("open {url}"))
+                .collect();
             lines.push(format!("wait {MEMORY_STABILIZE_MS}"));
             lines
         }
@@ -835,8 +816,7 @@ pub fn generate_bench_script_with(
 /// whether `--url` is required. See
 /// `tests::needs_automation_script_agrees_with_generate_bench_script` for
 /// the consistency check between the two.
-pub fn needs_automation_script(scenario: crate::browser::benchmark::scenario::Scenario) -> bool {
-    use crate::browser::benchmark::scenario::Scenario;
+pub fn needs_automation_script(scenario: Scenario) -> bool {
     !matches!(
         scenario,
         Scenario::ColdStartup | Scenario::WarmStartup | Scenario::FirstPageLoad
@@ -855,18 +835,13 @@ pub fn needs_automation_script(scenario: crate::browser::benchmark::scenario::Sc
 /// unchanged; the rest add enough margin for their own generated script's
 /// steps and waits to comfortably finish (and hit `quit`) before
 /// `velox-bench run` would otherwise kill the process.
-pub fn recommended_timeout_secs(scenario: crate::browser::benchmark::scenario::Scenario) -> u64 {
+pub fn recommended_timeout_secs(scenario: Scenario) -> u64 {
     recommended_timeout_secs_with(scenario, BenchScriptOverrides::default())
 }
 
 /// [`recommended_timeout_secs`] に計測用の上書きを渡す版 — ラウンド数や
 /// 揺り戻しの待ちを伸ばしたら、待ち切る前に殺されないよう上限も伸びる。
-pub fn recommended_timeout_secs_with(
-    scenario: crate::browser::benchmark::scenario::Scenario,
-    overrides: BenchScriptOverrides,
-) -> u64 {
-    use crate::browser::benchmark::scenario::Scenario;
-
+pub fn recommended_timeout_secs_with(scenario: Scenario, overrides: BenchScriptOverrides) -> u64 {
     /// Rough wall-clock cost of one `open`/`switch`/`close`/`navigate`
     /// step beyond its own explicit `wait`, covering the webview call
     /// itself plus IPC round-trip slack.
@@ -874,60 +849,59 @@ pub fn recommended_timeout_secs_with(
     const STARTUP_DEFAULT_SECS: u64 = 5;
     const TEARDOWN_BUFFER_SECS: u64 = 3;
 
+    // `open` + `wait STEP_SETTLE_MS` の組 (`open_with_settle_lines`) を
+    // `count` 回並べたときの所要時間。
+    let settled_opens_ms = |count: u64| count * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+    // `tab_count` 枚まで 1 枚ずつ開く準備 (起動時の 1 枚は開かない)。
+    let setup_ms = |tab_count: u32| settled_opens_ms(u64::from(tab_count.saturating_sub(1)));
+    // `memory_resume_rounds_lines` の復帰ラウンドの合計。
+    let resume_rounds_ms =
+        overrides.resume_rounds() as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
+
     let script_ms: u64 = match scenario {
         Scenario::ColdStartup | Scenario::WarmStartup | Scenario::FirstPageLoad => {
             return STARTUP_DEFAULT_SECS;
         }
-        Scenario::Navigation => NAVIGATION_STEPS as u64 * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS),
-        Scenario::TabCreate => TAB_CREATE_COUNT as u64 * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS),
+        Scenario::Navigation => settled_opens_ms(NAVIGATION_STEPS as u64),
+        Scenario::TabCreate => settled_opens_ms(TAB_CREATE_COUNT as u64),
         Scenario::TabSwitch => {
             let open_ms = TAB_SWITCH_EXTRA_TABS as u64 * PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS;
             let switch_ms = TAB_SWITCH_REPEATS as u64 * (PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS);
             open_ms + switch_ms
         }
         Scenario::TabResume => {
-            let open_ms = TAB_RESUME_EXTRA_TABS as u64 * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
+            let open_ms = settled_opens_ms(TAB_RESUME_EXTRA_TABS as u64);
             let round_ms = 2 * PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS + RESUME_SETTLE_MS;
             open_ms + TAB_RESUME_REPEATS as u64 * round_ms
         }
         Scenario::BackgroundCpu => 2 * BACKGROUND_CPU_SETTLE_MS + BACKGROUND_CPU_WINDOW_MS,
         Scenario::TabCreateAt(tab_count) => {
-            let setup_ms =
-                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
             let round_ms = 2 * PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS + SWITCH_SETTLE_MS;
-            setup_ms + TAB_CREATE_AT_ROUNDS as u64 * round_ms
+            setup_ms(tab_count) + TAB_CREATE_AT_ROUNDS as u64 * round_ms
         }
         Scenario::TabSwitchAt(tab_count) => {
-            let setup_ms =
-                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
-            setup_ms + TAB_SWITCH_AT_REPEATS as u64 * (PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS)
+            setup_ms(tab_count)
+                + TAB_SWITCH_AT_REPEATS as u64 * (PER_STEP_OVERHEAD_MS + SWITCH_SETTLE_MS)
         }
         Scenario::TabCountMemory(tab_count) => {
             let open_ms = u64::from(tab_count.saturating_sub(1)) * PER_STEP_OVERHEAD_MS;
             open_ms + MEMORY_STABILIZE_MS
         }
         Scenario::TabCountMemoryHold(tab_count) => {
-            let open_ms =
-                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
-            open_ms + MEMORY_HOLD_SETTLE_MS + MEMORY_HOLD_WINDOW_MS
+            setup_ms(tab_count) + MEMORY_HOLD_SETTLE_MS + MEMORY_HOLD_WINDOW_MS
         }
+        // 準備は `TabCountMemoryHold` と同じ。違いは `mark` 後の窓が
+        // 固定の待ち時間ではなくラウンドの合計になること。
         Scenario::TabCountMemoryResume(tab_count) => {
-            // 準備は `TabCountMemoryHold` と同じ。違いは `mark` 後の窓が
-            // 固定の待ち時間ではなくラウンドの合計になること。
-            let open_ms =
-                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
-            let rounds_ms =
-                overrides.resume_rounds() as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
-            open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms
+            setup_ms(tab_count) + MEMORY_HOLD_SETTLE_MS + resume_rounds_ms
         }
+        // `TabCountMemoryResume` と同じ計算に、末尾の
+        // `MEMORY_BOUNCE_SETTLE_MS` を足すだけ (Issue #279)。
         Scenario::TabCountMemoryBounce(tab_count) => {
-            // `TabCountMemoryResume` と同じ計算に、末尾の
-            // `MEMORY_BOUNCE_SETTLE_MS` を足すだけ (Issue #279)。
-            let open_ms =
-                u64::from(tab_count.saturating_sub(1)) * (PER_STEP_OVERHEAD_MS + STEP_SETTLE_MS);
-            let rounds_ms =
-                overrides.resume_rounds() as u64 * (PER_STEP_OVERHEAD_MS + RESUME_SETTLE_MS);
-            open_ms + MEMORY_HOLD_SETTLE_MS + rounds_ms + overrides.bounce_settle_ms()
+            setup_ms(tab_count)
+                + MEMORY_HOLD_SETTLE_MS
+                + resume_rounds_ms
+                + overrides.bounce_settle_ms()
         }
     };
     script_ms / 1000 + STARTUP_DEFAULT_SECS + TEARDOWN_BUFFER_SECS
@@ -969,9 +943,7 @@ pub fn recommended_timeout_secs_with(
 /// work, so tab count does not slow it down either. `benchmark::
 /// memory_sample_confidence` is the safety net for the case where the
 /// real environment is slow enough that even this still undersamples.
-pub fn recommended_rss_interval_ms(
-    scenario: crate::browser::benchmark::scenario::Scenario,
-) -> Option<u64> {
+pub fn recommended_rss_interval_ms(scenario: Scenario) -> Option<u64> {
     recommended_rss_interval_ms_with(scenario, BenchScriptOverrides::default())
 }
 
@@ -981,10 +953,9 @@ pub fn recommended_rss_interval_ms(
 /// `tabs_hold_N` と同じ `MEMORY_HOLD_WINDOW_MS` を最低値にする (0 で割らない・
 /// 間隔 0ms を返さない)。
 pub fn recommended_rss_interval_ms_with(
-    scenario: crate::browser::benchmark::scenario::Scenario,
+    scenario: Scenario,
     overrides: BenchScriptOverrides,
 ) -> Option<u64> {
-    use crate::browser::benchmark::scenario::Scenario;
     match scenario {
         Scenario::TabCountMemory(_) => Some(MEMORY_STABILIZE_MS / TARGET_STABILIZED_RSS_SAMPLES),
         // `tabs_hold_N` は `mark` の後ろの窓だけが集計対象なので、
@@ -1047,6 +1018,43 @@ pub fn recommended_rss_interval_ms_with(
 mod tests {
     use super::*;
 
+    const URL: &str = "http://127.0.0.1:8731/minimal.html";
+
+    /// `scenario` の既定スクリプトを [`URL`] で生成してパースしたもの。
+    fn script_for(scenario: Scenario) -> Vec<AutomationCommand> {
+        script_with(scenario, BenchScriptOverrides::default())
+    }
+
+    fn script_with(scenario: Scenario, overrides: BenchScriptOverrides) -> Vec<AutomationCommand> {
+        let text = generate_bench_script_with(scenario, URL, overrides)
+            .unwrap_or_else(|| panic!("{} はスクリプトを生成しない", scenario.id()));
+        parse_script(&text).unwrap()
+    }
+
+    fn mark_index(commands: &[AutomationCommand]) -> usize {
+        commands
+            .iter()
+            .position(|c| *c == AutomationCommand::Mark)
+            .unwrap_or_else(|| panic!("mark が無い: {commands:?}"))
+    }
+
+    fn count_opens(commands: &[AutomationCommand]) -> usize {
+        commands
+            .iter()
+            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
+            .count()
+    }
+
+    fn switch_indices(commands: &[AutomationCommand]) -> Vec<usize> {
+        commands
+            .iter()
+            .filter_map(|c| match c {
+                AutomationCommand::Switch { index } => Some(*index),
+                _ => None,
+            })
+            .collect()
+    }
+
     // -- parse_script: happy paths ---------------------------------------
 
     #[test]
@@ -1083,67 +1091,41 @@ mod tests {
     }
 
     #[test]
-    fn parses_new_window_and_rejects_arguments_on_it() {
-        assert_eq!(
-            parse_script("new_window\n").unwrap(),
-            vec![AutomationCommand::NewWindow]
-        );
-        let err = parse_script("new_window 3\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("new_window"), "{}", err.message);
-    }
-
-    #[test]
-    fn parses_new_private_window_and_rejects_arguments_on_it() {
-        assert_eq!(
-            parse_script("new_private_window\n").unwrap(),
-            vec![AutomationCommand::NewPrivateWindow]
-        );
-        let err = parse_script("new_private_window 3\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(
-            err.message.contains("new_private_window"),
-            "{}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn parses_mark_and_rejects_arguments_on_it() {
-        assert_eq!(
-            parse_script("mark\n").unwrap(),
-            vec![AutomationCommand::Mark]
-        );
-        let err = parse_script("mark 3\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("mark"), "{}", err.message);
+    fn parses_argumentless_commands_and_rejects_arguments_on_them() {
+        for (keyword, command) in [
+            ("new_window", AutomationCommand::NewWindow),
+            ("new_private_window", AutomationCommand::NewPrivateWindow),
+            ("mark", AutomationCommand::Mark),
+            ("quit", AutomationCommand::Quit),
+        ] {
+            assert_eq!(
+                parse_script(&format!("{keyword}\n")).unwrap(),
+                vec![command],
+                "{keyword}"
+            );
+            let err = parse_script(&format!("{keyword} 3\n")).unwrap_err();
+            assert_eq!(err.line, 1);
+            assert!(err.message.contains(keyword), "{}", err.message);
+        }
     }
 
     #[test]
     fn tab_create_at_measures_every_sample_at_the_same_tab_count() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         for tab_count in [1u32, 5, 20] {
-            let script = generate_bench_script(Scenario::TabCreateAt(tab_count), url).unwrap();
-            let commands = parse_script(&script).unwrap();
-            let marker = commands
-                .iter()
-                .position(|c| *c == AutomationCommand::Mark)
-                .unwrap_or_else(|| panic!("tab_count {tab_count}: no mark"));
+            let commands = script_for(Scenario::TabCreateAt(tab_count));
+            let marker = mark_index(&commands);
 
             // Setup leaves exactly `tab_count` tabs open (the initial tab
             // plus one per `open`).
-            let setup_opens = commands[..marker]
-                .iter()
-                .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-                .count();
+            let setup_opens = count_opens(&commands[..marker]);
             assert_eq!(setup_opens + 1, tab_count as usize);
 
             // Replay the measured phase against a real `Tabs`: every round
             // must create its tab with exactly `tab_count` already open,
             // and put the count back afterwards.
-            let mut tabs = crate::browser::tabs::Tabs::new(url);
+            let mut tabs = crate::browser::tabs::Tabs::new(URL);
             for _ in 0..setup_opens {
-                tabs.open(url);
+                tabs.open(URL);
             }
             let mut rounds = 0;
             for command in &commands[marker + 1..] {
@@ -1172,27 +1154,12 @@ mod tests {
 
     #[test]
     fn tab_switch_at_switches_only_among_the_tabs_it_opened() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         for tab_count in [1u32, 5, 20] {
-            let script = generate_bench_script(Scenario::TabSwitchAt(tab_count), url).unwrap();
-            let commands = parse_script(&script).unwrap();
-            let marker = commands
-                .iter()
-                .position(|c| *c == AutomationCommand::Mark)
-                .unwrap();
-            let setup_opens = commands[..marker]
-                .iter()
-                .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-                .count();
-            assert_eq!(setup_opens + 1, tab_count as usize);
+            let commands = script_for(Scenario::TabSwitchAt(tab_count));
+            let marker = mark_index(&commands);
+            assert_eq!(count_opens(&commands[..marker]) + 1, tab_count as usize);
 
-            let switches: Vec<usize> = commands[marker + 1..]
-                .iter()
-                .filter_map(|c| match c {
-                    AutomationCommand::Switch { index } => Some(*index),
-                    _ => None,
-                })
-                .collect();
+            let switches = switch_indices(&commands[marker + 1..]);
             assert_eq!(switches.len(), TAB_SWITCH_AT_REPEATS);
             assert!(
                 switches.iter().all(|i| *i < tab_count as usize),
@@ -1212,10 +1179,7 @@ mod tests {
         let url = "http://127.0.0.1:8731/busy.html";
         let script = generate_bench_script(Scenario::BackgroundCpu, url).unwrap();
         let commands = parse_script(&script).unwrap();
-        let marker = commands
-            .iter()
-            .position(|c| *c == AutomationCommand::Mark)
-            .expect("background_cpu must mark its measured phase");
+        let marker = mark_index(&commands);
 
         // Exactly one `open`, before the marker, and it must be the idle
         // variant — the busy page is already the homepage, so opening the
@@ -1229,9 +1193,7 @@ mod tests {
             .collect();
         assert_eq!(opened.len(), 1);
         assert!(opened[0].contains("idle=1"), "{}", opened[0]);
-        assert!(commands[..marker]
-            .iter()
-            .any(|c| matches!(c, AutomationCommand::Open { .. })));
+        assert_eq!(count_opens(&commands[..marker]), 1);
 
         // Nothing after the marker may touch the tabs: the window has to be
         // the browser sitting still with one hidden busy tab.
@@ -1264,14 +1226,11 @@ mod tests {
 
     #[test]
     fn only_the_parameterized_scenarios_emit_a_marker() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        for scenario in Scenario::all() {
-            let Some(script) = generate_bench_script(scenario, url) else {
-                continue;
-            };
-            let has_mark = parse_script(&script)
-                .unwrap()
-                .contains(&AutomationCommand::Mark);
+        for scenario in Scenario::all()
+            .into_iter()
+            .filter(|&s| needs_automation_script(s))
+        {
+            let has_mark = script_for(scenario).contains(&AutomationCommand::Mark);
             // `tabs_hold_N` も `mark` を出す (Issue #197)。こちらは
             // 「計測したい局面の直前で区切る」ためではなく、**タブを
             // 開き終えて休止が落ち着くまでの区間を集計から外す**ため。
@@ -1304,26 +1263,20 @@ mod tests {
         // 「開く間隔を空ける」「開き終えてから既定周期 2 回分以上待つ」
         // 「そのあとに `mark` を打つ」の 3 点。ここが崩れると測っている
         // ものが「落ち着いた後の値」でなくなるので、順序ごと固定する。
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::TabCountMemoryHold(3), url).unwrap();
-        let commands = parse_script(&script).unwrap();
-
-        let mark_at = commands
-            .iter()
-            .position(|c| *c == AutomationCommand::Mark)
-            .expect("tabs_hold script must emit a mark");
+        let commands = script_for(Scenario::TabCountMemoryHold(3));
+        let mark_at = mark_index(&commands);
 
         // mark より前: open が (N-1) 回、それぞれ直後に待ちがある。
-        let opens_before_mark = commands[..mark_at]
-            .iter()
-            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-            .count();
-        assert_eq!(opens_before_mark, 2, "script was {script:?}");
+        assert_eq!(
+            count_opens(&commands[..mark_at]),
+            2,
+            "script was {commands:?}"
+        );
         for (i, command) in commands[..mark_at].iter().enumerate() {
             if matches!(command, AutomationCommand::Open { .. }) {
                 assert!(
                     matches!(commands[i + 1], AutomationCommand::Wait { .. }),
-                    "open は必ず待ちを伴う: {script:?}"
+                    "open は必ず待ちを伴う: {commands:?}"
                 );
             }
         }
@@ -1355,22 +1308,11 @@ mod tests {
         // 共通部分は `memory_hold_setup_lines` に切り出してあるので分岐は
         // 起こりにくいが、**どちらかが `mark` より前に何かを足す**形なら
         // 関数を共有していても前提は崩れる。そこをここで固定する。
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let hold =
-            parse_script(&generate_bench_script(Scenario::TabCountMemoryHold(5), url).unwrap())
-                .unwrap();
-        let resume =
-            parse_script(&generate_bench_script(Scenario::TabCountMemoryResume(5), url).unwrap())
-                .unwrap();
+        let hold = script_for(Scenario::TabCountMemoryHold(5));
+        let resume = script_for(Scenario::TabCountMemoryResume(5));
 
-        let hold_mark = hold
-            .iter()
-            .position(|c| *c == AutomationCommand::Mark)
-            .expect("tabs_hold script must emit a mark");
-        let resume_mark = resume
-            .iter()
-            .position(|c| *c == AutomationCommand::Mark)
-            .expect("tabs_hold_resume script must emit a mark");
+        let hold_mark = mark_index(&hold);
+        let resume_mark = mark_index(&resume);
         assert_eq!(
             hold[..hold_mark],
             resume[..resume_mark],
@@ -1380,15 +1322,8 @@ mod tests {
         // mark の後ろ: 最長未使用のタブから順に戻す。休止は最長未使用
         // から行われるので、この順でないと「休止されていたタブ」を
         // 引き当てられない。
-        let switches: Vec<usize> = resume[resume_mark..]
-            .iter()
-            .filter_map(|c| match c {
-                AutomationCommand::Switch { index } => Some(*index),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            switches,
+            switch_indices(&resume[resume_mark..]),
             (0..MEMORY_RESUME_ROUNDS).collect::<Vec<_>>(),
             "index 0 から昇順でなければならない"
         );
@@ -1454,13 +1389,8 @@ mod tests {
         // `tabs_hold_resume_N` のスクリプトから `quit` を除いたものと
         // 一致しなければならない — 「最後のラウンドの `wait` まで完全に
         // 同一」であることを字面で固定する。
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let resume =
-            parse_script(&generate_bench_script(Scenario::TabCountMemoryResume(20), url).unwrap())
-                .unwrap();
-        let bounce =
-            parse_script(&generate_bench_script(Scenario::TabCountMemoryBounce(20), url).unwrap())
-                .unwrap();
+        let resume = script_for(Scenario::TabCountMemoryResume(20));
+        let bounce = script_for(Scenario::TabCountMemoryBounce(20));
 
         assert_eq!(resume.last(), Some(&AutomationCommand::Quit));
         let resume_without_quit = &resume[..resume.len() - 1];
@@ -1499,11 +1429,10 @@ mod tests {
 
     #[test]
     fn default_overrides_reproduce_the_plain_functions_byte_for_byte() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         for scenario in Scenario::all() {
             assert_eq!(
-                generate_bench_script(scenario, url),
-                generate_bench_script_with(scenario, url, BenchScriptOverrides::default()),
+                generate_bench_script(scenario, URL),
+                generate_bench_script_with(scenario, URL, BenchScriptOverrides::default()),
                 "{}",
                 scenario.id()
             );
@@ -1521,25 +1450,13 @@ mod tests {
 
     #[test]
     fn overridden_rounds_and_settle_change_only_the_tail_of_the_bounce_script() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         let overrides = BenchScriptOverrides {
             resume_rounds: Some(2),
             bounce_settle_ms: Some(60_000),
         };
-        let script = parse_script(
-            &generate_bench_script_with(Scenario::TabCountMemoryBounce(20), url, overrides)
-                .unwrap(),
-        )
-        .unwrap();
-        let switches: Vec<usize> = script
-            .iter()
-            .filter_map(|c| match c {
-                AutomationCommand::Switch { index } => Some(*index),
-                _ => None,
-            })
-            .collect();
+        let script = script_with(Scenario::TabCountMemoryBounce(20), overrides);
         assert_eq!(
-            switches,
+            switch_indices(&script),
             vec![0, 1],
             "ラウンド数の上書きが switch の数に効く"
         );
@@ -1549,40 +1466,23 @@ mod tests {
             "揺り戻しの待ちの上書きが quit 直前の wait に効く"
         );
         // mark までは何も変わらない (D110 決定3 の不変条件は上書きでも保つ)。
-        let plain =
-            parse_script(&generate_bench_script(Scenario::TabCountMemoryBounce(20), url).unwrap())
-                .unwrap();
-        let mark_at = |cmds: &[AutomationCommand]| {
-            cmds.iter()
-                .position(|c| matches!(c, AutomationCommand::Mark))
-                .unwrap()
-        };
-        assert_eq!(script[..=mark_at(&script)], plain[..=mark_at(&plain)]);
+        let plain = script_for(Scenario::TabCountMemoryBounce(20));
+        assert_eq!(script[..=mark_index(&script)], plain[..=mark_index(&plain)]);
     }
 
     #[test]
     fn zero_rounds_is_a_hold_with_no_switch_at_all() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         let overrides = BenchScriptOverrides {
             resume_rounds: Some(0),
             bounce_settle_ms: None,
         };
-        let script = parse_script(
-            &generate_bench_script_with(Scenario::TabCountMemoryBounce(20), url, overrides)
-                .unwrap(),
-        )
-        .unwrap();
+        let script = script_with(Scenario::TabCountMemoryBounce(20), overrides);
         assert!(
-            !script
-                .iter()
-                .any(|c| matches!(c, AutomationCommand::Switch { .. })),
+            switch_indices(&script).is_empty(),
             "0 ラウンドなら switch は 1 つも無い: {script:?}"
         );
         // mark と quit の間には揺り戻しの待ちが残る (空のスクリプトにはならない)。
-        let mark_at = script
-            .iter()
-            .position(|c| matches!(c, AutomationCommand::Mark))
-            .unwrap();
+        let mark_at = mark_index(&script);
         assert_eq!(
             script[mark_at + 1],
             AutomationCommand::Wait {
@@ -1603,17 +1503,9 @@ mod tests {
         assert!(overrides
             .validate_for(Scenario::TabCountMemoryResume(20))
             .is_err());
-        let empty = parse_script(
-            &generate_bench_script_with(Scenario::TabCountMemoryResume(20), url, overrides)
-                .unwrap(),
-        )
-        .unwrap();
-        let empty_mark = empty
-            .iter()
-            .position(|c| matches!(c, AutomationCommand::Mark))
-            .unwrap();
+        let empty = script_with(Scenario::TabCountMemoryResume(20), overrides);
         assert_eq!(
-            empty[empty_mark + 1],
+            empty[mark_index(&empty) + 1],
             AutomationCommand::Quit,
             "これが弾く理由そのもの: {empty:?}"
         );
@@ -1794,110 +1686,81 @@ mod tests {
         assert_eq!(commands, vec![AutomationCommand::Wait { ms: MAX_WAIT_MS }]);
     }
 
-    // -- wait_load (Issue #169) -------------------------------------------
+    // -- wait_load (Issue #169) / wait_startup (Issue #173) ------------------
+    //
+    // 2 つは引数の扱い (省略可・既定値・上限) が同じなので、同じ検査を
+    // キーワードごとに回す。
+
+    /// timeout_ms からコマンドを作る関数。
+    type WaitCommand = fn(u64) -> AutomationCommand;
+
+    /// `(キーワード, コマンドを作る関数)` の組。
+    const OPTIONAL_WAIT_COMMANDS: [(&str, WaitCommand); 2] = [
+        ("wait_load", |timeout_ms| AutomationCommand::WaitLoad {
+            timeout_ms,
+        }),
+        ("wait_startup", |timeout_ms| {
+            AutomationCommand::WaitStartup { timeout_ms }
+        }),
+    ];
 
     #[test]
-    fn wait_load_without_an_argument_uses_the_default_timeout() {
-        let commands = parse_script("wait_load\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitLoad {
-                timeout_ms: DEFAULT_WAIT_LOAD_TIMEOUT_MS
-            }]
-        );
+    fn optional_wait_without_an_argument_uses_the_default_timeout() {
+        for (keyword, command) in OPTIONAL_WAIT_COMMANDS {
+            assert_eq!(
+                parse_script(&format!("{keyword}\n")).unwrap(),
+                vec![command(DEFAULT_WAIT_LOAD_TIMEOUT_MS)],
+                "{keyword}"
+            );
+        }
     }
 
     #[test]
-    fn wait_load_with_an_argument_uses_it() {
-        let commands = parse_script("wait_load 2500\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitLoad { timeout_ms: 2500 }]
-        );
+    fn optional_wait_with_an_argument_uses_it() {
+        for (keyword, command) in OPTIONAL_WAIT_COMMANDS {
+            assert_eq!(
+                parse_script(&format!("{keyword} 2500\n")).unwrap(),
+                vec![command(2500)],
+                "{keyword}"
+            );
+        }
     }
 
     #[test]
-    fn wait_load_with_a_non_numeric_argument_is_rejected() {
-        let err = parse_script("wait_load abc\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("wait_load"), "{}", err.message);
+    fn optional_wait_with_a_non_numeric_argument_is_rejected() {
+        for (keyword, _) in OPTIONAL_WAIT_COMMANDS {
+            let err = parse_script(&format!("{keyword} abc\n")).unwrap_err();
+            assert_eq!(err.line, 1);
+            assert!(err.message.contains(keyword), "{}", err.message);
+        }
     }
 
     #[test]
-    fn wait_load_with_a_negative_argument_is_rejected() {
-        let err = parse_script("wait_load -1\n").unwrap_err();
-        assert_eq!(err.line, 1);
+    fn optional_wait_with_a_negative_argument_is_rejected() {
+        for (keyword, _) in OPTIONAL_WAIT_COMMANDS {
+            let err = parse_script(&format!("{keyword} -1\n")).unwrap_err();
+            assert_eq!(err.line, 1, "{keyword}");
+        }
     }
 
     #[test]
-    fn wait_load_beyond_the_cap_is_rejected() {
-        let err = parse_script(&format!("wait_load {}\n", MAX_WAIT_MS + 1)).unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
+    fn optional_wait_beyond_the_cap_is_rejected() {
+        for (keyword, _) in OPTIONAL_WAIT_COMMANDS {
+            let err = parse_script(&format!("{keyword} {}\n", MAX_WAIT_MS + 1)).unwrap_err();
+            assert_eq!(err.line, 1, "{keyword}");
+            assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
+        }
     }
 
     #[test]
-    fn wait_load_exactly_at_the_cap_is_accepted() {
-        let commands = parse_script(&format!("wait_load {MAX_WAIT_MS}\n")).unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitLoad {
-                timeout_ms: MAX_WAIT_MS
-            }]
-        );
-    }
-
-    // -- wait_startup (Issue #173) -----------------------------------------
-
-    #[test]
-    fn wait_startup_without_an_argument_uses_the_default_timeout() {
-        let commands = parse_script("wait_startup\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitStartup {
-                timeout_ms: DEFAULT_WAIT_LOAD_TIMEOUT_MS
-            }]
-        );
-    }
-
-    #[test]
-    fn wait_startup_with_an_argument_uses_it() {
-        let commands = parse_script("wait_startup 2500\n").unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitStartup { timeout_ms: 2500 }]
-        );
-    }
-
-    #[test]
-    fn wait_startup_with_a_non_numeric_argument_is_rejected() {
-        let err = parse_script("wait_startup abc\n").unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains("wait_startup"), "{}", err.message);
-    }
-
-    #[test]
-    fn wait_startup_with_a_negative_argument_is_rejected() {
-        let err = parse_script("wait_startup -1\n").unwrap_err();
-        assert_eq!(err.line, 1);
-    }
-
-    #[test]
-    fn wait_startup_beyond_the_cap_is_rejected() {
-        let err = parse_script(&format!("wait_startup {}\n", MAX_WAIT_MS + 1)).unwrap_err();
-        assert_eq!(err.line, 1);
-        assert!(err.message.contains(&MAX_WAIT_MS.to_string()));
-    }
-
-    #[test]
-    fn wait_startup_exactly_at_the_cap_is_accepted() {
-        let commands = parse_script(&format!("wait_startup {MAX_WAIT_MS}\n")).unwrap();
-        assert_eq!(
-            commands,
-            vec![AutomationCommand::WaitStartup {
-                timeout_ms: MAX_WAIT_MS
-            }]
-        );
+    fn optional_wait_exactly_at_the_cap_is_accepted() {
+        for (keyword, command) in OPTIONAL_WAIT_COMMANDS {
+            assert_eq!(
+                parse_script(&format!("{keyword} {MAX_WAIT_MS}\n")).unwrap(),
+                vec![command(MAX_WAIT_MS)],
+                "{keyword}"
+            );
+        }
     }
 
     #[test]
@@ -1921,32 +1784,21 @@ mod tests {
 
     // -- generate_bench_script --------------------------------------------
 
-    use crate::browser::benchmark::scenario::Scenario;
-
     #[test]
     fn startup_scenarios_need_no_automation_script() {
-        assert_eq!(
-            generate_bench_script(Scenario::ColdStartup, "http://127.0.0.1:8731/minimal.html"),
-            None
-        );
-        assert_eq!(
-            generate_bench_script(Scenario::WarmStartup, "http://127.0.0.1:8731/minimal.html"),
-            None
-        );
-        assert_eq!(
-            generate_bench_script(
-                Scenario::FirstPageLoad,
-                "http://127.0.0.1:8731/minimal.html"
-            ),
-            None
-        );
+        for scenario in [
+            Scenario::ColdStartup,
+            Scenario::WarmStartup,
+            Scenario::FirstPageLoad,
+        ] {
+            assert_eq!(generate_bench_script(scenario, URL), None);
+        }
     }
 
     #[test]
     fn every_generated_script_parses_and_ends_with_quit() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         for scenario in Scenario::all() {
-            let Some(script) = generate_bench_script(scenario, url) else {
+            let Some(script) = generate_bench_script(scenario, URL) else {
                 continue;
             };
             let commands = parse_script(&script).unwrap_or_else(|err| {
@@ -1966,60 +1818,34 @@ mod tests {
 
     #[test]
     fn tab_count_memory_script_opens_exactly_tab_count_minus_one_tabs() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::TabCountMemory(5), url).unwrap();
-        let commands = parse_script(&script).unwrap();
-        let open_count = commands
-            .iter()
-            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-            .count();
-        assert_eq!(open_count, 4);
+        let commands = script_for(Scenario::TabCountMemory(5));
+        assert_eq!(count_opens(&commands), 4);
     }
 
     #[test]
     fn tab_count_memory_of_one_opens_no_extra_tabs() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::TabCountMemory(1), url).unwrap();
-        let commands = parse_script(&script).unwrap();
-        assert!(!commands
-            .iter()
-            .any(|c| matches!(c, AutomationCommand::Open { .. })));
+        let commands = script_for(Scenario::TabCountMemory(1));
+        assert_eq!(count_opens(&commands), 0);
         assert_eq!(commands.last(), Some(&AutomationCommand::Quit));
     }
 
     #[test]
     fn tab_switch_script_opens_extra_tabs_and_switches_repeatedly() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::TabSwitch, url).unwrap();
-        let commands = parse_script(&script).unwrap();
-        let open_count = commands
-            .iter()
-            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-            .count();
-        let switch_count = commands
-            .iter()
-            .filter(|c| matches!(c, AutomationCommand::Switch { .. }))
-            .count();
-        assert_eq!(open_count, TAB_SWITCH_EXTRA_TABS);
-        assert_eq!(switch_count, TAB_SWITCH_REPEATS);
+        let commands = script_for(Scenario::TabSwitch);
+        assert_eq!(count_opens(&commands), TAB_SWITCH_EXTRA_TABS);
+        assert_eq!(switch_indices(&commands).len(), TAB_SWITCH_REPEATS);
     }
 
     #[test]
     fn tab_resume_script_suspends_then_switches_to_a_background_tab_each_round() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::TabResume, url).unwrap();
-        let commands = parse_script(&script).unwrap();
-        let open_count = commands
-            .iter()
-            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-            .count();
-        assert_eq!(open_count, TAB_RESUME_EXTRA_TABS);
+        let commands = script_for(Scenario::TabResume);
+        assert_eq!(count_opens(&commands), TAB_RESUME_EXTRA_TABS);
 
         // Replay the script against a `Tabs` to prove every `suspend`
         // lands on a background tab (the policy refuses the active tab,
         // so a script that targeted it would silently measure nothing)
         // and every `switch` resumes the tab just suspended.
-        let mut tabs = crate::browser::tabs::Tabs::new(url);
+        let mut tabs = crate::browser::tabs::Tabs::new(URL);
         let mut rounds = 0;
         let mut pending: Option<usize> = None;
         for command in &commands {
@@ -2053,9 +1879,7 @@ mod tests {
 
     #[test]
     fn navigation_script_navigates_to_distinct_urls() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::Navigation, url).unwrap();
-        let commands = parse_script(&script).unwrap();
+        let commands = script_for(Scenario::Navigation);
         let targets: Vec<&str> = commands
             .iter()
             .filter_map(|c| match c {
@@ -2074,25 +1898,18 @@ mod tests {
 
     #[test]
     fn tab_create_script_opens_tab_create_count_tabs() {
-        let url = "http://127.0.0.1:8731/minimal.html";
-        let script = generate_bench_script(Scenario::TabCreate, url).unwrap();
-        let commands = parse_script(&script).unwrap();
-        let open_count = commands
-            .iter()
-            .filter(|c| matches!(c, AutomationCommand::Open { .. }))
-            .count();
-        assert_eq!(open_count, TAB_CREATE_COUNT);
+        let commands = script_for(Scenario::TabCreate);
+        assert_eq!(count_opens(&commands), TAB_CREATE_COUNT);
     }
 
     // -- needs_automation_script / recommended_timeout_secs ---------------
 
     #[test]
     fn needs_automation_script_agrees_with_generate_bench_script() {
-        let url = "http://127.0.0.1:8731/minimal.html";
         for scenario in Scenario::all() {
             assert_eq!(
                 needs_automation_script(scenario),
-                generate_bench_script(scenario, url).is_some(),
+                generate_bench_script(scenario, URL).is_some(),
                 "mismatch for {:?}",
                 scenario.id()
             );

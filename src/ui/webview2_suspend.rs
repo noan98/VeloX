@@ -199,7 +199,7 @@ pub fn try_suspend(
                     let _ = proxy.send_event(UserEvent::TabFreezeFinished {
                         window_id,
                         tab_id,
-                        success: result.is_ok() && is_successful,
+                        success: error.is_none(),
                         error,
                     });
                     Ok(())

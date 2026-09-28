@@ -9,8 +9,7 @@
 use crate::browser::bookmarks::BookmarkStore;
 use crate::browser::history::HistoryStore;
 use crate::browser::input_history::InputHistoryStore;
-use crate::browser::navigation;
-use crate::browser::omnibox::{Candidate, CandidateKind, CandidateSource};
+use crate::browser::omnibox::{self, Candidate, CandidateKind, CandidateSource};
 use crate::browser::ranking;
 
 /// Combined history+bookmark candidate source — one source, not two, so
@@ -53,25 +52,22 @@ impl CandidateSource for HistoryBookmarkSource<'_> {
         let merged = ranking::merge_entries(history, self.bookmarks.entries());
         ranking::rank_page_entries(merged, input, self.now, limit)
             .into_iter()
-            .map(|entry| {
-                let title = entry.title.map(str::to_owned);
-                Candidate {
-                    kind: if entry.is_bookmark {
-                        CandidateKind::Bookmark
-                    } else {
-                        CandidateKind::History
-                    },
-                    target_url: entry.url.to_owned(),
-                    label: title.clone().unwrap_or_else(|| entry.url.to_owned()),
-                    // Show the actual destination URL as the secondary
-                    // line whenever the label is showing a title instead of
-                    // the URL itself — the user is one click away from
-                    // loading it, and a page's own <title> is not a
-                    // trustworthy stand-in for "where this will take you"
-                    // (deliberately not a visit timestamp; see
-                    // docs/decisions.md D37).
-                    detail: title.is_some().then(|| entry.url.to_owned()),
-                }
+            .map(|entry| Candidate {
+                kind: if entry.is_bookmark {
+                    CandidateKind::Bookmark
+                } else {
+                    CandidateKind::History
+                },
+                target_url: entry.url.to_owned(),
+                label: entry.title.unwrap_or(entry.url).to_owned(),
+                // Show the actual destination URL as the secondary
+                // line whenever the label is showing a title instead of
+                // the URL itself — the user is one click away from
+                // loading it, and a page's own <title> is not a
+                // trustworthy stand-in for "where this will take you"
+                // (deliberately not a visit timestamp; see
+                // docs/decisions.md D37).
+                detail: entry.title.map(|_| entry.url.to_owned()),
             })
             .collect()
     }
@@ -106,13 +102,10 @@ impl CandidateSource for InputHistorySource<'_> {
             // mainstream omniboxes, but here it is simply skipped.
             .filter(|entry| entry.text.to_lowercase() != query_lower)
             .filter_map(|entry| {
-                navigation::build_search_url(self.search_query_template, &entry.text).map(
-                    |target_url| Candidate {
-                        kind: CandidateKind::Search,
-                        target_url,
-                        label: entry.text.clone(),
-                        detail: Some(format!("{} で検索", self.search_engine_name)),
-                    },
+                omnibox::search_candidate(
+                    self.search_engine_name,
+                    self.search_query_template,
+                    &entry.text,
                 )
             })
             .collect()
@@ -124,15 +117,23 @@ mod tests {
     use super::*;
     use crate::browser::{BookmarkStore, HistoryStore};
 
+    /// 通常ウィンドウ (履歴あり) 相当の [`HistoryBookmarkSource`]。
+    fn history_bookmark_source<'a>(
+        history: &'a HistoryStore,
+        bookmarks: &'a BookmarkStore,
+    ) -> HistoryBookmarkSource<'a> {
+        HistoryBookmarkSource {
+            history: Some(history),
+            bookmarks,
+            now: 1_000,
+        }
+    }
+
     #[test]
     fn history_bookmark_source_yields_no_candidates_for_blank_input() {
         let history = HistoryStore::new();
         let bookmarks = BookmarkStore::new();
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         assert!(source.candidates("", 8).is_empty());
         assert!(source.candidates("   ", 8).is_empty());
     }
@@ -142,11 +143,7 @@ mod tests {
         let mut history = HistoryStore::new();
         history.record_visit("https://example.com/", Some("Example".to_owned()), 1, 0);
         let bookmarks = BookmarkStore::new();
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         assert!(source.candidates("example", 0).is_empty());
     }
 
@@ -160,11 +157,7 @@ mod tests {
             0,
         );
         let bookmarks = BookmarkStore::new();
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         let candidates = source.candidates("example", 8);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, CandidateKind::History);
@@ -181,11 +174,7 @@ mod tests {
         let mut history = HistoryStore::new();
         history.record_visit("https://example.com/", None, 1, 0);
         let bookmarks = BookmarkStore::new();
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         let candidates = source.candidates("example", 8);
         assert_eq!(candidates[0].label, "https://example.com/");
         assert_eq!(candidates[0].detail, None);
@@ -196,11 +185,7 @@ mod tests {
         let history = HistoryStore::new();
         let mut bookmarks = BookmarkStore::new();
         bookmarks.add("https://example.com/", Some("Example".to_owned()), 1);
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         let candidates = source.candidates("example", 8);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, CandidateKind::Bookmark);
@@ -212,11 +197,7 @@ mod tests {
         history.record_visit("https://example.com/", Some("Example".to_owned()), 1, 0);
         let mut bookmarks = BookmarkStore::new();
         bookmarks.add("https://example.com/", Some("Example".to_owned()), 1);
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         assert_eq!(source.candidates("example", 8).len(), 1);
     }
 
@@ -227,26 +208,26 @@ mod tests {
             history.record_visit(&format!("https://example{i}.test/"), None, i, 0);
         }
         let bookmarks = BookmarkStore::new();
-        let source = HistoryBookmarkSource {
-            history: Some(&history),
-            bookmarks: &bookmarks,
-            now: 1_000,
-        };
+        let source = history_bookmark_source(&history, &bookmarks);
         assert_eq!(source.candidates("example", 2).len(), 2);
     }
 
     const DDG: &str = "https://duckduckgo.com/?q={}";
 
+    fn input_history_source(store: &InputHistoryStore) -> InputHistorySource<'_> {
+        InputHistorySource {
+            store,
+            search_engine_name: "DuckDuckGo",
+            search_query_template: DDG,
+            now: 1_000,
+        }
+    }
+
     #[test]
     fn input_history_source_suggests_a_matching_past_query() {
         let mut store = InputHistoryStore::new();
         store.record("rust ownership", 1, 0);
-        let source = InputHistorySource {
-            store: &store,
-            search_engine_name: "DuckDuckGo",
-            search_query_template: DDG,
-            now: 1_000,
-        };
+        let source = input_history_source(&store);
         let candidates = source.candidates("rust", 8);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].kind, CandidateKind::Search);
@@ -263,12 +244,7 @@ mod tests {
         let mut store = InputHistoryStore::new();
         store.record("rust", 1, 0);
         store.record("rust ownership", 1, 0);
-        let source = InputHistorySource {
-            store: &store,
-            search_engine_name: "DuckDuckGo",
-            search_query_template: DDG,
-            now: 1_000,
-        };
+        let source = input_history_source(&store);
         let candidates = source.candidates("rust", 8);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].label, "rust ownership");
@@ -278,12 +254,7 @@ mod tests {
     fn input_history_source_yields_no_candidates_for_blank_input() {
         let mut store = InputHistoryStore::new();
         store.record("rust ownership", 1, 0);
-        let source = InputHistorySource {
-            store: &store,
-            search_engine_name: "DuckDuckGo",
-            search_query_template: DDG,
-            now: 1_000,
-        };
+        let source = input_history_source(&store);
         assert!(source.candidates("", 8).is_empty());
     }
 

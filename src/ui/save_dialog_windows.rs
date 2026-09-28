@@ -31,9 +31,9 @@
 use std::path::PathBuf;
 
 use tao::event_loop::EventLoopProxy;
-use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
-use windows::core::{HRESULT, HSTRING, PCWSTR, PWSTR};
-use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_INPROC_SERVER};
+use webview2_com::{take_pwstr, CallDevToolsProtocolMethodCompletedHandler};
+use windows::core::{HRESULT, HSTRING, PCWSTR};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Shell::Common::COMDLG_FILTERSPEC;
 use windows::Win32::UI::Shell::{
     FileSaveDialog, IFileSaveDialog, IShellItem, FOS_FORCEFILESYSTEM, FOS_OVERWRITEPROMPT,
@@ -130,32 +130,10 @@ pub fn show_save_dialog(default_file_name: &str) -> Result<Option<PathBuf>, Stri
         let display_name = item
             .GetDisplayName(SIGDN_FILESYSPATH)
             .map_err(|err| format!("保存先のパスを取得できませんでした: {err}"))?;
-        let path = pwstr_to_string(display_name);
-        CoTaskMemFree(Some(display_name.0 as *const _));
-        Ok(Some(PathBuf::from(path)))
+        // `take_pwstr` は文字列へコピーしたうえで `CoTaskMemFree` で解放する
+        // (`webview2_blocking` と同じ `webview2-com` のヘルパー)。
+        Ok(Some(PathBuf::from(take_pwstr(display_name))))
     }
-}
-
-/// Read a COM-owned, null-terminated UTF-16 string pointed to by `pwstr`
-/// (e.g. `IShellItem::GetDisplayName`'s result) without transferring
-/// ownership — the caller is still responsible for freeing `pwstr` itself
-/// (via `CoTaskMemFree`) once this returns.
-///
-/// # Safety
-/// `pwstr` must be null, or point to a valid null-terminated UTF-16 buffer
-/// that stays valid for the duration of this call (true for a COM
-/// allocator's out-parameter that has not been freed yet).
-unsafe fn pwstr_to_string(pwstr: PWSTR) -> String {
-    if pwstr.0.is_null() {
-        return String::new();
-    }
-    // SAFETY: caller guarantees `pwstr` points at a valid null-terminated
-    // UTF-16 buffer; reading one `u16` at a time until the terminator never
-    // reads past its end.
-    let len = unsafe { (0..).take_while(|&i| *pwstr.0.add(i) != 0).count() };
-    // SAFETY: `len` was just measured from the same valid buffer above.
-    let slice = unsafe { std::slice::from_raw_parts(pwstr.0, len) };
-    String::from_utf16_lossy(slice)
 }
 
 /// Capture `webview`'s current page as MHTML (via Chromium DevTools
@@ -180,6 +158,8 @@ pub fn capture_and_write_mhtml(
     // Kept for the synchronous-failure branch below: `proxy` itself is
     // moved into the completion closure, which never runs at all if the
     // COM call below fails outright, so that branch needs its own handle.
+    // `url`/`destination` も同じ理由で複製しておく。完了ハンドラは
+    // `FnOnce` なので、ハンドラ側は自分の複製をそのままイベントへ移す。
     let sync_failure_proxy = proxy.clone();
     let closure_url = url.clone();
     let closure_destination = destination.clone();
@@ -210,8 +190,8 @@ pub fn capture_and_write_mhtml(
                     };
                     let _ = proxy.send_event(UserEvent::SavePageFinished {
                         window_id,
-                        url: closure_url.clone(),
-                        destination: closure_destination.clone(),
+                        url: closure_url,
+                        destination: closure_destination,
                         error,
                     });
                     Ok(())

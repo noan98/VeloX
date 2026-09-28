@@ -132,14 +132,10 @@ mod tests {
     use crate::browser::metrics::{RssSample, TabLatencyKind};
     use std::fs;
 
-    /// A path under the OS temp dir unique to this test process + thread,
-    /// so parallel `cargo test` runs never collide.
+    /// A path under the OS temp dir unique to this test (see
+    /// `util::unique_temp_path`), so parallel `cargo test` runs never collide.
     fn temp_path(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!(
-            "velox-perf-log-test-{}-{:?}-{name}",
-            std::process::id(),
-            std::thread::current().id()
-        ))
+        crate::browser::util::unique_temp_path(&format!("velox-perf-log-test-{name}"))
     }
 
     #[test]
@@ -245,9 +241,6 @@ mod tests {
 
     #[test]
     fn ipc_log_writes_an_ipc_record() {
-        use crate::browser::metrics::IpcDirection;
-        use std::time::Instant;
-
         let path = temp_path("ipc.jsonl");
         let _ = fs::remove_file(&path);
 

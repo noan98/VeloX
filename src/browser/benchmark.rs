@@ -488,12 +488,12 @@ impl MetricKey {
             MetricKey::StartupToolbarScriptStartedMs => "toolbar_script_started_ms",
             MetricKey::StartupToolbarReadyMs => "toolbar_ready_ms",
             MetricKey::StartupFirstLoadMs => "first_load_ms",
-            MetricKey::PageLoadMs => "duration_ms",
+            MetricKey::PageLoadMs
+            | MetricKey::TabCreateMs
+            | MetricKey::TabSwitchMs
+            | MetricKey::TabResumeMs => "duration_ms",
             MetricKey::PageLoadEngineMs => "engine_duration_ms",
             MetricKey::PageLoadDispatchMs => "dispatch_duration_ms",
-            MetricKey::TabCreateMs => "duration_ms",
-            MetricKey::TabSwitchMs => "duration_ms",
-            MetricKey::TabResumeMs => "duration_ms",
             MetricKey::RssTotalBytes => "total_rss_bytes",
             MetricKey::RssProcessCount => "process_count",
             MetricKey::RssBrowserBytes => "browser_rss_bytes",
@@ -621,18 +621,14 @@ impl MetricKey {
                 }
                 let suspended = events
                     .iter()
-                    .filter(|event| {
-                        event.get("event").and_then(Value::as_str) == Some(self.event_name())
-                    })
+                    .filter(|event| is_event(event, self.event_name()))
                     .count();
                 vec![suspended as f64]
             }
             MetricSource::AfterMarker => self.extract_after_marker(events),
             MetricSource::Field => events
                 .iter()
-                .filter(|event| {
-                    event.get("event").and_then(Value::as_str) == Some(self.event_name())
-                })
+                .filter(|event| is_event(event, self.event_name()))
                 .filter_map(|event| event.get(self.field_name()).and_then(Value::as_f64))
                 .collect(),
         }
@@ -710,13 +706,11 @@ impl MetricKey {
                     .filter(|&(_, event)| is_event(event, "tab_suspend"))
                     .filter_map(|(index, event)| {
                         let suspend_ts = event.get("ts_ms").and_then(Value::as_f64)?;
-                        let resume_ts = phase[..index].iter().rev().find_map(|prior| {
-                            if is_event(prior, "tab_resume") {
-                                prior.get("ts_ms").and_then(Value::as_f64)
-                            } else {
-                                None
-                            }
-                        })?;
+                        let resume_ts = phase[..index]
+                            .iter()
+                            .rev()
+                            .filter(|prior| is_event(prior, "tab_resume"))
+                            .find_map(|prior| prior.get("ts_ms").and_then(Value::as_f64))?;
                         Some(suspend_ts - resume_ts)
                     })
                     .collect()
@@ -948,10 +942,9 @@ fn after_last_marker(trial: &[Value]) -> Option<&[Value]> {
         .map(|index| &trial[index + 1..])
 }
 
-/// Whether `event`'s `"event"` field is exactly `name`. A small helper for
-/// the multi-event-kind logic in [`MetricKey::extract_after_marker`], which
-/// (unlike [`MetricKey::extract`]'s other branches) checks more than one
-/// fixed event name in the same pass.
+/// Whether `event`'s `"event"` field is exactly `name`. Shared by every
+/// place in this module that filters parsed events by kind
+/// ([`MetricKey::extract`], [`after_last_marker`], [`summarize_ipc`]).
 fn is_event(event: &Value, name: &str) -> bool {
     event.get("event").and_then(Value::as_str) == Some(name)
 }
@@ -999,20 +992,17 @@ pub struct IpcSummary {
 /// layer around this (reads `--input` files, prints/saves the table).
 pub fn summarize_ipc(events: &[Value]) -> Vec<IpcSummary> {
     let mut by_key: BTreeMap<(String, String), (usize, u64, Vec<f64>)> = BTreeMap::new();
-    for event in events {
-        if event.get("event").and_then(Value::as_str) != Some("ipc") {
-            continue;
-        }
-        let direction = event
-            .get("direction")
+    // 文字列フィールドが無い/文字列でない行は "?" として集計する。
+    let str_field = |event: &Value, key: &str| {
+        event
+            .get(key)
             .and_then(Value::as_str)
             .unwrap_or("?")
-            .to_owned();
-        let name = event
-            .get("name")
-            .and_then(Value::as_str)
-            .unwrap_or("?")
-            .to_owned();
+            .to_owned()
+    };
+    for event in events.iter().filter(|event| is_event(event, "ipc")) {
+        let direction = str_field(event, "direction");
+        let name = str_field(event, "name");
         let bytes = event.get("bytes").and_then(Value::as_u64).unwrap_or(0);
         let duration_ms = event
             .get("duration_ms")
@@ -1257,17 +1247,25 @@ pub struct MetricDiff {
     pub regressed: bool,
 }
 
-fn diff_metric(baseline_median: f64, candidate_median: f64, threshold_pct: f64) -> MetricDiff {
-    let delta = candidate_median - baseline_median;
-    let pct_change = if baseline_median == 0.0 {
+/// `baseline` から `candidate` への変化率 (%)。[`MetricDiff::pct_change`] の
+/// 規則どおり、baseline が 0 のときは NaN にせず、candidate も 0 なら `0.0`、
+/// そうでなければ `f64::INFINITY` を返す。[`diff_metric`] と
+/// [`classify_pair`] で共有する。
+fn pct_change(baseline_median: f64, candidate_median: f64) -> f64 {
+    if baseline_median == 0.0 {
         if candidate_median == 0.0 {
             0.0
         } else {
             f64::INFINITY
         }
     } else {
-        delta / baseline_median * 100.0
-    };
+        (candidate_median - baseline_median) / baseline_median * 100.0
+    }
+}
+
+fn diff_metric(baseline_median: f64, candidate_median: f64, threshold_pct: f64) -> MetricDiff {
+    let delta = candidate_median - baseline_median;
+    let pct_change = pct_change(baseline_median, candidate_median);
     MetricDiff {
         baseline_median,
         candidate_median,
@@ -1484,6 +1482,18 @@ pub enum Severity {
     Fail,
 }
 
+impl Severity {
+    /// 人間向け出力 (`velox-bench gate` の表・[`render_gate_markdown`]) で
+    /// 使う大文字の表記 (`"OK"` / `"WARN"` / `"FAIL"`)。
+    pub fn label(self) -> &'static str {
+        match self {
+            Severity::Ok => "OK",
+            Severity::Warn => "WARN",
+            Severity::Fail => "FAIL",
+        }
+    }
+}
+
 /// A trial count below this, on either side of a comparison, is not enough
 /// to trust a median at all — the comparison is still reported (never
 /// silently dropped) but capped at [`Severity::Warn`] and flagged
@@ -1683,15 +1693,7 @@ fn classify_pair(
     thresholds: &GateThresholds,
 ) -> (f64, Severity) {
     let delta = candidate_median - baseline_median;
-    let pct_change = if baseline_median == 0.0 {
-        if candidate_median == 0.0 {
-            0.0
-        } else {
-            f64::INFINITY
-        }
-    } else {
-        delta / baseline_median * 100.0
-    };
+    let pct_change = pct_change(baseline_median, candidate_median);
     if delta.abs() < min_abs_delta {
         return (pct_change, Severity::Ok);
     }
@@ -1728,73 +1730,12 @@ pub fn evaluate_gate(
     let mut only_in_baseline = Vec::new();
 
     for (name, baseline_stats) in &baseline.metrics {
-        let min_abs_delta = MetricKey::from_metric_name(name)
-            .map(MetricKey::min_significant_delta)
-            .unwrap_or(0.0);
-
-        let mut candidate_medians = Vec::new();
-        let mut pct_changes = Vec::new();
-        let mut per_candidate_severity = Vec::new();
-        let mut low_confidence = baseline_stats.count < MIN_TRIALS_FOR_CONFIDENT_GATE;
-
-        for candidate in candidates {
-            let Some(candidate_stats) = candidate.metrics.get(name) else {
-                continue;
-            };
-            if candidate_stats.count < MIN_TRIALS_FOR_CONFIDENT_GATE {
-                low_confidence = true;
+        match metric_verdict(name, baseline_stats, candidates, thresholds) {
+            Some(verdict) => {
+                metrics.insert(name.clone(), verdict);
             }
-            let (pct_change, severity) = classify_pair(
-                baseline_stats.median,
-                candidate_stats.median,
-                min_abs_delta,
-                thresholds,
-            );
-            candidate_medians.push(candidate_stats.median);
-            pct_changes.push(pct_change);
-            per_candidate_severity.push(severity);
+            None => only_in_baseline.push(name.clone()),
         }
-
-        if candidate_medians.is_empty() {
-            only_in_baseline.push(name.clone());
-            continue;
-        }
-
-        let fail_votes = per_candidate_severity
-            .iter()
-            .filter(|s| **s == Severity::Fail)
-            .count();
-        // "More than half" — for 1 candidate that is 1/1, for 2 candidates
-        // it is 2/2 (both must fail), for 3 it is 2/3. See module docs.
-        let majority_fail = fail_votes * 2 > per_candidate_severity.len();
-        let any_at_least_warn = per_candidate_severity.iter().any(|s| *s >= Severity::Warn);
-
-        let severity = if low_confidence {
-            if any_at_least_warn {
-                Severity::Warn
-            } else {
-                Severity::Ok
-            }
-        } else if majority_fail {
-            Severity::Fail
-        } else if any_at_least_warn {
-            Severity::Warn
-        } else {
-            Severity::Ok
-        };
-
-        metrics.insert(
-            name.clone(),
-            GateMetricVerdict {
-                baseline_median: baseline_stats.median,
-                baseline_count: baseline_stats.count,
-                candidate_medians,
-                pct_changes,
-                per_candidate_severity,
-                low_confidence,
-                severity,
-            },
-        );
     }
 
     let mut only_in_candidates = Vec::new();
@@ -1812,6 +1753,106 @@ pub fn evaluate_gate(
     // metric loop above rather than short-circuiting it — a report that
     // says "these two files are not comparable" is more useful with the
     // numbers still attached than without them.
+    let problems = input_problems(baseline, candidates, metrics.is_empty(), &only_in_baseline);
+
+    let overall = metrics
+        .values()
+        .map(|verdict| verdict.severity)
+        .chain(problems.iter().map(GateInputProblem::severity))
+        .max()
+        .unwrap_or(Severity::Ok);
+
+    GateReport {
+        scenario: baseline.scenario.clone(),
+        thresholds: *thresholds,
+        candidate_count: candidates.len(),
+        metrics,
+        only_in_baseline,
+        only_in_candidates,
+        problems,
+        overall,
+    }
+}
+
+/// [`evaluate_gate`] の 1 メトリクス分: `name` を測った全 candidate と
+/// baseline を比べ、多数決と `low_confidence` の上限を適用した
+/// [`GateMetricVerdict`] を返す。どの candidate もこのメトリクスを
+/// 測っていなければ `None` (呼び出し側が `only_in_baseline` に回す)。
+fn metric_verdict(
+    name: &str,
+    baseline_stats: &Stats,
+    candidates: &[&BenchmarkResult],
+    thresholds: &GateThresholds,
+) -> Option<GateMetricVerdict> {
+    let min_abs_delta = MetricKey::from_metric_name(name)
+        .map(MetricKey::min_significant_delta)
+        .unwrap_or(0.0);
+
+    let mut candidate_medians = Vec::new();
+    let mut pct_changes = Vec::new();
+    let mut per_candidate_severity = Vec::new();
+    let mut low_confidence = baseline_stats.count < MIN_TRIALS_FOR_CONFIDENT_GATE;
+
+    for candidate_stats in candidates
+        .iter()
+        .filter_map(|candidate| candidate.metrics.get(name))
+    {
+        if candidate_stats.count < MIN_TRIALS_FOR_CONFIDENT_GATE {
+            low_confidence = true;
+        }
+        let (pct_change, severity) = classify_pair(
+            baseline_stats.median,
+            candidate_stats.median,
+            min_abs_delta,
+            thresholds,
+        );
+        candidate_medians.push(candidate_stats.median);
+        pct_changes.push(pct_change);
+        per_candidate_severity.push(severity);
+    }
+
+    if candidate_medians.is_empty() {
+        return None;
+    }
+
+    let fail_votes = per_candidate_severity
+        .iter()
+        .filter(|s| **s == Severity::Fail)
+        .count();
+    // "More than half" — for 1 candidate that is 1/1, for 2 candidates
+    // it is 2/2 (both must fail), for 3 it is 2/3. See module docs.
+    let majority_fail = fail_votes * 2 > per_candidate_severity.len();
+    let any_at_least_warn = per_candidate_severity.iter().any(|s| *s >= Severity::Warn);
+
+    // `low_confidence` のときは多数決が成立していても `Warn` で止める。
+    let severity = if majority_fail && !low_confidence {
+        Severity::Fail
+    } else if any_at_least_warn {
+        Severity::Warn
+    } else {
+        Severity::Ok
+    };
+
+    Some(GateMetricVerdict {
+        baseline_median: baseline_stats.median,
+        baseline_count: baseline_stats.count,
+        candidate_medians,
+        pct_changes,
+        per_candidate_severity,
+        low_confidence,
+        severity,
+    })
+}
+
+/// [`evaluate_gate`] の入力前提 (Issue #196) の検査。`metrics_empty` は
+/// 比較できたメトリクスが 1 件も無かったか、`only_in_baseline` は
+/// どの candidate も測らなかった baseline のメトリクス (ソート済み)。
+fn input_problems(
+    baseline: &BenchmarkResult,
+    candidates: &[&BenchmarkResult],
+    metrics_empty: bool,
+    only_in_baseline: &[String],
+) -> Vec<GateInputProblem> {
     let mut problems = Vec::new();
     for (index, candidate) in candidates.iter().enumerate() {
         if candidate.scenario != baseline.scenario {
@@ -1834,50 +1875,28 @@ pub fn evaluate_gate(
             });
         }
     }
-    if metrics.is_empty() {
+    if metrics_empty {
         problems.push(GateInputProblem::NoComparableMetrics);
     } else if !only_in_baseline.is_empty() {
         // Only worth saying when *something* was comparable: when nothing
         // was, `NoComparableMetrics` above already covers it and this
         // would just restate the whole baseline metric list.
         problems.push(GateInputProblem::MetricsMissingFromCandidates {
-            metrics: only_in_baseline.clone(),
+            metrics: only_in_baseline.to_vec(),
         });
     }
-
-    let overall = metrics
-        .values()
-        .map(|verdict| verdict.severity)
-        .chain(problems.iter().map(GateInputProblem::severity))
-        .max()
-        .unwrap_or(Severity::Ok);
-
-    GateReport {
-        scenario: baseline.scenario.clone(),
-        thresholds: *thresholds,
-        candidate_count: candidates.len(),
-        metrics,
-        only_in_baseline,
-        only_in_candidates,
-        problems,
-        overall,
-    }
+    problems
 }
 
 /// Render `report` as a Markdown table, suitable for a GitHub Actions job
 /// summary (`$GITHUB_STEP_SUMMARY`) or a PR comment — the "PR
 /// summary/comment" acceptance item in Issue #72.
 pub fn render_gate_markdown(report: &GateReport) -> String {
-    let severity_label = |s: Severity| match s {
-        Severity::Ok => "OK",
-        Severity::Warn => "WARN",
-        Severity::Fail => "FAIL",
-    };
     let mut out = String::new();
     out.push_str(&format!(
         "### 性能回帰ゲート: {} — 総合判定: **{}**\n\n",
         report.scenario,
-        severity_label(report.overall)
+        report.overall.label()
     ));
     out.push_str(&format!(
         "候補測定 {} 件 / warn 閾値 {:.1}% / fail 閾値 {:.1}%\n\n",
@@ -1912,7 +1931,7 @@ pub fn render_gate_markdown(report: &GateReport) -> String {
                 name,
                 verdict.baseline_median,
                 candidates_display,
-                severity_label(verdict.severity),
+                verdict.severity.label(),
                 confidence_note
             ));
         }
@@ -1937,7 +1956,7 @@ pub fn render_gate_markdown(report: &GateReport) -> String {
         for problem in &report.problems {
             out.push_str(&format!(
                 "- [{}] {}\n",
-                severity_label(problem.severity()),
+                problem.severity().label(),
                 problem.describe()
             ));
         }
@@ -1986,43 +2005,54 @@ mod gate_tests {
 
     const KEY: &str = "startup_first_load_ms";
 
+    /// `cold_startup` シナリオで [`KEY`] だけを 10 試行分 (信頼できる
+    /// 試行数) 持つ結果。大半のテストの baseline / candidate はこの形。
+    fn cold_startup_with(median: f64) -> BenchmarkResult {
+        result_with_stats("cold_startup", &[(KEY, stats_with(10, median))])
+    }
+
+    /// 既定の閾値で [`evaluate_gate`] を呼ぶ。
+    fn gate(baseline: &BenchmarkResult, candidates: &[&BenchmarkResult]) -> GateReport {
+        evaluate_gate(baseline, candidates, &GateThresholds::default())
+    }
+
     // -- basic pass/warn/fail --------------------------------------------
 
     #[test]
     fn ok_when_change_is_negligible() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 502.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(502.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
         assert_eq!(report.overall, Severity::Ok);
     }
 
     #[test]
     fn warn_when_change_exceeds_warn_pct_but_not_fail_pct() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let baseline = cold_startup_with(500.0);
         // +30%: above default warn_pct (20.0), below default fail_pct (60.0).
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 650.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let candidate = cold_startup_with(650.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Warn);
         assert_eq!(report.overall, Severity::Warn);
     }
 
     #[test]
     fn fail_when_single_candidate_exceeds_fail_pct() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let baseline = cold_startup_with(500.0);
         // +80%: above default fail_pct (60.0). One candidate is "more than
         // half of 1", so this alone is enough to fail.
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let candidate = cold_startup_with(900.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Fail);
         assert_eq!(report.overall, Severity::Fail);
     }
 
     #[test]
     fn improvement_is_ok_not_warn_or_fail() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 200.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(200.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
     }
 
@@ -2032,17 +2062,17 @@ mod gate_tests {
     fn exactly_at_warn_pct_is_still_ok() {
         // +20.0% exactly == warn_pct: strictly-greater-than means this is
         // still Ok, not Warn.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 600.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(600.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
     }
 
     #[test]
     fn just_above_warn_pct_is_warn() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 600.01))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(600.01);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Warn);
     }
 
@@ -2050,17 +2080,17 @@ mod gate_tests {
     fn exactly_at_fail_pct_is_warn_not_fail() {
         // +60.0% exactly == fail_pct: strictly-greater-than means this is
         // Warn, not Fail.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 800.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(800.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Warn);
     }
 
     #[test]
     fn just_above_fail_pct_is_fail() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 800.01))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(800.01);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Fail);
     }
 
@@ -2068,9 +2098,9 @@ mod gate_tests {
 
     #[test]
     fn identical_medians_are_ok() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(500.0);
+        let report = gate(&baseline, &[&candidate]);
         let verdict = &report.metrics[KEY];
         assert_eq!(verdict.severity, Severity::Ok);
         assert_eq!(verdict.pct_changes, vec![0.0]);
@@ -2078,9 +2108,9 @@ mod gate_tests {
 
     #[test]
     fn zero_baseline_and_zero_candidate_is_ok_not_nan() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 0.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 0.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(0.0);
+        let candidate = cold_startup_with(0.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
         assert_eq!(report.metrics[KEY].pct_changes, vec![0.0]);
     }
@@ -2089,21 +2119,21 @@ mod gate_tests {
 
     #[test]
     fn tiny_absolute_change_stays_ok_despite_huge_pct_change() {
-        // tab_switch_ms floor is 15.0ms; 0.1ms -> 5.0ms is a 4900% change
+        // tab_switch_ms floor is 20.0ms; 0.1ms -> 5.0ms is a 4900% change
         // but only a 4.9ms absolute delta, below the floor.
         let baseline = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 0.1))]);
         let candidate = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 5.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics["tab_switch_ms"].severity, Severity::Ok);
     }
 
     #[test]
     fn zero_baseline_with_delta_above_floor_is_fail() {
         // Infinite pct_change, but the 20ms absolute delta clears
-        // tab_switch_ms's 15ms floor, so it is evaluated normally.
+        // tab_switch_ms's 20ms floor, so it is evaluated normally.
         let baseline = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 0.0))]);
         let candidate = result_with_stats("tab_switch", &[("tab_switch_ms", stats_with(10, 20.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         let verdict = &report.metrics["tab_switch_ms"];
         assert_eq!(verdict.pct_changes, vec![f64::INFINITY]);
         assert_eq!(verdict.severity, Severity::Fail);
@@ -2118,7 +2148,7 @@ mod gate_tests {
             result_with_stats("cold_startup", &[("future_metric_ms", stats_with(10, 1.0))]);
         let candidate =
             result_with_stats("cold_startup", &[("future_metric_ms", stats_with(10, 2.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         // +100%, well above fail_pct, and the 1.0 absolute delta is not
         // filtered by any floor.
         assert_eq!(report.metrics["future_metric_ms"].severity, Severity::Fail);
@@ -2130,8 +2160,8 @@ mod gate_tests {
     fn low_baseline_trial_count_caps_severity_at_warn() {
         let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(2, 500.0))]);
         // +100%, which would otherwise be Fail.
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 1000.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let candidate = cold_startup_with(1000.0);
+        let report = gate(&baseline, &[&candidate]);
         let verdict = &report.metrics[KEY];
         assert!(verdict.low_confidence);
         assert_eq!(verdict.severity, Severity::Warn);
@@ -2139,9 +2169,9 @@ mod gate_tests {
 
     #[test]
     fn low_candidate_trial_count_caps_severity_at_warn() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let baseline = cold_startup_with(500.0);
         let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(1, 1000.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         let verdict = &report.metrics[KEY];
         assert!(verdict.low_confidence);
         assert_eq!(verdict.severity, Severity::Warn);
@@ -2151,7 +2181,7 @@ mod gate_tests {
     fn low_confidence_with_no_real_change_stays_ok() {
         let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(1, 500.0))]);
         let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(1, 502.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         let verdict = &report.metrics[KEY];
         assert!(verdict.low_confidence);
         assert_eq!(verdict.severity, Severity::Ok);
@@ -2167,7 +2197,7 @@ mod gate_tests {
             "cold_startup",
             &[(KEY, stats_with(MIN_TRIALS_FOR_CONFIDENT_GATE, 900.0))],
         );
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         let verdict = &report.metrics[KEY];
         assert!(!verdict.low_confidence);
         assert_eq!(verdict.severity, Severity::Fail);
@@ -2178,8 +2208,8 @@ mod gate_tests {
     #[test]
     fn metric_missing_from_baseline_is_reported_not_guessed() {
         let baseline = result_with_stats("cold_startup", &[]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let candidate = cold_startup_with(500.0);
+        let report = gate(&baseline, &[&candidate]);
         assert!(report.metrics.is_empty());
         assert_eq!(report.only_in_candidates, vec![KEY.to_owned()]);
         // The candidate-only metric itself is never guessed at — but the
@@ -2205,7 +2235,7 @@ mod gate_tests {
                 ("rss_total_bytes", stats_with(10, 1.0)),
             ],
         );
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.overall, Severity::Fail);
         assert_eq!(report.only_in_candidates.len(), 2);
         assert!(report
@@ -2215,14 +2245,10 @@ mod gate_tests {
 
     #[test]
     fn metric_missing_from_one_candidate_is_still_evaluated_from_the_other() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let with_metric = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
+        let baseline = cold_startup_with(500.0);
+        let with_metric = cold_startup_with(900.0);
         let without_metric = result_with_stats("cold_startup", &[]);
-        let report = evaluate_gate(
-            &baseline,
-            &[&with_metric, &without_metric],
-            &GateThresholds::default(),
-        );
+        let report = gate(&baseline, &[&with_metric, &without_metric]);
         let verdict = &report.metrics[KEY];
         assert_eq!(verdict.candidate_medians, vec![900.0]);
         // 1 candidate measured it, and that 1 exceeded fail_pct: "more than
@@ -2232,8 +2258,8 @@ mod gate_tests {
 
     #[test]
     fn no_candidates_at_all_fails_instead_of_panicking() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let report = evaluate_gate(&baseline, &[], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let report = gate(&baseline, &[]);
         // Nothing was actually compared (there is no candidate at all), so
         // no *metric* can be Warn/Fail — but the report as a whole fails
         // rather than passing (Issue #196), and the baseline's metric is
@@ -2251,14 +2277,10 @@ mod gate_tests {
 
     #[test]
     fn two_candidates_both_failing_is_fail() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate_a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
-        let candidate_b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 1000.0))]);
-        let report = evaluate_gate(
-            &baseline,
-            &[&candidate_a, &candidate_b],
-            &GateThresholds::default(),
-        );
+        let baseline = cold_startup_with(500.0);
+        let candidate_a = cold_startup_with(900.0);
+        let candidate_b = cold_startup_with(1000.0);
+        let report = gate(&baseline, &[&candidate_a, &candidate_b]);
         assert_eq!(report.metrics[KEY].severity, Severity::Fail);
     }
 
@@ -2267,34 +2289,30 @@ mod gate_tests {
         // Requires *more than half* to fail; 1 of 2 is not a majority, so
         // this is a noisy-looking single run, not a confirmed regression —
         // downgraded to Warn rather than dropped entirely.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate_a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]); // fail
-        let candidate_b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]); // ok
-        let report = evaluate_gate(
-            &baseline,
-            &[&candidate_a, &candidate_b],
-            &GateThresholds::default(),
-        );
+        let baseline = cold_startup_with(500.0);
+        let candidate_a = cold_startup_with(900.0); // fail
+        let candidate_b = cold_startup_with(505.0); // ok
+        let report = gate(&baseline, &[&candidate_a, &candidate_b]);
         assert_eq!(report.metrics[KEY].severity, Severity::Warn);
     }
 
     #[test]
     fn three_candidates_two_of_three_failing_is_fail() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]); // fail
-        let b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 1000.0))]); // fail
-        let c = result_with_stats("cold_startup", &[(KEY, stats_with(10, 502.0))]); // ok
-        let report = evaluate_gate(&baseline, &[&a, &b, &c], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let a = cold_startup_with(900.0); // fail
+        let b = cold_startup_with(1000.0); // fail
+        let c = cold_startup_with(502.0); // ok
+        let report = gate(&baseline, &[&a, &b, &c]);
         assert_eq!(report.metrics[KEY].severity, Severity::Fail);
     }
 
     #[test]
     fn three_candidates_one_of_three_failing_is_warn() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let a = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]); // fail
-        let b = result_with_stats("cold_startup", &[(KEY, stats_with(10, 502.0))]); // ok
-        let c = result_with_stats("cold_startup", &[(KEY, stats_with(10, 503.0))]); // ok
-        let report = evaluate_gate(&baseline, &[&a, &b, &c], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let a = cold_startup_with(900.0); // fail
+        let b = cold_startup_with(502.0); // ok
+        let c = cold_startup_with(503.0); // ok
+        let report = gate(&baseline, &[&a, &b, &c]);
         assert_eq!(report.metrics[KEY].severity, Severity::Warn);
     }
 
@@ -2318,7 +2336,7 @@ mod gate_tests {
                 ("rss_total_bytes", stats_with(10, 600_000_000.0)), // +100% -> fail
             ],
         );
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
         assert_eq!(report.metrics["rss_total_bytes"].severity, Severity::Fail);
         assert_eq!(report.overall, Severity::Fail);
@@ -2328,9 +2346,9 @@ mod gate_tests {
 
     #[test]
     fn markdown_report_mentions_overall_severity_and_metric_rows() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let candidate = cold_startup_with(900.0);
+        let report = gate(&baseline, &[&candidate]);
         let markdown = render_gate_markdown(&report);
         assert!(markdown.contains("FAIL"));
         assert!(markdown.contains(KEY));
@@ -2341,7 +2359,7 @@ mod gate_tests {
     fn markdown_report_of_empty_metrics_does_not_panic() {
         let baseline = result_with_stats("cold_startup", &[]);
         let candidate = result_with_stats("cold_startup", &[]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         let markdown = render_gate_markdown(&report);
         assert!(markdown.contains("比較可能なメトリクスがありません"));
         // Issue #196: the verdict is FAIL, and the reason for it has to be
@@ -2356,9 +2374,9 @@ mod gate_tests {
     fn scenario_mismatch_fails_even_when_the_numbers_look_fine() {
         // Identical medians: without the precondition check this is a
         // confident-looking `Ok` computed from two unrelated scenarios.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let baseline = cold_startup_with(500.0);
         let candidate = result_with_stats("tabs_20", &[(KEY, stats_with(10, 500.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
         assert_eq!(
             report.problems,
@@ -2375,10 +2393,10 @@ mod gate_tests {
     fn os_mismatch_fails() {
         // Epic #57 absolute rule 5: results are recorded per OS, and a
         // Linux number is never a stand-in for a Windows one.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let mut candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
+        let baseline = cold_startup_with(500.0);
+        let mut candidate = cold_startup_with(505.0);
         candidate.environment.os = "windows".to_owned();
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(
             report.problems,
             vec![GateInputProblem::OsMismatch {
@@ -2392,10 +2410,10 @@ mod gate_tests {
 
     #[test]
     fn mismatch_names_the_offending_candidate_by_index() {
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let good = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
+        let baseline = cold_startup_with(500.0);
+        let good = cold_startup_with(505.0);
         let bad = result_with_stats("tabs_5", &[(KEY, stats_with(10, 505.0))]);
-        let report = evaluate_gate(&baseline, &[&good, &bad], &GateThresholds::default());
+        let report = gate(&baseline, &[&good, &bad]);
         assert_eq!(
             report.problems,
             vec![GateInputProblem::ScenarioMismatch {
@@ -2412,9 +2430,9 @@ mod gate_tests {
         // The exact silent pass Issue #196 describes: every baseline
         // metric lands in `only_in_baseline`, no metric verdict exists, and
         // the old `overall` was `Ok`.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let baseline = cold_startup_with(500.0);
         let candidate = result_with_stats("cold_startup", &[]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         assert!(report.metrics.is_empty());
         assert_eq!(report.only_in_baseline, vec![KEY.to_owned()]);
         assert!(report
@@ -2435,8 +2453,8 @@ mod gate_tests {
                 ("rss_total_bytes", stats_with(10, 100.0)),
             ],
         );
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let candidate = cold_startup_with(505.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Ok);
         assert_eq!(
             report.problems,
@@ -2456,8 +2474,8 @@ mod gate_tests {
                 ("rss_total_bytes", stats_with(10, 100.0)),
             ],
         );
-        let candidate = result_with_stats("cold_startup", &[(KEY, stats_with(10, 900.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let candidate = cold_startup_with(900.0);
+        let report = gate(&baseline, &[&candidate]);
         assert_eq!(report.metrics[KEY].severity, Severity::Fail);
         assert_eq!(report.overall, Severity::Fail);
     }
@@ -2467,10 +2485,10 @@ mod gate_tests {
         // The shape `perf-gate.yml` actually passes: same scenario, same
         // OS, same metric set, two candidate runs. Nothing here may change
         // its verdict just because the checks exist.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
-        let first = result_with_stats("cold_startup", &[(KEY, stats_with(10, 505.0))]);
-        let second = result_with_stats("cold_startup", &[(KEY, stats_with(10, 498.0))]);
-        let report = evaluate_gate(&baseline, &[&first, &second], &GateThresholds::default());
+        let baseline = cold_startup_with(500.0);
+        let first = cold_startup_with(505.0);
+        let second = cold_startup_with(498.0);
+        let report = gate(&baseline, &[&first, &second]);
         assert!(report.problems.is_empty());
         assert_eq!(report.overall, Severity::Ok);
     }
@@ -2479,9 +2497,9 @@ mod gate_tests {
     fn gate_report_round_trips_through_json_with_problems() {
         // `velox-bench gate --output` writes this, and the dashboard reads
         // it back — the new field must survive the round trip.
-        let baseline = result_with_stats("cold_startup", &[(KEY, stats_with(10, 500.0))]);
+        let baseline = cold_startup_with(500.0);
         let candidate = result_with_stats("tabs_20", &[(KEY, stats_with(10, 500.0))]);
-        let report = evaluate_gate(&baseline, &[&candidate], &GateThresholds::default());
+        let report = gate(&baseline, &[&candidate]);
         let json = serde_json::to_string(&report).expect("serialize");
         let parsed: GateReport = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(parsed, report);
@@ -2697,28 +2715,18 @@ pub mod scenario {
                 Scenario::TabResume,
                 Scenario::BackgroundCpu,
             ];
-            scenarios.extend(
-                Self::TAB_COUNTS
-                    .iter()
-                    .map(|&n| Scenario::TabCountMemory(n)),
-            );
-            scenarios.extend(
-                Self::TAB_COUNTS
-                    .iter()
-                    .map(|&n| Scenario::TabCountMemoryHold(n)),
-            );
-            scenarios.extend(
-                Self::TAB_COUNTS
-                    .iter()
-                    .map(|&n| Scenario::TabCountMemoryResume(n)),
-            );
-            scenarios.extend(
-                Self::TAB_COUNTS
-                    .iter()
-                    .map(|&n| Scenario::TabCountMemoryBounce(n)),
-            );
-            scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabCreateAt(n)));
-            scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| Scenario::TabSwitchAt(n)));
+            // タブ数でパラメータ化された系統を、系統ごとに TAB_COUNTS 順で並べる。
+            let families: [fn(u32) -> Scenario; 6] = [
+                Scenario::TabCountMemory,
+                Scenario::TabCountMemoryHold,
+                Scenario::TabCountMemoryResume,
+                Scenario::TabCountMemoryBounce,
+                Scenario::TabCreateAt,
+                Scenario::TabSwitchAt,
+            ];
+            for build in families {
+                scenarios.extend(Self::TAB_COUNTS.iter().map(|&n| build(n)));
+            }
             scenarios
         }
 
@@ -2772,17 +2780,15 @@ pub mod scenario {
             // `tabs_` に食われ、残り "hold_10" の数値パースに失敗して
             // `None` になる (`tabs_hold_is_not_swallowed_by_tabs` が
             // これを守っている)。
-            for (prefix, build) in [
+            type Build = fn(u32) -> Scenario;
+            let families: [(&str, Build); 6] = [
                 // `tabs_hold_resume_` は `tabs_hold_` より **前**。同じ
                 // 理由 (先に一致したプレフィックスで return する) で、
                 // 逆にすると "tabs_hold_resume_20" が `tabs_hold_` に
                 // 食われて残り "resume_20" のパースに失敗し `None` に
                 // なる (`tabs_hold_resume_is_not_swallowed_by_tabs_hold`
                 // がこれを守っている)。
-                (
-                    "tabs_hold_resume_",
-                    Scenario::TabCountMemoryResume as fn(u32) -> Scenario,
-                ),
+                ("tabs_hold_resume_", Scenario::TabCountMemoryResume),
                 // `tabs_hold_bounce_` も同じ理由で `tabs_hold_` より
                 // **前**。`tabs_hold_resume_` とは接尾辞が違う
                 // (`resume_`/`bounce_`) ので互いを食い合うことはなく、
@@ -2791,18 +2797,13 @@ pub mod scenario {
                 // に食われて残り "bounce_20" のパースに失敗し `None` に
                 // なる (`tabs_hold_bounce_is_not_swallowed_by_tabs_hold`
                 // がこれを守っている)。
-                (
-                    "tabs_hold_bounce_",
-                    Scenario::TabCountMemoryBounce as fn(u32) -> Scenario,
-                ),
-                (
-                    "tabs_hold_",
-                    Scenario::TabCountMemoryHold as fn(u32) -> Scenario,
-                ),
-                ("tabs_", Scenario::TabCountMemory as fn(u32) -> Scenario),
-                ("tab_create_", Scenario::TabCreateAt as fn(u32) -> Scenario),
-                ("tab_switch_", Scenario::TabSwitchAt as fn(u32) -> Scenario),
-            ] {
+                ("tabs_hold_bounce_", Scenario::TabCountMemoryBounce),
+                ("tabs_hold_", Scenario::TabCountMemoryHold),
+                ("tabs_", Scenario::TabCountMemory),
+                ("tab_create_", Scenario::TabCreateAt),
+                ("tab_switch_", Scenario::TabSwitchAt),
+            ];
+            for (prefix, build) in families {
                 if let Some(rest) = id.strip_prefix(prefix) {
                     return rest
                         .parse::<u32>()

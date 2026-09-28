@@ -18852,3 +18852,32 @@ D96 Revisit (2) の分散計測はこの commit を境に読み分けること (
 既定のスクリプトの形で取り直す。(2) 私的コミットを使う以上、Linux の
 対称 (`RssAnon:`) を足す動機は無い。Linux の予算を PSS 以外にしたくなった
 ときに改めて決める。
+
+## D153: WebKitGTK 系ターゲットの cfg を build.rs の `gtk_backend` エイリアスにまとめる — ソース中の 5 OS 列挙をやめる
+
+**対象**: コードベース全体のリファクタリング (PR #295)。`src/ui/window`
+配下では、wry が WebKitGTK バックエンドを使うターゲット (linux /
+dragonfly / freebsd / openbsd / netbsd) を列挙した
+`#[cfg(any(target_os = "linux", ...))]` が 16 回繰り返されていた。
+
+### 決定
+
+`build.rs` が Cargo の `CARGO_CFG_TARGET_OS` (ホストではなくビルド対象)
+を見て、上記 5 OS のときに `cargo:rustc-cfg=gtk_backend` を出す。
+`cargo:rustc-check-cfg=cfg(gtk_backend)` も出すので、`unexpected_cfgs`
+警告にはならない。ソース側は `#[cfg(gtk_backend)]` /
+`#[cfg(not(gtk_backend))]` を使う。**WebKitGTK 系の分岐を新しく書くときは
+5 OS を列挙せず、このエイリアスを使うこと。**
+
+ホスト OS ではなく target を見るため、Linux 上での
+`cargo check --target x86_64-pc-windows-msvc` (D61) では立たない。
+
+### 見送ったもの・既知の制約
+
+`Cargo.toml` の `[target.'cfg(any(...))'.dependencies]` (`gtk` 依存) では
+build script が出すカスタム cfg を使えないため、そこだけ列挙が残る。
+`build.rs` の `GTK_TARGET_OSES` と一致させる旨をコメントに書いてある。
+
+**Revisit condition**: wry が WebKitGTK を使う OS の一覧を変えたら、
+`build.rs` の `GTK_TARGET_OSES` と `Cargo.toml` の target 指定を同時に
+更新する。

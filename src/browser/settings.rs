@@ -476,15 +476,9 @@ impl PerformanceSettings {
         // means for these three signals ("off") — collapse it to `None`
         // rather than storing a value every consumer would have to special-
         // case, mirroring `config::resolve_suspension`'s `positive()` filter.
-        if self.auto_suspend_after_ms == Some(0) {
-            self.auto_suspend_after_ms = None;
-        }
-        if self.max_live_tabs == Some(0) {
-            self.max_live_tabs = None;
-        }
-        if self.memory_budget_mb == Some(0) {
-            self.memory_budget_mb = None;
-        }
+        self.auto_suspend_after_ms = self.auto_suspend_after_ms.filter(|&ms| ms != 0);
+        self.max_live_tabs = self.max_live_tabs.filter(|&tabs| tabs != 0);
+        self.memory_budget_mb = self.memory_budget_mb.filter(|&mib| mib != 0);
         if self.memory_check_interval_ms == 0 {
             self.memory_check_interval_ms = default_memory_check_interval_ms();
         }
@@ -506,12 +500,7 @@ pub struct DownloadsSettings {
 
 impl DownloadsSettings {
     fn sanitize(&mut self) {
-        self.download_dir_override = self
-            .download_dir_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
+        self.download_dir_override = sanitize_optional_path(&self.download_dir_override);
     }
 }
 
@@ -564,6 +553,8 @@ impl AdvancedSettings {
     }
 }
 
+/// 任意指定のパス欄の共通整形: 前後の空白を除き、空になったら未設定
+/// (`None`) として扱う。
 fn sanitize_optional_path(raw: &Option<String>) -> Option<String> {
     raw.as_deref()
         .map(str::trim)
@@ -581,7 +572,7 @@ fn sanitize_optional_path(raw: &Option<String>) -> Option<String> {
 // behavior itself is out of scope for the settings screen, and D77 for why
 // full UI remapping is out of scope for #38 too.
 
-use super::shortcuts::{Platform, ShortcutId, SHORTCUT_TABLE};
+use super::shortcuts::{Platform, ShortcutDef, ShortcutId, SHORTCUT_TABLE};
 
 /// One row of the Shortcuts tab's reference table. Owned `String`s (not
 /// `&'static str`, unlike most other static-ish data in this module) because
@@ -593,13 +584,16 @@ pub struct ShortcutInfo {
     pub keys: String,
 }
 
+/// [`SHORTCUT_TABLE`] から `id` の定義を引く。
+fn shortcut_def(id: ShortcutId) -> Option<&'static ShortcutDef> {
+    SHORTCUT_TABLE.iter().find(|def| def.id == id)
+}
+
 /// Look up a single [`SHORTCUT_TABLE`] entry's chord label(s) for `platform`,
 /// joining more than one chord (only [`ShortcutId::OpenDevtools`] has more
 /// than one today) with `" / "`.
 fn chord_label(id: ShortcutId, platform: Platform) -> String {
-    SHORTCUT_TABLE
-        .iter()
-        .find(|def| def.id == id)
+    shortcut_def(id)
         .map(|def| {
             def.chords
                 .iter()
@@ -623,70 +617,40 @@ fn chord_label(id: ShortcutId, platform: Platform) -> String {
 /// `browser::shortcuts::SHORTCUT_TABLE` entry.
 pub fn shortcut_reference() -> Vec<ShortcutInfo> {
     let platform = Platform::current();
-    let activate_tab_prefix = SHORTCUT_TABLE
-        .iter()
-        .find(|def| def.id == ShortcutId::ActivateTabAt(1))
+    let activate_tab_prefix = shortcut_def(ShortcutId::ActivateTabAt(1))
         .and_then(|def| def.chords.first())
         .map(|chord| chord.modifiers.label(platform))
         .unwrap_or_default();
+    let row = |action: &str, keys: String| ShortcutInfo {
+        action: action.to_owned(),
+        keys,
+    };
+    let chord = |id| chord_label(id, platform);
 
     vec![
-        ShortcutInfo {
-            action: "新しいタブ".to_owned(),
-            keys: chord_label(ShortcutId::NewTab, platform),
-        },
-        ShortcutInfo {
-            action: "タブを閉じる".to_owned(),
-            keys: chord_label(ShortcutId::CloseTab, platform),
-        },
-        ShortcutInfo {
-            action: "閉じたタブを再度開く".to_owned(),
-            keys: chord_label(ShortcutId::ReopenClosedTab, platform),
-        },
-        ShortcutInfo {
-            action: "次のタブ".to_owned(),
-            keys: chord_label(ShortcutId::NextTab, platform),
-        },
-        ShortcutInfo {
-            action: "前のタブ".to_owned(),
-            keys: chord_label(ShortcutId::PrevTab, platform),
-        },
-        ShortcutInfo {
-            action: "1〜8番目のタブに切り替え".to_owned(),
-            keys: format!("{activate_tab_prefix}+1〜8"),
-        },
-        ShortcutInfo {
-            action: "最後のタブに切り替え".to_owned(),
-            keys: chord_label(ShortcutId::ActivateLastTab, platform),
-        },
-        ShortcutInfo {
-            action: "アドレスバーにフォーカス".to_owned(),
-            keys: chord_label(ShortcutId::FocusAddressBar, platform),
-        },
-        ShortcutInfo {
-            action: "ブックマークの追加/削除".to_owned(),
-            keys: chord_label(ShortcutId::ToggleBookmark, platform),
-        },
-        ShortcutInfo {
-            action: "ブックマークバーの表示切替".to_owned(),
-            keys: chord_label(ShortcutId::ToggleBookmarkBar, platform),
-        },
-        ShortcutInfo {
-            action: "新しいウィンドウ".to_owned(),
-            keys: chord_label(ShortcutId::NewWindow, platform),
-        },
-        ShortcutInfo {
-            action: "ページ内検索を開く".to_owned(),
-            keys: chord_label(ShortcutId::OpenFindBar, platform),
-        },
-        ShortcutInfo {
-            action: "DevTools を開く".to_owned(),
-            keys: chord_label(ShortcutId::OpenDevtools, platform),
-        },
-        ShortcutInfo {
-            action: "ページのソースを表示".to_owned(),
-            keys: chord_label(ShortcutId::ViewSource, platform),
-        },
+        row("新しいタブ", chord(ShortcutId::NewTab)),
+        row("タブを閉じる", chord(ShortcutId::CloseTab)),
+        row("閉じたタブを再度開く", chord(ShortcutId::ReopenClosedTab)),
+        row("次のタブ", chord(ShortcutId::NextTab)),
+        row("前のタブ", chord(ShortcutId::PrevTab)),
+        row(
+            "1〜8番目のタブに切り替え",
+            format!("{activate_tab_prefix}+1〜8"),
+        ),
+        row("最後のタブに切り替え", chord(ShortcutId::ActivateLastTab)),
+        row(
+            "アドレスバーにフォーカス",
+            chord(ShortcutId::FocusAddressBar),
+        ),
+        row("ブックマークの追加/削除", chord(ShortcutId::ToggleBookmark)),
+        row(
+            "ブックマークバーの表示切替",
+            chord(ShortcutId::ToggleBookmarkBar),
+        ),
+        row("新しいウィンドウ", chord(ShortcutId::NewWindow)),
+        row("ページ内検索を開く", chord(ShortcutId::OpenFindBar)),
+        row("DevTools を開く", chord(ShortcutId::OpenDevtools)),
+        row("ページのソースを表示", chord(ShortcutId::ViewSource)),
     ]
 }
 

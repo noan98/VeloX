@@ -21,6 +21,7 @@
 //! `reopen_closed`, which only ever append at the very end) already
 //! upholds it for free.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use super::session::SavedTab;
@@ -57,9 +58,10 @@ pub enum ActivationEffect {
 #[derive(Debug, Default)]
 struct ClosedTabs {
     /// Oldest entry first, most recently closed last (so `pop` — via
-    /// `Vec::pop` — returns the most recently closed tab, matching a LIFO
-    /// stack). Trimmed from the front once [`Self::CAP`] is exceeded.
-    urls: Vec<String>,
+    /// `VecDeque::pop_back` — returns the most recently closed tab, matching
+    /// a LIFO stack). Trimmed from the front once [`Self::CAP`] is exceeded
+    /// (先頭からの削除が O(1) で済むよう `VecDeque` にしている)。
+    urls: VecDeque<String>,
 }
 
 impl ClosedTabs {
@@ -73,15 +75,15 @@ impl ClosedTabs {
     /// remembered entry is dropped to make room.
     fn push(&mut self, url: impl Into<String>) {
         if self.urls.len() >= Self::CAP {
-            self.urls.remove(0);
+            self.urls.pop_front();
         }
-        self.urls.push(url.into());
+        self.urls.push_back(url.into());
     }
 
     /// Take the most recently closed URL, if any, removing it from the
     /// stack (reopening a tab does not leave it available to reopen again).
     fn pop(&mut self) -> Option<String> {
-        self.urls.pop()
+        self.urls.pop_back()
     }
 }
 
@@ -303,7 +305,7 @@ impl Tabs {
             // A tab to the left of the active one shifted everything after
             // it down by one slot; follow the active tab to its new index.
             self.active -= 1;
-        } else if index == self.active {
+        } else if closing_active {
             // The active tab itself closed: the tab that slid into its slot
             // becomes active (the next tab), or the new last tab if we just
             // closed the rightmost one.
@@ -361,11 +363,11 @@ impl Tabs {
     /// Ctrl/Cmd+Shift+Tab). `Tabs` is never empty, so this always succeeds.
     pub fn activate_relative(&mut self, delta: i64, now: Instant) -> Option<ActivationEffect> {
         let len = self.tabs.len() as i64;
-        // Double-mod (`% len` then `+ len) % len`) to land in `0..len` even
-        // when `self.active as i64 + delta` is negative, since Rust's `%`
-        // keeps the sign of its left operand rather than always returning a
+        // `rem_euclid` so the result lands in `0..len` even when
+        // `self.active as i64 + delta` is negative — Rust's `%` keeps the
+        // sign of its left operand rather than always returning a
         // non-negative result.
-        let index = ((self.active as i64 + delta) % len + len) % len;
+        let index = (self.active as i64 + delta).rem_euclid(len);
         self.activate_index_at(index as usize, now)
     }
 
@@ -439,11 +441,8 @@ impl Tabs {
     /// only the automatic path would leave a pinned tab one click away
     /// from exactly the state pinning it was supposed to prevent.
     pub fn suspend(&mut self, id: TabId) -> bool {
-        match self.get_mut(id) {
-            Some(tab) if tab.is_pinned() => false,
-            Some(tab) => tab.suspend().is_ok(),
-            None => false,
-        }
+        self.get_mut(id)
+            .is_some_and(|tab| !tab.is_pinned() && tab.suspend().is_ok())
     }
 
     /// Pin or unpin tab `id` (Issue #277, D144): the tab strip's pin
@@ -494,11 +493,23 @@ impl Tabs {
     /// Pure and clock-injected on purpose, so the auto-suspend policy is
     /// unit-testable without sleeping a real thread — see the tests below.
     pub fn idle_background_tabs(&self, now: Instant, idle_after: Duration) -> Vec<TabId> {
-        self.tabs
-            .iter()
-            .filter(|tab| tab.state() == TabState::Background && tab.idle_for(now) >= idle_after)
+        self.background_tabs()
+            .filter(|tab| tab.idle_for(now) >= idle_after)
             .map(Tab::id)
             .collect()
+    }
+
+    /// `Background` 状態 (webview は生きているが非表示) のタブを表示順で返す。
+    /// 自動休止の候補になり得るのはこれだけである。
+    fn background_tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.state() == TabState::Background)
+    }
+
+    /// webview が生きている (`Suspended` でない) タブを表示順で返す。
+    fn live_tabs(&self) -> impl Iterator<Item = &Tab> {
+        self.tabs.iter().filter(|tab| !tab.is_suspended())
     }
 
     /// How many tabs currently have a live content webview: every tab that
@@ -506,10 +517,7 @@ impl Tabs {
     /// The number `browser::suspension::SuspensionPolicy::max_live_tabs`
     /// is compared against.
     pub fn live_tab_count(&self) -> usize {
-        self.tabs
-            .iter()
-            .filter(|tab| tab.state() != TabState::Suspended)
-            .count()
+        self.live_tabs().count()
     }
 
     /// Every live (not suspended) tab as a suspension [`Candidate`] for
@@ -528,9 +536,7 @@ impl Tabs {
         protect: impl Fn(TabId) -> bool,
         process_group: impl Fn(TabId) -> Option<u64>,
     ) -> Vec<Candidate> {
-        self.tabs
-            .iter()
-            .filter(|tab| tab.state() != TabState::Suspended)
+        self.live_tabs()
             .map(|tab| Candidate {
                 id: tab.id(),
                 active: tab.state() != TabState::Background,
@@ -550,9 +556,7 @@ impl Tabs {
     /// `None` when there is no such tab (e.g. a single-tab window, or every
     /// background tab is already suspended) — nothing to wait for.
     pub fn next_idle_deadline(&self, idle_after: Duration) -> Option<Instant> {
-        self.tabs
-            .iter()
-            .filter(|tab| tab.state() == TabState::Background)
+        self.background_tabs()
             .map(|tab| tab.last_active_at() + idle_after)
             .min()
     }
@@ -565,6 +569,29 @@ mod tests {
 
     fn ids(tabs: &Tabs) -> Vec<TabId> {
         tabs.iter().map(Tab::id).collect()
+    }
+
+    /// `a`, `b` の 2 タブ (表示順もこの順)。後から開いた `b` がアクティブ。
+    fn two_tabs() -> (Tabs, TabId, TabId) {
+        let mut tabs = Tabs::new("https://a.example/");
+        let a = tabs.active_id();
+        let b = tabs.open("https://b.example/");
+        (tabs, a, b)
+    }
+
+    /// `a`, `b`, `c` の 3 タブ (表示順もこの順)。最後に開いた `c` がアクティブ。
+    fn three_tabs() -> (Tabs, TabId, TabId, TabId) {
+        let (mut tabs, a, b) = two_tabs();
+        let c = tabs.open("https://c.example/");
+        (tabs, a, b, c)
+    }
+
+    /// [`two_tabs`] から `a` をアクティブに戻し、背景に回った `b` を休止させた状態。
+    fn a_active_b_suspended() -> (Tabs, TabId, TabId) {
+        let (mut tabs, a, b) = two_tabs();
+        tabs.activate(a);
+        assert!(tabs.suspend(b));
+        (tabs, a, b)
     }
 
     #[test]
@@ -635,10 +662,7 @@ mod tests {
 
     #[test]
     fn closing_active_middle_tab_activates_the_next_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/");
+        let (mut tabs, a, b, c) = three_tabs();
         assert_eq!(ids(&tabs), vec![a, b, c]);
 
         tabs.activate(b);
@@ -652,10 +676,7 @@ mod tests {
 
     #[test]
     fn closing_active_rightmost_tab_activates_the_previous_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/");
+        let (mut tabs, a, b, c) = three_tabs();
         assert_eq!(tabs.active_id(), c);
 
         let (new_active, effect) = tabs.close(c).unwrap();
@@ -668,10 +689,7 @@ mod tests {
 
     #[test]
     fn closing_active_leftmost_tab_activates_the_following_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let _c = tabs.open("https://c.example/");
+        let (mut tabs, a, b, _) = three_tabs();
         tabs.activate(a);
 
         let (new_active, _effect) = tabs.close(a).unwrap();
@@ -682,11 +700,7 @@ mod tests {
 
     #[test]
     fn closing_the_active_tab_resumes_a_suspended_replacement() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/"); // active
-        tabs.activate(a); // b now background
-        assert!(tabs.suspend(b));
+        let (mut tabs, a, b) = a_active_b_suspended();
         let c = tabs.open("https://c.example/"); // active; order: a, b, c
         assert_eq!(ids(&tabs), vec![a, b, c]);
 
@@ -702,9 +716,7 @@ mod tests {
 
     #[test]
     fn activate_switches_active_tab_and_rejects_unknown_ids() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
         assert_eq!(tabs.active_id(), b);
 
         assert_eq!(tabs.activate(a), Some(ActivationEffect::Switch));
@@ -726,11 +738,7 @@ mod tests {
 
     #[test]
     fn activating_a_suspended_tab_resumes_it() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/"); // active
-        tabs.activate(a); // b now background
-        assert!(tabs.suspend(b));
+        let (mut tabs, _, b) = a_active_b_suspended();
         assert!(tabs.get(b).unwrap().is_suspended());
 
         let effect = tabs.activate(b);
@@ -743,9 +751,7 @@ mod tests {
 
     #[test]
     fn ids_are_never_reused() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
         tabs.close(b);
         let c = tabs.open("https://c.example/");
 
@@ -755,9 +761,7 @@ mod tests {
 
     #[test]
     fn get_and_get_mut_find_any_tab_by_id() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
 
         assert_eq!(tabs.get(a).unwrap().current_url(), "https://a.example/");
         assert!(tabs.get(TabId::from(999)).is_none());
@@ -773,9 +777,7 @@ mod tests {
         // A `TabId` that never existed and one for a tab that has since
         // been closed must both behave the same way: `None`, no panic —
         // the shape a stale toolbar/webview event's `TabId` takes.
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
         tabs.activate(a);
         tabs.close(b).unwrap();
         let closed = b;
@@ -810,9 +812,7 @@ mod tests {
 
     #[test]
     fn suspend_marks_a_background_tab_dormant() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/"); // active
+        let (mut tabs, a, b) = two_tabs();
         tabs.activate(a); // b is now the background tab
 
         assert!(tabs.suspend(b));
@@ -823,9 +823,7 @@ mod tests {
 
     #[test]
     fn activate_at_marks_the_outgoing_tab_backgrounded() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/"); // active
+        let (mut tabs, a, b) = two_tabs();
 
         let t0 = Instant::now();
         assert_eq!(tabs.activate_at(a, t0), Some(ActivationEffect::Switch));
@@ -867,10 +865,7 @@ mod tests {
 
     #[test]
     fn idle_background_tabs_excludes_the_active_and_already_suspended_tabs() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/"); // active
+        let (mut tabs, a, b, c) = three_tabs();
 
         let t0 = Instant::now();
         tabs.activate_at(a, t0); // backgrounds c
@@ -897,9 +892,7 @@ mod tests {
 
     #[test]
     fn idle_background_tabs_respects_the_threshold() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
         let t0 = Instant::now();
         tabs.activate_at(a, t0); // backgrounds b at t0
 
@@ -921,9 +914,7 @@ mod tests {
 
     #[test]
     fn next_idle_deadline_tracks_the_soonest_background_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
         let t0 = Instant::now();
         tabs.activate_at(a, t0); // backgrounds b at t0
 
@@ -1029,10 +1020,7 @@ mod tests {
 
     #[test]
     fn activate_relative_moves_forward_and_wraps_around() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/"); // active
+        let (mut tabs, a, b, c) = three_tabs();
         assert_eq!(tabs.active_id(), c);
 
         assert_eq!(
@@ -1049,10 +1037,7 @@ mod tests {
 
     #[test]
     fn activate_relative_moves_backward_and_wraps_around() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let _b = tabs.open("https://b.example/");
-        let _c = tabs.open("https://c.example/");
+        let (mut tabs, a, _, c) = three_tabs();
         tabs.activate(a);
 
         assert_eq!(
@@ -1060,7 +1045,7 @@ mod tests {
             Some(ActivationEffect::Switch)
         );
         // Wrapped backward past the start, landing on the last tab.
-        assert_eq!(tabs.active_id(), _c);
+        assert_eq!(tabs.active_id(), c);
     }
 
     #[test]
@@ -1076,10 +1061,7 @@ mod tests {
 
     #[test]
     fn activate_by_position_uses_one_based_display_order() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/");
+        let (mut tabs, a, b, c) = three_tabs();
         assert_eq!(ids(&tabs), vec![a, b, c]);
 
         assert_eq!(
@@ -1096,15 +1078,12 @@ mod tests {
 
     #[test]
     fn activate_by_position_is_none_out_of_range() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        tabs.open("https://b.example/");
+        let (mut tabs, _, b) = two_tabs();
 
         assert_eq!(tabs.activate_by_position(0, Instant::now()), None);
         assert_eq!(tabs.activate_by_position(99, Instant::now()), None);
         // Neither out-of-range attempt changed the active tab.
-        assert_eq!(tabs.active_id(), tabs.iter().nth(1).unwrap().id());
-        let _ = a;
+        assert_eq!(tabs.active_id(), b);
     }
 
     #[test]
@@ -1124,11 +1103,7 @@ mod tests {
 
     #[test]
     fn activate_relative_resumes_a_suspended_target() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/"); // active
-        tabs.activate(a); // b now background
-        assert!(tabs.suspend(b));
+        let (mut tabs, _, b) = a_active_b_suspended();
 
         assert_eq!(
             tabs.activate_relative(1, Instant::now()),
@@ -1185,10 +1160,7 @@ mod tests {
 
     #[test]
     fn mutating_one_tab_never_touches_another_tabs_state() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/"); // active
+        let (mut tabs, a, b, c) = three_tabs();
 
         // Drive very different state into each tab.
         tabs.get_mut(a)
@@ -1319,6 +1291,14 @@ mod tests {
             title: None,
             favicon: None,
             pinned: false,
+        }
+    }
+
+    /// [`saved_tab`] のピン留め版。
+    fn pinned_saved_tab(url: &str) -> SavedTab {
+        SavedTab {
+            pinned: true,
+            ..saved_tab(url)
         }
     }
 
@@ -1455,11 +1435,10 @@ mod tests {
 
     #[test]
     fn suspend_refuses_a_pinned_background_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let b = tabs.open("https://b.example/"); // active
-                                                 // Background it so only "pinned" is the reason `suspend` could
-                                                 // refuse — `a` is neither active nor already suspended.
-        let a = tabs.iter().next().unwrap().id();
+        // `a` is backgrounded by opening `b`, so only "pinned" is the reason
+        // `suspend` could refuse — `a` is neither active nor already
+        // suspended.
+        let (mut tabs, a, b) = two_tabs();
         tabs.toggle_pinned(a);
 
         assert!(!tabs.suspend(a), "a pinned tab must never be suspended");
@@ -1498,10 +1477,7 @@ mod tests {
 
     #[test]
     fn pinning_moves_a_tab_to_just_after_the_last_pinned_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/");
+        let (mut tabs, a, b, c) = three_tabs();
         // Display order: a, b, c.
         tabs.toggle_pinned(b);
         // b jumps to the front (no other pinned tab yet): b, a, c.
@@ -1514,10 +1490,7 @@ mod tests {
 
     #[test]
     fn unpinning_moves_a_tab_to_the_first_unpinned_position() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
-        let c = tabs.open("https://c.example/");
+        let (mut tabs, a, b, c) = three_tabs();
         tabs.toggle_pinned(a);
         tabs.toggle_pinned(b);
         tabs.toggle_pinned(c);
@@ -1531,9 +1504,7 @@ mod tests {
 
     #[test]
     fn toggle_pinned_never_disturbs_which_tab_is_active() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/"); // active
+        let (mut tabs, a, b) = two_tabs();
         assert_eq!(tabs.active_id(), b);
 
         // Pinning a *different* tab moves it around b without touching
@@ -1565,9 +1536,7 @@ mod tests {
 
     #[test]
     fn reopen_closed_never_lands_before_a_pinned_tab() {
-        let mut tabs = Tabs::new("https://a.example/");
-        let a = tabs.active_id();
-        let b = tabs.open("https://b.example/");
+        let (mut tabs, a, b) = two_tabs();
         tabs.toggle_pinned(a);
         tabs.close(b);
 
@@ -1578,12 +1547,7 @@ mod tests {
     #[test]
     fn restore_applies_the_pinned_flag_from_the_saved_snapshot() {
         let saved = vec![
-            SavedTab {
-                url: "https://a.example/".to_owned(),
-                title: None,
-                favicon: None,
-                pinned: true,
-            },
+            pinned_saved_tab("https://a.example/"),
             saved_tab("https://b.example/"),
         ];
         let tabs = Tabs::restore(&saved, 1);
@@ -1602,12 +1566,7 @@ mod tests {
         // that produced this). `restore` must not just copy it as-is.
         let saved = vec![
             saved_tab("https://a.example/"),
-            SavedTab {
-                url: "https://b.example/".to_owned(),
-                title: None,
-                favicon: None,
-                pinned: true,
-            },
+            pinned_saved_tab("https://b.example/"),
             saved_tab("https://c.example/"),
         ];
         let tabs = Tabs::restore(&saved, 2); // c.example was active
@@ -1642,12 +1601,7 @@ mod tests {
         // suspended tab, pinned or not.
         let saved = vec![
             saved_tab("https://a.example/"),
-            SavedTab {
-                url: "https://b.example/".to_owned(),
-                title: None,
-                favicon: None,
-                pinned: true,
-            },
+            pinned_saved_tab("https://b.example/"),
         ];
         let mut tabs = Tabs::restore(&saved, 0);
         let b = tabs

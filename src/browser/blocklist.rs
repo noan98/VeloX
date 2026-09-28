@@ -181,6 +181,16 @@ struct DomainScope {
     excluded: Vec<String>,
 }
 
+impl DomainScope {
+    /// 小文字化済みのページホスト `host` にこのスコープが当てはまるか:
+    /// `included` が空でなければそのどれかに該当し、かつ `excluded` の
+    /// どれにも該当しないこと。
+    fn allows(&self, host: &str) -> bool {
+        let matches_any = |domains: &[String]| domains.iter().any(|d| domain_suffix_match(d, host));
+        (self.included.is_empty() || matches_any(&self.included)) && !matches_any(&self.excluded)
+    }
+}
+
 /// The `$...` options attached to a rule that this matcher actually acts on.
 /// Everything else recognized in the option string (`third-party`,
 /// `important`, ...) is accepted for parsing purposes but has no field here
@@ -197,27 +207,15 @@ struct RuleOptions {
 /// information (a `None` field) never excludes the rule — see
 /// [`MatchContext`]'s docs for why.
 fn options_apply(options: &RuleOptions, ctx: &MatchContext) -> bool {
-    if let Some(types) = &options.resource_types {
-        if let Some(rt) = ctx.resource_type {
-            if !types.contains(&rt) {
-                return false;
-            }
-        }
-    }
-    if let Some(scope) = &options.domain_scope {
-        if let Some(host) = ctx.page_host {
-            let host = host.trim().to_ascii_lowercase();
-            if !scope.included.is_empty()
-                && !scope.included.iter().any(|d| domain_suffix_match(d, &host))
-            {
-                return false;
-            }
-            if scope.excluded.iter().any(|d| domain_suffix_match(d, &host)) {
-                return false;
-            }
-        }
-    }
-    true
+    let type_ok = match (&options.resource_types, ctx.resource_type) {
+        (Some(types), Some(rt)) => types.contains(&rt),
+        _ => true,
+    };
+    let domain_ok = match (&options.domain_scope, ctx.page_host) {
+        (Some(scope), Some(host)) => scope.allows(&host.trim().to_ascii_lowercase()),
+        _ => true,
+    };
+    type_ok && domain_ok
 }
 
 /// Domain-anchor suffix match: `host` equals `domain` or is a subdomain of
@@ -225,7 +223,10 @@ fn options_apply(options: &RuleOptions, ctx: &MatchContext) -> bool {
 /// relationship applied to two different hosts (the request host vs. the
 /// page host).
 fn domain_suffix_match(domain: &str, host: &str) -> bool {
-    host == domain || host.ends_with(&format!(".{domain}"))
+    // `host == domain` か `host` が `".{domain}"` で終わるか、を
+    // 文字列を組み立てずに判定する。
+    host.strip_suffix(domain)
+        .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
 }
 
 /// Only ASCII letters/digits/`.`/`-`/`_` — used to validate the domain text
@@ -381,8 +382,16 @@ fn looks_like_options(s: &str) -> bool {
         .all(|token| token.is_empty() || token_looks_like_option(token))
 }
 
+/// 先頭の `~` (否定) を剥がし、剥がしたかどうかと残りを返す。
+fn strip_negation(s: &str) -> (bool, &str) {
+    match s.strip_prefix('~') {
+        Some(rest) => (true, rest),
+        None => (false, s),
+    }
+}
+
 fn token_looks_like_option(token: &str) -> bool {
-    let token = token.strip_prefix('~').unwrap_or(token);
+    let (_, token) = strip_negation(token);
     let mut chars = token.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() => {}
@@ -419,10 +428,7 @@ fn parse_options(raw: &str) -> Option<RuleOptions> {
             options.domain_scope = Some(parse_domain_scope(domains)?);
             continue;
         }
-        let (negated, keyword) = match token.strip_prefix('~') {
-            Some(k) => (true, k),
-            None => (false, token),
-        };
+        let (negated, keyword) = strip_negation(token);
         // Recognized but never gate a match — see the module docs.
         if matches!(
             keyword,
@@ -446,9 +452,7 @@ fn parse_options(raw: &str) -> Option<RuleOptions> {
             _ => return None,
         }
     }
-    if !resource_types.is_empty() {
-        options.resource_types = Some(resource_types);
-    }
+    options.resource_types = (!resource_types.is_empty()).then_some(resource_types);
     Some(options)
 }
 
@@ -459,10 +463,7 @@ fn parse_domain_scope(raw: &str) -> Option<DomainScope> {
         if part.is_empty() {
             continue;
         }
-        let (excluded, domain) = match part.strip_prefix('~') {
-            Some(d) => (true, d),
-            None => (false, part),
-        };
+        let (excluded, domain) = strip_negation(part);
         if !is_valid_domain_str(domain) {
             return None;
         }
@@ -512,28 +513,28 @@ fn tokenize_pattern(pattern: &str) -> Option<(Vec<Token>, bool, bool)> {
 
     let mut tokens = Vec::new();
     let mut buf = String::new();
+    // 溜まっているリテラルがあればトークンとして確定させる。
+    let flush_literal = |tokens: &mut Vec<Token>, buf: &mut String| {
+        if !buf.is_empty() {
+            tokens.push(Token::Literal(std::mem::take(buf)));
+        }
+    };
     for c in body.to_ascii_lowercase().chars() {
         match c {
             '*' => {
-                if !buf.is_empty() {
-                    tokens.push(Token::Literal(std::mem::take(&mut buf)));
-                }
+                flush_literal(&mut tokens, &mut buf);
                 if !matches!(tokens.last(), Some(Token::Wildcard)) {
                     tokens.push(Token::Wildcard);
                 }
             }
             '^' => {
-                if !buf.is_empty() {
-                    tokens.push(Token::Literal(std::mem::take(&mut buf)));
-                }
+                flush_literal(&mut tokens, &mut buf);
                 tokens.push(Token::Separator);
             }
             other => buf.push(other),
         }
     }
-    if !buf.is_empty() {
-        tokens.push(Token::Literal(buf));
-    }
+    flush_literal(&mut tokens, &mut buf);
     if tokens.is_empty() || tokens.iter().all(|t| matches!(t, Token::Wildcard)) {
         return None;
     }
@@ -556,59 +557,57 @@ fn parse_line(line: &str) -> ParsedLine {
         return ParsedLine::Ignored;
     }
 
+    parse_network_rule(line).unwrap_or(ParsedLine::Ignored)
+}
+
+/// コメント・ヘッダ・コスメティック行を除いた、ネットワークルール 1 行の
+/// 解釈。ルールとして採用できない行は `None` (呼び出し側で
+/// [`ParsedLine::Ignored`] 扱い)。
+fn parse_network_rule(line: &str) -> Option<ParsedLine> {
     let (is_exception, rest) = match line.strip_prefix("@@") {
         Some(r) => (true, r),
         None => (false, line),
     };
     if rest.is_empty() {
-        return ParsedLine::Ignored;
+        return None;
     }
 
     let (pattern_text, options_text) = split_options(rest);
     let options = match options_text {
-        Some(raw) => match parse_options(raw) {
-            Some(o) => o,
-            None => return ParsedLine::Ignored,
-        },
+        Some(raw) => parse_options(raw)?,
         None => RuleOptions::default(),
     };
     if pattern_text.is_empty() || is_regex_pattern(pattern_text) {
-        return ParsedLine::Ignored;
+        return None;
     }
 
     if let Some(body) = pattern_text.strip_prefix("||") {
-        return match parse_domain_anchor_body(body) {
-            Some(domain) => {
-                let rule = DomainRule { domain, options };
-                if is_exception {
-                    ParsedLine::DomainException(rule)
-                } else {
-                    ParsedLine::DomainBlock(rule)
-                }
-            }
-            // A malformed `||...` body is not re-interpreted as a generic
-            // pattern — `||` has a specific host-anchoring meaning that a
-            // best-effort fallback would risk getting subtly wrong.
-            None => ParsedLine::Ignored,
+        // A malformed `||...` body is not re-interpreted as a generic
+        // pattern — `||` has a specific host-anchoring meaning that a
+        // best-effort fallback would risk getting subtly wrong.
+        let rule = DomainRule {
+            domain: parse_domain_anchor_body(body)?,
+            options,
         };
+        return Some(if is_exception {
+            ParsedLine::DomainException(rule)
+        } else {
+            ParsedLine::DomainBlock(rule)
+        });
     }
 
-    match tokenize_pattern(pattern_text) {
-        Some((tokens, anchor_start, anchor_end)) => {
-            let rule = PatternRule {
-                tokens,
-                anchor_start,
-                anchor_end,
-                options,
-            };
-            if is_exception {
-                ParsedLine::PatternException(rule)
-            } else {
-                ParsedLine::PatternBlock(rule)
-            }
-        }
-        None => ParsedLine::Ignored,
-    }
+    let (tokens, anchor_start, anchor_end) = tokenize_pattern(pattern_text)?;
+    let rule = PatternRule {
+        tokens,
+        anchor_start,
+        anchor_end,
+        options,
+    };
+    Some(if is_exception {
+        ParsedLine::PatternException(rule)
+    } else {
+        ParsedLine::PatternBlock(rule)
+    })
 }
 
 impl FilterList {
@@ -677,26 +676,17 @@ impl FilterList {
             return false;
         };
         let url_lower = url.to_ascii_lowercase();
-
-        let exempted = self
-            .domain_exceptions
-            .iter()
-            .any(|r| r.matches(&host) && options_apply(&r.options, ctx))
-            || self
-                .pattern_exceptions
+        let hits = |domain_rules: &[DomainRule], pattern_rules: &[PatternRule]| {
+            domain_rules
                 .iter()
-                .any(|r| r.matches(&url_lower) && options_apply(&r.options, ctx));
-        if exempted {
-            return false;
-        }
+                .any(|r| r.matches(&host) && options_apply(&r.options, ctx))
+                || pattern_rules
+                    .iter()
+                    .any(|r| r.matches(&url_lower) && options_apply(&r.options, ctx))
+        };
 
-        self.domain_blocks
-            .iter()
-            .any(|r| r.matches(&host) && options_apply(&r.options, ctx))
-            || self
-                .pattern_blocks
-                .iter()
-                .any(|r| r.matches(&url_lower) && options_apply(&r.options, ctx))
+        let exempted = hits(&self.domain_exceptions, &self.pattern_exceptions);
+        !exempted && hits(&self.domain_blocks, &self.pattern_blocks)
     }
 }
 
@@ -710,6 +700,20 @@ fn host_of(url: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn type_ctx(resource_type: RuleResourceType) -> MatchContext<'static> {
+        MatchContext {
+            resource_type: Some(resource_type),
+            page_host: None,
+        }
+    }
+
+    fn page_ctx(page_host: &str) -> MatchContext<'_> {
+        MatchContext {
+            resource_type: None,
+            page_host: Some(page_host),
+        }
+    }
 
     // -- Domain-anchor rules (pre-existing behavior, unchanged) --------
 
@@ -727,6 +731,16 @@ mod tests {
         assert!(!list.is_blocked("https://example.com/"));
         // "notdoubleclick.net" must not match via a naive substring check.
         assert!(!list.is_blocked("https://notdoubleclick.net/"));
+    }
+
+    #[test]
+    fn domain_suffix_match_requires_a_label_boundary() {
+        assert!(domain_suffix_match("example.com", "example.com"));
+        assert!(domain_suffix_match("example.com", "a.example.com"));
+        assert!(domain_suffix_match("example.com", "a.b.example.com"));
+        assert!(!domain_suffix_match("example.com", "notexample.com"));
+        assert!(!domain_suffix_match("example.com", "example.com.evil"));
+        assert!(!domain_suffix_match("a.example.com", "example.com"));
     }
 
     #[test]
@@ -881,14 +895,8 @@ mod tests {
     #[test]
     fn resource_type_option_gates_is_blocked_with_context() {
         let list = FilterList::parse("||ads.example^$script,image");
-        let script_ctx = MatchContext {
-            resource_type: Some(RuleResourceType::Script),
-            page_host: None,
-        };
-        let stylesheet_ctx = MatchContext {
-            resource_type: Some(RuleResourceType::Stylesheet),
-            page_host: None,
-        };
+        let script_ctx = type_ctx(RuleResourceType::Script);
+        let stylesheet_ctx = type_ctx(RuleResourceType::Stylesheet);
         assert!(list.is_blocked_with_context("https://ads.example/x", &script_ctx));
         assert!(!list.is_blocked_with_context("https://ads.example/x", &stylesheet_ctx));
         // Unknown resource type never excludes the match.
@@ -907,14 +915,8 @@ mod tests {
     #[test]
     fn domain_scope_restricts_the_rule_to_included_page_hosts() {
         let list = FilterList::parse("||ads.example^$domain=news.example");
-        let news_ctx = MatchContext {
-            resource_type: None,
-            page_host: Some("news.example"),
-        };
-        let other_ctx = MatchContext {
-            resource_type: None,
-            page_host: Some("other.example"),
-        };
+        let news_ctx = page_ctx("news.example");
+        let other_ctx = page_ctx("other.example");
         assert!(list.is_blocked_with_context("https://ads.example/x", &news_ctx));
         assert!(!list.is_blocked_with_context("https://ads.example/x", &other_ctx));
         // Unknown page host never excludes the match.
@@ -924,14 +926,8 @@ mod tests {
     #[test]
     fn domain_scope_excludes_negated_page_hosts() {
         let list = FilterList::parse("||ads.example^$domain=~good.example");
-        let good_ctx = MatchContext {
-            resource_type: None,
-            page_host: Some("good.example"),
-        };
-        let other_ctx = MatchContext {
-            resource_type: None,
-            page_host: Some("other.example"),
-        };
+        let good_ctx = page_ctx("good.example");
+        let other_ctx = page_ctx("other.example");
         assert!(!list.is_blocked_with_context("https://ads.example/x", &good_ctx));
         assert!(list.is_blocked_with_context("https://ads.example/x", &other_ctx));
     }

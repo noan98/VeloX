@@ -20,11 +20,7 @@ use super::TabId;
 /// empty string (an empty pattern would otherwise "match" everywhere).
 pub fn normalize_query(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_owned())
-    }
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
 /// One tab's in-page find session: the query currently searched for
@@ -104,34 +100,23 @@ impl FindState {
     /// immediately after a search, without requiring an explicit "next".
     pub fn set_total(&mut self, total: usize) {
         self.total = total;
-        self.active = if total == 0 { None } else { Some(0) };
+        self.active = (total > 0).then_some(0);
     }
 
     /// Cyclic "next match": wraps from the last match back to the first.
     /// A no-op (returns `None`) when there are no matches.
     pub fn next_match(&mut self) -> Option<usize> {
-        self.active = if self.total == 0 {
-            None
-        } else {
-            Some(match self.active {
-                Some(i) => (i + 1) % self.total,
-                None => 0,
-            })
-        };
+        let total = self.total;
+        self.active = (total > 0).then(|| self.active.map_or(0, |i| (i + 1) % total));
         self.active
     }
 
     /// Cyclic "previous match": wraps from the first match to the last.
     /// A no-op (returns `None`) when there are no matches.
     pub fn previous_match(&mut self) -> Option<usize> {
-        self.active = if self.total == 0 {
-            None
-        } else {
-            Some(match self.active {
-                Some(i) => (i + self.total - 1) % self.total,
-                None => self.total - 1,
-            })
-        };
+        let total = self.total;
+        self.active =
+            (total > 0).then(|| self.active.map_or(total - 1, |i| (i + total - 1) % total));
         self.active
     }
 }

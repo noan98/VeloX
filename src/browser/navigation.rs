@@ -38,18 +38,13 @@ pub fn normalize_input(input: &str) -> Option<String> {
         }
     }
 
-    let with_https = format!("https://{input}");
-    match Url::parse(&with_https) {
-        Ok(mut parsed) => {
-            if is_loopback_host(&parsed) {
-                // Both http and https are "special" schemes, so this cannot
-                // fail; keep https if it somehow does.
-                let _ = parsed.set_scheme("http");
-            }
-            Some(parsed.into())
-        }
-        Err(_) => None,
+    let mut parsed = Url::parse(&format!("https://{input}")).ok()?;
+    if is_loopback_host(&parsed) {
+        // Both http and https are "special" schemes, so this cannot
+        // fail; keep https if it somehow does.
+        let _ = parsed.set_scheme("http");
     }
+    Some(parsed.into())
 }
 
 /// True for hosts that almost certainly serve plain HTTP during development.
@@ -115,11 +110,7 @@ pub fn classify_input(input: &str) -> Option<Intent> {
 
     if let Some(rest) = trimmed.strip_prefix('?') {
         let rest = rest.trim();
-        return if rest.is_empty() {
-            None
-        } else {
-            Some(Intent::Search(rest.to_owned()))
-        };
+        return (!rest.is_empty()).then(|| Intent::Search(rest.to_owned()));
     }
 
     if trimmed.split_whitespace().count() > 1 {
@@ -161,11 +152,7 @@ pub fn build_search_url(template: &str, query: &str) -> Option<String> {
     let encoded: String = url::form_urlencoded::byte_serialize(query.trim().as_bytes()).collect();
     let candidate = template.replacen("{}", &encoded, 1);
     let parsed = Url::parse(&candidate).ok()?;
-    if matches!(parsed.scheme(), "http" | "https") {
-        Some(parsed.into())
-    } else {
-        None
-    }
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.into())
 }
 
 #[cfg(test)]
@@ -413,13 +400,13 @@ mod tests {
         for hostile in [
             "not-a-real-scheme://host/",
             "chrome://settings/",
-            "about:config", // only `about:blank` is meaningful, but the
-            // scheme itself is allowed — this documents that
-            // `normalize_input` does not special-case the
-            // path/opaque-data half of an `about:` URL.
-            "file:///etc/passwd", // `file:` is in ALLOWED_SCHEMES (D-nothing,
-                                  // predates decision numbering) — kept
-                                  // exactly as-is, not newly rejected here.
+            // Only `about:blank` is meaningful, but the scheme itself is
+            // allowed — this documents that `normalize_input` does not
+            // special-case the path/opaque-data half of an `about:` URL.
+            "about:config",
+            // `file:` is in ALLOWED_SCHEMES (D-nothing, predates decision
+            // numbering) — kept exactly as-is, not newly rejected here.
+            "file:///etc/passwd",
         ] {
             let _ = normalize_input(hostile); // must not panic either way
         }

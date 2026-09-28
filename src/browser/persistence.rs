@@ -68,12 +68,12 @@ fn platform_data_dir() -> Option<PathBuf> {
 /// Load the history store from `dir`. Any failure (missing file, unreadable,
 /// malformed JSON) yields an empty store rather than an error.
 pub fn load_history(dir: &Path) -> HistoryStore {
-    read_json(&dir.join(HISTORY_FILE)).unwrap_or_default()
+    read_json(dir, HISTORY_FILE).unwrap_or_default()
 }
 
 /// Persist the history store to `dir`, creating the directory if needed.
 pub fn save_history(dir: &Path, store: &HistoryStore) -> std::io::Result<()> {
-    write_json(dir, &dir.join(HISTORY_FILE), store)
+    write_json(dir, HISTORY_FILE, store)
 }
 
 /// Load the bookmark store from `dir`. Any failure (missing file,
@@ -85,27 +85,27 @@ pub fn save_history(dir: &Path, store: &HistoryStore) -> std::io::Result<()> {
 /// why plain deserialization alone cannot be trusted to keep that invariant
 /// (Issue #35, docs/decisions.md D62).
 pub fn load_bookmarks(dir: &Path) -> BookmarkStore {
-    let mut store: BookmarkStore = read_json(&dir.join(BOOKMARKS_FILE)).unwrap_or_default();
+    let mut store: BookmarkStore = read_json(dir, BOOKMARKS_FILE).unwrap_or_default();
     store.repair_dangling_folder_ids();
     store
 }
 
 /// Persist the bookmark store to `dir`, creating the directory if needed.
 pub fn save_bookmarks(dir: &Path, store: &BookmarkStore) -> std::io::Result<()> {
-    write_json(dir, &dir.join(BOOKMARKS_FILE), store)
+    write_json(dir, BOOKMARKS_FILE, store)
 }
 
 /// Load the typed-search-query history store from `dir` (Issue #20 — see
 /// docs/decisions.md D38). Any failure yields an empty store, same as
 /// [`load_history`]/[`load_bookmarks`].
 pub fn load_input_history(dir: &Path) -> InputHistoryStore {
-    read_json(&dir.join(INPUT_HISTORY_FILE)).unwrap_or_default()
+    read_json(dir, INPUT_HISTORY_FILE).unwrap_or_default()
 }
 
 /// Persist the typed-search-query history store to `dir`, creating the
 /// directory if needed.
 pub fn save_input_history(dir: &Path, store: &InputHistoryStore) -> std::io::Result<()> {
-    write_json(dir, &dir.join(INPUT_HISTORY_FILE), store)
+    write_json(dir, INPUT_HISTORY_FILE, store)
 }
 
 /// Load the site permission store from `dir` (Issue #24 — see
@@ -114,13 +114,13 @@ pub fn save_input_history(dir: &Path, store: &InputHistoryStore) -> std::io::Res
 /// rather than the browser failing to start over a damaged permissions
 /// file, same as [`load_history`]/[`load_bookmarks`].
 pub fn load_site_permissions(dir: &Path) -> SitePermissionStore {
-    read_json(&dir.join(SITE_PERMISSIONS_FILE)).unwrap_or_default()
+    read_json(dir, SITE_PERMISSIONS_FILE).unwrap_or_default()
 }
 
 /// Persist the site permission store to `dir`, creating the directory if
 /// needed.
 pub fn save_site_permissions(dir: &Path, store: &SitePermissionStore) -> std::io::Result<()> {
-    write_json(dir, &dir.join(SITE_PERMISSIONS_FILE), store)
+    write_json(dir, SITE_PERMISSIONS_FILE, store)
 }
 
 /// Load the last-saved tab session from `dir` (Issue #25 — see
@@ -134,7 +134,7 @@ pub fn save_site_permissions(dir: &Path, store: &SitePermissionStore) -> std::io
 /// [`SessionSnapshot::sanitize`] before trusting it further; this function
 /// only answers "did a session file parse at all".
 pub fn load_session(dir: &Path) -> Option<SessionSnapshot> {
-    read_json(&dir.join(SESSION_FILE))
+    read_json(dir, SESSION_FILE)
 }
 
 /// Persist the current tab session to `dir`, creating the directory if
@@ -145,7 +145,7 @@ pub fn load_session(dir: &Path) -> Option<SessionSnapshot> {
 /// hook alone would never run in exactly the cases session restore is
 /// supposed to help with.
 pub fn save_session(dir: &Path, snapshot: &SessionSnapshot) -> std::io::Result<()> {
-    write_json(dir, &dir.join(SESSION_FILE), snapshot)
+    write_json(dir, SESSION_FILE, snapshot)
 }
 
 /// Load persisted user settings from `dir` (Issue #30 — see
@@ -156,7 +156,7 @@ pub fn save_session(dir: &Path, snapshot: &SessionSnapshot) -> std::io::Result<(
 /// and always runs the result through [`Settings::sanitize`] besides, so a
 /// well-formed but hostile/out-of-range value never reaches this far either.
 pub fn load_settings(dir: &Path) -> Option<Settings> {
-    read_json(&dir.join(SETTINGS_FILE))
+    read_json(dir, SETTINGS_FILE)
 }
 
 /// Persist `settings` to `dir`, creating the directory if needed. Called
@@ -165,28 +165,33 @@ pub fn load_settings(dir: &Path) -> Option<Settings> {
 /// launch — the same reasoning `save_session` documents for writing on every
 /// change rather than only at exit.
 pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
-    write_json(dir, &dir.join(SETTINGS_FILE), settings)
+    write_json(dir, SETTINGS_FILE, settings)
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> Option<T> {
-    let data = fs::read_to_string(path).ok()?;
+/// `dir` 直下の `file` を JSON として読む。読めない・解釈できないものは
+/// すべて `None`。
+fn read_json<T: DeserializeOwned>(dir: &Path, file: &str) -> Option<T> {
+    let data = fs::read_to_string(dir.join(file)).ok()?;
     serde_json::from_str(&data).ok()
 }
 
-fn write_json<T: Serialize>(dir: &Path, path: &Path, value: &T) -> std::io::Result<()> {
+/// `value` を整形済み JSON として `dir` 直下の `file` に書く。`dir` が
+/// 無ければ作成する。
+fn write_json<T: Serialize>(dir: &Path, file: &str, value: &T) -> std::io::Result<()> {
     fs::create_dir_all(dir)?;
     let data = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
-    fs::write(path, data)
+    fs::write(dir.join(file), data)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::session::{SavedTab, SavedWindow};
     use super::*;
+    use crate::browser::util::unique_temp_path;
 
     #[test]
     fn missing_files_load_as_empty_stores() {
-        let dir = unique_temp_dir("velox-persist-missing");
+        let dir = unique_temp_path("velox-persist-missing");
         assert_eq!(load_history(&dir), HistoryStore::new());
         assert_eq!(load_bookmarks(&dir), BookmarkStore::new());
         assert_eq!(load_input_history(&dir), InputHistoryStore::new());
@@ -195,7 +200,7 @@ mod tests {
 
     #[test]
     fn input_history_round_trips_through_disk() {
-        let dir = unique_temp_dir("velox-persist-input-history");
+        let dir = unique_temp_path("velox-persist-input-history");
         let mut store = InputHistoryStore::new();
         store.record("rust ownership", 100, 0);
         store.record("rust async", 200, 0);
@@ -209,7 +214,7 @@ mod tests {
 
     #[test]
     fn history_round_trips_through_disk() {
-        let dir = unique_temp_dir("velox-persist-history");
+        let dir = unique_temp_path("velox-persist-history");
         let mut store = HistoryStore::new();
         store.record_visit("https://example.com/", Some("Example".to_owned()), 100, 0);
         store.record_visit("https://rust-lang.org/", None, 200, 0);
@@ -223,7 +228,7 @@ mod tests {
 
     #[test]
     fn bookmarks_round_trip_through_disk() {
-        let dir = unique_temp_dir("velox-persist-bookmarks");
+        let dir = unique_temp_path("velox-persist-bookmarks");
         let mut store = BookmarkStore::new();
         store.add("https://example.com/", Some("Example".to_owned()), 100);
 
@@ -236,21 +241,18 @@ mod tests {
 
     #[test]
     fn save_creates_missing_parent_directories() {
-        let dir = unique_temp_dir("velox-persist-mkdir")
-            .join("nested")
-            .join("data");
+        let root = unique_temp_path("velox-persist-mkdir");
+        let dir = root.join("nested").join("data");
         assert!(!dir.exists());
         save_history(&dir, &HistoryStore::new()).expect("save_history should create the dir");
         assert!(dir.join(HISTORY_FILE).exists());
 
-        fs::remove_dir_all(unique_temp_dir("velox-persist-mkdir")).ok();
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
     fn corrupt_file_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-corrupt");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(HISTORY_FILE), "not json").unwrap();
+        let dir = temp_dir_with_file("velox-persist-corrupt", HISTORY_FILE, "not json");
         assert_eq!(load_history(&dir), HistoryStore::new());
 
         fs::remove_dir_all(&dir).ok();
@@ -263,7 +265,7 @@ mod tests {
 
     #[test]
     fn truncated_json_falls_back_to_an_empty_store_for_every_store() {
-        let dir = unique_temp_dir("velox-persist-truncated");
+        let dir = unique_temp_path("velox-persist-truncated");
         fs::create_dir_all(&dir).unwrap();
         // A file that starts out as valid-looking JSON but is cut off
         // mid-value, e.g. by a crash or a full disk during a previous save.
@@ -280,9 +282,7 @@ mod tests {
 
     #[test]
     fn an_empty_file_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-empty-file");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(HISTORY_FILE), "").unwrap();
+        let dir = temp_dir_with_file("velox-persist-empty-file", HISTORY_FILE, "");
         assert_eq!(load_history(&dir), HistoryStore::new());
 
         fs::remove_dir_all(&dir).ok();
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn json_of_the_wrong_shape_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-wrong-shape");
+        let dir = unique_temp_path("velox-persist-wrong-shape");
         fs::create_dir_all(&dir).unwrap();
         // Valid JSON, but not the shape any of these stores expect (e.g. a
         // bare array, or an object missing every required field).
@@ -307,7 +307,7 @@ mod tests {
 
     #[test]
     fn json_with_wrong_field_types_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-wrong-types");
+        let dir = unique_temp_path("velox-persist-wrong-types");
         fs::create_dir_all(&dir).unwrap();
         // `id` should be a `u64`, `visited_at` a `u64` — strings/negative
         // numbers here must fail deserialization cleanly, not panic.
@@ -326,7 +326,7 @@ mod tests {
         // Same JSON-bomb shape `ui::toolbar`'s IPC parser is hardened
         // against — the store loader goes through the same `serde_json`
         // parser and must be equally immune to a stack overflow.
-        let dir = unique_temp_dir("velox-persist-deep-nesting");
+        let dir = unique_temp_path("velox-persist-deep-nesting");
         fs::create_dir_all(&dir).unwrap();
         let depth = 100_000;
         let bomb = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
@@ -342,7 +342,7 @@ mod tests {
         // issue: a large *legitimate* history file (many entries
         // accumulated over a long-lived profile) must still load — nothing
         // here should impose an accidental low ceiling.
-        let dir = unique_temp_dir("velox-persist-huge-legit");
+        let dir = unique_temp_path("velox-persist-huge-legit");
         let mut store = HistoryStore::new();
         for i in 0..20_000u64 {
             store.record_visit(&format!("https://example.com/{i}"), None, i, 0);
@@ -361,10 +361,9 @@ mod tests {
         // confirms `load_bookmarks` (not just the store method in
         // isolation) actually calls the repair step on a real file (Issue
         // #35, docs/decisions.md D62).
-        let dir = unique_temp_dir("velox-persist-dangling-folder");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(BOOKMARKS_FILE),
+        let dir = temp_dir_with_file(
+            "velox-persist-dangling-folder",
+            BOOKMARKS_FILE,
             r#"{
                 "entries": [
                     {"id": 1, "url": "https://example.com/", "title": null, "created_at": 100, "folder_id": 999}
@@ -373,8 +372,7 @@ mod tests {
                 "folders": [],
                 "next_folder_id": 1
             }"#,
-        )
-        .unwrap();
+        );
 
         let store = load_bookmarks(&dir);
         assert_eq!(store.entries()[0].folder_id, None);
@@ -385,9 +383,11 @@ mod tests {
 
     #[test]
     fn a_null_byte_in_the_json_file_is_handled_without_panicking() {
-        let dir = unique_temp_dir("velox-persist-nul-byte");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(HISTORY_FILE), b"{\"entries\":[]\0,\"next_id\":1}").unwrap();
+        let dir = temp_dir_with_file(
+            "velox-persist-nul-byte",
+            HISTORY_FILE,
+            b"{\"entries\":[]\0,\"next_id\":1}",
+        );
         // No expectation on the exact outcome, only that loading a file
         // containing a stray NUL byte cannot panic.
         let _ = load_history(&dir);
@@ -399,7 +399,7 @@ mod tests {
     fn site_permissions_round_trip_through_disk() {
         use super::super::site_permissions::{PermissionDecision, PermissionKind};
 
-        let dir = unique_temp_dir("velox-persist-site-permissions");
+        let dir = unique_temp_path("velox-persist-site-permissions");
         let mut store = SitePermissionStore::new();
         store.set(
             "https://example.com",
@@ -423,9 +423,11 @@ mod tests {
 
     #[test]
     fn corrupt_site_permissions_file_falls_back_to_an_empty_store() {
-        let dir = unique_temp_dir("velox-persist-corrupt-permissions");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(SITE_PERMISSIONS_FILE), "not json").unwrap();
+        let dir = temp_dir_with_file(
+            "velox-persist-corrupt-permissions",
+            SITE_PERMISSIONS_FILE,
+            "not json",
+        );
         assert_eq!(load_site_permissions(&dir), SitePermissionStore::new());
 
         fs::remove_dir_all(&dir).ok();
@@ -435,13 +437,13 @@ mod tests {
 
     #[test]
     fn missing_session_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-missing");
+        let dir = unique_temp_path("velox-persist-session-missing");
         assert_eq!(load_session(&dir), None);
     }
 
     #[test]
     fn session_round_trips_through_disk() {
-        let dir = unique_temp_dir("velox-persist-session");
+        let dir = unique_temp_path("velox-persist-session");
         let snapshot = SessionSnapshot {
             windows: vec![SavedWindow {
                 tabs: vec![
@@ -472,9 +474,7 @@ mod tests {
 
     #[test]
     fn corrupt_session_file_loads_as_none_not_a_panic() {
-        let dir = unique_temp_dir("velox-persist-session-corrupt");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(SESSION_FILE), "not json").unwrap();
+        let dir = temp_dir_with_file("velox-persist-session-corrupt", SESSION_FILE, "not json");
         assert_eq!(load_session(&dir), None);
 
         fs::remove_dir_all(&dir).ok();
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn truncated_session_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-truncated");
+        let dir = unique_temp_path("velox-persist-session-truncated");
         fs::create_dir_all(&dir).unwrap();
         // A well-formed session, chopped off mid-object — simulates a write
         // interrupted by a crash or power loss.
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn session_file_of_the_wrong_json_shape_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-wrong-shape");
+        let dir = unique_temp_path("velox-persist-session-wrong-shape");
         fs::create_dir_all(&dir).unwrap();
         // A bare array/number/string instead of the expected object.
         for wrong in ["[1,2,3]", "42", "\"hello\"", "null"] {
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn session_file_with_wrong_field_types_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-session-wrong-types");
+        let dir = unique_temp_path("velox-persist-session-wrong-types");
         fs::create_dir_all(&dir).unwrap();
         // `active_index` as a string, `tabs` as an object instead of an
         // array — both should fail to deserialize rather than panicking or
@@ -543,7 +543,7 @@ mod tests {
         // `serde_json` streams through `fs::read_to_string` just like every
         // other store here, so this exercises that path at a size no real
         // user session would ever reach.
-        let dir = unique_temp_dir("velox-persist-session-large");
+        let dir = unique_temp_path("velox-persist-session-large");
         let tabs: Vec<SavedTab> = (0..20_000)
             .map(|i| SavedTab {
                 url: format!("https://{i}.example/"),
@@ -572,13 +572,13 @@ mod tests {
 
     #[test]
     fn missing_settings_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-settings-missing");
+        let dir = unique_temp_path("velox-persist-settings-missing");
         assert_eq!(load_settings(&dir), None);
     }
 
     #[test]
     fn settings_round_trip_through_disk() {
-        let dir = unique_temp_dir("velox-persist-settings");
+        let dir = unique_temp_path("velox-persist-settings");
         let mut settings = Settings::default();
         settings.general.homepage = "https://example.com/".to_owned();
         settings.privacy.content_blocking_site_exceptions = vec!["example.com".to_owned()];
@@ -592,9 +592,7 @@ mod tests {
 
     #[test]
     fn corrupt_settings_file_loads_as_none_not_a_panic() {
-        let dir = unique_temp_dir("velox-persist-settings-corrupt");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(SETTINGS_FILE), "not json").unwrap();
+        let dir = temp_dir_with_file("velox-persist-settings-corrupt", SETTINGS_FILE, "not json");
         assert_eq!(load_settings(&dir), None);
 
         fs::remove_dir_all(&dir).ok();
@@ -602,7 +600,7 @@ mod tests {
 
     #[test]
     fn truncated_settings_file_loads_as_none() {
-        let dir = unique_temp_dir("velox-persist-settings-truncated");
+        let dir = unique_temp_path("velox-persist-settings-truncated");
         fs::create_dir_all(&dir).unwrap();
         let full = serde_json::to_string(&Settings::default()).unwrap();
         let truncated = &full[..full.len() / 2];
@@ -617,13 +615,11 @@ mod tests {
         // Simulates upgrading across a version that added a whole new
         // category (`#[serde(default)]` on every field is what makes this
         // work) — the issue's own "デフォルト値/マイグレーション" criterion.
-        let dir = unique_temp_dir("velox-persist-settings-old-shape");
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(
-            dir.join(SETTINGS_FILE),
+        let dir = temp_dir_with_file(
+            "velox-persist-settings-old-shape",
+            SETTINGS_FILE,
             r#"{"general":{"homepage":"https://old.example/"}}"#,
-        )
-        .unwrap();
+        );
         let loaded = load_settings(&dir).expect("a partial but valid object should still parse");
         assert_eq!(loaded.general.homepage, "https://old.example/");
         assert_eq!(
@@ -634,17 +630,12 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
-    /// A per-test temp directory under the OS temp dir, distinguished by
-    /// `label` plus the current thread so parallel tests never collide.
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let unique = format!(
-            "{label}-{:?}-{}",
-            std::thread::current().id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or_default()
-        );
-        std::env::temp_dir().join(unique)
+    /// [`unique_temp_path`] を作成し、その中の `file` に `contents` を書き
+    /// 込んで返す。壊れた/想定外の内容のファイルを 1 つ置くだけのテスト用。
+    fn temp_dir_with_file(label: &str, file: &str, contents: impl AsRef<[u8]>) -> PathBuf {
+        let dir = unique_temp_path(label);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(file), contents).unwrap();
+        dir
     }
 }
