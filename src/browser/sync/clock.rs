@@ -134,6 +134,10 @@ impl HlcClock {
     }
 
     /// 最後に発行した値 (未発行なら `None`)。永続化して [`Self::restore`] に渡す。
+    ///
+    /// `(wall, counter) == (0, 0)` を「未発行」の番人値として使っている。
+    /// Unix epoch ちょうど (`tick(0)`) で最初に発行した値だけは、ここで
+    /// `None` と区別できない (実運用で `now_ms` が 0 になることは無い)。
     pub fn last(&self) -> Option<Hlc> {
         if self.last_wall == 0 && self.last_counter == 0 {
             None

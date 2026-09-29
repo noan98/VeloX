@@ -88,6 +88,10 @@ pub enum RecordError {
     TooManyFields,
     BadFieldName,
     ValueTooLarge,
+    /// フィールドも墓石も持たない。どのビューにも現れず、`compact` の
+    /// 回収条件 (墓石の時刻) にも掛からないため、受け入れると状態に
+    /// 残り続ける。リモート入力としては拒否する。
+    Empty,
 }
 
 impl fmt::Display for RecordError {
@@ -98,6 +102,7 @@ impl fmt::Display for RecordError {
             RecordError::TooManyFields => "too many fields",
             RecordError::BadFieldName => "bad field name",
             RecordError::ValueTooLarge => "field value too large",
+            RecordError::Empty => "record has neither fields nor tombstone",
         })
     }
 }
@@ -186,6 +191,9 @@ impl Record {
         }
         if self.key.id.len() > MAX_ID_LEN {
             return Err(RecordError::IdTooLong);
+        }
+        if self.fields.is_empty() && self.tombstone.is_none() {
+            return Err(RecordError::Empty);
         }
         if self.fields.len() > MAX_FIELDS {
             return Err(RecordError::TooManyFields);
@@ -327,6 +335,14 @@ pub(crate) mod tests {
         assert_eq!(many.validate(), Err(RecordError::TooManyFields));
         let bad = put(hlc(1, 0, "a"), &[("", json!(1))]);
         assert_eq!(bad.validate(), Err(RecordError::BadFieldName));
+    }
+
+    #[test]
+    fn validate_rejects_a_record_with_neither_fields_nor_tombstone() {
+        let empty = put(hlc(1, 0, "a"), &[]);
+        assert_eq!(empty.validate(), Err(RecordError::Empty));
+        // 墓石だけのレコード (削除) は正当な入力。
+        assert!(Record::delete(key(), &hlc(1, 0, "a")).validate().is_ok());
     }
 
     #[test]

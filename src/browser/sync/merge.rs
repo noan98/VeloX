@@ -71,8 +71,12 @@ impl SyncState {
     /// 最小 ack カーソル) が保証する。docs/sync.md §5.4。
     pub fn compact(&mut self, before_wall: u64) -> usize {
         let before = self.records.len();
-        self.records.retain(|_, r| {
-            r.is_live() || !matches!(&r.tombstone, Some(Hlc { wall, .. }) if *wall < before_wall)
+        // 墓石を持たない非 live レコード (フィールドも墓石も無い) は、どの
+        // ビューにも現れず、残しておく理由が無いので時刻に関係なく回収する。
+        self.records.retain(|_, r| match &r.tombstone {
+            _ if r.is_live() => true,
+            Some(Hlc { wall, .. }) => *wall >= before_wall,
+            None => false,
         });
         before - self.records.len()
     }
@@ -392,6 +396,21 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert!(s.get(&RecordKey::new(Kind::Bookmark, "old")).is_none());
         assert!(s.get(&RecordKey::new(Kind::Bookmark, "new")).is_some());
+    }
+
+    #[test]
+    fn compact_drops_records_with_neither_fields_nor_tombstone() {
+        let mut s = SyncState::new();
+        s.apply(&bm("live", "https://l/", 1, 1));
+        s.apply(&Record::put(
+            RecordKey::new(Kind::Bookmark, "ghost"),
+            &hlc(100, 0, "a"),
+            Vec::<(String, serde_json::Value)>::new(),
+        ));
+        // 時刻が新しくても、墓石の無い空レコードは残す理由が無い。
+        assert_eq!(s.compact(10), 1);
+        assert!(s.get(&RecordKey::new(Kind::Bookmark, "ghost")).is_none());
+        assert!(s.get(&RecordKey::new(Kind::Bookmark, "live")).is_some());
     }
 
     #[test]
