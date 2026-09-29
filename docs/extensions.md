@@ -7,6 +7,8 @@ Issue #82 (Epic #80 Stage 1) の設計文書です。**実装より先に、信�
 - 判断の要約と Revisit condition: docs/decisions/archive.md の **D159**
 - マニフェストスキーマの機械可読な実装 (未配線): `src/browser/extension_manifest.rs`
   (#83 / #84 が使う土台。**アプリの挙動は変えていない**)
+- API・ライフサイクル・ストレージのホスト側の実装 (未配線): `src/browser/extensions/`
+  (Issue #83 / #84、D163。§12「実装状況」)
 - 後続: #83 (Extension API 最小サブセット) / #84 (Lifecycle / Storage) /
   #87 (カスタマイズ)
 
@@ -507,8 +509,8 @@ D159 の要約。各項目は上の節に根拠がある。
 | Issue | 範囲 |
 |---|---|
 | #82 (本文書) | 設計・スキーマ (`extension_manifest.rs`、未配線)・Decision D159 |
-| #83 | API 仕様 (versioned schema)・最小 API (`runtime` / `storage` / `tabs` / `scripting`)・権限検査・統合テスト |
-| #84 | インストール/更新/削除・有効化/無効化・ストレージ (分離・クォータ・復旧) |
+| #83 | API 仕様 (versioned schema)・最小 API (`runtime` / `storage` / `tabs` / `scripting` / `permissions`)・権限検査・統合テスト。**ホストのコアを実装済み・未配線 (D163、下の「実装状況」)** |
+| #84 | インストール/更新/削除・有効化/無効化・ストレージ (分離・クォータ・復旧)。**同上** |
 | #87 | 拡張機能設定 (`extension preferences`) |
 
 未決 (後続で実測・決定する):
@@ -522,3 +524,57 @@ D159 の要約。各項目は上の節に根拠がある。
 - サブフレーム content script の Linux/macOS 対応。
 - 拡張機能パッケージの完全性 (署名/ハッシュ) と自動更新の配布経路。
 - 実行予算 (CPU・メモリ・メッセージ量) の具体値。
+
+## 12. 実装状況
+
+Issue #83 / #84 (Decision: **D163**)。実装は `src/browser/extensions/`、統合テストは
+`tests/extensions_api.rs`。**ホスト側の核だけが実装済みで、アプリには配線して
+いない** (拡張機能の JS はどの WebView でも動かず、ユーザから見た挙動は変わらない)。
+
+### 実装済み
+
+| 設計の節 | 実装 |
+|---|---|
+| §3.2 専用チャネル・ID は Rust が決める | `host::ExtensionHost::handle_request(extension_id, raw, browser)`。要求本文に ID フィールドは無く、自己申告は未知フィールドとして拒否 |
+| §4.1 default-deny・使用時検査 | 呼び出しごとに「有効か → 承認済み権限 → params → メソッド固有 (ホスト・タブ)」を検査 (`host.rs`)。権限の根拠は `permissions::Approval` |
+| §4.2 ホストパターン | `extension_manifest::HostPattern` を再利用。`scripting.executeScript` は**呼び出し時点の**タブ URL で判定 |
+| §4.3 権限 | `storage` / `tabs` / `active_tab` / `scripting` を API に接続 (下の未実装を参照) |
+| §4.4 実行時の付与 | `permissions.request` は `optional_*` 宣言のみ・ユーザ操作を消費・信頼 UI の同意後に付与。`permissions.remove` は即時失効 |
+| §5 ライフサイクル | `lifecycle.rs` (状態機械 + イベント)、`registry.rs` (install / update / enable / disable / approve / uninstall)。権限が増える更新は無効化して再承認、ダウングレード拒否、置き換えは原子的 |
+| §5 install の検査 | `package.rs`: 件数・サイズ上限、zip slip・隠しファイル・Windows 予約名・大文字小文字衝突の拒否、ディレクトリ読み込みはシンボリックリンク拒否 |
+| §5 crash / 破損 | 起動時にマニフェストを再検証して隔離 (`Corrupt`)、索引の破損は退避して `packages/` から要再承認で再構築、作業領域・孤児・中断した更新/削除の後始末。**起動は止まらない** |
+| §7 ストレージ | `storage.rs`: 拡張機能ごとのディレクトリ、キー長・値サイズ・件数・総量のクォータ、原子的な書き込み、破損の退避と復旧、uninstall で削除 |
+| §8 API バージョニング | `api.rs`: `API_VERSION` / `MIN_SUPPORTED_API_VERSION` の交渉、`schema_json()` が機械可読な仕様を出力 |
+
+**API (`api_version: 1`、要求 `{api_version, id, method, params}` / 応答 `{ok, result|error}`):**
+
+| メソッド | 必要な権限 |
+|---|---|
+| `runtime.getInfo` / `runtime.getManifest` | なし |
+| `storage.get` / `set` / `remove` / `clear` / `getBytesInUse` | `storage` |
+| `tabs.query` | `tabs` (http/https のタブのみ) |
+| `tabs.get` | `tabs`、または対象タブへの `active_tab` 付与 |
+| `scripting.executeScript` | `scripting` + タブ URL がホスト権限に一致 (または `active_tab`)。`file` はパッケージ内の `.js` |
+| `permissions.getAll` / `contains` | なし |
+| `permissions.request` / `remove` | なし (メソッド内で `optional_*` 宣言・ユーザ操作・同意を検査) |
+
+エラーコード: `invalid_request` / `unsupported_version` / `unknown_method` /
+`invalid_params` / `permission_denied` / `extension_disabled` / `not_found` /
+`quota_exceeded` / `internal`。
+
+### 未実装・未配線 (配線時に必要)
+
+- **背景実行・注入**: 拡張機能ごとの background WebView / `WebContext`、ID を束縛した専用
+  IPC ハンドラ、content script の初期化スクリプト注入 (§3.2 / §3.3 / §6)。ブラウザ本体
+  への操作は `host::BrowserHost` トレイトに切り出してあり、`app.rs` 側の実装を足す。
+- **信頼 UI**: インストール/更新/再承認の承認ダイアログ、`permissions.request` の同意
+  プロンプト、拡張機能の管理画面 (#87)。`ExtensionHost::preview` が承認ダイアログに
+  渡す情報を返す。
+- **API 未提供**: `alarms` / `context_menus` / `clipboard_write` / `notifications`
+  (権限名だけがスキーマにある)、`runtime.sendMessage` (content script ↔ background)。
+- **実行時の状態**: イベントページの休止 (`Suspended`)、実行予算 (CPU / メモリ /
+  メッセージ量)、プライベートウィンドウでの既定無効 (§4.4。`BrowserHost::tabs` の
+  責務として記述済み)。
+- **配布**: zip 等のアーカイブ展開、署名/ハッシュ、自動更新 (別 Decision)。
+- ライフサイクルイベントは `drain_events` で取り出せるだけで、`runtime.onInstalled`
+  等としての配送はしない。

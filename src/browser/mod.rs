@@ -20,6 +20,7 @@ pub mod crash_report;
 pub mod crash_store;
 pub mod downloads;
 pub mod extension_manifest;
+pub mod extensions;
 pub mod find;
 pub mod gui_probe;
 pub mod history;
