@@ -205,6 +205,7 @@ fn host_of(url: &str) -> Option<String> {
     url::Url::parse(url)
         .ok()
         .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .filter(|host| !host.is_empty())
 }
 
 #[cfg(test)]
@@ -321,5 +322,12 @@ mod tests {
     fn suggest_pdf_filename_falls_back_to_a_generic_name_for_an_unparseable_url() {
         assert_eq!(suggest_pdf_filename(None, "about:blank"), "ページ.pdf");
         assert_eq!(suggest_pdf_filename(None, "not a url"), "ページ.pdf");
+    }
+
+    #[test]
+    fn suggest_pdf_filename_falls_back_when_the_host_is_empty() {
+        // Issue #298: ホストが空文字 (`foo://`) でも `.pdf` だけの名前にしない。
+        assert_eq!(suggest_pdf_filename(None, "foo://"), "ページ.pdf");
+        assert_eq!(suggest_pdf_filename(Some("  "), "foo://"), "ページ.pdf");
     }
 }
