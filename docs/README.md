@@ -28,6 +28,7 @@ Phase 3 (Epic #57) の成果物です。**計測結果は OS ごとに分けて�
 | 文書 | 内容 |
 | --- | --- |
 | [windows-code-signing.md](windows-code-signing.md) | コード署名と配布信頼性の調査結果、および現状の実装 |
+| [release-channels.md](release-channels.md) | リリースチャネル (Nightly / Beta / Stable)・バージョニング・Stable 昇格条件・ロールバック方針 |
 
 ## この索引以外の入り口
 
