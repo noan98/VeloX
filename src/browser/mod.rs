@@ -39,6 +39,7 @@ pub mod site_data;
 pub mod site_permissions;
 pub mod subresource;
 pub mod suspension;
+pub mod sync;
 pub mod tab;
 pub mod tabs;
 pub(crate) mod util;
