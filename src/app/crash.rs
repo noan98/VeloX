@@ -39,24 +39,30 @@ pub(super) fn handle_content_process_failed(
             ),
         ),
         Recovery::RecoverTab => {
-            if tabs_of(state, window_id).active_id() == tab_id {
-                // 同じタブが短時間に繰り返し落ちるなら再読み込みしない
-                // (決定的に描画プロセスを落とすページでのループ防止)。
-                if state
-                    .reload_guard
-                    .allow_reload((window_id, tab_id), crate::browser::util::now_unix())
-                {
-                    log_failure("reload crashed tab", window.reload());
-                    show_print_status(window, "ページが異常終了したため再読み込みしました");
-                } else {
-                    show_print_status(
-                        window,
-                        "ページが繰り返し異常終了したため、自動再読み込みを停止しました",
-                    );
-                }
-            } else if !suspend_tab(window, window_id, state, tab_id) {
-                // 固定タブなどで休止できないときは通知だけに留める。
-                show_print_status(window, "バックグラウンドのタブが異常終了しました");
+            // 同じタブが短時間に繰り返し落ちるなら自動復旧しない
+            // (決定的に描画プロセスを落とすページでのループ防止)。
+            // アクティブ/背景を問わずタブ単位で数える。
+            if !state
+                .reload_guard
+                .allow_reload((window_id, tab_id), crate::browser::util::now_unix())
+            {
+                show_print_status(
+                    window,
+                    "ページが繰り返し異常終了したため、自動再読み込みを停止しました",
+                );
+            } else if tabs_of(state, window_id).active_id() == tab_id {
+                log_failure("reload crashed tab", window.reload());
+                show_print_status(window, "ページが異常終了したため再読み込みしました");
+            } else if suspend_tab(window, window_id, state, tab_id) {
+                // 休止すると webview は捨てられ、次の切替で作り直される。
+            } else {
+                // 固定タブなど休止できないタブは、死んだ webview が残るので
+                // そのタブの webview を直接再読み込みする。
+                log_failure("reload crashed background tab", window.reload_tab(tab_id));
+                show_print_status(
+                    window,
+                    "バックグラウンドのタブが異常終了したため再読み込みしました",
+                );
             }
         }
     }

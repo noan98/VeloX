@@ -1230,6 +1230,14 @@ impl BrowserWindow {
         self.with_active_webview(WebView::reload)
     }
 
+    /// Reload tab `id`'s page, whether or not it is the active tab (Issue
+    /// #89, D156: recovering a background tab whose renderer crashed and
+    /// that cannot be suspended, e.g. a pinned one). A no-op for an unknown
+    /// or suspended tab (no live webview).
+    pub fn reload_tab(&self, id: TabId) -> wry::Result<()> {
+        self.tab_webview(id).map_or(Ok(()), WebView::reload)
+    }
+
     /// Clear all site data (cookies, cache, local/session storage,
     /// IndexedDB, service workers — `WebsiteDataTypes::ALL`/
     /// `WKWebsiteDataStore::allWebsiteDataTypes`/`COREWEBVIEW2_BROWSING_
