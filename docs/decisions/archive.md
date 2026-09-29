@@ -18882,6 +18882,138 @@ build script が出すカスタム cfg を使えないため、そこだけ列�
 `build.rs` の `GTK_TARGET_OSES` と `Cargo.toml` の target 指定を同時に
 更新する。
 
+## D155: `file://` ページの IPC は wry が捨てていた — shim は入っていた (Issue #275) — 同じ `ipc` メッセージにもう 1 本ハンドラを繋ぎ、`file:` のときだけ拾う
+
+**対象**: Issue #275。D143 が「WebKitGTK では `file://` ページに `window.ipc`
+shim が入らない」と記録し、Issue #275 もそう読んでいた。**その読みは
+間違っていた。** D18 (DevTools ショートカット) / D23 (タブ操作) / D78
+(コンテキストメニュー) / D142・D143 (フォーム入力) の 4 本は、ローカル
+ファイルを開いている間ずっと黙って効いていなかったが、原因は注入ではなく
+**受け側**にある。
+
+### 原因 (Linux で実測)
+
+使い捨ての wry プログラムで、初期化スクリプトと、ページ自身の
+`<script>` の両方から `window.ipc.postMessage` を呼び、ページの
+`document.title` に `typeof window.ipc` を書かせた。
+
+| URL | `window.ipc` | 初期化スクリプトの実行 | Rust 側の ipc ハンドラ |
+| --- | --- | --- | --- |
+| `file:///…/page.html` | **`object` (在る)** | 実行された | **何も届かない** |
+| `http://127.0.0.1:…/page.html` | `object` | 実行された | 届く (2 件とも) |
+
+`allow-file-access-from-file-urls` / `allow-universal-access-from-file-urls`
+を立てても結果は同じ (`WebKitSettings` の問題ではない)。wry
+0.57 の WebKitGTK 実装 (`src/webkitgtk/mod.rs`) に、スキームや
+`UserScript` の許可/拒否リストによる絞り込みも無い (`init` は
+許可/拒否リストに `&[]` を渡す)。
+
+落ちている場所は `attach_ipc_handler` である。
+
+```rust
+let uri = webview.uri().map(|u| u.to_string()).unwrap_or_default();
+match Request::builder().uri(uri).body(js.to_string()) {
+  Ok(request) => ipc_handler(request),
+  Err(_error) => { /* tracing 無効ならここで何も起きない */ }
+}
+```
+
+`http::Uri` は権限部が空の `file:///…` を拒否する。実測:
+
+| 文字列 | `str::parse::<http::Uri>()` |
+| --- | --- |
+| `file:///tmp/a.html` | `Err(InvalidFormat)` |
+| `file:/tmp/a.html` | `Err(InvalidFormat)` |
+| `file://localhost/tmp/a.html` | `Ok` |
+| `probe://main/x` / `about:blank` | `Ok` |
+
+つまり `Request` の組み立てに失敗し、`Err` を握りつぶして**メッセージごと
+捨てている**。カスタムプロトコル (`probe://main/`) で届いたのは権限部が
+あったからで、Issue #275 の比較表と合致する。「初期化スクリプトの到達も
+確認できなかった」のは、確認手段が同じ IPC だったため (スクリプトは動いて
+いた)。**器具を疑う (D140) の対象は、計測の道具そのものだった。**
+
+### 決定1: 上流を待たず、VeloX 側で同じ `ipc` メッセージにもう 1 本ハンドラを繋ぐ
+
+`UserContentManager::connect_script_message_received(Some("ipc"), …)` は
+何本でも繋げる。`engine::forward_file_url_ipc` が各 content webview の
+構築直後 (初期タブ・新規タブ・休止からの再構築のすべて。`BrowserWindow::new` /
+`open_tab` を通る) に 1 本足し、**`webview.uri()` のスキームが `file` の
+ときだけ**、既存の `content_ipc_event` に流す。`file:` 以外は wry が既に
+配送しているので、拾うと二重配送になる (`file:` 限定にすると二重にならない
+ことをプローブで確認した)。
+
+### 決定2: 信頼境界は動かない
+
+このチャネルは D18/D23/D78 が定めた「信頼しない IPC」そのもので、
+固定 sentinel の完全一致・上限付きパースしか通さない。**`file:` のページが
+新たに得る権能は無い** — 他のページが既に持っているものと同じで、`file:`
+だけ壊れていたのを揃えただけである。
+
+**採らなかった案 (信頼境界を広げる)**: `allow-universal-access-from-
+file-urls` / `allow-file-access-from-file-urls` を有効にする案。効果が無い
+ことを実測したうえ、有効にすれば `file://` ページから他のローカルファイル
+を XHR で読めるようになり、**IPC とは無関係に攻撃面が広がる**。ローカル
+ファイルを VeloX のカスタムプロトコルで配信する案は、アドレスバー表示・
+相対パス・ダウンロード/保存の挙動すべてに触れるため、原因が「受け側の
+1 箇所」と分かった今は割に合わない。
+
+### 決定3: 依存は直接依存に 2 つ足すが、新しいクレートは 1 つも増えない (D6)
+
+`webkit2gtk = "=2.0.2"` と `javascriptcore-rs = "=1.1.2"` を `gtk_backend`
+限定の直接依存にした。どちらも wry が既に依存しているクレートで、wry と
+**完全に同じバージョンに固定**しているので、Cargo.lock に増えるのは velox の
+依存リストの 2 行だけ (パッケージは増えず、二重化も起きない)。必要な理由:
+`script-message-received` のシグナルと、メッセージ本文 (`JavascriptResult`
+から文字列) の取り出しがこの 2 つの API にしか無い。wry の更新でバージョンが
+動いたときは Cargo が解決の食い違いで止めるので、黙って二重化することは
+ない (D146 の「同時にしか上げられない」対象が増える)。
+
+### 決定4: Windows (WebView2) — 同じ原因で落ちているはずだが**実機では未検証**
+
+wry 0.57 `src/webview2/mod.rs` の `add_WebMessageReceived` は、
+`args.Source()` の文字列を WebKitGTK と**同じ**
+`Request::builder().uri(url).body(js)` に通し、`Err` は同様に握りつぶす。
+WebView2 の `Source` はローカルファイルで `file:///C:/…` を返すので
+(権限部が空)、`http::Uri` が拒否する条件は WebKitGTK と同一である。
+`window.ipc` shim 自体は `AddScriptToExecuteOnDocumentCreated` で入り
+URL による絞り込みは無い。**読みの結論は「Windows でも shim は在るが受け側で
+捨てられる」**である。
+
+そのため `#[cfg(windows)]` にも同じ趣旨の実装を入れた
+(`add_WebMessageReceived` は複数登録でき、2 本目で `file:` だけ拾う)。
+**確認できたのは `cargo clippy --target x86_64-pc-windows-msvc
+--all-targets -- -D warnings` (D61) までで、実行はしていない。** 実機確認は
+#197 に積む: `file:///C:/…` を開いて F12 / Ctrl+T / 右クリックが効くこと。
+もし Windows では元から届いていた場合、2 本目が二重配送になる恐れがある。
+届くのは同じ sentinel なので、二重で害になるのは「タブを 2 つ開く」系の
+ショートカット (Ctrl+T など) で、実機ではそこを最初に見る。macOS
+(WKWebView) は `wry_web_view_delegate.rs` が同じ `Request::builder().uri(url)`
+を使うので同じ疑いがあるが、CLAUDE.md の OS 優先度により今回は見送る。
+
+### テスト
+
+- 統合テスト `a_tab_with_form_input_on_a_file_url_page_is_not_suspended`:
+  `file:///…` の HTML を開き、入力ありの信号が IPC 経由で届いたときだけ
+  休止から守られる形にした。**呼び出しを外すと落ちることを確認済み**
+  (`suspended_ids = [0]`)。4 つの注入スクリプトは同じ `content_ipc_event`
+  を通るので、F12 / タブ操作 / コンテキストメニューも同じ配送路に乗る。
+- 単体テスト `is_file_scheme` (二重配送を避ける判定)。
+
+### 見送ったもの・既知の制約
+
+(1) 上流 (wry) への提案: `Request::builder().uri(..)` の失敗を握りつぶさず、
+`file:` は `http::Uri` に通らない前提で扱う (または権限部を補う)。直れば
+`forward_file_url_ipc` は不要になる。(2) `data:` や `blob:` など `file:` 以外で
+`http::Uri` に通らない URI があれば同じ症状になりうるが、再現していないので
+拾っていない。(3) 未確認: macOS、Windows 実機。
+
+**Revisit condition**: (1) wry が `file:` のメッセージを配送するようになったら
+(`forward_file_url_ipc` を外しても上の統合テストが通る)、2 本目のハンドラと
+直接依存 2 つを外す。D143 の Revisit (2) の「統合テストのフィクスチャを
+`file://` に戻してよい」も同時に満たされる。(2) Windows 実機で決定4 の
+二重配送が見えたら、Windows 側だけ `file:` の判定を外す。
+
 ## D159: 拡張機能の信頼境界・権限モデル・マニフェストスキーマ (#82) — 拡張機能は悪意があるものとして設計し、Chrome 互換は目指さない
 
 **対象**: Issue #82 (Epic #80 Stage 1)。受け入れ条件は 4 点 (trust
