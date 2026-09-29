@@ -42,6 +42,12 @@ wry = "0.57"
 # it to the source as the `cfg(gtk_backend)` alias.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
 gtk = "0.18"
+# Issue #275 / D155: a second `ipc` script-message handler for `file://`
+# pages (wry drops those messages itself). Both crates are already in the
+# tree through wry; the exact pins match wry's so a second copy of either
+# can never appear. See docs/decisions D155 and D6.
+webkit2gtk = "=2.0.2"
+javascriptcore-rs = "=1.1.2"
 
 # Embeds assets/icon/velox.ico into velox.exe as its resource icon (what
 # Explorer / the taskbar / the Start menu show). Windows-only: other targets
