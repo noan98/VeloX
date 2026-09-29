@@ -299,3 +299,137 @@ pub(super) fn attach_webview(
 pub(super) fn attach_webview(window: &Window, builder: WebViewBuilder<'_>) -> wry::Result<WebView> {
     builder.build_as_child(window)
 }
+
+/// `file://` ページの IPC を wry の代わりに VeloX が受ける (Issue #275、
+/// docs/decisions.md D155)。
+///
+/// **原因は shim の欠落ではない。** wry の `window.ipc` は `file://` でも
+/// 入っている。落ちているのは受け側で、wry の script-message ハンドラは
+/// `webview.uri()` を `http::Uri` に変換してから `ipc_handler` を呼ぶが、
+/// `file:///…` は権限部が空のため `http::Uri` が拒否し、`Err` を握りつぶして
+/// **メッセージごと捨てる** (wry 0.57 `src/webkitgtk/mod.rs` の
+/// `attach_ipc_handler`)。
+///
+/// ここでは同じ `ipc` メッセージ名にもう 1 本ハンドラを繋ぎ、**`file:` の
+/// ときだけ**同じ `content_ipc_event` に流す。`file:` 以外は wry が既に
+/// 配送しているので、ここで触ると二重配送になる。届くのは wry の経路と同じ
+/// 「信頼しない IPC」で、固定 sentinel の完全一致・上限付きパースしか
+/// 通らない (D18 / D23 / D78)。ページに新しい権限は増えない。
+#[cfg(gtk_backend)]
+pub(super) fn forward_file_url_ipc(
+    webview: &WebView,
+    own_id: WindowId,
+    id: TabId,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
+    use javascriptcore::ValueExt as _;
+    use webkit2gtk::{UserContentManagerExt as _, WebViewExt as _};
+    use wry::WebViewExtUnix;
+
+    let inner = webview.webview();
+    let Some(manager) = inner.user_content_manager() else {
+        eprintln!("velox: no UserContentManager; file:// IPC fallback not installed");
+        return;
+    };
+    let proxy = proxy.clone();
+    let source = inner.clone();
+    manager.connect_script_message_received(Some("ipc"), move |_, message| {
+        let is_file = source.uri().is_some_and(|uri| is_file_scheme(uri.as_str()));
+        if !is_file {
+            return;
+        }
+        let Some(value) = message.js_value() else {
+            return;
+        };
+        if let Some(event) =
+            super::content_scripts::content_ipc_event(own_id, id, value.to_str().as_str())
+        {
+            let _ = proxy.send_event(event);
+        }
+    });
+}
+
+/// Windows (WebView2) 版。**実機では未検証** (D155)。wry 0.57 の
+/// `webview2/mod.rs` は `args.Source()` を同じ `Request::builder().uri(..)` に
+/// 通して `Err` を握りつぶすので、`file:///C:/…` は WebKitGTK と同じ理由で
+/// 捨てられるはずである。`add_WebMessageReceived` は複数登録できるため、
+/// 2 本目を足して `file:` だけを拾う。
+#[cfg(windows)]
+pub(super) fn forward_file_url_ipc(
+    webview: &WebView,
+    own_id: WindowId,
+    id: TabId,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
+    use webview2_com::{take_pwstr, WebMessageReceivedEventHandler};
+    use windows::core::PWSTR;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let proxy = proxy.clone();
+    let mut token: i64 = 0;
+    // SAFETY: `add_WebMessageReceived` は生きている `ICoreWebView2` への
+    // 素の COM 呼び出しで (`webview2_blocking::attach` と同じ理屈)、
+    // クロージャが触るのはこのコールバックの間だけ有効なイベント引数のみ。
+    let result = unsafe {
+        core.add_WebMessageReceived(
+            &WebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
+                let Some(args) = args else {
+                    return Ok(());
+                };
+                let mut source = PWSTR::null();
+                args.Source(&mut source)?;
+                if !is_file_scheme(&take_pwstr(source)) {
+                    return Ok(());
+                }
+                let mut body = PWSTR::null();
+                args.TryGetWebMessageAsString(&mut body)?;
+                let body = take_pwstr(body);
+                if let Some(event) =
+                    super::content_scripts::content_ipc_event(own_id, id, body.as_str())
+                {
+                    let _ = proxy.send_event(event);
+                }
+                Ok(())
+            })),
+            &mut token,
+        )
+    };
+    if let Err(err) = result {
+        eprintln!("velox: WebMessageReceived (file://) の登録に失敗しました: {err}");
+    }
+}
+
+#[cfg(not(any(gtk_backend, windows)))]
+pub(super) fn forward_file_url_ipc(
+    _webview: &WebView,
+    _own_id: WindowId,
+    _id: TabId,
+    _proxy: &EventLoopProxy<UserEvent>,
+) {
+}
+
+/// `uri` のスキームが `file` か。`forward_file_url_ipc` が wry との二重配送を
+/// 避けるための判定。WebKit はスキームを小文字に正規化して返すが、念のため
+/// 大文字小文字は区別しない。
+#[cfg(any(gtk_backend, windows, test))]
+fn is_file_scheme(uri: &str) -> bool {
+    uri.split_once(':')
+        .is_some_and(|(scheme, _)| scheme.eq_ignore_ascii_case("file"))
+}
+
+#[cfg(test)]
+mod file_scheme_tests {
+    use super::is_file_scheme;
+
+    #[test]
+    fn only_file_urls_are_taken_over_from_wry() {
+        assert!(is_file_scheme("file:///home/u/memo.html"));
+        assert!(is_file_scheme("FILE:///C:/a.html"));
+        assert!(!is_file_scheme("https://example.com/file:///x"));
+        assert!(!is_file_scheme("velox://internal/file:"));
+        assert!(!is_file_scheme("about:blank"));
+        assert!(!is_file_scheme("profile:x"));
+        assert!(!is_file_scheme(""));
+    }
+}

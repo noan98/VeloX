@@ -715,7 +715,7 @@ fn resolve_perf_env(
     if !metrics_requested {
         return (false, None);
     }
-    let interval = match interval_raw.and_then(|value| value.parse::<u64>().ok()) {
+    let interval = match parse_trimmed::<u64>(interval_raw) {
         Some(0) => None,
         Some(ms) => Some(Duration::from_millis(ms)),
         None => Some(DEFAULT_PERF_RSS_INTERVAL),

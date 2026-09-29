@@ -295,8 +295,10 @@ fn cmd_run(args: &[String]) -> Result<i32, String> {
     // slower machine).
     let default_warmup_secs = automation::recommended_timeout_secs_with(scenario, overrides);
     let warmup_secs: u64 = flags
-        .one("warmup-secs")
-        .map(|v| v.parse().unwrap_or(default_warmup_secs))
+        .parsed::<u64>(
+            "warmup-secs",
+            "--warmup-secs は 0 以上の整数 (秒) で指定してください",
+        )?
         .unwrap_or(default_warmup_secs);
 
     match url {
@@ -1501,5 +1503,31 @@ MemFree:         1234567 kB
         assert_eq!(result.total_memory_bytes, Some(2_048));
         assert_eq!(result.os_version, None);
         assert_eq!(result.webview_runtime, None);
+    }
+}
+
+#[cfg(test)]
+mod flags_tests {
+    use super::*;
+
+    fn flags(args: &[&str]) -> Flags {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        Flags::parse(&args).expect("valid flags")
+    }
+
+    #[test]
+    fn parsed_rejects_a_non_numeric_value_instead_of_falling_back() {
+        // Issue #297: --warmup-secs の不正値は既定値へ黙って落とさずエラーにする。
+        let result = flags(&["--warmup-secs", "abc"]).parsed::<u64>("warmup-secs", "invalid");
+        assert_eq!(result, Err("invalid".to_owned()));
+    }
+
+    #[test]
+    fn parsed_returns_none_when_absent_and_value_when_valid() {
+        assert_eq!(flags(&[]).parsed::<u64>("warmup-secs", "invalid"), Ok(None));
+        assert_eq!(
+            flags(&["--warmup-secs", "30"]).parsed::<u64>("warmup-secs", "invalid"),
+            Ok(Some(30))
+        );
     }
 }

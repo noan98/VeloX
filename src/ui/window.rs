@@ -77,8 +77,8 @@ use download_handlers::{
     SAVE_PAGE_NO_WEBVIEW_MESSAGE,
 };
 use engine::{
-    apply_memory_target, attach_webview, effective_suspend_mechanism, freeze_webview,
-    new_webview_builder, thaw_webview, webview_is_playing_audio,
+    apply_memory_target, attach_webview, effective_suspend_mechanism, forward_file_url_ipc,
+    freeze_webview, new_webview_builder, thaw_webview, webview_is_playing_audio,
 };
 
 pub use download_handlers::DOWNLOAD_SUCCESS_FLAG_IS_SHARED;
@@ -727,6 +727,8 @@ impl BrowserWindow {
             },
         );
         let content = attach(content_builder)?;
+        // Issue #275 / D155: wry drops IPC from `file://` pages on WebKitGTK.
+        forward_file_url_ipc(&content, id, initial_tab, &proxy);
         // Windows-only subresource blocking (Issue #22, D59): a no-op on
         // every other platform (`attach` compiles away entirely there — see
         // its doc comment). Attached after `attach()` because it needs the
@@ -904,6 +906,8 @@ impl BrowserWindow {
         let webview = attach_webview(&self.host, builder)?;
         #[cfg(not(gtk_backend))]
         let webview = attach_webview(&self.window, builder)?;
+        // Issue #275 / D155: wry drops IPC from `file://` pages on WebKitGTK.
+        forward_file_url_ipc(&webview, self.id, id, &self.proxy);
         // Same Windows-only hook as `BrowserWindow::new` — see its call
         // site's doc comment. Covers every tab opened after startup and
         // every tab rebuilt on resume from suspension (`resume_tab` reuses
