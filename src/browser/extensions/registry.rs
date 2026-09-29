@@ -696,14 +696,18 @@ impl ExtensionRegistry {
             .ok_or_else(|| RegistryError::NotInstalled(id.clone()))?;
         let current = ExtensionVersion::parse(&prev.version);
         let repairing = prev.state == ExtensionState::Disabled(DisabledReason::Corrupt);
-        if let Some(cur) = &current {
-            let newer = manifest.version > *cur || (repairing && manifest.version == *cur);
-            if !newer {
-                return Err(RegistryError::NotNewer {
-                    current: prev.version.clone(),
-                    offered: manifest.version.to_string(),
-                });
-            }
+        // 記録された版が読めない (索引の破損・改ざん) ときに単調増加の検査を
+        // 飛ばすと、ダウングレードが素通りする。修復中 (破損で無効化された
+        // もの) の置き換えだけは許し、それ以外は拒否する。
+        let newer = match &current {
+            Some(cur) => manifest.version > *cur || (repairing && manifest.version == *cur),
+            None => repairing,
+        };
+        if !newer {
+            return Err(RegistryError::NotNewer {
+                current: prev.version.clone(),
+                offered: manifest.version.to_string(),
+            });
         }
 
         let mut approval = prev.approval.clone();
@@ -997,6 +1001,20 @@ mod tests {
         assert!(matches!(
             reg.install(&pkg_bg("1.0.0", r#","min_velox_version":"9.0.0""#), true),
             Err(RegistryError::VeloxTooOld { .. })
+        ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn update_is_refused_when_the_recorded_version_is_unreadable() {
+        let root = unique_temp_path("velox-ext-reg-badver");
+        let mut reg = open(&root);
+        let id = reg.install(&pkg_bg("2.0.0", ""), true).unwrap();
+        // 索引が壊れて (または改ざんされて) 版が読めなくなった状態。
+        reg.entries.get_mut(&id).unwrap().version = "not-a-version".into();
+        assert!(matches!(
+            reg.update(&pkg_bg("0.0.1", "")),
+            Err(RegistryError::NotNewer { .. })
         ));
         std::fs::remove_dir_all(&root).ok();
     }
