@@ -19140,6 +19140,80 @@ release workflow (D51 / D70) は既にあったが、リリース手順・リリ
 (3) #88 でチャンネルが決まったら、タグ規則とリリースノートの分け方を
 見直す。
 
+## D158: `@claude` レビューの Bash 権限は広げない (Issue #274) — CI の結果を読ませ、`contents: write` を持つ workflow にリポジトリのコードを実行させない
+
+**対象**: `.github/workflows/claude.yml`。PR #271 / #273 / #276 のレビューが
+「`cargo fmt --check` / `python3 -m unittest discover -s .github/scripts` などを
+Bash 権限の制約で実行できなかった」と報告した。Issue #274 は、その許可を広げる
+べきかを問うた。**選んだのは「何もしない」(案 3) である。**
+
+### 事実 (2026-09 時点で読んだもの)
+
+- `claude.yml` は `issue_comment` / `pull_request_review_comment` で起動し、
+  `contents: write` / `pull-requests: write` / `issues: write` / `id-token: write`
+  を持ち、`secrets.CLAUDE_CODE_OAUTH_TOKEN` を `claude-code-action` に渡す。
+  起動は D102 の `if` (OWNER / MEMBER / COLLABORATOR のみ) で絞ってある。
+- action への入力は `claude_code_oauth_token` と `show_full_output` だけで、
+  `claude_args` / `allowed_tools` は無い。ツール許可は action の既定である。
+- workflow 自身の `actions/checkout` は `ref` 指定なしなので、`issue_comment`
+  では既定ブランチ側を取る。**ただし、PR へのメンションでは action 自身が
+  PR ブランチへ切り替えて作業する (action の挙動であり、このリポジトリの
+  設定からは確認できない)。** そのため「レビュー中の作業ツリーは PR の
+  内容」と考えて設計する。
+- `ci.yml` は `pull_request` / `push` (main) で fmt・clippy・test
+  (Linux / Windows)、および `scripts/` と `.github/scripts/` の Python テスト
+  (D108) を回す。`permissions` は明示していないが、シークレットを渡して
+  いない。`auto-merge.yml` は Auto Merge 自身を除く全チェックが success /
+  skipped でなければマージしない (D55 / D91)。
+
+### 決定
+
+`claude.yml` の Bash 許可は広げない。レビュアーには「CI のチェック結果を読む」
+ことでテスト結果を確認させ、コマンドを再実行させない。
+
+### 理由
+
+1. **`cargo test` / `cargo clippy` / `cargo build` / `python3 -m unittest` は
+   PR のコードを実行する。** `build.rs`、proc macro、テスト本体、Python の
+   テストモジュールはいずれも任意コードなので、「列挙した数個のコマンドだけ
+   許可」しても実質は任意コード実行と同じである。ワイルドカードを避ける
+   (Issue の受け入れ条件) だけでは封じられない。
+2. **この job は書き込み権限のトークンとシークレットを持つ。** PR のコードが
+   走れば、`contents: write` の `GITHUB_TOKEN` (main へは届かなくても
+   ブランチ・PR・Issue は書き換えられる) と `CLAUDE_CODE_OAUTH_TOKEN` に
+   触れる。D102 の `if` はコメント投稿者を信頼できる相手に絞るが、
+   **コメントするのが信頼できる人でも、走らせるコードの出どころは別問題**
+   である。fork からの PR は D102 の時点で共同作業者限定のため当面無い
+   (`pull_request_creation_policy: collaborators_only`) が、共同作業者の
+   アカウント侵害や、レビュー対象に混ざる悪意あるコードは残る。
+   その両方を、レビューの利便のために書き込み権限つきの job へ持ち込む理由が無い。
+3. **同じ検査は既に読み取り側で独立に回っている。** ci.yml が上記のチェックを
+   PR ごとに回し、auto-merge は全緑を要求する。PR 本文の「テストが通った」が
+   偽なら CI が赤になり、マージされない。レビューが再実行しないことで
+   **検証されない領域は生じない**。失われるのは「レビューが自分の目で
+   確かめる」という質だけで、それは CI のチェック結果 (`gh pr checks` /
+   check runs の読み取り) で代替できる。
+4. **案 2 (最小権限の別 workflow) は ci.yml の重複になる。** 読み取り専用
+   トークンで cargo / python3 を回す workflow を足すと、ci.yml と同じ検査を
+   もう 1 つ維持することになる。
+
+Issue が求めた判断材料 (「レビューがコマンドを回せたとして、CI が既に捕まえて
+いるもの以外に何を捕まえられるか」) には、今のところ具体例が無い。
+
+### 見送ったもの
+
+- 案 1 (コマンドを列挙して許可): 理由 1 のとおり列挙では封じられない。
+- 案 2 (別 workflow): 理由 4。
+- `claude.yml` の権限自体の縮小: 今回の論点ではない。`@claude` は
+  実装依頼にも使われるため `contents: write` が要る。
+
+**Revisit condition**: (1) CI が緑なのに、レビュー中にコマンドを実行して
+いれば見つかったはずの不具合がマージされた具体例が出たとき。(2) レビューを
+`pull_request` トリガの、**読み取り専用トークンかつシークレット無し** の
+workflow へ移せる見通しが立ったとき (その場合はコマンド許可を再検討できる)。
+(3) 共同作業者以外からの PR が可能になるなど、D102 の前提 (PR 作成は共同
+作業者のみ) が変わったとき。その場合、この決定はより強く効く。
+
 ## D161: リリースチャネルを Beta / Stable の 2 つ + タグなし Nightly とし、pre-release タグを自動で pre-release 公開する (Issue #88)
 
 **対象**: `docs/release-channels.md` (新規)、`.github/workflows/release-windows.yml` /
