@@ -10,7 +10,8 @@
 //!    ここで保つ。
 //! 2. **移行する前に元を残す。** 古い版のファイルは、移行を試みる前に元の
 //!    バイト列をそのまま `<name>.v<旧版>.bak` へ書き出す。移行が失敗しても
-//!    旧データはそこに残る。
+//!    旧データはそこに残る。控えを書けなければ元ファイルを退避へ回し、
+//!    次の保存が旧データを上書きしないようにする (約束 3 の写しも同じ)。
 //! 3. **知らない新しい版を黙って捨てない。** 自分より新しい版のファイル
 //!    (新版からダウングレードした場合) は `<name>.v<その版>.bak` へ写してから
 //!    読めるだけ読む。読めなければ、自分の版のバックアップ (更新前に取られた
@@ -134,7 +135,8 @@ pub enum LoadStatus {
     Missing,
     /// 現在の版のファイルをそのまま読めた。
     Current,
-    /// 古い版から移行した。`backup` は移行前の元データの保存先。
+    /// 古い版から移行した。`backup` は移行前の元データの保存先 (控えが
+    /// 取れなかったときは退避先)。
     Migrated { from: u32, backup: Option<PathBuf> },
     /// 移行に失敗した。元データは `backup` (取れなかったときは退避先) に残る。
     MigrationFailed {
@@ -142,7 +144,8 @@ pub enum LoadStatus {
         reason: String,
         backup: Option<PathBuf>,
     },
-    /// 自分より新しい版のファイル。`backup` はその写しの保存先。
+    /// 自分より新しい版のファイル。`backup` はその写しの保存先 (写しが
+    /// 取れなかったときは退避先)。
     NewerVersion {
         found: u32,
         backup: Option<PathBuf>,
@@ -270,7 +273,7 @@ pub fn load<T: DeserializeOwned>(path: &Path, schema: &Schema) -> Loaded<T> {
     }
 
     // 古い版: 何かする前に元のバイト列を控える。
-    let backup = write_backup(path, version, &bytes);
+    let backup = backup_or_quarantine(path, version, &bytes);
     let migrated = schema
         .migrate(json, version)
         .and_then(|v| serde_json::from_value(v).map_err(|e| format!("移行後の形が不正: {e}")));
@@ -282,21 +285,14 @@ pub fn load<T: DeserializeOwned>(path: &Path, schema: &Schema) -> Loaded<T> {
                 backup,
             },
         },
-        Err(reason) => {
-            // 控えが取れなかったときは、次の保存で上書きされないよう元を退避する。
-            let backup = match backup {
-                Some(b) => Some(b),
-                None => quarantine(path),
-            };
-            Loaded {
-                value: None,
-                status: LoadStatus::MigrationFailed {
-                    from: version,
-                    reason,
-                    backup,
-                },
-            }
-        }
+        Err(reason) => Loaded {
+            value: None,
+            status: LoadStatus::MigrationFailed {
+                from: version,
+                reason,
+                backup,
+            },
+        },
     }
 }
 
@@ -307,7 +303,7 @@ fn load_newer<T: DeserializeOwned>(
     json: Value,
     found: u32,
 ) -> Loaded<T> {
-    let backup = write_backup(path, found, bytes);
+    let backup = backup_or_quarantine(path, found, bytes);
     let (value, source) = if let Ok(v) = serde_json::from_value(json) {
         (Some(v), NewerSource::BestEffort)
     } else if let Some(v) = read_own_backup(path, schema) {
@@ -338,6 +334,13 @@ fn read_own_backup<T: DeserializeOwned>(path: &Path, schema: &Schema) -> Option<
 fn write_backup(path: &Path, version: u32, bytes: &[u8]) -> Option<PathBuf> {
     let dest = backup_path(path, version);
     fsutil::atomic_write(&dest, bytes).ok().map(|()| dest)
+}
+
+/// 控えを書く。書けなかったときは、次の保存で元データが上書きされないよう
+/// 元ファイルを退避する (移行の成否や新しい版かどうかに関わらず、元データの
+/// 置き場所を必ず 1 つ残すため)。
+fn backup_or_quarantine(path: &Path, version: u32, bytes: &[u8]) -> Option<PathBuf> {
+    write_backup(path, version, bytes).or_else(|| quarantine(path))
 }
 
 fn quarantined<T>(path: &Path, reason: String) -> Loaded<T> {
@@ -628,6 +631,45 @@ mod tests {
             LoadStatus::MigrationFailed { from: 1, .. }
         ));
         assert!(backup_path(&path, 1).exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrated_data_is_quarantined_when_the_backup_cannot_be_written() {
+        let original = r#"{"title":"old"}"#;
+        let (dir, path) = setup("velox-migr-nobackup", original);
+        // 控えの置き場所をディレクトリで塞ぎ、書き込みを失敗させる。
+        fs::create_dir_all(backup_path(&path, 1)).unwrap();
+        let loaded: Loaded<V3> = load(&path, &SCHEMA);
+        assert_eq!(loaded.value.unwrap().name, "old");
+        match loaded.status {
+            LoadStatus::Migrated {
+                from: 1,
+                backup: Some(moved),
+            } => assert_eq!(fs::read_to_string(moved).unwrap(), original),
+            other => panic!("unexpected status {other:?}"),
+        }
+        // 元の場所には何も残っていないので、次の保存が元データを潰すことはない。
+        assert!(!path.exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn newer_data_is_quarantined_when_the_copy_cannot_be_written() {
+        let original = r#"{"schema_version":9,"name":"future","count":1}"#;
+        let (dir, path) = setup("velox-migr-newer-nocopy", original);
+        fs::create_dir_all(backup_path(&path, 9)).unwrap();
+        let loaded: Loaded<V3> = load(&path, &SCHEMA);
+        assert_eq!(loaded.value.unwrap().name, "future");
+        match loaded.status {
+            LoadStatus::NewerVersion {
+                found: 9,
+                backup: Some(moved),
+                ..
+            } => assert_eq!(fs::read_to_string(moved).unwrap(), original),
+            other => panic!("unexpected status {other:?}"),
+        }
+        assert!(!path.exists());
         fs::remove_dir_all(&dir).ok();
     }
 
