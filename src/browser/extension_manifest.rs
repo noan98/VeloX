@@ -262,6 +262,28 @@ pub struct HostPattern {
     pub path: String,
 }
 
+/// 正規形の文字列 (`parse` に戻すと同じパターンになる)。承認済みの集合を
+/// 永続化・比較する (#84) ために使う。`<all_urls>` は `*://*/*` と書く。
+impl fmt::Display for HostPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scheme = match self.scheme {
+            SchemeMatch::Http => "http",
+            SchemeMatch::Https => "https",
+            SchemeMatch::HttpOrHttps => "*",
+        };
+        write!(f, "{scheme}://")?;
+        match &self.host {
+            HostMatch::Any => write!(f, "*")?,
+            HostMatch::Subdomains(d) => write!(f, "*.{d}")?,
+            HostMatch::Exact(h) => write!(f, "{h}")?,
+        }
+        if let Some(port) = self.port {
+            write!(f, ":{port}")?;
+        }
+        write!(f, "{}", self.path)
+    }
+}
+
 impl HostPattern {
     /// `<all_urls>` と同値のパターン。
     pub fn all_urls() -> HostPattern {
@@ -891,7 +913,7 @@ fn parse_patterns_limited(
 }
 
 /// パッケージ内リソース (JS) の相対パスの形を検査する。実在確認は行わない。
-fn validate_resource_path(path: &str) -> Result<(), ManifestError> {
+pub fn validate_resource_path(path: &str) -> Result<(), ManifestError> {
     let bad = || ManifestError::InvalidResourcePath(path.chars().take(64).collect());
     if path.is_empty() || path.len() > MAX_RESOURCE_PATH_LEN || !path.ends_with(".js") {
         return Err(bad());
@@ -911,6 +933,22 @@ fn validate_resource_path(path: &str) -> Result<(), ManifestError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_pattern_display_round_trips_through_parse() {
+        for raw in [
+            "<all_urls>",
+            "https://*.example.com/*",
+            "http://localhost:3000/a/*",
+            "*://example.org/docs/*",
+            "https://127.0.0.1/",
+        ] {
+            let p = HostPattern::parse(raw).expect(raw);
+            let again = HostPattern::parse(&p.to_string()).expect("canonical form parses");
+            assert_eq!(p, again, "{raw}");
+        }
+        assert_eq!(HostPattern::all_urls().to_string(), "*://*/*");
+    }
 
     const MINIMAL: &str = r#"{
         "manifest_version": 1,
