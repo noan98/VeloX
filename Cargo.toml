@@ -5,7 +5,7 @@ edition = "2021"
 description = "A fast, lightweight web browser built with Rust."
 license = "MIT"
 repository = "https://github.com/noan98/VeloX"
-rust-version = "1.85"
+rust-version = "1.89"
 
 [dependencies]
 # Window creation and event loop (cross-platform: macOS / Linux / Windows).

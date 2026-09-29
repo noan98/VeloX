@@ -9,6 +9,8 @@ pub mod toolbar;
 #[cfg(windows)]
 pub mod webview2_blocking;
 #[cfg(windows)]
+pub mod webview2_crash;
+#[cfg(windows)]
 pub mod webview2_print;
 #[cfg(windows)]
 pub mod webview2_suspend;

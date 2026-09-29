@@ -751,6 +751,8 @@ impl BrowserWindow {
             content_blocking_enabled,
             proxy.clone(),
         );
+        #[cfg(windows)]
+        crate::ui::webview2_crash::attach(&content, id, initial_tab, proxy.clone());
 
         let mut contents = HashMap::new();
         contents.insert(
@@ -918,6 +920,8 @@ impl BrowserWindow {
             self.content_blocking_enabled,
             self.proxy.clone(),
         );
+        #[cfg(windows)]
+        crate::ui::webview2_crash::attach(&webview, self.id, id, self.proxy.clone());
         if std::env::var_os("VELOX_DEBUG").is_some() {
             // Which `WebKitWebProcess` group this tab landed in (D54) —
             // the one piece of placement state nothing else surfaces, and

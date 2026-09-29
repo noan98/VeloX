@@ -17,6 +17,8 @@ use tao::event_loop::{
 };
 
 use crate::browser::automation::{self, AutomationCommand};
+use crate::browser::crash_report::{self, ProcessFailureKind};
+use crate::browser::crash_store::{self, RunMarker};
 use crate::browser::downloads;
 use crate::browser::navigation::Intent;
 use crate::browser::perf_log::{IpcLog, PerfLog};
@@ -37,6 +39,7 @@ use crate::ui::toolbar::{self, Panel, ToolbarCommand};
 use crate::ui::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};
 
 mod automation_script;
+mod crash;
 mod download_actions;
 mod find_bar;
 mod page_actions;
@@ -49,6 +52,7 @@ use automation_script::{
     handle_automation_command, poll_automation_wait_timeout, resolve_automation_wait_for_startup,
     resolve_automation_wait_if_matching, spawn_automation, AutomationWaitState,
 };
+use crash::handle_content_process_failed;
 use download_actions::{
     cancel_download, open_download, open_downloads_folder, record_download_completion,
     record_save_page_completion,
@@ -322,6 +326,16 @@ pub enum UserEvent {
         success: bool,
         error: Option<String>,
     },
+    /// Tab `tab_id`'s content webview (window `window_id`) reported that one
+    /// of the engine's processes failed (Issue #89, docs/decisions.md D156).
+    /// Only WebView2's `ProcessFailed` event feeds this (Windows); wry 0.57
+    /// exposes no equivalent on WebKitGTK, and macOS's
+    /// `with_on_web_content_process_terminate_handler` is not wired up.
+    ContentProcessFailed {
+        window_id: WindowId,
+        tab_id: TabId,
+        kind: ProcessFailureKind,
+    },
     /// The active tab's page markup came back from
     /// `BrowserWindow::fetch_page_source` for View Source (Issue #45, see
     /// docs/decisions.md D72). `page_url` is the page it belongs to, as
@@ -417,6 +431,12 @@ struct AppState {
     /// `persistence::default_data_dir`), in which case all three stores
     /// stay in-memory only for this run.
     data_dir: Option<PathBuf>,
+    /// Whether crash reports may be written this run (Issue #89, D156): off
+    /// with `VELOX_CRASH_REPORTS=0` and in a `--private` launch.
+    crash_reports_enabled: bool,
+    /// One-shot notice about the previous run having ended uncleanly,
+    /// shown in the status banner on the first toolbar `ready` (D156).
+    startup_notice: Option<String>,
     /// The [`SessionSnapshot`] most recently written to `session.json` by
     /// [`persist_session`] (Issue #67) — `None` until the first successful
     /// write. `sync_tab_strip` calls `persist_session` after nearly every
@@ -566,6 +586,24 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
     // 環境変数を読むだけの純粋な解決なので一度だけ行い、`settings.json`・
     // サイト権限・セッション復元・履歴類のすべてで共有する。
     let data_dir = persistence::default_data_dir();
+    // Issue #89 (D156): local-only crash reports + unclean-shutdown
+    // detection. Off with `VELOX_CRASH_REPORTS=0`, and in a private launch
+    // (which leaves no trace on disk, D14/D74).
+    let crash_reports_enabled =
+        crash_report::reports_enabled(std::env::var("VELOX_CRASH_REPORTS").ok().as_deref())
+            && !config.private;
+    let (mut run_marker, crash_notice) = match data_dir.as_deref() {
+        Some(dir) if crash_reports_enabled => {
+            crash_store::install_panic_hook(dir.to_path_buf());
+            let (marker, previous) = RunMarker::acquire(dir);
+            let notice = crash_store::startup_notice(Some(dir), previous);
+            if let Some(notice) = &notice {
+                eprintln!("velox: {notice}");
+            }
+            (marker, notice)
+        }
+        _ => (None, None),
+    };
     let settings = match data_dir.as_deref().and_then(persistence::load_settings) {
         Some(loaded) => {
             let sanitized = loaded.sanitize();
@@ -822,6 +860,8 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         bookmarks,
         input_history,
         data_dir,
+        crash_reports_enabled,
+        startup_notice: crash_notice,
         last_persisted_session: None,
         perf: perf_log
             .clone()
@@ -883,6 +923,14 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         *control_flow = ControlFlow::Wait;
 
         match event {
+            // Issue #89 (D156): a clean exit empties the run marker; any
+            // other way out (panic, kill, power loss) leaves it filled, which
+            // the next launch reads as an unclean shutdown.
+            Event::LoopDestroyed => {
+                if let Some(marker) = run_marker.take() {
+                    marker.release();
+                }
+            }
             // Issue #29 (D68): `window_id` here is `tao`'s own id for the
             // native window the event happened in — distinct from
             // `browser::WindowId` — so every window-scoped `WindowEvent` is
@@ -1570,6 +1618,17 @@ fn handle_user_event(
             };
             handle_tab_freeze_finished(window, window_id, state, tab_id, success, error);
         }
+        UserEvent::ContentProcessFailed {
+            window_id,
+            tab_id,
+            kind,
+        } => {
+            // Same "window may have closed" guard, first, as above.
+            let Some(window) = ui_windows.get_mut(&window_id) else {
+                return;
+            };
+            handle_content_process_failed(window, window_id, state, tab_id, kind);
+        }
         UserEvent::ViewSourceReady {
             window_id,
             page_url,
@@ -2028,6 +2087,12 @@ fn handle_toolbar_command(
             );
             sync_block_count(window, tabs_of(state, window_id));
             sync_active_bookmark_star(window, window_id, state);
+            // Issue #89 (D156): tell the user once that the last run ended
+            // unexpectedly. Session restore already happened at startup
+            // (`session.json` is written eagerly, D65).
+            if let Some(notice) = state.startup_notice.take() {
+                show_print_status(window, &notice);
+            }
             refresh_history_panel(window, state, config);
             refresh_bookmarks_panel(window, state);
             refresh_downloads_panel(window, state);
@@ -2959,6 +3024,8 @@ mod tests {
             bookmarks: BookmarkStore::new(),
             input_history: InputHistoryStore::new(),
             data_dir: None,
+            crash_reports_enabled: false,
+            startup_notice: None,
             last_persisted_session: None,
             perf: None,
             downloads: DownloadStore::new(),
