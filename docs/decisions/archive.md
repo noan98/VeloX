@@ -19306,6 +19306,102 @@ workflow へ移せる見通しが立ったとき (その場合はコマンド許
 (b) 資格情報の永続化 (キーチェーン) を再検討する。滞留スレッドが実測で
 問題になれば、HTTP 側のタイムアウト必須化かプール化を検討する。
 
+## D163: 拡張機能ホストのコア (Extension API 最小サブセットと Lifecycle / Storage) を、アプリへ配線せずに実装する (#83 / #84)
+
+**対象**: Issue #83 (Extension API 最小サブセット) と #84 (Lifecycle /
+Storage)。D159 (`docs/extensions.md`) の設計と `extension_manifest.rs` を
+そのまま使い、**ホスト側の核だけ**を `src/browser/extensions/` に実装した。
+**拡張機能の JS はどの WebView でも動かず、ユーザから見た挙動は変わらない。**
+
+### 決定
+
+1. **配線しない。純粋ロジック + 薄い IO 層に留める。** 「拡張機能を実際に
+   動かす」には、拡張機能ごとの background WebView / `WebContext`、ID を束縛した
+   専用 IPC ハンドラ、content script の注入、承認ダイアログ (信頼 UI) が要り、
+   いずれも `app.rs` / `ui::window` を跨ぐ変更で、性能目標 (Epic #57) への影響を
+   実測してから決める未決事項 (D159 見送り項目) に依存する。それらを先に決めずに
+   配線すると、信頼境界が最も壊れやすい部分を実測なしで確定してしまう。一方、
+   権限検査・入力検証・ストレージ・ライフサイクル・復旧は WebView なしで完結し、
+   ここが最もセキュリティ上の価値が高くテストしやすい。ブラウザ本体への操作は
+   `BrowserHost` トレイトに切り出したので、配線は「トレイトの実装 + IPC
+   ハンドラ」の追加で済む。
+2. **API はバージョン付きスキーマ (`api.rs`)。** 要求 `{api_version, id, method,
+   params}` / 応答 `{ok, result|error}`。**要求に拡張機能 ID のフィールドは
+   無い** (D159 決定2: 呼び出し元は Rust が経路から決めて `handle_request` の
+   引数で渡す。自己申告フィールドは未知フィールドとして拒否)。未知の
+   フィールド・メソッド・版は拒否、サイズはパース前に検査 (64 KiB)。メソッド表
+   `METHODS` が権限との対応の唯一の情報源で、`schema_json()` が機械可読な仕様と
+   して出す。版は `MIN_SUPPORTED..=API_VERSION` で交渉する。
+3. **最小 API は 14 メソッド**: `runtime.getInfo` / `getManifest`、
+   `storage.get|set|remove|clear|getBytesInUse`、`tabs.query|get`、
+   `scripting.executeScript`、`permissions.getAll|contains|request|remove`。
+   D159 §4.3 の 8 権限のうち `alarms` / `context_menus` / `clipboard_write` /
+   `notifications` は、対応する API を今回は作らない (権限名だけがスキーマに
+   ある)。`runtime.sendMessage` (content script ↔ background) も、送信元タブを
+   webview の経路から決める配線が要るので未実装。
+4. **権限は使用時に、承認記録 (`Approval`) だけを根拠に検査する。** マニフェスト
+   は「要求」、`Approval` (インストール/再承認で承認した必須 + 実行時に付与した
+   任意) が「付与」。読み込み時は承認をマニフェストの宣言へ切り詰める。
+   `tabs.query` は `tabs` 権限のみ・http/https のタブだけ (内部ページは見せない)。
+   `tabs.get` は `tabs` か対象タブの `active_tab`。`scripting.executeScript` は
+   `scripting` + **呼び出し時点のタブ URL** がホストパターンに一致 (または
+   `active_tab`)。`active_tab` は付与時の URL と一致する間だけ有効
+   (ナビゲーション・無効化・更新で失効)。`permissions.request` は
+   `optional_*` に宣言したものだけ、直前のユーザ操作を消費し、信頼 UI の同意を
+   得た場合のみ付与する。
+5. **ライフサイクルは状態機械 (`lifecycle.rs`)**: `Enabled` /
+   `Disabled(User | NeedsReconsent | Corrupt)`。`enable` は `NeedsReconsent` /
+   `Corrupt` を素通りさせない (`approve` / 更新での修復が要る)。イベント
+   (`Installed` / `Updated` / `Enabled` / `Disabled` / `ConsentRequired` /
+   `Quarantined` / `Uninstalled`) はレジストリが溜め、`drain_events` で取り出す
+   (`runtime.onInstalled` 等としての配送は配線時)。イベントページの休止
+   (`Suspended`) は実行時の状態なので今回は持たない。
+6. **インストール/更新/削除 (`registry.rs`)**: 承認なしのインストールは拒否。
+   一時領域へ書く → 検証 → rename。索引を書けなければ巻き戻す。更新は単調増加のみ
+   (隔離中の修復だけ同版可)、**承認を超える権限・ホストが増えたら更新を適用した
+   まま無効化して再承認待ち**、減る分は黙って適用 (失効した権限は即時に使えない)。
+   置き換えは旧版を `.old` へ退避してから配置し、失敗・クラッシュ時は旧版へ戻す。
+   アンインストールは索引から外してトゥームストーンを書いてから実ファイルを消し、
+   消せなければ次回起動で再試行、その間 ID の再利用は拒否する。
+7. **パッケージ (`package.rs`)**: パス・件数 (256)・1 ファイル (1 MiB)・合計 (8 MiB)
+   を検査し、zip slip・隠しファイル・Windows 予約名・大文字小文字だけが違う衝突は
+   パッケージごと拒否。ディレクトリからの読み込みはシンボリックリンクを拒否。
+   **zip 等のアーカイブ展開は実装しない** (依存を増やさない。D6。配布経路の
+   Decision と一緒に決める)。
+8. **ストレージ (`storage.rs`)**: 拡張機能ごとに `storage/<id>/storage.json`。キー
+   128 B・値 64 KiB・512 件・合計 1 MiB。書き込みは一時ファイル → rename で、
+   失敗したらメモリも元に戻す。破損 (JSON 不正・上限超過・未知の版) は
+   `storage.json.corrupt` へ退避してその拡張機能だけ空で続行する。
+9. **復旧 (起動は決して止めない)**: 起動ごとにディスク上のマニフェストを再検証し、
+   読めなければ `Corrupt` で隔離、承認を超える宣言 (改ざん) は `NeedsReconsent`。
+   索引が壊れていれば `index.json.corrupt` へ退避し、`packages/` から**承認なし
+   (要再承認)** で再構築する (承認を推測で復元しない。読めない/索引が不明な
+   ディレクトリは消さず残す)。索引が無傷なときだけ、索引にないパッケージ/
+   ストレージ・作業領域をクラッシュの残骸として消す。
+10. 依存クレートは追加していない (既存の `serde` / `serde_json` / `url` のみ)。
+    `extension_manifest.rs` には `HostPattern` の `Display` (正規形。承認記録の
+    永続化用) と `validate_resource_path` の公開だけを足した。
+
+### 見送ったもの (配線時に必要)
+
+- background WebView / `WebContext`・専用 IPC ハンドラ・`BrowserHost` の実装・
+  content script の注入・承認ダイアログ・拡張機能の管理 UI (#87)。
+- 実行予算 (CPU / メモリ / メッセージ量)、`alarms` 等の API、`runtime.sendMessage`。
+- パッケージの署名/ハッシュ・自動更新・zip 展開 (配布経路の Decision)。
+- 拡張機能ごとの WebView2 プロファイルのコスト計測 (D159 の未決事項のまま)。
+- Windows 実機での検証: ここまでの実装は OS 非依存で、Linux 上のテストと
+  Windows 向けの型チェック/clippy で確認した。`rename` による置き換えは std の
+  仕様 (Windows は既存ファイルを置換、ディレクトリの上書きはしない設計にして
+  いる) に依存するが、実機では未検証 (CLAUDE.md の OS 優先度。Windows での
+  ファイル使用中の削除失敗はトゥームストーンが受ける)。
+
+**Revisit condition**: (1) 配線に着手するとき、`BrowserHost` の形 (特に
+`tabs` の可視範囲とプライベートウィンドウ、user activation の取り方) を
+実際の `app.rs` に合わせて見直す。(2) 拡張機能の実データ量が上限 (1 MiB /
+512 件) に当たる要望が出たら、上限を Decision として見直す。(3) 配布経路 (署名・
+ストア) を決めるとき、`ExtensionPackage` の入口 (アーカイブ展開・ハッシュ検証)
+を足す。
+
 ## D161: リリースチャネルを Beta / Stable の 2 つ + タグなし Nightly とし、pre-release タグを自動で pre-release 公開する (Issue #88)
 
 **対象**: `docs/release-channels.md` (新規)、`.github/workflows/release-windows.yml` /
