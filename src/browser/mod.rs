@@ -10,6 +10,7 @@
 //! `perf_log`'s [`metrics::PerfRecord`] lines); see their module doc
 //! comments.
 
+pub mod ai;
 pub mod automation;
 pub mod benchmark;
 pub mod blocklist;

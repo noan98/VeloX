@@ -19272,6 +19272,40 @@ workflow へ移せる見通しが立ったとき (その場合はコマンド許
 オフを変えるのは E2E が入ってから。(3) 並べ替えの競合が実害になるなら
 `order` をフラクショナルインデックスに替える (`v` を上げる)。
 
+## D162: AI プロバイダ抽象を同期 trait + ワーカースレッド + channel で作る (Issue #76) — 期限は dispatcher が強制し、資格情報は `Secret` 型と環境変数のみ
+
+**対象**: Issue #76 (Epic #73、#77 / #78 の土台)。設計は
+[`docs/ai-providers.md`](../ai-providers.md)、実装は `src/browser/ai/`。
+**app には配線していない** (挙動変更なし)。
+
+### 決定
+
+1. **同期 `AiProvider` trait**。ストリームは `on_chunk` コールバック、実行は
+   専用ワーカースレッド、結果は `std::sync::mpsc`。app.rs のメインスレッド
+   イベントループはブロックできず、非同期ランタイムは依存追加 (D6) になる
+   ため。`notify` から `EventLoopProxy` 経由の `UserEvent` に繋ぐ。
+2. **期限とキャンセルは dispatcher が強制**する (監督スレッドの
+   `recv_timeout`)。プロバイダに守らせる設計だと、1 つの不具合実装が UI を
+   固めるため。代償として、キャンセルを無視するプロバイダのスレッドは
+   終了まで残る (安全なスレッド強制終了が無い)。
+3. **`Secret` 型**: `Debug` / `Display` は伏せ字、`Serialize` を実装しない。
+   保管は環境変数のみ (または資格情報なし)。OS キーチェーンは実プロバイダの
+   Issue まで見送る。
+4. **プロバイダは同梱・既定有効にしない**。ユーザが設定するまでデータは端末外へ
+   出ない。ページ内容の送信可否は #78 で決める。
+5. `AiError` は 8 分類の共通エラー。UI は分類だけで表示を決める。
+
+### 見送ったもの
+
+- HTTP クライアント・実プロバイダ (依存追加の是非を含め別 Issue)。
+- OS キーチェーン連携。
+- async trait / tokio (D6)。
+- ワーカースレッドのプール化 (AI 未使用時のコストゼロを優先。要求は低頻度)。
+
+**Revisit condition**: 実プロバイダを入れる Issue で (a) HTTP 依存の選定、
+(b) 資格情報の永続化 (キーチェーン) を再検討する。滞留スレッドが実測で
+問題になれば、HTTP 側のタイムアウト必須化かプール化を検討する。
+
 ## D161: リリースチャネルを Beta / Stable の 2 つ + タグなし Nightly とし、pre-release タグを自動で pre-release 公開する (Issue #88)
 
 **対象**: `docs/release-channels.md` (新規)、`.github/workflows/release-windows.yml` /
