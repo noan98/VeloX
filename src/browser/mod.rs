@@ -18,6 +18,7 @@ pub mod bookmarks;
 pub mod context_menu;
 pub mod downloads;
 pub mod extension_manifest;
+pub mod extensions;
 pub mod find;
 pub mod gui_probe;
 pub mod history;
