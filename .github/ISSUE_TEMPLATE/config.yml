@@ -1,0 +1,12 @@
+# Issue 作成画面の入口設定 (Issue #94)。
+#
+# 空の Issue (テンプレートなし) は許可しない。セキュリティ脆弱性は公開 Issue に
+# 書かせず、SECURITY.md の手順 (非公開の脆弱性報告) へ誘導する。
+blank_issues_enabled: false
+contact_links:
+  - name: セキュリティ脆弱性の報告 (非公開)
+    url: https://github.com/noan98/VeloX/security/advisories/new
+    about: 脆弱性は公開 Issue に書かないでください。非公開の脆弱性報告を使ってください。手順は SECURITY.md にあります。
+  - name: 使い方・インストール・トラブルシューティング
+    url: https://github.com/noan98/VeloX/blob/main/docs/user-guide.md
+    about: インストール・更新・アンインストール・よくある問題の対処をまとめています。報告の前に確認してください。
