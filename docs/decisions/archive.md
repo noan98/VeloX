@@ -19093,3 +19093,49 @@ decisions/README.md 規則 4)。(3) 拡張機能ごとのプロファイルの�
 性能目標 (Epic #57) を破るなら §7 の分離方式を見直す。(4) 拡張機能から
 `history` / `bookmarks` を読みたいという要望が出たら、一括読み取りではなく
 狭い個別 API として別途検討する。
+
+## D157: リリース運用の整備 (#94) — 自動生成リリースノート + ラベル分類、CHANGELOG.md は置かない、Issue フォームで報告の導線を作る
+
+**対象**: Issue #94 (Release Automation / Documentation / Support)。
+release workflow (D51 / D70) は既にあったが、リリース手順・リリース
+ノートの方針・利用者向け文書・Issue の入口が無かった。
+
+### 決定
+
+1. **リリースノートは GitHub の自動生成に任せ、`.github/release.yml` で
+   既存ラベル (`bug` / `enhancement` / `documentation` / `dependencies`) ごとに
+   分類する。** 両 release workflow は既に `generate_release_notes: true`
+   なので、workflow の変更は要らない。`CHANGELOG.md` は置かない: PR の
+   タイトル・本文は CLAUDE.md で日本語と決まっており、手で書く履歴を
+   もう 1 つ持つと Release とずれるため。**PR にラベルを付けることが運用
+   上の前提**になる (無ければ「その他」に入る)。
+2. **リリース手順は `docs/releasing.md` に書く。** 手作業・未対応 (署名 =
+   #42 / #91、macOS、Windows インストーラの `.sha256`、自動更新 #90、
+   移行・ロールバック #92、チャンネル #88) を隠さず表にする。
+3. **利用者向けは `docs/user-guide.md`** (インストール・更新・アンインストール・
+   トラブルシューティング・問い合わせ)。記述は実コード・workflow・
+   `installer/windows/velox.iss` から確認できることだけに限る。
+4. **報告の導線は `.github/ISSUE_TEMPLATE/` に置く。** 不具合・機能要望の
+   フォームと、`blank_issues_enabled: false` + セキュリティ用の
+   `contact_links` (非公開の脆弱性報告 → SECURITY.md)。フォームは報告者に
+   `cost:*` / `benefit:*` を付けさせない (メンテナが起票後に付与する、
+   CLAUDE.md のラベリングポリシー)。issue フォームは `labels` で
+   `bug` / `enhancement` だけを自動付与する。
+5. README の Windows 節が古かった (zip・`.sha256` 付きと記載していたが、
+   実際はインストーラのみで Windows には `.sha256` が付かない) ので、workflow
+   に合わせて直した。
+
+### 見送ったもの
+
+- Windows インストーラの `.sha256` を workflow で生成する変更: 署名 (#42 /
+  #91) の導入で意味が変わるため、そちらと一緒に判断する。
+- リリース PR の自動作成・バージョン更新の自動化: リリース頻度が低い間は
+  手順書で足りる。
+- 新しい workflow は追加していない (公開リポジトリでは
+  `issue_comment` 等の権限付き workflow に投稿者ゲートが必要、CLAUDE.md)。
+
+**Revisit condition**: (1) 署名が有効になったら releasing.md の「手作業・
+未対応」と user-guide.md の署名・検証の記述を更新する。(2) リリースが
+頻繁になったら、ラベル未付与 PR の検知や `release.yml` の除外設定を足す。
+(3) #88 でチャンネルが決まったら、タグ規則とリリースノートの分け方を
+見直す。
