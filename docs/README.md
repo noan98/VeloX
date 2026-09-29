@@ -28,6 +28,8 @@ Phase 3 (Epic #57) の成果物です。**計測結果は OS ごとに分けて�
 | 文書 | 内容 |
 | --- | --- |
 | [windows-code-signing.md](windows-code-signing.md) | コード署名と配布信頼性の調査結果、および現状の実装 |
+| [releasing.md](releasing.md) | タグから GitHub Release を作る手順、リリースノートの生成、手作業・未対応の項目 |
+| [user-guide.md](user-guide.md) | 利用者向け: インストール・更新・アンインストール・トラブルシューティング・問い合わせ窓口 |
 
 ## この索引以外の入り口
 
