@@ -19014,6 +19014,86 @@ URL による絞り込みは無い。**読みの結論は「Windows でも shim 
 `file://` に戻してよい」も同時に満たされる。(2) Windows 実機で決定4 の
 二重配送が見えたら、Windows 側だけ `file:` の判定を外す。
 
+## D159: 拡張機能の信頼境界・権限モデル・マニフェストスキーマ (#82) — 拡張機能は悪意があるものとして設計し、Chrome 互換は目指さない
+
+**対象**: Issue #82 (Epic #80 Stage 1)。受け入れ条件は 4 点 (trust
+boundary の定義 / 最小権限の権限設計 / manifest schema の定義 /
+悪意ある拡張機能を想定した設計判断の記録)。**設計のみで、拡張機能を読み込む
+コードは無い。** 全文は `docs/extensions.md`、スキーマの機械可読版は
+`src/browser/extension_manifest.rs` (純粋ロジック・単体テスト付き・
+**アプリには未配線**。#83 / #84 が使う土台)。
+
+### 決定
+
+1. **拡張機能は信頼境界の外側 (信頼しないコード)。** 既存の 2 つの境界
+   (toolbar webview / content webview、D18・D23・D78) は動かさず、拡張機能を
+   3 つ目として足す。拡張機能由来の入力は専用の IPC ハンドラで受け、
+   `ToolbarCommand` パーサにも D18 の固定センチネルのチャネルにも混ぜない
+   (D18 の「2 つ目のコンテンツ由来アクションには専用チャネルを」の踏襲)。
+2. **呼び出し元の拡張機能 ID は Rust が経路から決める** (拡張機能ごとの
+   background webview の IPC ハンドラのクロージャが束縛)。メッセージ内の
+   自己申告 ID は存在させない。権限検査は `browser::` の純粋関数で、
+   メインスレッドの `UserEvent` 上で使用時に行う。
+3. **wry 0.57 の実ソースで確認した事実に設計を合わせた**:
+   分離ワールドは 3 エンジンとも無い (初期化スクリプトは常に main world。
+   `WKContentWorld` は iOS の未使用バインディングにしか無い)。
+   Windows は初期化スクリプトが常にサブフレームにも入る。Linux は IPC の
+   要求 URL が iframe でもトップフレームのものになる。このため
+   **content script は特権 API を持たず、そのメッセージはページが偽造できる
+   ものとして扱い、権限判断はタブの現在 URL (Rust 側) から導く。**
+   ホストパターンの一致は注入前に Rust が確認し、不一致ならスクリプトを
+   存在させない。
+4. **権限は default-deny・閉じた列挙 8 個** (`storage` / `alarms` / `tabs` /
+   `active_tab` / `scripting` / `context_menus` / `clipboard_write` /
+   `notifications`)。未知の権限名・未知のマニフェストキー・未知の
+   `manifest_version` は拒否。`cookies` / `web_request` / `history` /
+   `bookmarks` / `native_messaging` / `debugger` / `management` / `proxy` /
+   `downloads` は**意図的に提供せず**、単なる未知の名前と区別して拒否する。
+5. **ホストパターン**は `http` / `https` のみ (`file` / `data` / `velox` 等は
+   書けない)。ポート省略は既定ポートのみ。userinfo 付き URL は一致しない。
+   `*.com` 相当は不可。全ホスト対象は `allow_all_urls: true` の明示が必須
+   (`content_scripts.matches` と optional も対象)。`content_scripts.matches`
+   はホストアクセスとして数える。
+6. **ライフサイクル**: 更新で権限・ホストが承認済みを超えたら無効化して再承認、
+   ダウングレード拒否、パッケージは zip slip / 展開サイズを検査して原子的に
+   確定、uninstall は全データ削除、壊れた拡張機能は隔離して起動を止めない。
+   background は**イベントページのみ** (常駐しない)。プライベートウィンドウ
+   (D15) では既定で無効。
+7. **Chrome / Chrome Web Store 互換は目指さない** (Epic #80)。互換に必要な
+   分離ワールド・拡張機能専用プロセス・`webRequest` は wry では同じ安全性で
+   再現できず、既存拡張機能の多くが要求する広い権限は最小権限の原則と
+   衝突する。**WebView2 ネイティブの拡張機能サポート
+   (`with_browser_extensions_enabled`) は VeloX の権限モデルをバイパスする
+   ため使わない。**
+8. **`id` は `velox.` 接頭辞を予約**、`name` / `description` は制御・双方向制御・
+   ゼロ幅文字を拒否 (権限プロンプトでのなりすまし対策)。マニフェスト・
+   メッセージ・パッケージのすべてにサイズ/件数上限を持つ (上限値は
+   `extension_manifest.rs` の定数)。
+
+### 見送ったもの・既知の制約
+
+- 拡張機能ごとの WebView2 プロファイル / `WebContext` のコスト (メモリ・
+  起動時間) は未計測。#84 のプロトタイプで測って確定する。高すぎる場合は
+  「ID 束縛 IPC + 別 origin のみで分離」との比較を Decision にする。
+- Windows のカスタムプロトコル origin (`http://<scheme>.<path>`) が拡張機能ごとに
+  分離されるかは未検証。
+- サブフレームへの content script は Windows のみ先に対応し、macOS / Linux は
+  `all_frames: false` のみ (CLAUDE.md の OS 優先度。Linux の IPC がフレームを
+  区別できない制約による)。
+- `serde_json` は同一キーの重複を後勝ちで受理する。検証は解釈後の値に対して
+  のみ行う。パッケージの完全性 (署名/ハッシュ) と自動更新は配布経路を決める段階で
+  別 Decision。
+
+**Revisit condition**: (1) wry が分離ワールド (`WKContentWorld` /
+WebView2 の isolated world 相当) や IPC の送信フレーム特定を公開したら、
+content script の境界 (特に「特権を持たせない」「サブフレーム注入」) を
+強化する方向で見直す。(2) 権限を足す・意味を広げる提案が出たら、脅威モデルの
+更新を伴う新しい Decision として記録する (この Decision は書き換えない、
+decisions/README.md 規則 4)。(3) 拡張機能ごとのプロファイルのコストが
+性能目標 (Epic #57) を破るなら §7 の分離方式を見直す。(4) 拡張機能から
+`history` / `bookmarks` を読みたいという要望が出たら、一括読み取りではなく
+狭い個別 API として別途検討する。
+
 ## D157: リリース運用の整備 (#94) — 自動生成リリースノート + ラベル分類、CHANGELOG.md は置かない、Issue フォームで報告の導線を作る
 
 **対象**: Issue #94 (Release Automation / Documentation / Support)。
