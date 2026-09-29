@@ -848,6 +848,27 @@
     border-bottom: 1px solid var(--border);
   }
   .settings-readonly-row:last-child { border-bottom: none; }
+  .shortcut-row-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+  .shortcut-row-main button {
+    width: auto;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: 6px;
+    background: rgba(128, 128, 128, 0.15);
+    font-size: 11px;
+  }
+  .shortcut-row-main .shortcut-capturing { outline: 2px solid var(--accent, #4a90e2); }
+  .shortcut-warning {
+    flex: 0 0 100%;
+    font-size: 11px;
+    color: #d9534f;
+  }
+  .settings-readonly-row.shortcut-row { flex-wrap: wrap; }
   .settings-footer {
     flex: none;
     padding: 6px 12px;
@@ -1059,7 +1080,11 @@
       </div>
       <div class="settings-tab-panel" data-tab="shortcuts" hidden>
         <div class="settings-hint" style="margin-bottom: 8px;">
-          キーボードショートカット一覧です（このバージョンでは変更できません）。
+          「変更」を押してから新しいキーの組み合わせを押してください（Esc でキャンセル）。
+          変更は「保存」を押すと反映されます。
+        </div>
+        <div class="settings-actions-row">
+          <button id="settings-shortcuts-reset-all">すべて既定に戻す</button>
         </div>
         <div id="settings-shortcuts-rows"></div>
       </div>
@@ -1298,69 +1323,75 @@
      section for why. A new *toolbar-reachable* shortcut still needs a
      branch here plus a `ToolbarCommand` variant, in addition to a
      `SHORTCUT_TABLE` row if it should also work from the content webview. */
+  /* Issue #156 (D154): the key table is no longer hand-written here. Rust
+     pushes the *effective* chords (defaults + the user's overrides) with
+     every `veloxSetSettings` (`view.shortcuts[].chords`), and this trusted
+     listener dispatches on them. Only the action -> structured-command
+     mapping below stays in this file, because `ToolbarCommand` is a real
+     Rust enum (D77). Until the first `veloxSetSettings` arrives (the
+     `ready` handshake below) no toolbar shortcut fires. */
+  let shortcutBindings = [];
+  let shortcutCaptureId = null;
+  const TOOLBAR_SHORTCUT_COMMANDS = {
+    new_tab: { cmd: "new_tab" },
+    close_tab: { cmd: "close_active_tab" },
+    reopen_closed_tab: { cmd: "reopen_closed_tab" },
+    next_tab: { cmd: "next_tab" },
+    prev_tab: { cmd: "prev_tab" },
+    activate_last_tab: { cmd: "activate_last_tab" },
+    focus_address_bar: { cmd: "focus_address_bar" },
+    toggle_bookmark: { cmd: "toggle_bookmark" },
+    toggle_bookmark_bar: { cmd: "toggle_bookmark_bar" },
+    new_window: { cmd: "new_window" },
+    new_private_window: { cmd: "new_private_window" },
+    open_find_bar: { cmd: "open_find_bar" },
+    save_page: { cmd: "save_page" },
+    print: { cmd: "print" },
+    view_source: { cmd: "view_source" },
+  };
+  function toolbarShortcutMessage(id) {
+    if (Object.prototype.hasOwnProperty.call(TOOLBAR_SHORTCUT_COMMANDS, id)) {
+      return TOOLBAR_SHORTCUT_COMMANDS[id];
+    }
+    const match = /^activate_tab_([1-8])$/.exec(id);
+    if (match) {
+      return { cmd: "activate_tab_by_index", index: Number(match[1]) };
+    }
+    return null; /* e.g. open_devtools: delivered by the content webview only */
+  }
+  /* Same matching rules as the content webview's generated script
+     (`ui::window::content_scripts::shortcut_listener_script`). */
+  function chordMatchesEvent(chord, event) {
+    if (chord.primary && chord.alt) {
+      if (!event.metaKey) return false;
+    } else if (chord.primary !== (event.ctrlKey || event.metaKey)) {
+      return false;
+    }
+    if (chord.shift !== event.shiftKey || chord.alt !== event.altKey) return false;
+    const k = chord.key;
+    if (k === "tab") return event.key === "Tab";
+    if (k === "f12") return event.key === "F12";
+    if (k >= "1" && k <= "9") return event.code === "Digit" + k || event.key === k;
+    return (
+      (typeof event.key === "string" && event.key.toLowerCase() === k) ||
+      (chord.alt && event.code === "Key" + k.toUpperCase())
+    );
+  }
   window.addEventListener("keydown", (event) => {
-    const mod = event.ctrlKey || event.metaKey;
-    if (!mod) {
-      return;
+    if (shortcutCaptureId !== null) {
+      return; /* the Shortcuts tab is capturing a new chord */
     }
-    let message = null;
-    if (!event.altKey && !event.shiftKey) {
-      if (event.key === "t" || event.key === "T") {
-        message = { cmd: "new_tab" };
-      } else if (event.key === "w" || event.key === "W") {
-        message = { cmd: "close_active_tab" };
-      } else if (event.key === "Tab") {
-        message = { cmd: "next_tab" };
-      } else if (event.key === "9") {
-        message = { cmd: "activate_last_tab" };
-      } else if (event.key >= "1" && event.key <= "8") {
-        message = { cmd: "activate_tab_by_index", index: Number(event.key) };
-      } else if (event.key === "l" || event.key === "L") {
-        // Ctrl/Cmd+L (Issue #15): focus the address bar and select its
-        // contents. Harmless to send even when the address bar already has
-        // focus — veloxFocusAddressBar always re-selects.
-        message = { cmd: "focus_address_bar" };
-      } else if (event.key === "d" || event.key === "D") {
-        // Ctrl/Cmd+D (Issue #19): bookmark/unbookmark the current page.
-        message = { cmd: "toggle_bookmark" };
-      } else if (event.key === "n" || event.key === "N") {
-        // Ctrl/Cmd+N (Issue #29): open a new window.
-        message = { cmd: "new_window" };
-      } else if (event.key === "f" || event.key === "F") {
-        // Ctrl/Cmd+F (Issue #43): open the in-page find bar. See
-        // docs/decisions.md D69.
-        message = { cmd: "open_find_bar" };
-      } else if (event.key === "s" || event.key === "S") {
-        // Ctrl/Cmd+S (Issue #46): save the current page. See
-        // docs/decisions.md D76.
-        message = { cmd: "save_page" };
-      } else if (event.key === "p" || event.key === "P") {
-        // Ctrl/Cmd+P (Issue #40): print the active tab. See
-        // docs/decisions.md D75.
-        message = { cmd: "print" };
-      } else if (event.key === "u" || event.key === "U") {
-        // Ctrl/Cmd+U (Issue #45): view the active tab's page source. See
-        // docs/decisions.md D72.
-        message = { cmd: "view_source" };
-      }
-    } else if (event.shiftKey && !event.altKey) {
-      if (event.key === "t" || event.key === "T") {
-        message = { cmd: "reopen_closed_tab" };
-      } else if (event.key === "Tab") {
-        message = { cmd: "prev_tab" };
-      } else if (event.key === "b" || event.key === "B") {
-        // Ctrl/Cmd+Shift+B (Issue #19): show/hide the bookmark bar.
-        message = { cmd: "toggle_bookmark_bar" };
-      } else if (event.key === "n" || event.key === "N") {
-        // Ctrl/Cmd+Shift+N (Issue #27): open a new private window.
-        message = { cmd: "new_private_window" };
+    for (const binding of shortcutBindings) {
+      const message = toolbarShortcutMessage(binding.id);
+      if (message === null) continue;
+      for (const chord of binding.chords) {
+        if (chordMatchesEvent(chord, event)) {
+          event.preventDefault();
+          send(message);
+          return;
+        }
       }
     }
-    if (message === null) {
-      return;
-    }
-    event.preventDefault();
-    send(message);
   }, true);
 
   /* Called from Rust via evaluate_script. Keep the user's in-progress edit. */
@@ -2184,6 +2215,7 @@
       downloads: {
         download_dir_override: optionalText("set-download-dir-override"),
       },
+      shortcut_overrides: shortcutOverridesForSave(),
       advanced: {
         perf_metrics_enabled: document.getElementById("set-perf-metrics-enabled").checked,
         perf_format: document.getElementById("set-perf-format").value,
@@ -2228,23 +2260,167 @@
       settings.advanced.extra_blocklist_path ?? "";
   }
 
-  /* Shortcuts tab: a static, read-only reference table
-     (`browser::settings::shortcut_reference`) — not user-remappable in this
-     issue, see docs/decisions.md D67. */
-  function renderShortcuts(shortcuts) {
+  /* Shortcuts tab (Issue #156, D154): editable. `shortcutView` is the last
+     `veloxSetSettings` payload; `shortcutDraft` maps action id -> staged
+     override chord (initialised from the saved `shortcut_overrides`, sent
+     back with the rest of the form on "保存"). Conflicts are checked here
+     for immediate feedback and again, authoritatively, by
+     `browser::shortcuts::ShortcutOverrides::sanitize` on the Rust side. */
+  let shortcutView = null;
+  let shortcutDraft = new Map();
+  const shortcutWarnings = new Map();
+  function isMacPlatform() {
+    return shortcutView !== null && shortcutView.platform === "macos";
+  }
+  function chordLabel(chord) {
+    const mac = isMacPlatform();
+    const parts = [];
+    if (chord.primary) parts.push(mac ? "Cmd" : "Ctrl");
+    if (chord.alt) parts.push(mac ? "Option" : "Alt");
+    if (chord.shift) parts.push("Shift");
+    const key = chord.key === "tab" ? "Tab" : chord.key === "f12" ? "F12" : chord.key.toUpperCase();
+    parts.push(key);
+    return parts.join("+");
+  }
+  function chordsEqual(a, b) {
+    return a.key === b.key && a.primary === b.primary && a.shift === b.shift && a.alt === b.alt;
+  }
+  function currentChords(info) {
+    return shortcutDraft.has(info.id) ? [shortcutDraft.get(info.id)] : info.default_chords;
+  }
+  function conflictingActions(id, chord) {
+    return shortcutView.shortcuts.filter(
+      (other) => other.id !== id && currentChords(other).some((c) => chordsEqual(c, chord)),
+    );
+  }
+  /* Turn a keydown into a chord, or a reason it cannot be one. */
+  function chordFromEvent(event) {
+    const primary = event.ctrlKey || event.metaKey;
+    let key = null;
+    if (event.key === "Tab") key = "tab";
+    else if (event.key === "F12") key = "f12";
+    else if (/^Digit[1-9]$/.test(event.code)) key = event.code.slice(5);
+    else if (typeof event.key === "string" && /^[a-zA-Z]$/.test(event.key)) key = event.key.toLowerCase();
+    else if (event.altKey && /^Key[A-Z]$/.test(event.code)) key = event.code.slice(3).toLowerCase();
+    if (key === null) return { error: "このキーは割り当てできません" };
+    const chord = { key, primary, shift: event.shiftKey, alt: event.altKey };
+    if (chord.primary && chord.alt && !event.metaKey) {
+      return { error: "Ctrl+Alt は AltGr と区別できないため使えません" };
+    }
+    if (!chord.primary && key !== "f12") {
+      return { error: (isMacPlatform() ? "Cmd" : "Ctrl") + " を組み合わせてください" };
+    }
+    if (shortcutView.reserved_shortcuts.some((reserved) => chordsEqual(reserved, chord))) {
+      return { error: chordLabel(chord) + " は予約されているため使えません" };
+    }
+    return { chord };
+  }
+  function stopShortcutCapture() {
+    shortcutCaptureId = null;
+    window.removeEventListener("keydown", onShortcutCaptureKey, true);
+  }
+  function onShortcutCaptureKey(event) {
+    if (shortcutCaptureId === null) return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    if (["Control", "Shift", "Alt", "Meta"].includes(event.key)) return; /* keep waiting */
+    const id = shortcutCaptureId;
+    stopShortcutCapture();
+    shortcutWarnings.delete(id);
+    if (event.key === "Escape") {
+      renderShortcuts();
+      return;
+    }
+    const result = chordFromEvent(event);
+    if (result.error) {
+      shortcutWarnings.set(id, result.error);
+    } else {
+      const own = shortcutView.shortcuts.find((info) => info.id === id);
+      const conflicts = conflictingActions(id, result.chord);
+      if (conflicts.length > 0) {
+        shortcutWarnings.set(
+          id,
+          chordLabel(result.chord) + " は「" + conflicts.map((c) => c.action).join("」「") +
+            "」と衝突しています。先にそちらを変更してください",
+        );
+      } else if (own.default_chords.length === 1 && chordsEqual(own.default_chords[0], result.chord)) {
+        shortcutDraft.delete(id); /* back to the default */
+      } else {
+        shortcutDraft.set(id, result.chord);
+      }
+    }
+    renderShortcuts();
+  }
+  function startShortcutCapture(id) {
+    stopShortcutCapture();
+    shortcutCaptureId = id;
+    shortcutWarnings.delete(id);
+    window.addEventListener("keydown", onShortcutCaptureKey, true);
+    renderShortcuts();
+  }
+  function renderShortcuts() {
     settingsShortcutsRowsEl.replaceChildren();
-    for (const shortcut of shortcuts) {
+    if (shortcutView === null) return;
+    for (const info of shortcutView.shortcuts) {
       const row = document.createElement("div");
-      row.className = "settings-readonly-row";
+      row.className = "settings-readonly-row shortcut-row";
       const action = document.createElement("span");
-      action.textContent = shortcut.action;
+      action.textContent = info.action;
+      const main = document.createElement("span");
+      main.className = "shortcut-row-main";
       const keys = document.createElement("span");
       keys.className = "panel-row-meta";
-      keys.textContent = shortcut.keys;
-      row.append(action, keys);
+      const capturing = shortcutCaptureId === info.id;
+      const overridden = shortcutDraft.has(info.id);
+      keys.textContent = capturing
+        ? "キーを押してください…"
+        : currentChords(info).map(chordLabel).join(" / ") + (overridden ? " *" : "");
+      const change = document.createElement("button");
+      change.textContent = capturing ? "キャンセル" : "変更";
+      change.addEventListener("click", () => {
+        if (capturing) {
+          stopShortcutCapture();
+          renderShortcuts();
+        } else {
+          startShortcutCapture(info.id);
+        }
+      });
+      if (capturing) change.classList.add("shortcut-capturing");
+      main.append(keys, change);
+      if (overridden) {
+        const reset = document.createElement("button");
+        reset.textContent = "既定に戻す";
+        reset.title = "既定: " + info.default_chords.map(chordLabel).join(" / ");
+        reset.addEventListener("click", () => {
+          shortcutDraft.delete(info.id);
+          shortcutWarnings.delete(info.id);
+          renderShortcuts();
+        });
+        main.appendChild(reset);
+      }
+      row.append(action, main);
+      const warning = shortcutWarnings.get(info.id);
+      if (warning) {
+        const warn = document.createElement("div");
+        warn.className = "shortcut-warning";
+        warn.setAttribute("role", "alert");
+        warn.textContent = warning;
+        row.appendChild(warn);
+      }
       settingsShortcutsRowsEl.appendChild(row);
     }
   }
+  function shortcutOverridesForSave() {
+    const out = {};
+    for (const [id, chord] of shortcutDraft) out[id] = chord;
+    return out;
+  }
+  document.getElementById("settings-shortcuts-reset-all").addEventListener("click", () => {
+    stopShortcutCapture();
+    shortcutDraft = new Map();
+    shortcutWarnings.clear();
+    renderShortcuts();
+  });
 
   /* Security tab: a read-only view of `browser::site_permissions::
      SitePermissionStore` (Issue #24, D60) — this issue does not add a way
@@ -2302,7 +2478,12 @@
      persisted (post-`sanitize`), never just what was typed. */
   window.veloxSetSettings = (view) => {
     populateSettingsForm(view.settings);
-    renderShortcuts(view.shortcuts);
+    stopShortcutCapture();
+    shortcutView = view;
+    shortcutBindings = view.shortcuts;
+    shortcutDraft = new Map(Object.entries(view.settings.shortcut_overrides || {}));
+    shortcutWarnings.clear();
+    renderShortcuts();
     renderSitePermissions(view.site_permissions);
   };
 
