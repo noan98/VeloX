@@ -131,3 +131,6 @@ jobs:
             dist/${{ steps.package.outputs.name }}.tar.gz
             dist/${{ steps.package.outputs.name }}.tar.gz.sha256
           generate_release_notes: true
+          # `-` を含むタグ (例: v0.2.0-beta.1) は pre-release として公開する
+          # (docs/release-channels.md / D161)。安定版タグ (v0.2.0) は従来どおり。
+          prerelease: ${{ contains(github.ref_name, '-') }}
