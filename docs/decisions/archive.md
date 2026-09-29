@@ -19455,3 +19455,111 @@ Storage)。D159 (`docs/extensions.md`) の設計と `extension_manifest.rs` を
 定義し直す (Nightly の Release 化も検討)。(2) #92 が入ったら §6.3 の「追加のみ」
 規律を緩める。(3) 個人メンテナ以外が Stable を切るようになったら、昇格判定の
 自動チェックリスト化を検討する。
+
+## D154: キーボードショートカットの再割り当て (Issue #156) — 上書き表だけを永続化し、生成される JS も toolbar の keydown も「有効表」から作る
+
+**対象**: `browser::shortcuts` (`ShortcutOverrides` / `KeyChord` の serde /
+`reserved_chords`)、`browser::settings::Settings::shortcut_overrides`、
+`ui::window::content_scripts` (`tab_shortcut_script` /
+`devtools_shortcut_script`)、`ui/toolbar.html` の Shortcuts タブと keydown
+リスナー。D67 / D77 で「見送った」とした UI での再割り当てを実装する。
+
+### 決定 1: 永続化するのは「既定との差分」だけ
+
+`settings.json` の `shortcut_overrides` は
+`{"new_tab": {"key":"k","primary":true,"shift":false,"alt":false}}` の形で、
+既定 (`SHORTCUT_TABLE`) と異なる行だけを持つ。既定値を書き出さないので、
+将来 `SHORTCUT_TABLE` の既定を変えても、触っていないユーザには追従する。
+フィールドは `#[serde(default)]` なので、これ以前の `settings.json` はそのまま
+読める (スキーマ版数は上げない — D67 の「加法的な追加はマイグレーション不要」)。
+
+キーは `ShortcutId::config_key()` (`activate_tab_3` のような平坦な文字列)。
+派生 serde 形式は `{"activate_tab_at":3}` で JSON オブジェクトのキーに
+できないため別に用意した。
+
+### 決定 2: 読み込みは寛容、`sanitize` が権威
+
+- 未知の id・壊れた chord は **その 1 件だけ**捨てる (`ShortcutOverrides` の
+  `Deserialize` は値を一度 `serde_json::Value` で受ける)。1 件の不正で
+  設定ファイル全体が読めなくなり既定に戻る、という D62 が避けたい事態を
+  作らない。
+- `sanitize`: 既定と同じ・割り当て不可 (`KeyChord::is_assignable`)・衝突している
+  上書きを落とす。衝突は「衝突に関与した上書きをすべて落として再計算」を
+  収束するまで繰り返す (上書きは減る一方で、既定同士は衝突しない — テストで
+  固定) ので必ず止まる。A と B のキーの入れ替えは、最終状態に衝突がないので
+  そのまま通る。
+- 割り当て不可: 修飾キーなしは F12 のみ (ページの入力を奪うため)、数字は
+  1〜9、コピー/貼り付け/切り取り/全選択/元に戻す/やり直し
+  (`reserved_chords`) は予約。予約表は Rust に 1 か所だけ持ち、UI へは
+  `SettingsView.reserved_shortcuts` として渡す (JS 側に複製しない)。
+- 上書きは行の全 chord を置き換える。`OpenDevtools` の既定は 2 つ
+  (F12 / Cmd+Opt+I) だが、上書きすると 1 つになる。「既定に戻す」で両方戻る。
+
+### 決定 3: content webview の信頼境界 (D18/D23/D78) は変えない
+
+- 注入 JS は Rust が「有効表」から生成する。ページ由来のデータは一切読まない。
+  JS が postMessage できるのは `ShortcutId::sentinel()` の閉じた集合だけで、
+  再割り当てが変えるのは「どのキーがどの固定文字列を送るか」のみ。
+  `parse_sentinel` / `parse_content_shortcut` は無変更。構造化コマンドや
+  設定値を content 側から受け付ける経路は増やしていない。
+- 各スクリプトは `window.__veloxSetTabShortcuts` /
+  `__veloxSetDevtoolsShortcuts` (列挙不可) を公開し、2 回目の評価では表を
+  差し替えるだけでリスナーを重ねない。ページがこれを呼べても、変えられるのは
+  「どのキーが固定センチネルを送るか」だけで、ページは元々 `window.ipc` で
+  任意のセンチネルを直接送れる (D18) ので新しい攻撃面ではない。
+- 従来の手書きの `if` 分岐生成 (`tab_shortcut_branches`) は廃止し、JSON の表 +
+  共通のマッチ関数にした。マッチ規則は従来と同じ (primary は
+  `ctrlKey || metaKey`、Shift/Alt は完全一致) に、primary+Alt は
+  `metaKey` 必須 (Windows の AltGr = Ctrl+Alt を潰さない。従来の DevTools
+  スクリプトが Cmd 専用だったのと同じ理由) を明文化した。
+
+### 決定 4: 反映の経路 — 新規は焼き込み、既存タブは差し替え
+
+init スクリプトは webview 作成時に焼き込まれ、後から外せない。そこで:
+
+1. 「現在の有効表」をプロセス全体の `static` (`RwLock<Option<..>>`) に置く。
+   content webview はタブ作成・休止からの復帰など複数箇所で作られ、
+   ビルダーの引数を全部に通すより単純なため。書き込みはメインスレッドの
+   起動時と設定保存時のみ。ロックの汚染は `into_inner` で復旧する。
+2. 設定保存時、既に開いている全タブに `refresh_shortcut_scripts` で表を
+   差し替える (古いキーはここで効かなくなる)。
+3. 古い表が焼き込まれたままのタブはナビゲーションで初期化スクリプトが
+   再実行され古い表に戻るので、`LoadFinished` のたびに
+   `refresh_tab_shortcuts` で掛け直す。読み込み開始から完了までの間は
+   古い表のままで、これは既知の小さな隙間。
+
+### 決定 5: toolbar の keydown も有効表で動かす
+
+`ToolbarCommand` は実 enum のままなので「id → コマンド」の対応表は
+`toolbar.html` に残るが、キーの表は持たない。Rust が
+`veloxSetSettings` の `shortcuts[].chords` として有効 chord を送り、
+リスナーはそれで照合する。`ready` への応答が届くまでは toolbar 側の
+ショートカットは効かない (数 ms)。`open_devtools` は従来どおり content
+webview 専用 (toolbar の keydown には無い)。
+
+### 決定 6: Shortcuts タブの UI
+
+各行に「変更」(次の keydown を捕捉、Esc でキャンセル)・「既定に戻す」、
+上部に「すべて既定に戻す」。編集は下書きで、他のタブと同じく「保存」で
+`update_settings` に載って送られる。衝突は JS が即座に警告して**採用しない**
+(入れ替えは片方を先に空けてから)。JS の判定は即時フィードバック用で、
+権威は Rust の `sanitize`。修飾キーだけの押下は無視して待ち続ける。
+捕捉中はグローバルの keydown を止める。
+
+### 見送ったもの・既知の制約
+
+- 使えるキーは英字・数字 1〜9・Tab・F12 のみ (`Key` の既存の範囲)。
+  ファンクションキー全般・記号キー・矢印などは対象外。
+- 1 アクションに割り当てられる chord は 1 つ (DevTools の既定の 2 つ目を
+  残す手段はない)。
+- 手書きの `settings.json` で衝突する上書きを書くと、関与した上書きが
+  すべて既定に戻る (どれを残すかは決められないため)。
+- macOS / Linux は「動作する」ことを優先した最小実装 (CLAUDE.md の OS 優先度)。
+  Option キーで `event.key` が変わる件は `event.code` のフォールバックで
+  吸収したが、実機検証はしていない。Windows も実機の WebView2 では未検証で、
+  ユニットテストは生成 JS の表と Rust 側の検証まで。
+
+**Revisit condition**: `Key` に記号/ファンクションキーを足すとき
+(`is_assignable`・JS の捕捉・`Key::wire` を同時に更新)、または content
+webview の init スクリプトを後から差し替えられる API が wry に入ったとき
+(決定 4 の `LoadFinished` での掛け直しが不要になる)。

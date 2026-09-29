@@ -68,8 +68,9 @@ pub use settings::{
     SearchSettings, Settings, ShortcutInfo, Theme, SETTINGS_SCHEMA_VERSION,
 };
 pub use shortcuts::{
-    find_conflicts, parse_sentinel, Key, KeyChord, Modifiers, Platform, ShortcutConflict,
-    ShortcutDef, ShortcutId, SHORTCUT_TABLE,
+    find_conflicts, parse_sentinel, reserved_chords, AssignError, EffectiveShortcut, Key, KeyChord,
+    Modifiers, Platform, ShortcutConflict, ShortcutDef, ShortcutId, ShortcutOverrides,
+    SHORTCUT_TABLE,
 };
 pub use site_data::ClearOutcome;
 pub use site_permissions::{

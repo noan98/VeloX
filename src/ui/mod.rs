@@ -14,4 +14,6 @@ pub mod webview2_print;
 pub mod webview2_suspend;
 pub mod window;
 
-pub use window::{BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies};
+pub use window::{
+    set_shortcut_overrides, BrowserWindow, ContentShortcut, PdfExportRequest, SitePolicies,
+};

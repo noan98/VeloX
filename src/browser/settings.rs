@@ -3,15 +3,15 @@
 //! This is the data model behind the settings screen
 //! (`ui/toolbar.html`'s "設定" panel): General / Appearance / Search /
 //! Privacy / Performance / Downloads / Advanced fields the user can change
-//! from the UI and that survive a restart. Security and Shortcuts are
-//! deliberately **not** part of this persisted shape — the settings screen
-//! still shows a tab for each, but as a read-only view over data that
-//! already exists elsewhere ([`shortcut_reference`], generated from
-//! `browser::shortcuts::SHORTCUT_TABLE` — Issue #38, D77 — and
-//! `browser::site_permissions::SitePermissionStore`, already loaded by
-//! `app::AppState`) rather than a new preference. See docs/decisions.md D67
-//! for the full reasoning behind that split, and for which fields below
-//! take effect immediately vs. only after the next restart.
+//! from the UI and that survive a restart. Security is deliberately **not**
+//! part of this persisted shape — the settings screen shows a read-only view
+//! over `browser::site_permissions::SitePermissionStore`, already loaded by
+//! `app::AppState`. Shortcuts were display-only too (generated from
+//! `browser::shortcuts::SHORTCUT_TABLE`, Issue #38, D77) until Issue #156
+//! (D154) added [`Settings::shortcut_overrides`]: only the user's *overrides*
+//! are persisted, the defaults stay in the table. See docs/decisions.md D67
+//! for the reasoning behind the split, and for which fields below take
+//! effect immediately vs. only after the next restart.
 //!
 //! Shaped like [`crate::browser::session::SessionSnapshot`]: plain,
 //! serde-derived, UI/engine-independent data with a [`Settings::sanitize`]
@@ -91,6 +91,10 @@ pub struct Settings {
     pub downloads: DownloadsSettings,
     #[serde(default)]
     pub advanced: AdvancedSettings,
+    /// Per-action keyboard-shortcut overrides (Issue #156, docs/decisions.md
+    /// D154). Empty by default; absent from older `settings.json` files.
+    #[serde(default)]
+    pub shortcut_overrides: ShortcutOverrides,
 }
 
 fn default_schema_version() -> u32 {
@@ -108,6 +112,7 @@ impl Default for Settings {
             performance: PerformanceSettings::default(),
             downloads: DownloadsSettings::default(),
             advanced: AdvancedSettings::default(),
+            shortcut_overrides: ShortcutOverrides::default(),
         }
     }
 }
@@ -133,6 +138,7 @@ impl Settings {
         self.performance.sanitize();
         self.downloads.sanitize();
         self.advanced.sanitize();
+        self.shortcut_overrides.sanitize();
         self
     }
 }
@@ -562,101 +568,80 @@ fn sanitize_optional_path(raw: &Option<String>) -> Option<String> {
         .map(str::to_owned)
 }
 
-// --- Shortcuts tab: a reference table generated from `browser::shortcuts`,
-//     not a persisted setting ---
+// --- Shortcuts tab: rows generated from `browser::shortcuts` (defaults) merged
+//     with the persisted `Settings::shortcut_overrides` (Issue #156, D154) ---
 //
-// Every binding here is defined once in `browser::shortcuts::SHORTCUT_TABLE`
-// (Issue #38, see docs/decisions.md D77) and is not user-remappable by this
-// issue; the settings screen only displays it for discoverability. See
-// docs/decisions.md D67 for why remapping the *toolbar*/*content-webview*
-// behavior itself is out of scope for the settings screen, and D77 for why
-// full UI remapping is out of scope for #38 too.
+// Every default binding is defined once in `browser::shortcuts::SHORTCUT_TABLE`
+// (Issue #38, D77). Remapping used to be out of scope (D67/D77) and is what
+// Issue #156 (D154) adds: the override table is merged in by
+// `ShortcutOverrides::effective`, and the content webview / toolbar key
+// handling is driven by the same effective table.
 
-use super::shortcuts::{Platform, ShortcutDef, ShortcutId, SHORTCUT_TABLE};
+use super::shortcuts::{KeyChord, Platform, ShortcutOverrides, SHORTCUT_TABLE};
 
-/// One row of the Shortcuts tab's reference table. Owned `String`s (not
-/// `&'static str`, unlike most other static-ish data in this module) because
-/// [`shortcut_reference`] renders each key label for [`Platform::current`]
-/// at call time — the whole point of D77's `KeyChord::label`.
+/// One row of the Shortcuts tab (Issue #156: now editable). Owned `String`s
+/// (not `&'static str`) because the key labels are rendered for
+/// [`Platform::current`] at call time — the whole point of D77's
+/// `KeyChord::label`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ShortcutInfo {
+    /// [`ShortcutId::config_key`](super::shortcuts::ShortcutId::config_key):
+    /// the key of this action in `shortcut_overrides` and the id the toolbar
+    /// dispatches on.
+    pub id: String,
     pub action: String,
+    /// Effective chord label(s) for this platform (`" / "`-joined).
     pub keys: String,
+    /// Effective chords, machine-readable — the toolbar's own `keydown`
+    /// listener (a trusted, structured-command channel, D22) matches
+    /// against these, and the editor uses them for live conflict warnings.
+    pub chords: Vec<KeyChord>,
+    /// Default chord label(s), so the UI can offer "reset to X".
+    pub default_keys: String,
+    /// Default chords, machine-readable, so the editor can check a candidate
+    /// against actions it is *not* currently overriding.
+    pub default_chords: Vec<KeyChord>,
+    pub overridden: bool,
 }
 
-/// [`SHORTCUT_TABLE`] から `id` の定義を引く。
-fn shortcut_def(id: ShortcutId) -> Option<&'static ShortcutDef> {
-    SHORTCUT_TABLE.iter().find(|def| def.id == id)
+fn join_labels(chords: &[KeyChord], platform: Platform) -> String {
+    chords
+        .iter()
+        .map(|chord| chord.label(platform))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
-/// Look up a single [`SHORTCUT_TABLE`] entry's chord label(s) for `platform`,
-/// joining more than one chord (only [`ShortcutId::OpenDevtools`] has more
-/// than one today) with `" / "`.
-fn chord_label(id: ShortcutId, platform: Platform) -> String {
-    shortcut_def(id)
-        .map(|def| {
-            def.chords
-                .iter()
-                .map(|chord| chord.label(platform))
-                .collect::<Vec<_>>()
-                .join(" / ")
-        })
-        .unwrap_or_default()
-}
-
-/// Every keyboard shortcut VeloX currently wires up, in the order the
-/// Shortcuts tab lists them, with each row's key label rendered for
-/// [`Platform::current`] (Issue #38's "macOS/Windows/Linuxで適切な
-/// modifierになる" acceptance criterion — `Ctrl` on Windows/Linux, `Cmd`
+/// Every keyboard shortcut VeloX wires up, in [`SHORTCUT_TABLE`] order, with
+/// each row's *effective* chord (defaults merged with `overrides`, Issue
+/// #156) rendered for [`Platform::current`] — `Ctrl` on Windows/Linux, `Cmd`
 /// on macOS; the underlying key handling still accepts either modifier on
-/// every platform, see docs/decisions.md D23).
+/// every platform, see docs/decisions.md D23.
 ///
-/// `ActivateTabAt(1..=8)` is rendered as one combined "1〜8番目のタブに
-/// 切り替え" row rather than eight separate ones, matching the pre-#38
-/// display; every other row is a 1:1 read of one
-/// `browser::shortcuts::SHORTCUT_TABLE` entry.
-pub fn shortcut_reference() -> Vec<ShortcutInfo> {
+/// Unlike the pre-#156 (formerly display-only) version, `ActivateTabAt(1..=8)` are no
+/// longer folded into one row: each position is remappable on its own.
+pub fn shortcut_reference(overrides: &ShortcutOverrides) -> Vec<ShortcutInfo> {
     let platform = Platform::current();
-    let activate_tab_prefix = shortcut_def(ShortcutId::ActivateTabAt(1))
-        .and_then(|def| def.chords.first())
-        .map(|chord| chord.modifiers.label(platform))
-        .unwrap_or_default();
-    let row = |action: &str, keys: String| ShortcutInfo {
-        action: action.to_owned(),
-        keys,
-    };
-    let chord = |id| chord_label(id, platform);
-
-    vec![
-        row("新しいタブ", chord(ShortcutId::NewTab)),
-        row("タブを閉じる", chord(ShortcutId::CloseTab)),
-        row("閉じたタブを再度開く", chord(ShortcutId::ReopenClosedTab)),
-        row("次のタブ", chord(ShortcutId::NextTab)),
-        row("前のタブ", chord(ShortcutId::PrevTab)),
-        row(
-            "1〜8番目のタブに切り替え",
-            format!("{activate_tab_prefix}+1〜8"),
-        ),
-        row("最後のタブに切り替え", chord(ShortcutId::ActivateLastTab)),
-        row(
-            "アドレスバーにフォーカス",
-            chord(ShortcutId::FocusAddressBar),
-        ),
-        row("ブックマークの追加/削除", chord(ShortcutId::ToggleBookmark)),
-        row(
-            "ブックマークバーの表示切替",
-            chord(ShortcutId::ToggleBookmarkBar),
-        ),
-        row("新しいウィンドウ", chord(ShortcutId::NewWindow)),
-        row("ページ内検索を開く", chord(ShortcutId::OpenFindBar)),
-        row("DevTools を開く", chord(ShortcutId::OpenDevtools)),
-        row("ページのソースを表示", chord(ShortcutId::ViewSource)),
-    ]
+    overrides
+        .effective()
+        .into_iter()
+        .zip(SHORTCUT_TABLE)
+        .map(|(effective, def)| ShortcutInfo {
+            id: effective.id.config_key(),
+            action: effective.label.to_owned(),
+            keys: join_labels(&effective.chords, platform),
+            chords: effective.chords,
+            default_keys: join_labels(def.chords, platform),
+            default_chords: def.chords.to_vec(),
+            overridden: effective.overridden,
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::shortcuts::{Key, Modifiers, ShortcutId};
 
     // --- Settings::default / round-trip ---
 
@@ -930,7 +915,7 @@ mod tests {
 
     #[test]
     fn shortcut_reference_is_non_empty_with_no_blank_entries() {
-        let shortcuts = shortcut_reference();
+        let shortcuts = shortcut_reference(&ShortcutOverrides::default());
         assert!(!shortcuts.is_empty());
         for shortcut in &shortcuts {
             assert!(!shortcut.action.trim().is_empty());
@@ -940,7 +925,7 @@ mod tests {
 
     #[test]
     fn shortcut_reference_actions_are_unique() {
-        let shortcuts = shortcut_reference();
+        let shortcuts = shortcut_reference(&ShortcutOverrides::default());
         let mut actions: Vec<&str> = shortcuts.iter().map(|s| s.action.as_str()).collect();
         let before = actions.len();
         actions.sort_unstable();
@@ -959,7 +944,7 @@ mod tests {
 
     #[test]
     fn shortcut_reference_includes_shortcuts_added_after_d67() {
-        let shortcuts = shortcut_reference();
+        let shortcuts = shortcut_reference(&ShortcutOverrides::default());
         assert!(shortcuts
             .iter()
             .any(|s| s.action == "新しいウィンドウ" && !s.keys.is_empty()));
@@ -970,7 +955,7 @@ mod tests {
 
     #[test]
     fn shortcut_reference_key_labels_use_this_platform_s_primary_modifier() {
-        let shortcuts = shortcut_reference();
+        let shortcuts = shortcut_reference(&ShortcutOverrides::default());
         let new_tab = shortcuts
             .iter()
             .find(|s| s.action == "新しいタブ")
@@ -985,6 +970,70 @@ mod tests {
             "{}",
             new_tab.keys
         );
+    }
+
+    // --- Issue #156 (D154): shortcut overrides in Settings ---
+
+    fn ctrl(c: char) -> KeyChord {
+        KeyChord::new(Key::Char(c), Modifiers::PRIMARY)
+    }
+
+    #[test]
+    fn default_settings_have_no_shortcut_overrides() {
+        assert!(Settings::default().shortcut_overrides.is_empty());
+    }
+
+    #[test]
+    fn settings_without_shortcut_overrides_field_still_load() {
+        // A settings.json written before Issue #156.
+        let settings: Settings = serde_json::from_str(r#"{"general":{"homepage":"about:blank"}}"#)
+            .expect("older settings.json must still parse");
+        assert!(settings.shortcut_overrides.is_empty());
+    }
+
+    #[test]
+    fn shortcut_overrides_round_trip_through_settings_json() {
+        let mut settings = Settings::default();
+        settings
+            .shortcut_overrides
+            .insert(ShortcutId::NewTab, ctrl('k'));
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""shortcut_overrides":{"new_tab":"#));
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn settings_sanitize_repairs_bad_shortcut_overrides() {
+        let json = r#"{"shortcut_overrides":{
+            "new_tab":{"key":"w","primary":true},
+            "bogus":{"key":"j","primary":true},
+            "print":{"key":"k","primary":true}
+        }}"#;
+        let settings: Settings = serde_json::from_str(json).unwrap();
+        let settings = settings.sanitize();
+        // new_tab -> Ctrl+W collides with close_tab's default, so it is
+        // dropped; the unknown id was dropped on load; print survives.
+        assert_eq!(settings.shortcut_overrides.len(), 1);
+        assert_eq!(
+            settings.shortcut_overrides.get(ShortcutId::Print),
+            Some(ctrl('k'))
+        );
+    }
+
+    #[test]
+    fn shortcut_reference_reflects_overrides() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides.insert(ShortcutId::NewTab, ctrl('k'));
+        let rows = shortcut_reference(&overrides);
+        let row = rows.iter().find(|r| r.id == "new_tab").unwrap();
+        assert!(row.overridden);
+        assert!(row.keys.ends_with("+K"), "{}", row.keys);
+        assert!(row.default_keys.ends_with("+T"), "{}", row.default_keys);
+        assert_eq!(row.chords, vec![ctrl('k')]);
+        let other = rows.iter().find(|r| r.id == "close_tab").unwrap();
+        assert!(!other.overridden);
+        assert_eq!(rows.len(), SHORTCUT_TABLE.len());
     }
 
     // --- Theme ---
