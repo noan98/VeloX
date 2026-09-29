@@ -10,6 +10,7 @@ Older releases may not receive security fixes.
 Please do **not** open a public GitHub issue for a suspected security vulnerability.
 
 Use the repository's **Security** tab and submit a private vulnerability report when available.
+The issue chooser links there too (`.github/ISSUE_TEMPLATE/config.yml`); the public issue forms are for bugs and feature requests only.
 If private vulnerability reporting is not enabled, contact the repository owner through GitHub before disclosing the issue publicly.
 
 When reporting, include:

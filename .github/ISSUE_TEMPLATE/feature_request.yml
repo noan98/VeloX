@@ -1,0 +1,38 @@
+name: 機能要望
+description: 新機能や改善の提案をします
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提案の前に、[README の機能一覧とロードマップ](https://github.com/noan98/VeloX/blob/main/README.md) と既存の Issue に同じ提案がないか確認してください。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 解決したい課題
+      description: 何に困っているか、どんな場面か。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提案内容
+      description: 望ましい動作。代替案があれば併記してください。
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 対象 OS
+      description: 開発リソースは Windows に集中しています。OS ごとの優先度は CLAUDE.md を参照してください。
+      multiple: true
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+  - type: markdown
+    attributes:
+      value: |
+        メンテナ向けメモ: 起票後、CLAUDE.md の Issue ラベリングポリシーに従い `cost:low|medium|high` と `benefit:1`〜`benefit:5` を付与します (報告者は付けなくて構いません)。
