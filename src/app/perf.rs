@@ -229,6 +229,9 @@ pub(super) fn record_perf_event(
         | UserEvent::TabFreezeFinished { .. }
         // Same for Issue #45's View Source: no performance budget calls for
         // it either.
+        // Issue #89's WebView process failure is a recovery path, not a
+        // perf-tracked operation.
+        | UserEvent::ContentProcessFailed { .. }
         | UserEvent::ViewSourceReady { .. }
         // Issue #39's context menu is not a perf-tracked operation either.
         | UserEvent::ContextMenuRequested { .. }

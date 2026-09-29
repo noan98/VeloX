@@ -754,6 +754,8 @@ impl BrowserWindow {
             content_blocking_enabled,
             proxy.clone(),
         );
+        #[cfg(windows)]
+        crate::ui::webview2_crash::attach(&content, id, initial_tab, proxy.clone());
 
         let mut contents = HashMap::new();
         contents.insert(
@@ -923,6 +925,8 @@ impl BrowserWindow {
             self.content_blocking_enabled,
             self.proxy.clone(),
         );
+        #[cfg(windows)]
+        crate::ui::webview2_crash::attach(&webview, self.id, id, self.proxy.clone());
         if std::env::var_os("VELOX_DEBUG").is_some() {
             // Which `WebKitWebProcess` group this tab landed in (D54) —
             // the one piece of placement state nothing else surfaces, and
@@ -1253,6 +1257,14 @@ impl BrowserWindow {
     /// Reload the active tab's current page.
     pub fn reload(&self) -> wry::Result<()> {
         self.with_active_webview(WebView::reload)
+    }
+
+    /// Reload tab `id`'s page, whether or not it is the active tab (Issue
+    /// #89, D156: recovering a background tab whose renderer crashed and
+    /// that cannot be suspended, e.g. a pinned one). A no-op for an unknown
+    /// or suspended tab (no live webview).
+    pub fn reload_tab(&self, id: TabId) -> wry::Result<()> {
+        self.tab_webview(id).map_or(Ok(()), WebView::reload)
     }
 
     /// Clear all site data (cookies, cache, local/session storage,
