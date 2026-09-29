@@ -64,6 +64,17 @@ impl Platform {
         }
     }
 
+    /// Stable lower-case name (`"windows"`, `"macos"`, `"linux"`), for the
+    /// Shortcuts tab's own JS to build key labels the way [`KeyChord::label`]
+    /// does.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Platform::Windows => "windows",
+            Platform::MacOs => "macos",
+            Platform::Linux => "linux",
+        }
+    }
+
     /// Label for [`Modifiers::primary`] on this platform: "Cmd" on macOS,
     /// "Ctrl" everywhere else. VeloX's actual key handling always accepts
     /// *both* Ctrl and Cmd on every platform (docs/decisions.md D23) — this
@@ -99,6 +110,37 @@ pub enum Key {
 }
 
 impl Key {
+    /// Stable wire form used in `settings.json` and toolbar IPC (Issue #156):
+    /// a lower-case letter, a digit `"1"`..=`"9"`, `"tab"`, or `"f12"`.
+    pub fn wire(self) -> String {
+        match self {
+            Key::Char(c) => c.to_ascii_lowercase().to_string(),
+            Key::Digit(d) => d.to_string(),
+            Key::Tab => "tab".to_owned(),
+            Key::F12 => "f12".to_owned(),
+        }
+    }
+
+    /// Inverse of [`Key::wire`], case-insensitive. `None` for anything that
+    /// is not one of the keys VeloX can bind (a letter, `1`..=`9`, Tab, F12).
+    pub fn from_wire(raw: &str) -> Option<Self> {
+        let lower = raw.to_ascii_lowercase();
+        match lower.as_str() {
+            "tab" => return Some(Key::Tab),
+            "f12" => return Some(Key::F12),
+            _ => {}
+        }
+        let mut chars = lower.chars();
+        let (Some(c), None) = (chars.next(), chars.next()) else {
+            return None;
+        };
+        match c {
+            'a'..='z' => Some(Key::Char(c)),
+            '1'..='9' => c.to_digit(10).map(|d| Key::Digit(d as u8)),
+            _ => None,
+        }
+    }
+
     fn label(self) -> String {
         match self {
             Key::Char(c) => c.to_ascii_uppercase().to_string(),
@@ -130,7 +172,10 @@ impl Key {
 /// either modifier on every platform regardless (docs/decisions.md D23), so
 /// this struct never branches behavior on `Platform`, only
 /// [`KeyChord::label`]'s wording does.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
+#[serde(default)]
 pub struct Modifiers {
     pub primary: bool,
     pub shift: bool,
@@ -178,15 +223,103 @@ impl Modifiers {
 }
 
 /// A key plus the modifiers held with it — one keyboard shortcut chord.
+///
+/// Serializes as `{"key":"t","primary":true,"shift":false,"alt":false}`
+/// (Issue #156) — the same shape `settings.json`, the toolbar IPC and the
+/// generated content-webview scripts all use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyChord {
     pub key: Key,
     pub modifiers: Modifiers,
 }
 
+impl serde::Serialize for Key {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.wire())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for Key {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = String::deserialize(deserializer)?;
+        Key::from_wire(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("unsupported key {raw:?}")))
+    }
+}
+
+impl serde::Serialize for KeyChord {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = serializer.serialize_struct("KeyChord", 4)?;
+        st.serialize_field("key", &self.key)?;
+        st.serialize_field("primary", &self.modifiers.primary)?;
+        st.serialize_field("shift", &self.modifiers.shift)?;
+        st.serialize_field("alt", &self.modifiers.alt)?;
+        st.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for KeyChord {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            key: Key,
+            #[serde(default)]
+            primary: bool,
+            #[serde(default)]
+            shift: bool,
+            #[serde(default)]
+            alt: bool,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(KeyChord::new(
+            raw.key,
+            Modifiers {
+                primary: raw.primary,
+                shift: raw.shift,
+                alt: raw.alt,
+            },
+        ))
+    }
+}
+
+/// The chords [`KeyChord::is_assignable`] refuses as reserved, so the editor
+/// can warn about them up front instead of duplicating the list in JS.
+pub fn reserved_chords() -> &'static [KeyChord] {
+    RESERVED_CHORDS
+}
+
+/// Chords a user may never assign: the platform's clipboard/undo/select-all
+/// editing shortcuts, which pages and text fields rely on (Issue #156).
+const RESERVED_CHORDS: &[KeyChord] = &[
+    KeyChord::new(Key::Char('c'), Modifiers::PRIMARY),
+    KeyChord::new(Key::Char('v'), Modifiers::PRIMARY),
+    KeyChord::new(Key::Char('x'), Modifiers::PRIMARY),
+    KeyChord::new(Key::Char('a'), Modifiers::PRIMARY),
+    KeyChord::new(Key::Char('z'), Modifiers::PRIMARY),
+    KeyChord::new(Key::Char('y'), Modifiers::PRIMARY),
+    KeyChord::new(Key::Char('z'), Modifiers::PRIMARY_SHIFT),
+];
+
 impl KeyChord {
     pub const fn new(key: Key, modifiers: Modifiers) -> Self {
         Self { key, modifiers }
+    }
+
+    /// Whether a *user* may bind this chord (Issue #156). A chord without the
+    /// primary modifier would swallow ordinary typing in every page, so only
+    /// F12 may stand alone; digits are limited to `1`..=`9` (what
+    /// [`Key::from_wire`] produces); and the editing shortcuts in
+    /// [`RESERVED_CHORDS`] are off limits. It only gates overrides — the
+    /// default table is not checked against it.
+    pub fn is_assignable(&self) -> bool {
+        let key_ok = match self.key {
+            Key::Char(c) => c.is_ascii_lowercase(),
+            Key::Digit(d) => (1..=9).contains(&d),
+            Key::Tab | Key::F12 => true,
+        };
+        let modifier_ok = self.modifiers.primary || self.key == Key::F12;
+        key_ok && modifier_ok && !RESERVED_CHORDS.contains(self)
     }
 
     /// Human-readable label for `platform`, e.g. `"Ctrl+T"`, `"Cmd+Shift+B"`.
@@ -239,6 +372,43 @@ pub enum ShortcutId {
 }
 
 impl ShortcutId {
+    /// Stable string key used for this action in `settings.json`'s
+    /// `shortcut_overrides` map and the toolbar IPC (Issue #156). Unlike
+    /// the derived serde form, this is a flat string for every variant
+    /// (`ActivateTabAt(3)` is `"activate_tab_3"`), so it works as a JSON
+    /// object key.
+    pub fn config_key(&self) -> String {
+        match self {
+            ShortcutId::NewTab => "new_tab".to_owned(),
+            ShortcutId::CloseTab => "close_tab".to_owned(),
+            ShortcutId::ReopenClosedTab => "reopen_closed_tab".to_owned(),
+            ShortcutId::NextTab => "next_tab".to_owned(),
+            ShortcutId::PrevTab => "prev_tab".to_owned(),
+            ShortcutId::ActivateTabAt(n) => format!("activate_tab_{n}"),
+            ShortcutId::ActivateLastTab => "activate_last_tab".to_owned(),
+            ShortcutId::FocusAddressBar => "focus_address_bar".to_owned(),
+            ShortcutId::ToggleBookmark => "toggle_bookmark".to_owned(),
+            ShortcutId::ToggleBookmarkBar => "toggle_bookmark_bar".to_owned(),
+            ShortcutId::NewWindow => "new_window".to_owned(),
+            ShortcutId::NewPrivateWindow => "new_private_window".to_owned(),
+            ShortcutId::OpenFindBar => "open_find_bar".to_owned(),
+            ShortcutId::Print => "print".to_owned(),
+            ShortcutId::SavePage => "save_page".to_owned(),
+            ShortcutId::ViewSource => "view_source".to_owned(),
+            ShortcutId::OpenDevtools => "open_devtools".to_owned(),
+        }
+    }
+
+    /// Inverse of [`ShortcutId::config_key`], resolved against
+    /// [`SHORTCUT_TABLE`] so only real, bindable actions parse (`None` for
+    /// unknown ids — they are dropped when loading settings).
+    pub fn from_config_key(key: &str) -> Option<Self> {
+        SHORTCUT_TABLE
+            .iter()
+            .map(|def| def.id)
+            .find(|id| id.config_key() == key)
+    }
+
     /// The fixed sentinel string the content-webview channel sends for this
     /// action (docs/decisions.md D18/D23) — the single place this format is
     /// defined; `ui::window::parse_content_shortcut` and
@@ -487,16 +657,22 @@ pub struct ShortcutConflict {
 /// or a hypothetical future user-customized table (once a remapping UI
 /// exists — see the module doc comment).
 pub fn find_conflicts(defs: &[ShortcutDef]) -> Vec<ShortcutConflict> {
+    conflicts_among(defs.iter().map(|def| (def.id, def.chords)))
+}
+
+fn conflicts_among<'a>(
+    bindings: impl Iterator<Item = (ShortcutId, &'a [KeyChord])>,
+) -> Vec<ShortcutConflict> {
     let mut by_chord: Vec<(KeyChord, Vec<ShortcutId>)> = Vec::new();
-    for def in defs {
-        for &chord in def.chords {
+    for (id, chords) in bindings {
+        for &chord in chords {
             match by_chord.iter_mut().find(|(c, _)| *c == chord) {
                 Some((_, actions)) => {
-                    if !actions.contains(&def.id) {
-                        actions.push(def.id);
+                    if !actions.contains(&id) {
+                        actions.push(id);
                     }
                 }
-                None => by_chord.push((chord, vec![def.id])),
+                None => by_chord.push((chord, vec![id])),
             }
         }
     }
@@ -505,6 +681,171 @@ pub fn find_conflicts(defs: &[ShortcutDef]) -> Vec<ShortcutConflict> {
         .filter(|(_, actions)| actions.len() > 1)
         .map(|(chord, actions)| ShortcutConflict { chord, actions })
         .collect()
+}
+
+/// One action's *effective* chords: its [`SHORTCUT_TABLE`] defaults, or the
+/// user's override (Issue #156).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EffectiveShortcut {
+    pub id: ShortcutId,
+    pub label: &'static str,
+    pub chords: Vec<KeyChord>,
+    pub overridden: bool,
+}
+
+/// Why [`ShortcutOverrides::try_assign`] refused a chord.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssignError {
+    /// Not a bindable chord (see [`KeyChord::is_assignable`]).
+    NotAssignable,
+    /// Already used by these other actions.
+    Conflict(Vec<ShortcutId>),
+}
+
+/// The user's per-action key overrides (Issue #156, docs/decisions.md D154),
+/// persisted in `settings.json` as
+/// `"shortcut_overrides": {"new_tab": {"key":"k","primary":true,...}}`.
+///
+/// Invariant after [`ShortcutOverrides::sanitize`]: every entry names a real
+/// [`SHORTCUT_TABLE`] action, differs from that action's default, is
+/// [assignable](KeyChord::is_assignable), and the resulting effective table
+/// has no conflicts. Loading is lenient: an unknown action id or a malformed
+/// chord drops just that entry rather than failing the whole settings file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShortcutOverrides(std::collections::HashMap<ShortcutId, KeyChord>);
+
+impl ShortcutOverrides {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn get(&self, id: ShortcutId) -> Option<KeyChord> {
+        self.0.get(&id).copied()
+    }
+
+    /// Set an override without validation (callers run [`Self::sanitize`],
+    /// or use [`Self::try_assign`]).
+    pub fn insert(&mut self, id: ShortcutId, chord: KeyChord) {
+        self.0.insert(id, chord);
+    }
+
+    pub fn remove(&mut self, id: ShortcutId) {
+        self.0.remove(&id);
+    }
+
+    /// Validated assignment: refuses non-assignable chords and any chord
+    /// another action already effectively uses.
+    pub fn try_assign(&mut self, id: ShortcutId, chord: KeyChord) -> Result<(), AssignError> {
+        if !chord.is_assignable() {
+            return Err(AssignError::NotAssignable);
+        }
+        let users: Vec<ShortcutId> = self
+            .effective()
+            .into_iter()
+            .filter(|e| e.id != id && e.chords.contains(&chord))
+            .map(|e| e.id)
+            .collect();
+        if !users.is_empty() {
+            return Err(AssignError::Conflict(users));
+        }
+        self.0.insert(id, chord);
+        Ok(())
+    }
+
+    /// Effective chords for every action, in [`SHORTCUT_TABLE`] order.
+    pub fn effective(&self) -> Vec<EffectiveShortcut> {
+        SHORTCUT_TABLE
+            .iter()
+            .map(|def| match self.0.get(&def.id) {
+                Some(&chord) => EffectiveShortcut {
+                    id: def.id,
+                    label: def.label,
+                    chords: vec![chord],
+                    overridden: true,
+                },
+                None => EffectiveShortcut {
+                    id: def.id,
+                    label: def.label,
+                    chords: def.chords.to_vec(),
+                    overridden: false,
+                },
+            })
+            .collect()
+    }
+
+    /// Conflicts in the effective table (empty after [`Self::sanitize`]).
+    pub fn conflicts(&self) -> Vec<ShortcutConflict> {
+        let effective = self.effective();
+        conflicts_among(effective.iter().map(|e| (e.id, e.chords.as_slice())))
+    }
+
+    /// Repair, never reject: drop overrides that equal the default or are
+    /// not assignable, then repeatedly drop every override involved in a
+    /// conflict until the effective table is conflict-free. Terminates
+    /// because the override set only shrinks and the defaults are
+    /// conflict-free (tested).
+    pub fn sanitize(&mut self) {
+        self.0.retain(|id, chord| {
+            chord.is_assignable()
+                && SHORTCUT_TABLE
+                    .iter()
+                    .any(|def| def.id == *id && def.chords != [*chord])
+        });
+        loop {
+            let conflicts = self.conflicts();
+            if conflicts.is_empty() {
+                return;
+            }
+            let before = self.0.len();
+            for conflict in conflicts {
+                for id in conflict.actions {
+                    self.0.remove(&id);
+                }
+            }
+            if self.0.len() == before {
+                // Only possible if the *defaults* conflict: nothing left to
+                // drop, so stop rather than spin.
+                return;
+            }
+        }
+    }
+}
+
+impl serde::Serialize for ShortcutOverrides {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        // SHORTCUT_TABLE order, so settings.json diffs are stable.
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for def in SHORTCUT_TABLE {
+            if let Some(chord) = self.0.get(&def.id) {
+                map.serialize_entry(&def.id.config_key(), chord)?;
+            }
+        }
+        map.end()
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ShortcutOverrides {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Entries are read as loose JSON values first so one bad entry
+        // cannot fail the whole settings document (Issue #35/D62).
+        let raw =
+            std::collections::BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+        let mut out = std::collections::HashMap::new();
+        for (key, value) in raw {
+            let Some(id) = ShortcutId::from_config_key(&key) else {
+                continue;
+            };
+            if let Ok(chord) = serde_json::from_value::<KeyChord>(value) {
+                out.insert(id, chord);
+            }
+        }
+        Ok(ShortcutOverrides(out))
+    }
 }
 
 #[cfg(test)]
@@ -773,5 +1114,192 @@ mod tests {
             let back: ShortcutId = serde_json::from_str(&json).unwrap();
             assert_eq!(back, def.id);
         }
+    }
+
+    // --- Overrides (Issue #156, D154) ---
+
+    fn chord(c: char) -> KeyChord {
+        KeyChord::new(Key::Char(c), Modifiers::PRIMARY)
+    }
+
+    #[test]
+    fn config_keys_are_unique_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for def in SHORTCUT_TABLE {
+            let key = def.id.config_key();
+            assert!(seen.insert(key.clone()), "duplicate config key {key}");
+            assert_eq!(ShortcutId::from_config_key(&key), Some(def.id));
+        }
+        assert_eq!(ShortcutId::from_config_key("activate_tab_9"), None);
+        assert_eq!(ShortcutId::from_config_key("quit"), None);
+    }
+
+    #[test]
+    fn key_wire_round_trips_and_rejects_unsupported_keys() {
+        for key in [Key::Char('k'), Key::Digit(7), Key::Tab, Key::F12] {
+            assert_eq!(Key::from_wire(&key.wire()), Some(key));
+        }
+        assert_eq!(Key::from_wire("K"), Some(Key::Char('k')));
+        for bad in ["", "0", "10", "ab", "f5", "!", "é", "enter"] {
+            assert_eq!(Key::from_wire(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn key_chord_serializes_as_a_flat_object() {
+        let json =
+            serde_json::to_string(&KeyChord::new(Key::Tab, Modifiers::PRIMARY_SHIFT)).unwrap();
+        assert_eq!(
+            json,
+            r#"{"key":"tab","primary":true,"shift":true,"alt":false}"#
+        );
+        let back: KeyChord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, KeyChord::new(Key::Tab, Modifiers::PRIMARY_SHIFT));
+        // Missing modifier flags default to false.
+        let f12: KeyChord = serde_json::from_str(r#"{"key":"F12"}"#).unwrap();
+        assert_eq!(f12, KeyChord::new(Key::F12, Modifiers::NONE));
+    }
+
+    #[test]
+    fn assignability_rules() {
+        assert!(chord('k').is_assignable());
+        assert!(KeyChord::new(Key::F12, Modifiers::NONE).is_assignable());
+        // A bare letter would swallow typing.
+        assert!(!KeyChord::new(Key::Char('k'), Modifiers::NONE).is_assignable());
+        assert!(!KeyChord::new(Key::Tab, Modifiers::NONE).is_assignable());
+        // Editing shortcuts are reserved.
+        assert!(!chord('c').is_assignable());
+        assert!(!chord('v').is_assignable());
+        assert!(!KeyChord::new(Key::Char('z'), Modifiers::PRIMARY_SHIFT).is_assignable());
+        assert!(!KeyChord::new(Key::Digit(0), Modifiers::PRIMARY).is_assignable());
+    }
+
+    #[test]
+    fn empty_overrides_reproduce_the_default_table() {
+        let effective = ShortcutOverrides::default().effective();
+        assert_eq!(effective.len(), SHORTCUT_TABLE.len());
+        for (e, def) in effective.iter().zip(SHORTCUT_TABLE) {
+            assert_eq!(e.id, def.id);
+            assert_eq!(e.chords, def.chords);
+            assert!(!e.overridden);
+        }
+        assert!(ShortcutOverrides::default().conflicts().is_empty());
+    }
+
+    #[test]
+    fn override_replaces_only_that_actions_chords() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides
+            .try_assign(ShortcutId::NewTab, chord('k'))
+            .unwrap();
+        let effective = overrides.effective();
+        let new_tab = effective
+            .iter()
+            .find(|e| e.id == ShortcutId::NewTab)
+            .unwrap();
+        assert_eq!(new_tab.chords, vec![chord('k')]);
+        assert!(new_tab.overridden);
+        let close = effective
+            .iter()
+            .find(|e| e.id == ShortcutId::CloseTab)
+            .unwrap();
+        assert!(!close.overridden);
+        // The old default (Ctrl+T) is free again.
+        assert!(overrides.try_assign(ShortcutId::Print, chord('t')).is_ok());
+    }
+
+    #[test]
+    fn overriding_devtools_replaces_both_default_chords() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides
+            .try_assign(ShortcutId::OpenDevtools, chord('k'))
+            .unwrap();
+        let effective = overrides.effective();
+        let dev = effective
+            .iter()
+            .find(|e| e.id == ShortcutId::OpenDevtools)
+            .unwrap();
+        assert_eq!(dev.chords, vec![chord('k')]);
+    }
+
+    #[test]
+    fn try_assign_reports_conflicts_and_leaves_state_untouched() {
+        let mut overrides = ShortcutOverrides::default();
+        // Ctrl+W belongs to CloseTab.
+        assert_eq!(
+            overrides.try_assign(ShortcutId::NewTab, chord('w')),
+            Err(AssignError::Conflict(vec![ShortcutId::CloseTab]))
+        );
+        assert!(overrides.is_empty());
+        assert_eq!(
+            overrides.try_assign(ShortcutId::NewTab, chord('c')),
+            Err(AssignError::NotAssignable)
+        );
+        // Re-assigning an action to its own chord is not a conflict.
+        assert!(overrides.try_assign(ShortcutId::NewTab, chord('t')).is_ok());
+    }
+
+    #[test]
+    fn sanitize_drops_defaults_unassignable_and_conflicting_overrides() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides.insert(ShortcutId::NewTab, chord('t')); // == default
+        overrides.insert(ShortcutId::CloseTab, chord('c')); // reserved
+        overrides.insert(ShortcutId::Print, chord('k'));
+        overrides.insert(ShortcutId::SavePage, chord('k')); // clashes with Print
+        overrides.insert(ShortcutId::ViewSource, chord('l')); // FocusAddressBar's default
+        overrides.insert(ShortcutId::NewWindow, chord('j')); // fine
+        overrides.sanitize();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides.get(ShortcutId::NewWindow), Some(chord('j')));
+        assert!(overrides.conflicts().is_empty());
+    }
+
+    #[test]
+    fn sanitize_keeps_a_valid_swap() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides.insert(ShortcutId::NewTab, chord('w'));
+        overrides.insert(ShortcutId::CloseTab, chord('t'));
+        overrides.sanitize();
+        assert_eq!(overrides.len(), 2);
+        assert!(overrides.conflicts().is_empty());
+    }
+
+    #[test]
+    fn sanitize_always_ends_conflict_free() {
+        // Every action pointed at one chord.
+        let mut overrides = ShortcutOverrides::default();
+        for def in SHORTCUT_TABLE {
+            overrides.insert(def.id, chord('k'));
+        }
+        overrides.sanitize();
+        assert!(overrides.conflicts().is_empty());
+    }
+
+    #[test]
+    fn overrides_serialize_in_table_order_and_round_trip() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides.insert(ShortcutId::Print, chord('k'));
+        overrides.insert(ShortcutId::NewTab, chord('j'));
+        let json = serde_json::to_string(&overrides).unwrap();
+        assert_eq!(
+            json,
+            r#"{"new_tab":{"key":"j","primary":true,"shift":false,"alt":false},"print":{"key":"k","primary":true,"shift":false,"alt":false}}"#
+        );
+        let back: ShortcutOverrides = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, overrides);
+    }
+
+    #[test]
+    fn overrides_deserialize_leniently() {
+        let json = r#"{
+            "new_tab": {"key":"j","primary":true},
+            "bogus_action": {"key":"j","primary":true},
+            "print": {"key":"enter","primary":true},
+            "save_page": "ctrl+s",
+            "close_tab": 5
+        }"#;
+        let overrides: ShortcutOverrides = serde_json::from_str(json).unwrap();
+        assert_eq!(overrides.len(), 1);
+        assert_eq!(overrides.get(ShortcutId::NewTab), Some(chord('j')));
     }
 }

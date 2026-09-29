@@ -4,11 +4,13 @@
 //! どれも webview を持たない純粋な文字列処理なので、表示環境なしで単体
 //! テストできる。信頼境界の考え方は docs/decisions.md D18/D23/D62/D78 を参照。
 
+use std::sync::RwLock;
+
 use serde::Deserialize;
 
 use crate::app::UserEvent;
 use crate::browser::context_menu;
-use crate::browser::{parse_sentinel, ShortcutId, TabId, WindowId, SHORTCUT_TABLE};
+use crate::browser::{parse_sentinel, KeyChord, ShortcutId, ShortcutOverrides, TabId, WindowId};
 use crate::ui::toolbar;
 
 use super::ContentShortcut;
@@ -37,7 +39,7 @@ const OPEN_DEVTOOLS_MESSAGE: &str = "velox:open-devtools";
 // previously one `const` per shortcut here — into
 // `browser::shortcuts::ShortcutId::sentinel()`, read from
 // `browser::shortcuts::SHORTCUT_TABLE`. [`parse_content_shortcut`] and
-// [`tab_shortcut_script`] (via [`tab_shortcut_branches`]) both call it
+// [`tab_shortcut_script`] both call it
 // rather than each hand-rolling their own copy of the string table, and
 // this module's tests call it directly instead of naming a
 // module-private `const`.
@@ -292,8 +294,9 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
 }
 
 /// Initialization script injected into the content webview to capture the
-/// devtools shortcut (F12, or Cmd+Opt+I on macOS) even while the page has
-/// focus, and forward it to Rust over [`OPEN_DEVTOOLS_MESSAGE`].
+/// devtools shortcut (default F12, or Cmd+Opt+I on macOS; user-remappable,
+/// Issue #156) even while the page has focus, and forward it to Rust over
+/// [`OPEN_DEVTOOLS_MESSAGE`].
 ///
 /// Registered via `with_initialization_script`, so it runs before any page
 /// script on every navigation, and listens in the capture phase so it gets
@@ -301,22 +304,17 @@ fn parse_content_shortcut(body: &str) -> Option<ContentShortcut> {
 /// See docs/decisions.md D18 for why this approach was chosen over a
 /// tao-level accelerator / `WindowEvent::KeyboardInput`.
 pub(super) fn devtools_shortcut_script() -> String {
-    format!(
-        r#"(() => {{
-  "use strict";
-  window.addEventListener("keydown", (event) => {{
-    const isF12 = event.key === "F12";
-    const isMacToggle = event.metaKey && event.altKey && (event.key === "i" || event.key === "I");
-    if (!isF12 && !isMacToggle) {{
-      return;
-    }}
-    event.preventDefault();
-    if (window.ipc) {{
-      window.ipc.postMessage("{OPEN_DEVTOOLS_MESSAGE}");
-    }}
-  }}, true);
-}})();"#
-    )
+    devtools_shortcut_script_for(&current_shortcut_overrides())
+}
+
+fn devtools_shortcut_script_for(overrides: &ShortcutOverrides) -> String {
+    let entries: Vec<(String, Vec<KeyChord>)> = overrides
+        .effective()
+        .into_iter()
+        .filter(|e| e.id == ShortcutId::OpenDevtools)
+        .map(|e| (OPEN_DEVTOOLS_MESSAGE.to_owned(), e.chords))
+        .collect();
+    shortcut_listener_script(DEVTOOLS_SETTER, &entries)
 }
 
 /// Initialization script that reports form input to Rust over
@@ -397,93 +395,139 @@ pub(super) fn form_input_script() -> String {
 }
 
 /// Initialization script that captures the tab-management keyboard
-/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/...) while the
-/// content webview has focus, forwarding a fixed sentinel string per
+/// shortcuts (Ctrl/Cmd+T/W/Shift+T/Tab/Shift+Tab/1-9/N/... by default) while
+/// the content webview has focus, forwarding a fixed sentinel string per
 /// shortcut over the same untrusted IPC channel devtools uses (see
 /// [`ContentShortcut`] and docs/decisions.md D18/D23 for why this is a
 /// separate injected script rather than a tao-level accelerator).
 ///
-/// `event.ctrlKey || event.metaKey` accepts both modifiers on every
-/// platform instead of branching on OS (macOS is Cmd, Linux/Windows is
-/// Ctrl) — the simplest way to "handle both", and harmless since Cmd simply
-/// never fires outside macOS and vice versa.
-///
-/// The two `if`/`else if` chains inside (`mod` alone, `mod+Shift`) are built
-/// by [`tab_shortcut_branches`] from `browser::shortcuts::SHORTCUT_TABLE`
-/// (Issue #38/D77) rather than hand-written here — adding a new *plain*
-/// Ctrl/Cmd(+Shift)+key content-webview shortcut now means adding one row to
-/// that table (plus, unavoidably, a new [`ContentShortcut`] variant and
-/// [`parse_content_shortcut`] arm, since those must stay real Rust types —
-/// see docs/decisions.md D77), not hand-editing this JS template too.
+/// The key table baked into the script is the *effective* table
+/// ([`ShortcutOverrides::effective`]: `SHORTCUT_TABLE` defaults merged with
+/// the user's overrides, Issue #156/D154), generated on the Rust side only.
+/// The trust boundary is unchanged: the script can only ever post one of the
+/// closed set of sentinels ([`ShortcutId::sentinel`]); the user's remapping
+/// changes *which key* triggers a sentinel, never what can be sent, and no
+/// page-supplied data is read anywhere.
 pub(super) fn tab_shortcut_script() -> String {
-    let (plain_arms, shift_arms) = tab_shortcut_branches();
+    tab_shortcut_script_for(&current_shortcut_overrides())
+}
+
+fn tab_shortcut_script_for(overrides: &ShortcutOverrides) -> String {
+    // `ShortcutId::OpenDevtools` is skipped: it is delivered through the
+    // separate, pre-existing [`OPEN_DEVTOOLS_MESSAGE`]/
+    // [`devtools_shortcut_script`] mechanism (docs/decisions.md D18).
+    let entries: Vec<(String, Vec<KeyChord>)> = overrides
+        .effective()
+        .into_iter()
+        .filter(|e| e.id != ShortcutId::OpenDevtools)
+        .map(|e| (e.id.sentinel(), e.chords))
+        .collect();
+    shortcut_listener_script(TAB_SETTER, &entries)
+}
+
+/// Script that (re)applies the current effective shortcut tables to a page
+/// that is already loaded, or reloaded after a settings change (Issue #156).
+/// Evaluating it on a page whose init script already installed the listener
+/// only swaps the table (see [`shortcut_listener_script`]).
+pub(super) fn shortcut_refresh_script() -> String {
+    format!("{}\n{}", tab_shortcut_script(), devtools_shortcut_script())
+}
+
+/// Name of the (non-enumerable) window function each shortcut script exposes
+/// so a later evaluation can swap in a new table. A page could call it, but
+/// that can only change which keys post which *fixed sentinel* — the page
+/// can already post any sentinel directly through `window.ipc` (D18).
+const TAB_SETTER: &str = "__veloxSetTabShortcuts";
+const DEVTOOLS_SETTER: &str = "__veloxSetDevtoolsShortcuts";
+
+// Process-wide effective shortcut overrides (Issue #156, D154). Content
+// webviews are built in many places (new tab, resume from suspension, ...)
+// and the init script is baked at build time, so the current table is kept
+// here instead of being threaded through every builder call. The main
+// thread writes it (`set_shortcut_overrides`, on startup and on every
+// settings save); the lock is never held across other work.
+static SHORTCUT_OVERRIDES: RwLock<Option<ShortcutOverrides>> = RwLock::new(None);
+
+/// Replace the process-wide shortcut overrides used to generate every
+/// content webview's shortcut scripts from now on.
+pub fn set_shortcut_overrides(overrides: &ShortcutOverrides) {
+    let mut guard = SHORTCUT_OVERRIDES
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *guard = Some(overrides.clone());
+}
+
+fn current_shortcut_overrides() -> ShortcutOverrides {
+    SHORTCUT_OVERRIDES
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
+/// Build one keydown-listener script from `(message, chords)` bindings.
+///
+/// Both tables and the matcher are plain data/logic generated here; `message`
+/// is always a fixed sentinel from Rust. `window[setter]` makes the script
+/// idempotent: a second evaluation swaps the table instead of stacking a
+/// second listener, which is how already-open tabs pick up a remapping and
+/// how the *old* key stops working.
+///
+/// Matching mirrors the historical hand-written scripts: the primary
+/// modifier is `ctrlKey || metaKey` on every platform (D23), except that a
+/// primary+Alt chord requires `metaKey` (Ctrl+Alt is AltGr on many Windows
+/// layouts and must keep typing characters — the old devtools script was
+/// Cmd-only for the same reason); Shift/Alt must match exactly.
+fn shortcut_listener_script(setter: &str, entries: &[(String, Vec<KeyChord>)]) -> String {
+    let table: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(message, chords)| serde_json::json!({ "m": message, "c": chords }))
+        .collect();
+    let table_json = serde_json::to_string(&table).unwrap_or_else(|_| "[]".to_owned());
     format!(
         r#"(() => {{
   "use strict";
+  const SETTER = "{setter}";
+  const table = {table_json};
+  if (typeof window[SETTER] === "function") {{
+    window[SETTER](table);
+    return;
+  }}
+  let bindings = table;
+  function matches(chord, event) {{
+    if (chord.primary && chord.alt) {{
+      if (!event.metaKey) return false;
+    }} else if (chord.primary !== (event.ctrlKey || event.metaKey)) {{
+      return false;
+    }}
+    if (chord.shift !== event.shiftKey || chord.alt !== event.altKey) return false;
+    const k = chord.key;
+    if (k === "tab") return event.key === "Tab";
+    if (k === "f12") return event.key === "F12";
+    if (k >= "1" && k <= "9") return event.code === "Digit" + k || event.key === k;
+    // With Alt held some layouts (macOS Option) change `event.key`, so a
+    // primary+Alt chord also accepts the physical letter key.
+    return (typeof event.key === "string" && event.key.toLowerCase() === k) ||
+      (chord.alt && event.code === "Key" + k.toUpperCase());
+  }}
   window.addEventListener("keydown", (event) => {{
-    const mod = event.ctrlKey || event.metaKey;
-    if (!mod) {{
-      return;
-    }}
-    let message = null;
-    if (!event.altKey && !event.shiftKey) {{
-      {plain_arms}
-    }} else if (event.shiftKey && !event.altKey) {{
-      {shift_arms}
-    }}
-    if (message === null) {{
-      return;
-    }}
-    event.preventDefault();
-    if (window.ipc) {{
-      window.ipc.postMessage(message);
+    for (const binding of bindings) {{
+      for (const chord of binding.c) {{
+        if (matches(chord, event)) {{
+          event.preventDefault();
+          if (window.ipc) {{
+            window.ipc.postMessage(binding.m);
+          }}
+          return;
+        }}
+      }}
     }}
   }}, true);
+  Object.defineProperty(window, SETTER, {{
+    value: (next) => {{ if (Array.isArray(next)) bindings = next; }},
+  }});
 }})();"#
     )
-}
-
-/// Build the two `if`/`else if` chains [`tab_shortcut_script`] splices into
-/// its listener — `(mod only, mod+Shift)` — from
-/// `browser::shortcuts::SHORTCUT_TABLE`. `ShortcutId::OpenDevtools` is
-/// skipped: it is delivered through the separate, pre-existing
-/// [`OPEN_DEVTOOLS_MESSAGE`]/[`devtools_shortcut_script`] mechanism (see
-/// docs/decisions.md D18), not through this table-driven content-shortcut
-/// channel.
-///
-/// `debug_assert!`s rather than silently mishandling a future table row that
-/// combines `mod` with `Alt`: no shortcut in scope for this generator uses
-/// `Alt` today (only `ShortcutId::OpenDevtools`'s Cmd+Option+I does, and
-/// that row is skipped above), so this generator only ever builds the two
-/// branches `tab_shortcut_script`'s listener already distinguishes — a
-/// programming-error guard, not attacker-reachable input, since
-/// `SHORTCUT_TABLE` is a fixed compile-time constant.
-fn tab_shortcut_branches() -> (String, String) {
-    let mut plain = Vec::new();
-    let mut shift = Vec::new();
-    for def in SHORTCUT_TABLE {
-        if def.id == ShortcutId::OpenDevtools {
-            continue;
-        }
-        for chord in def.chords {
-            debug_assert!(
-                !chord.modifiers.alt,
-                "tab_shortcut_branches only generates mod/mod+Shift combos; {:?} needs a dedicated branch",
-                def.id
-            );
-            let arm = format!(
-                "if ({}) {{\n        message = \"{}\";\n      }}",
-                chord.key.js_condition(),
-                def.id.sentinel()
-            );
-            if chord.modifiers.shift {
-                shift.push(arm);
-            } else {
-                plain.push(arm);
-            }
-        }
-    }
-    (plain.join(" else "), shift.join(" else "))
 }
 
 /// Initialization script that resolves this page's favicon URL on demand:
@@ -901,17 +945,42 @@ pub(super) fn content_ipc_event(own_id: WindowId, id: TabId, body: &str) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::{Key, Modifiers};
 
     #[test]
     fn devtools_script_captures_f12_and_mac_toggle_and_reports_the_trigger_message() {
-        let script = devtools_shortcut_script();
-        assert!(script.contains("F12"));
-        assert!(script.contains("metaKey && event.altKey"));
-        assert!(script.contains(&format!(
-            "window.ipc.postMessage(\"{OPEN_DEVTOOLS_MESSAGE}\")"
-        )));
+        let script = devtools_shortcut_script_for(&ShortcutOverrides::default());
+        let table = embedded_table(&script);
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[0]["m"], OPEN_DEVTOOLS_MESSAGE);
+        let chords = table[0]["c"].as_array().expect("chords");
+        assert_eq!(chords.len(), 2);
+        assert_eq!(chords[0]["key"], "f12");
+        assert_eq!(chords[1]["key"], "i");
+        assert_eq!(chords[1]["primary"], true);
+        assert_eq!(chords[1]["alt"], true);
+        assert!(script.contains("window.ipc.postMessage(binding.m)"));
+        // Ctrl+Alt (AltGr) must not trigger a primary+Alt chord.
+        assert!(script.contains("if (!event.metaKey) return false;"));
         // Registered in the capture phase (the trailing `true` to addEventListener).
         assert!(script.contains("}, true);"));
+    }
+
+    #[test]
+    fn remapped_devtools_chord_replaces_both_defaults() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides
+            .try_assign(
+                ShortcutId::OpenDevtools,
+                KeyChord::new(Key::Char('k'), Modifiers::PRIMARY_SHIFT),
+            )
+            .unwrap();
+        let script = devtools_shortcut_script_for(&overrides);
+        let table = embedded_table(&script);
+        let chords = table[0]["c"].as_array().expect("chords");
+        assert_eq!(chords.len(), 1);
+        assert_eq!(chords[0]["key"], "k");
+        assert_eq!(chords[0]["shift"], true);
     }
 
     #[test]
@@ -931,7 +1000,7 @@ mod tests {
 
     #[test]
     fn tab_shortcut_script_captures_expected_combos_in_capture_phase() {
-        let script = tab_shortcut_script();
+        let script = tab_shortcut_script_for(&ShortcutOverrides::default());
         for message in [
             ShortcutId::NewTab.sentinel(),
             ShortcutId::CloseTab.sentinel(),
@@ -961,6 +1030,75 @@ mod tests {
         assert!(!script.contains(&ShortcutId::OpenDevtools.sentinel()));
         assert!(script.contains("event.ctrlKey || event.metaKey"));
         assert!(script.contains("}, true);"));
+    }
+
+    /// Issue #156: a remapped key is what the script matches, and the old
+    /// key is gone from the table (so it stops working).
+    #[test]
+    fn tab_shortcut_script_uses_the_overridden_key_only() {
+        let mut overrides = ShortcutOverrides::default();
+        overrides
+            .try_assign(
+                ShortcutId::NewTab,
+                KeyChord::new(Key::Char('k'), Modifiers::PRIMARY),
+            )
+            .unwrap();
+        let script = tab_shortcut_script_for(&overrides);
+        let table = embedded_table(&script);
+        let new_tab = table
+            .iter()
+            .find(|e| e["m"] == ShortcutId::NewTab.sentinel())
+            .expect("new tab entry");
+        assert_eq!(new_tab["c"].as_array().map(Vec::len), Some(1));
+        assert_eq!(new_tab["c"][0]["key"], "k");
+        // Untouched actions keep their defaults.
+        let close = table
+            .iter()
+            .find(|e| e["m"] == ShortcutId::CloseTab.sentinel())
+            .expect("close tab entry");
+        assert_eq!(close["c"][0]["key"], "w");
+        // Ctrl+T is not bound to anything any more.
+        assert!(!table
+            .iter()
+            .any(|e| e["c"][0]["key"] == "t" && e["c"][0]["shift"] == false));
+    }
+
+    /// Pull the JSON table out of a generated listener script.
+    fn embedded_table(script: &str) -> Vec<serde_json::Value> {
+        let start = script.find("const table = ").expect("table") + "const table = ".len();
+        let end = script[start..].find(";\n").expect("end") + start;
+        serde_json::from_str(&script[start..end]).expect("valid json table")
+    }
+
+    #[test]
+    fn shortcut_script_is_idempotent_via_a_setter() {
+        let script = tab_shortcut_script_for(&ShortcutOverrides::default());
+        assert!(script.contains("typeof window[SETTER] === \"function\""));
+        assert!(script.contains(TAB_SETTER));
+        // The two scripts use different setters so refreshing one does not
+        // clobber the other.
+        assert_ne!(TAB_SETTER, DEVTOOLS_SETTER);
+    }
+
+    #[test]
+    fn shortcut_overrides_static_feeds_the_scripts() {
+        // Only this test touches the process-wide static.
+        let mut overrides = ShortcutOverrides::default();
+        overrides
+            .try_assign(
+                ShortcutId::Print,
+                KeyChord::new(Key::Char('k'), Modifiers::PRIMARY),
+            )
+            .unwrap();
+        set_shortcut_overrides(&overrides);
+        let table = embedded_table(&tab_shortcut_script());
+        let print = table
+            .iter()
+            .find(|e| e["m"] == ShortcutId::Print.sentinel())
+            .unwrap();
+        assert_eq!(print["c"][0]["key"], "k");
+        assert!(shortcut_refresh_script().contains(DEVTOOLS_SETTER));
+        set_shortcut_overrides(&ShortcutOverrides::default());
     }
 
     /// Issue #38's explicit acceptance test: the content webview (untrusted

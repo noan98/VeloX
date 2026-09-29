@@ -108,10 +108,12 @@ pub(super) fn refresh_settings_panel(window: &BrowserWindow, state: &AppState) {
     // platform (Issue #38, docs/decisions.md D77) and so returns an owned
     // `Vec` rather than a `&'static` slice — kept alive in this local for
     // `SettingsView` to borrow.
-    let shortcuts = shortcut_reference();
+    let shortcuts = shortcut_reference(&state.settings.shortcut_overrides);
     let view = toolbar::SettingsView {
         settings: &state.settings,
         shortcuts: &shortcuts,
+        platform: crate::browser::Platform::current().as_str(),
+        reserved_shortcuts: crate::browser::reserved_chords(),
         site_permissions: state.site_permissions.records(),
     };
     log_failure("update settings panel", window.set_settings(&view));
@@ -145,6 +147,9 @@ pub(super) fn apply_updated_settings(
     settings: Settings,
 ) {
     state.settings = settings.sanitize();
+    // Issue #156/D154: new/resumed content webviews get the new key table
+    // from here on; already-open tabs are refreshed below.
+    crate::ui::set_shortcut_overrides(&state.settings.shortcut_overrides);
     let state = &*state;
     if let Some(dir) = &state.data_dir {
         log_failure(
@@ -158,6 +163,10 @@ pub(super) fn apply_updated_settings(
         log_failure(
             "apply bookmark bar visibility",
             window.set_bookmark_bar_visible(appearance.show_bookmark_bar),
+        );
+        log_failure(
+            "apply shortcut overrides",
+            window.refresh_shortcut_scripts(),
         );
         refresh_settings_panel(window, state);
     }

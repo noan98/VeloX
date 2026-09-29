@@ -422,6 +422,11 @@ impl<'a> BookmarksView<'a> {
 pub struct SettingsView<'a> {
     pub settings: &'a Settings,
     pub shortcuts: &'a [ShortcutInfo],
+    /// `Platform::as_str()`: lets the Shortcuts editor label modifiers
+    /// (Ctrl/Cmd, Alt/Option) the way Rust does.
+    pub platform: &'a str,
+    /// Chords the editor must refuse (`browser::reserved_chords`).
+    pub reserved_shortcuts: &'a [crate::browser::KeyChord],
     pub site_permissions: &'a [PermissionRecord],
 }
 
@@ -1606,10 +1611,12 @@ mod tests {
     #[test]
     fn settings_script_embeds_the_view_as_json() {
         let settings = crate::browser::Settings::default();
-        let shortcuts = crate::browser::shortcut_reference();
+        let shortcuts = crate::browser::shortcut_reference(&settings.shortcut_overrides);
         let view = SettingsView {
             settings: &settings,
             shortcuts: &shortcuts,
+            platform: "linux",
+            reserved_shortcuts: crate::browser::reserved_chords(),
             site_permissions: &[],
         };
         let script = set_settings_script(&view);
@@ -1617,6 +1624,38 @@ mod tests {
         assert!(script.contains(r#""schema_version""#));
         assert!(script.contains(r#""shortcuts""#));
         assert!(script.contains(r#""site_permissions":[]"#));
+    }
+
+    /// Issue #156: the editor round-trips overrides through the ordinary
+    /// `update_settings` command, and the view carries what the JS needs.
+    #[test]
+    fn update_settings_carries_shortcut_overrides_and_view_exposes_chords() {
+        use crate::browser::{Key, KeyChord, Modifiers, ShortcutId};
+        let json = r#"{"cmd":"update_settings","settings":{"shortcut_overrides":{
+            "new_tab":{"key":"k","primary":true,"shift":false,"alt":false},
+            "nonsense":{"key":"k","primary":true}}}}"#;
+        let Ok(ToolbarCommand::UpdateSettings { settings }) = parse_command(json) else {
+            panic!("update_settings with overrides must parse");
+        };
+        let settings = settings.sanitize();
+        assert_eq!(
+            settings.shortcut_overrides.get(ShortcutId::NewTab),
+            Some(KeyChord::new(Key::Char('k'), Modifiers::PRIMARY))
+        );
+        assert_eq!(settings.shortcut_overrides.len(), 1);
+
+        let shortcuts = crate::browser::shortcut_reference(&settings.shortcut_overrides);
+        let view = SettingsView {
+            settings: &settings,
+            shortcuts: &shortcuts,
+            platform: "windows",
+            reserved_shortcuts: crate::browser::reserved_chords(),
+            site_permissions: &[],
+        };
+        let script = set_settings_script(&view);
+        assert!(script.contains(r#""default_chords""#));
+        assert!(script.contains(r#""reserved_shortcuts""#));
+        assert!(script.contains(r#""platform":"windows""#));
     }
 
     #[test]
