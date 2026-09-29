@@ -9,7 +9,7 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,9 +76,17 @@ pub fn dispatch(
         wake: inner_tx.clone(),
     };
 
+    // 監督スレッドを起こせなかったときも終端を 1 回出せるよう、送信側と
+    // `notify` は監督スレッドの外にも残す (`Mutex` は `notify` に `Sync` を
+    // 要求しないため)。
+    let notify = Arc::new(Mutex::new(notify));
+    let fallback_tx = out_tx.clone();
+    let fallback_notify = Arc::clone(&notify);
     let emit = move |kind: AiEventKind| {
         let _ = out_tx.send(AiEvent { request_id, kind });
-        notify();
+        if let Ok(notify) = notify.lock() {
+            notify();
+        }
     };
 
     let worker_tx = inner_tx;
@@ -136,8 +144,18 @@ pub fn dispatch(
             emit(terminal);
         });
     if supervisor.is_err() {
-        // 監督スレッドを起こせない: 終端を出せないので、ワーカーを止めて諦める。
+        // 監督スレッドを起こせない: ワーカーを止め、終端はここで出す
+        // (「終端はちょうど 1 回」の約束を、この経路でも守る)。
         handle.cancel.cancel();
+        let _ = fallback_tx.send(AiEvent {
+            request_id,
+            kind: AiEventKind::Failed(AiError::Unavailable(
+                "failed to start supervisor thread".into(),
+            )),
+        });
+        if let Ok(notify) = fallback_notify.lock() {
+            notify();
+        }
     }
     handle
 }
