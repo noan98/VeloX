@@ -134,6 +134,49 @@ impl ProcessFailureKind {
     }
 }
 
+/// 同じタブの自動再読み込みを許す間隔 (秒)。
+pub const RELOAD_WINDOW_SECS: u64 = 30;
+
+/// 保持するタブ数の上限 (超えたら最古のものから捨てる)。
+const RELOAD_GUARD_CAP: usize = 64;
+
+/// 描画プロセスが落ちるページを延々と再読み込みしないための、タブ単位の
+/// 自動再読み込みの抑制 (Issue #89, D156)。`RELOAD_WINDOW_SECS` 秒以内に
+/// 同じタブで 2 回目の異常が起きたら再読み込みを許さない。時刻は呼び出し側
+/// から渡す (純粋・テスト可能)。古い記録は検査のたびに掃除し、件数にも
+/// 上限があるので、タブを閉じたときの明示的な後始末は要らない。
+#[derive(Debug, Clone)]
+pub struct ReloadGuard<K> {
+    last: Vec<(K, u64)>,
+}
+
+impl<K: PartialEq> Default for ReloadGuard<K> {
+    fn default() -> Self {
+        Self { last: Vec::new() }
+    }
+}
+
+impl<K: PartialEq> ReloadGuard<K> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `key` を今 (`now`, unix 秒) 自動再読み込みしてよいか。許すときは
+    /// 記録も更新する。
+    pub fn allow_reload(&mut self, key: K, now: u64) -> bool {
+        self.last
+            .retain(|(_, t)| now.saturating_sub(*t) < RELOAD_WINDOW_SECS);
+        if self.last.iter().any(|(k, _)| *k == key) {
+            return false;
+        }
+        if self.last.len() >= RELOAD_GUARD_CAP {
+            self.last.remove(0);
+        }
+        self.last.push((key, now));
+        true
+    }
+}
+
 /// 1 件のクラッシュレポート。URL・ページ内容・タイトルを入れる欄は無い。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CrashReport {
@@ -447,6 +490,29 @@ mod tests {
         assert!(text.contains("message: cannot open <url>\n"));
         assert!(text.contains("backtrace:\n0: velox::app::run\n"));
         assert!(!text.contains("secret.example"));
+    }
+
+    #[test]
+    fn reload_guard_allows_one_reload_per_window_per_key() {
+        let mut g = ReloadGuard::new();
+        assert!(g.allow_reload(1, 100));
+        assert!(!g.allow_reload(1, 101));
+        assert!(!g.allow_reload(1, 100 + RELOAD_WINDOW_SECS - 1));
+        // 別のタブは独立。
+        assert!(g.allow_reload(2, 101));
+        // 窓を過ぎれば再び許す。
+        assert!(g.allow_reload(1, 100 + RELOAD_WINDOW_SECS));
+    }
+
+    #[test]
+    fn reload_guard_stays_bounded() {
+        let mut g = ReloadGuard::new();
+        for k in 0..1000u32 {
+            assert!(g.allow_reload(k, 5));
+        }
+        assert!(g.last.len() <= 64);
+        // 時計が戻っても panic しない。
+        assert!(g.allow_reload(5000, 0));
     }
 
     #[test]

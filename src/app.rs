@@ -437,6 +437,8 @@ struct AppState {
     /// One-shot notice about the previous run having ended uncleanly,
     /// shown in the status banner on the first toolbar `ready` (D156).
     startup_notice: Option<String>,
+    /// Per-tab limiter for automatic reloads after a renderer crash (D156).
+    reload_guard: crash_report::ReloadGuard<(WindowId, TabId)>,
     /// The [`SessionSnapshot`] most recently written to `session.json` by
     /// [`persist_session`] (Issue #67) — `None` until the first successful
     /// write. `sync_tab_strip` calls `persist_session` after nearly every
@@ -862,6 +864,7 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         data_dir,
         crash_reports_enabled,
         startup_notice: crash_notice,
+        reload_guard: crash_report::ReloadGuard::new(),
         last_persisted_session: None,
         perf: perf_log
             .clone()
@@ -3026,6 +3029,7 @@ mod tests {
             data_dir: None,
             crash_reports_enabled: false,
             startup_notice: None,
+            reload_guard: crash_report::ReloadGuard::new(),
             last_persisted_session: None,
             perf: None,
             downloads: DownloadStore::new(),

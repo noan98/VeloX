@@ -40,8 +40,20 @@ pub(super) fn handle_content_process_failed(
         ),
         Recovery::RecoverTab => {
             if tabs_of(state, window_id).active_id() == tab_id {
-                log_failure("reload crashed tab", window.reload());
-                show_print_status(window, "ページが異常終了したため再読み込みしました");
+                // 同じタブが短時間に繰り返し落ちるなら再読み込みしない
+                // (決定的に描画プロセスを落とすページでのループ防止)。
+                if state
+                    .reload_guard
+                    .allow_reload((window_id, tab_id), crate::browser::util::now_unix())
+                {
+                    log_failure("reload crashed tab", window.reload());
+                    show_print_status(window, "ページが異常終了したため再読み込みしました");
+                } else {
+                    show_print_status(
+                        window,
+                        "ページが繰り返し異常終了したため、自動再読み込みを停止しました",
+                    );
+                }
             } else if !suspend_tab(window, window_id, state, tab_id) {
                 // 固定タブなどで休止できないときは通知だけに留める。
                 show_print_status(window, "バックグラウンドのタブが異常終了しました");
