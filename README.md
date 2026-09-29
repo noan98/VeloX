@@ -145,20 +145,25 @@ cargo build
 
 #### Release build via GitHub Actions
 
-`.github/workflows/release-windows.yml` builds `velox.exe` (and
-`velox-bench.exe`) in release mode on a `windows-latest` runner:
+`.github/workflows/release-windows.yml` builds `velox.exe` in release mode
+on a `windows-latest` runner and packages it into an Inno Setup installer
+(`installer/windows/velox.iss`):
 
-- **Manual**: Actions → "Release (Windows)" → "Run workflow". The zip is
-  attached to the run as the `velox-windows-x86_64` artifact.
+- **Manual**: Actions → "Release (Windows)" → "Run workflow". The installer
+  is attached to the run as the `velox-windows-x86_64-installer` artifact.
 - **Tag push**: `git tag v0.1.0 && git push origin v0.1.0` additionally
-  creates a GitHub Release with the zip and its SHA-256 attached. The same
+  creates a GitHub Release with the installer attached. The same
   tag also triggers `release-linux.yml`, which attaches a Linux tar.gz to
   the same Release. Both workflows verify the tag (`vX.Y.Z`) matches the
   `version` in `Cargo.toml` and fail the build if it doesn't, so a Release
   can't be published under a version that doesn't match its own artifacts.
 
-The zip contains the two executables plus README/LICENSE. WebView2 Runtime
-must be present on the target machine (it is on Windows 11).
+The installer (`velox-<version>-windows-x86_64-setup.exe`) installs
+`velox.exe` plus README/LICENSE. WebView2 Runtime must be present on the
+target machine (it is on Windows 11). The full release procedure, including
+what is still manual, is in [docs/releasing.md](docs/releasing.md); end-user
+install / update / uninstall instructions are in
+[docs/user-guide.md](docs/user-guide.md).
 
 #### Code signing
 
@@ -173,14 +178,14 @@ scope for now (Issue #42 / docs/decisions.md D73).
 
 #### Verifying a release download
 
-Every release asset (Windows zip, Linux tar.gz) ships with a `.sha256` file
-next to it. Until signing is enabled (see above), this is the only way to
-confirm a downloaded archive matches what CI built. Compare the computed
-hash against the value in the `.sha256` file:
+The Linux tar.gz ships with a `.sha256` file next to it (the Windows
+installer currently does not). Until signing is enabled (see above), this is
+the only way to confirm a downloaded archive matches what CI built. Compare
+the computed hash against the value in the `.sha256` file:
 
 ```powershell
-# Windows (PowerShell)
-Get-FileHash .\velox-<version>-windows-x86_64.zip -Algorithm SHA256
+# Windows (PowerShell) — computes the hash; there is no published value to compare yet
+Get-FileHash .\velox-<version>-windows-x86_64-setup.exe -Algorithm SHA256
 ```
 
 ```sh
@@ -226,6 +231,12 @@ See [docs/architecture.md](docs/architecture.md) for the full design and
 [docs/decisions.md](docs/decisions.md) for why wry was chosen over embedding
 Servo directly — and for every subsequent design decision, including the
 per-platform gaps deliberately left open.
+
+Using and releasing VeloX: [docs/user-guide.md](docs/user-guide.md)
+(install / update / uninstall / troubleshooting / how to report problems) and
+[docs/releasing.md](docs/releasing.md) (release procedure and release notes).
+Bugs and feature requests go through the issue forms; security
+vulnerabilities go through [SECURITY.md](SECURITY.md).
 
 Performance work has its own documentation:
 
