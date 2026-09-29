@@ -568,6 +568,21 @@ fn numeric_env_knobs_do_not_panic_on_a_value_that_overflows_its_integer_type() {
 }
 
 #[test]
+fn perf_interval_is_trimmed_before_parsing() {
+    // Issue #296: 前後の空白は他の数値 env と同じく無視する。
+    assert_eq!(
+        resolve_perf_env(true, Some(" 100")).1,
+        Some(Duration::from_millis(100))
+    );
+    assert_eq!(
+        resolve_perf_env(true, Some("100 ")).1,
+        Some(Duration::from_millis(100))
+    );
+    // 0 はサンプリング無効 (空白付きでも同じ)。
+    assert_eq!(resolve_perf_env(true, Some(" 0")).1, None);
+}
+
+#[test]
 fn resolve_homepage_does_not_panic_on_an_extremely_long_or_hostile_value() {
     let huge = format!("https://example.com/{}", "a".repeat(2_000_000));
     assert_eq!(
