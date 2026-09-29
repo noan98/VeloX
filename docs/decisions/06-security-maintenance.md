@@ -4,7 +4,7 @@
 
 ## 対象
 
-主担当は **D61–D63, D65, D67, D102, D116, D146, D159, D163** の 10 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D61–D63, D65, D67, D102, D116, D146, D159, D162–D163** の 11 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D61–D63** — CI 実行環境 / input robustness / dependency & security audit
 - **D65** — tab session restore
@@ -14,7 +14,7 @@
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D61–D63, D65, D67, D102, D116, D146, D159, D163** (10 件)
+**このカテゴリが主担当の Decision: D61–D63, D65, D67, D102, D116, D146, D159, D162–D163** (11 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -33,6 +33,7 @@
 - [D116](./archive.md#d116-設計判断の索引は手で書かずarchivemd-から生成して-ci-で検査する-issue-227) — 設計判断の索引は手で書かず、`archive.md` から生成して CI で検査する (Issue #227)
 - [D146](./archive.md#d146-wry--windows--webview2-com-は-3-つ同時にしか上げられない-dependabot-pr-259--199--198--個別の-bump-は-windows-core-の二重化で-windows-ビルドが必ず落ちる) — wry / windows / webview2-com は 3 つ同時にしか上げられない (dependabot PR #259 / #199 / #198) — 個別の bump は `windows-core` の二重化で Windows ビルドが必ず落ちる
 - [D159](./archive.md#d159-拡張機能の信頼境界権限モデルマニフェストスキーマ-82--拡張機能は悪意があるものとして設計しchrome-互換は目指さない) — 拡張機能の信頼境界・権限モデル・マニフェストスキーマ (#82) — 拡張機能は悪意があるものとして設計し、Chrome 互換は目指さない
+- [D162](./archive.md#d162-ai-プロバイダ抽象を同期-trait--ワーカースレッド--channel-で作る-issue-76--期限は-dispatcher-が強制し資格情報は-secret-型と環境変数のみ) — AI プロバイダ抽象を同期 trait + ワーカースレッド + channel で作る (Issue #76) — 期限は dispatcher が強制し、資格情報は `Secret` 型と環境変数のみ
 - [D163](./archive.md#d163-拡張機能ホストのコア-extension-api-最小サブセットと-lifecycle--storage-をアプリへ配線せずに実装する-83--84) — 拡張機能ホストのコア (Extension API 最小サブセットと Lifecycle / Storage) を、アプリへ配線せずに実装する (#83 / #84)
 
 ---
