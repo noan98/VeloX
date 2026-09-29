@@ -64,10 +64,11 @@ mod content_webview;
 mod download_handlers;
 mod engine;
 
+pub use content_scripts::set_shortcut_overrides;
 use content_scripts::{
     context_menu_render_script, extract_js_string_result, find_activate_script, find_query_literal,
-    find_search_script, find_search_total, CONTEXT_MENU_HIDE_SCRIPT, FIND_CLEAR_SCRIPT,
-    RESOLVE_FAVICON_SCRIPT, VIEW_SOURCE_FETCH_SCRIPT,
+    find_search_script, find_search_total, shortcut_refresh_script, CONTEXT_MENU_HIDE_SCRIPT,
+    FIND_CLEAR_SCRIPT, RESOLVE_FAVICON_SCRIPT, VIEW_SOURCE_FETCH_SCRIPT,
 };
 use content_webview::{content_webview_builder, ContentPolicy, WebviewIsolation};
 use download_handlers::{
@@ -1201,6 +1202,30 @@ impl BrowserWindow {
     /// The active tab's content webview, if any is currently active.
     fn active_webview(&self) -> Option<&WebView> {
         self.tab_webview(self.active?)
+    }
+
+    /// 現在の有効ショートカット表 (Issue #156, D154) を、既に開いている
+    /// すべてのタブに反映する。注入済みのリスナーは表だけを差し替えるので、
+    /// 再割り当て前のキーはここで効かなくなる。休止中のタブは再開時に
+    /// 最新の表で作り直されるので対象外。失敗しても残りのタブへ進み、
+    /// 最初のエラーを返す。
+    pub fn refresh_shortcut_scripts(&self) -> wry::Result<()> {
+        let script = shortcut_refresh_script();
+        let mut first_error = None;
+        for webview in self.live_webviews() {
+            if let Err(err) = webview.evaluate_script(&script) {
+                first_error.get_or_insert(err);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// [`Self::refresh_shortcut_scripts`] の 1 タブ版。ナビゲーションで
+    /// ページが読み込み直されると、その webview に焼き込まれた作成時点の
+    /// 初期化スクリプトが再実行されて古い表に戻るため、読み込み完了の
+    /// たびにこれで最新の表を掛け直す。
+    pub fn refresh_tab_shortcuts(&self, tab_id: TabId) -> wry::Result<()> {
+        self.eval_in_tab(tab_id, &shortcut_refresh_script())
     }
 
     /// アクティブタブの webview に `action` を適用する。アクティブタブが

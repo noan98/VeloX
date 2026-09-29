@@ -614,6 +614,9 @@ pub fn run(mut config: Config, process_start: Instant) -> Result<(), Box<dyn Err
         }
         None => config.to_settings(),
     };
+    // Issue #156 (D154): every content webview built from here on (the first
+    // tab included) bakes the user's key table into its shortcut scripts.
+    crate::ui::set_shortcut_overrides(&settings.shortcut_overrides);
 
     // `.then(...)` short-circuits: when metrics are off, no `Instant` is
     // captured here and `startup` stays `None`, so every checkpoint below
@@ -1303,6 +1306,10 @@ fn handle_user_event(
             let Some(window) = ui_windows.get_mut(&window_id) else {
                 return;
             };
+            // Issue #156/D154: a reload re-runs the shortcut init script
+            // baked into this webview when it was built, which may predate a
+            // remapping — re-apply the current table.
+            log_failure("refresh shortcuts", window.refresh_tab_shortcuts(id));
             let is_active = state.windows.tabs_mut(window_id).is_some_and(|tabs| {
                 // A failed load reports an empty URL; keep showing the URL
                 // the tab tried to reach instead of blanking it out.

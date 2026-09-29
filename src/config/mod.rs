@@ -603,6 +603,8 @@ impl Config {
                 perf_output_path: self.perf_output_path.clone(),
                 extra_blocklist_path: self.extra_blocklist_path.clone(),
             },
+            // Key overrides live only in settings.json, never in `Config`.
+            shortcut_overrides: Default::default(),
         }
         // Sanitized regardless: `self` is already a valid `Config`, so this
         // is expected to be a no-op, but running it keeps the contract
