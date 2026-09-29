@@ -1,0 +1,71 @@
+name: 不具合の報告
+description: VeloX の動作がおかしい、クラッシュする、などの不具合を報告します
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        報告の前に [ユーザーガイドのトラブルシューティング](https://github.com/noan98/VeloX/blob/main/docs/user-guide.md) を確認してください。
+        **セキュリティ上の問題 (脆弱性) はここに書かないでください。** [SECURITY.md](https://github.com/noan98/VeloX/blob/main/SECURITY.md) の手順で非公開に報告してください。
+        パスワード・トークン・個人情報は書き込まないでください (ログを貼る前に伏せてください)。
+  - type: textarea
+    id: summary
+    attributes:
+      label: 何が起きましたか
+      description: 期待した動作と、実際に起きた動作を書いてください。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 再現手順
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: VeloX のバージョン
+      description: リリースのバージョン (例 `0.1.0`)、またはソースから実行した場合はコミット。
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: OS
+      description: Windows が最優先の対象です。macOS / Linux は「ビルドが通り既存機能を壊さない」範囲の整備です。
+      options:
+        - Windows 11
+        - Windows 10
+        - macOS
+        - Linux
+        - その他
+    validations:
+      required: true
+  - type: input
+    id: engine
+    attributes:
+      label: WebView ランタイムのバージョン (分かれば)
+      description: Windows は WebView2 Runtime、Linux は WebKitGTK のバージョン。
+  - type: dropdown
+    id: install
+    attributes:
+      label: 入手方法
+      options:
+        - Windows インストーラ (GitHub Release)
+        - Linux tar.gz (GitHub Release)
+        - ソースからビルド (cargo)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: ログ・スクリーンショット
+      description: ターミナルから起動した場合の標準エラー出力など。`VELOX_DEBUG` を設定して起動すると詳細ログが出ます。
+      render: shell
+  - type: markdown
+    attributes:
+      value: |
+        メンテナ向けメモ: 起票後、CLAUDE.md の Issue ラベリングポリシーに従い `cost:*` / `benefit:*` ラベルを付与します (報告者は付けなくて構いません)。
