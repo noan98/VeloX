@@ -24,7 +24,8 @@
 //!
 //! **Trust boundary (docs/decisions.md D18/D23)**: this module does not
 //! change VeloX's dual-delivery security design at all. It only replaces
-//! *duplicated hand-written tables* with *one hand-written table*; the
+//! *duplicated hand-written tables* with *one default table* (plus, since
+//! Issue #156/D154, the user's per-action overrides merged on top); the
 //! content webview still only ever receives a fixed, Rust-enumerated set of
 //! sentinel strings ([`ShortcutId::sentinel`] over [`SHORTCUT_TABLE`], a
 //! closed compile-time list), never anything resembling a structured command

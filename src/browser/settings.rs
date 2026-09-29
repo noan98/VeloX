@@ -618,7 +618,7 @@ fn join_labels(chords: &[KeyChord], platform: Platform) -> String {
 /// on macOS; the underlying key handling still accepts either modifier on
 /// every platform, see docs/decisions.md D23.
 ///
-/// Unlike the pre-#156 display-only version, `ActivateTabAt(1..=8)` are no
+/// Unlike the pre-#156 (formerly display-only) version, `ActivateTabAt(1..=8)` are no
 /// longer folded into one row: each position is remappable on its own.
 pub fn shortcut_reference(overrides: &ShortcutOverrides) -> Vec<ShortcutInfo> {
     let platform = Platform::current();

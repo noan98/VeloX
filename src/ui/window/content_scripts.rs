@@ -440,12 +440,16 @@ pub(super) fn shortcut_refresh_script() -> String {
 const TAB_SETTER: &str = "__veloxSetTabShortcuts";
 const DEVTOOLS_SETTER: &str = "__veloxSetDevtoolsShortcuts";
 
-// Process-wide effective shortcut overrides (Issue #156, D154). Content
-// webviews are built in many places (new tab, resume from suspension, ...)
-// and the init script is baked at build time, so the current table is kept
-// here instead of being threaded through every builder call. The main
-// thread writes it (`set_shortcut_overrides`, on startup and on every
-// settings save); the lock is never held across other work.
+/// Process-wide effective shortcut overrides (Issue #156, D154).
+///
+/// A deliberate exception to the app's "all state lives on the main thread,
+/// no locks" design: content webviews are built in many places (new tab,
+/// resume from suspension, ...) and the init script is baked at build time,
+/// so the current table is kept here instead of being threaded through every
+/// builder call. A `static` needs interior mutability, hence the `RwLock`;
+/// in practice only the main thread writes it (`set_shortcut_overrides`, on
+/// startup and on every settings save), and the lock is never held across
+/// other work, so it is never contended.
 static SHORTCUT_OVERRIDES: RwLock<Option<ShortcutOverrides>> = RwLock::new(None);
 
 /// Replace the process-wide shortcut overrides used to generate every
@@ -473,7 +477,7 @@ fn current_shortcut_overrides() -> ShortcutOverrides {
 /// second listener, which is how already-open tabs pick up a remapping and
 /// how the *old* key stops working.
 ///
-/// Matching mirrors the historical hand-written scripts: the primary
+/// Matching mirrors the pre-#156 per-shortcut scripts: the primary
 /// modifier is `ctrlKey || metaKey` on every platform (D23), except that a
 /// primary+Alt chord requires `metaKey` (Ctrl+Alt is AltGr on many Windows
 /// layouts and must keep typing characters — the old devtools script was

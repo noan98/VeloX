@@ -1317,12 +1317,12 @@
      macOS and Cmd is harmlessly ignored elsewhere.
      Issue #38/D77 (`browser::shortcuts::SHORTCUT_TABLE`) centralized the
      content webview's half of this feature (`ui::window::tab_shortcut_script`
-     is now generated from that table) and the Settings screen's Shortcuts
-     tab (`shortcut_reference`), but deliberately left this trusted,
-     structured-command listener hand-written — see D77's "見送ったこと"
-     section for why. A new *toolbar-reachable* shortcut still needs a
-     branch here plus a `ToolbarCommand` variant, in addition to a
-     `SHORTCUT_TABLE` row if it should also work from the content webview. */
+     is generated from that table) and the Settings screen's Shortcuts tab
+     (`shortcut_reference`). Issue #156/D154 made this trusted listener
+     table-driven too (see below) and the keys user-remappable. A new
+     *toolbar-reachable* shortcut needs a `SHORTCUT_TABLE` row, a
+     `ToolbarCommand` variant and an entry in `TOOLBAR_SHORTCUT_COMMANDS`
+     below — no key-matching branch. */
   /* Issue #156 (D154): the key table is no longer hand-written here. Rust
      pushes the *effective* chords (defaults + the user's overrides) with
      every `veloxSetSettings` (`view.shortcuts[].chords`), and this trusted
