@@ -10,7 +10,15 @@
 //! `app.rs`'s `log_failure` pattern) — a missing, corrupt, or unwritable
 //! data directory degrades to an in-memory, non-persisted session rather
 //! than crashing the browser.
+//!
+//! Versioning, step-wise migration, pre-migration backups, atomic writes and
+//! quarantining of unparseable files are delegated to
+//! [`crate::browser::migration`] (Issue #92, docs/decisions.md D164, see
+//! docs/migration.md): every file written here carries a top-level
+//! `"schema_version"`, and a file without one (written before #92) is read as
+//! the current version, so existing profiles load unchanged.
 
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -20,8 +28,9 @@ use serde::Serialize;
 use super::bookmarks::BookmarkStore;
 use super::history::HistoryStore;
 use super::input_history::InputHistoryStore;
+use super::migration::{self, Schema};
 use super::session::SessionSnapshot;
-use super::settings::Settings;
+use super::settings::{Settings, SETTINGS_SCHEMA_VERSION};
 use super::site_permissions::SitePermissionStore;
 
 const HISTORY_FILE: &str = "history.json";
@@ -30,6 +39,11 @@ const INPUT_HISTORY_FILE: &str = "input_history.json";
 const SESSION_FILE: &str = "session.json";
 const SITE_PERMISSIONS_FILE: &str = "site_permissions.json";
 const SETTINGS_FILE: &str = "settings.json";
+
+/// 設定以外のストア (履歴・ブックマーク・入力履歴・セッション・サイト権限)
+/// の現在の版 (Issue #92)。`schema_version` 欄の無い既存ファイルもこの版と
+/// して読む。
+pub const STORE_SCHEMA_VERSION: u32 = 1;
 
 /// Resolve the directory VeloX stores its history/bookmarks files in.
 ///
@@ -168,19 +182,35 @@ pub fn save_settings(dir: &Path, settings: &Settings) -> std::io::Result<()> {
     write_json(dir, SETTINGS_FILE, settings)
 }
 
-/// `dir` 直下の `file` を JSON として読む。読めない・解釈できないものは
-/// すべて `None`。
-fn read_json<T: DeserializeOwned>(dir: &Path, file: &str) -> Option<T> {
-    let data = fs::read_to_string(dir.join(file)).ok()?;
-    serde_json::from_str(&data).ok()
+/// `file` の版情報。今あるストアはどれも形を変えたことが無いので、全部
+/// [`Schema::initial`] (`schema_version` 欄の無い既存ファイル = 現在の版)。
+/// 構造を変えるときは該当ストアの `current` を上げ、[`migration::Migration`]
+/// を足す (docs/migration.md)。設定だけは以前から版を持っており
+/// [`SETTINGS_SCHEMA_VERSION`] と揃える。
+fn schema_for(file: &str) -> Schema {
+    if file == SETTINGS_FILE {
+        Schema::initial(SETTINGS_SCHEMA_VERSION)
+    } else {
+        // history / bookmarks / input_history / session / site_permissions
+        Schema::initial(STORE_SCHEMA_VERSION)
+    }
 }
 
-/// `value` を整形済み JSON として `dir` 直下の `file` に書く。`dir` が
-/// 無ければ作成する。
+/// `dir` 直下の `file` を読む (移行・退避は [`migration::load`])。使える値が
+/// 無ければ `None`。平常時以外の出来事 (移行・退避・新しい版) は stderr に
+/// 1 行残す — 利用者が「履歴が消えた」ときに原因と控えの場所を辿れるように。
+fn read_json<T: DeserializeOwned>(dir: &Path, file: &str) -> Option<T> {
+    let loaded = migration::load(&dir.join(file), &schema_for(file));
+    if loaded.status.is_notable() {
+        eprintln!("velox: {file}: {}", loaded.status);
+    }
+    loaded.value
+}
+
+/// `value` を整形済み JSON として `dir` 直下の `file` に原子的に書く
+/// (`schema_version` 付き)。`dir` が無ければ作成する。
 fn write_json<T: Serialize>(dir: &Path, file: &str, value: &T) -> std::io::Result<()> {
-    fs::create_dir_all(dir)?;
-    let data = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
-    fs::write(dir.join(file), data)
+    migration::save(&dir.join(file), &schema_for(file), value)
 }
 
 #[cfg(test)]
@@ -627,6 +657,98 @@ mod tests {
             super::super::settings::PerformanceSettings::default()
         );
 
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // --- Versioning / migration / rollback (Issue #92, D164) ---
+
+    #[test]
+    fn every_saved_file_carries_a_schema_version() {
+        let dir = unique_temp_path("velox-persist-versioned");
+        save_history(&dir, &HistoryStore::new()).unwrap();
+        save_bookmarks(&dir, &BookmarkStore::new()).unwrap();
+        save_input_history(&dir, &InputHistoryStore::new()).unwrap();
+        save_site_permissions(&dir, &SitePermissionStore::new()).unwrap();
+        save_session(&dir, &SessionSnapshot::default()).unwrap();
+        save_settings(&dir, &Settings::default()).unwrap();
+        for (file, expected) in [
+            (HISTORY_FILE, STORE_SCHEMA_VERSION),
+            (BOOKMARKS_FILE, STORE_SCHEMA_VERSION),
+            (INPUT_HISTORY_FILE, STORE_SCHEMA_VERSION),
+            (SITE_PERMISSIONS_FILE, STORE_SCHEMA_VERSION),
+            (SESSION_FILE, STORE_SCHEMA_VERSION),
+            (SETTINGS_FILE, SETTINGS_SCHEMA_VERSION),
+        ] {
+            let raw: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir.join(file)).unwrap()).unwrap();
+            assert_eq!(
+                raw[migration::SCHEMA_VERSION_KEY],
+                serde_json::json!(expected),
+                "{file}"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn files_written_before_versioning_still_load_without_backups() {
+        // Issue #92 以前の VeloX が書いた形 (`schema_version` 欄なし)。
+        let dir = unique_temp_path("velox-persist-legacy");
+        let mut history = HistoryStore::new();
+        history.record_visit("https://example.com/", None, 100, 0);
+        let session = SessionSnapshot {
+            windows: vec![SavedWindow {
+                tabs: vec![SavedTab {
+                    url: "https://a.example/".to_owned(),
+                    title: None,
+                    favicon: None,
+                    pinned: false,
+                }],
+                active_index: 0,
+            }],
+            ..SessionSnapshot::default()
+        };
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(HISTORY_FILE),
+            serde_json::to_string(&history).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            dir.join(SESSION_FILE),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(load_history(&dir), history);
+        assert_eq!(load_session(&dir), Some(session));
+        assert!(migration::list_backups(&dir.join(HISTORY_FILE)).is_empty());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_corrupt_store_is_quarantined_instead_of_silently_overwritten() {
+        let dir = temp_dir_with_file("velox-persist-quarantine", BOOKMARKS_FILE, "{broken");
+        assert_eq!(load_bookmarks(&dir), BookmarkStore::new());
+        let path = dir.join(BOOKMARKS_FILE);
+        let moved = migration::corrupt_files(&path);
+        assert_eq!(moved.len(), 1);
+        assert_eq!(fs::read_to_string(&moved[0]).unwrap(), "{broken");
+        // 次の保存は新しいファイルを作るだけで、退避したものは残る。
+        save_bookmarks(&dir, &BookmarkStore::new()).unwrap();
+        assert!(moved[0].exists());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn settings_from_a_newer_velox_are_backed_up_before_being_overwritten() {
+        let newer = r#"{"schema_version":2,"general":{"homepage":"https://new.example/"}}"#;
+        let dir = temp_dir_with_file("velox-persist-newer", SETTINGS_FILE, newer);
+        let loaded = load_settings(&dir).expect("additive newer file should still load");
+        assert_eq!(loaded.general.homepage, "https://new.example/");
+        save_settings(&dir, &loaded.sanitize()).unwrap();
+        let backup = migration::backup_path(&dir.join(SETTINGS_FILE), 2);
+        assert_eq!(fs::read_to_string(backup).unwrap(), newer);
         fs::remove_dir_all(&dir).ok();
     }
 

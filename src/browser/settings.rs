@@ -44,8 +44,11 @@ use crate::browser::suspension::DEFAULT_MEMORY_BUDGET_BYTES;
 
 /// Bumped only for a structural (not just additive) change to this shape —
 /// see the module doc comment. Every field added so far has been additive
-/// (`#[serde(default)]` handles it), so nothing currently branches on this
-/// value; it exists as the documented seam for when one eventually does.
+/// (`#[serde(default)]` handles it), so no migration step exists yet. The
+/// value is read by `browser::migration` (Issue #92, docs/decisions.md D164,
+/// docs/migration.md) through `persistence`: a structural change bumps this
+/// and registers a `migration::Migration` for the old version, and the
+/// pre-migration file is kept as `settings.json.v<old>.bak`.
 pub const SETTINGS_SCHEMA_VERSION: u32 = 1;
 
 /// Kept in sync with `config::Config::default().homepage` by convention

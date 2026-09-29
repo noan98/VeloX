@@ -5,9 +5,10 @@
 //! `history`, `bookmarks`, `site_permissions`, `session`, `settings`,
 //! `benchmark`, `automation`, `suspension` and `find` hold no filesystem
 //! or UI dependency.
-//! `persistence`, `crash_store` and `perf_log` are the exceptions — thin, deliberately
-//! "dumb" IO layers (JSON files for `persistence`; stderr/a file for
-//! `perf_log`'s [`metrics::PerfRecord`] lines); see their module doc
+//! `persistence`, `migration`, `crash_store` and `perf_log` are the exceptions — thin,
+//! deliberately "dumb" IO layers (JSON files for `persistence`, with
+//! versioning/migration/backup/quarantine in `migration` (Issue #92); stderr/a
+//! file for `perf_log`'s [`metrics::PerfRecord`] lines); see their module doc
 //! comments.
 
 pub mod ai;
@@ -22,10 +23,12 @@ pub mod downloads;
 pub mod extension_manifest;
 pub mod extensions;
 pub mod find;
+pub(crate) mod fsutil;
 pub mod gui_probe;
 pub mod history;
 pub mod input_history;
 pub mod metrics;
+pub mod migration;
 pub mod navigation;
 pub mod network_activity;
 pub mod omnibox;

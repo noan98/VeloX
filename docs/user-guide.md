@@ -102,6 +102,11 @@ Get-FileHash .\velox-<バージョン>-windows-x86_64-setup.exe -Algorithm SHA25
 `session.json` / `site_permissions.json` / `settings.json` です。
 バックアップしたいときはこのフォルダをコピーします。
 
+同じフォルダに `*.v<数字>.bak` (更新・ダウングレード時に自動で取られる控え) や
+`*.corrupt-<数字>` (壊れていたため退避されたファイル) ができることがあります。
+旧版へ戻すときの使い方は [migration.md](migration.md) の「ロールバック」を
+参照してください。
+
 ## トラブルシューティング
 
 | 症状 | 確認すること |
