@@ -9,6 +9,7 @@
 | --- | --- |
 | [architecture.md](architecture.md) | UI (`src/ui/`) / Application (`src/app.rs`) / Browser logic (`src/browser/`) / Web engine (wry) という 4 層の責務分担と依存方向。UI 側は状態を直接触らず `UserEvent` を投げる、という設計もここ (`src/config/` は `src/browser/` と同じく純粋 Rust の補助モジュールで、層には数えない) |
 | [extensions.md](extensions.md) | 拡張機能の設計 (Issue #82 / Epic #80): 信頼境界・脅威モデル・権限モデル・ライフサイクル・マニフェストスキーマ。悪意ある拡張機能を前提にした決定は D159。スキーマの実装は `src/browser/extension_manifest.rs`、API / ライフサイクル / ストレージのホスト側コアは `src/browser/extensions/` (#83 / #84、D163。いずれも未配線) |
+| [sync.md](sync.md) | 複数端末同期の設計仕様 (同期対象・HLC・競合解決・オフラインキュー・プロトコルバージョン・脅威モデル)。実装は `src/browser/sync/` (アプリ未接続)、暗号化とサーバは #86 |
 | [decisions/README.md](decisions/README.md) | 設計判断の入口。D 番号をテーマ別に整理し、詳細な一次記録は `decisions/archive.md` に保持 |
 
 ## 性能
