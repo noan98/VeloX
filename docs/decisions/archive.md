@@ -19402,6 +19402,60 @@ Storage)。D159 (`docs/extensions.md`) の設計と `extension_manifest.rs` を
 ストア) を決めるとき、`ExtensionPackage` の入口 (アーカイブ展開・ハッシュ検証)
 を足す。
 
+## D161: リリースチャネルを Beta / Stable の 2 つ + タグなし Nightly とし、pre-release タグを自動で pre-release 公開する (Issue #88)
+
+**対象**: `docs/release-channels.md` (新規)、`.github/workflows/release-windows.yml` /
+`release-linux.yml` の Release 作成ステップ。
+
+### 決定
+
+1. **チャネルは Nightly / Beta / Stable。ただし実在する Release は Beta と
+   Stable だけ**。Nightly は既存の `workflow_dispatch` の Actions Artifact (保持 30
+   日) で済ませ、タグも GitHub Release も作らない。個人メンテナが 3 種類の Release を
+   維持するのは非現実的で、自動更新 (#90) が無いため段階配布の利点も得られない。
+2. **バージョニングは SemVer 2.0.0**。`1.0.0` 未満では MINOR を機能・永続データ形式
+   の追加、PATCH を不具合修正のみとする。pre-release 識別子は `beta.N` のみ。
+   タグは `Cargo.toml` の version と完全一致 (既存の Windows workflow の検査を
+   そのまま前提にする)。Stable 昇格は version 行のみを変えた新 commit にタグを
+   打つ。タグの付け替え・番号の巻き戻しはしない。
+3. **Stable 昇格条件は既存ゲートに接地する**: CI (Linux/Windows) 緑、release
+   workflow 成功、`perf-gate` が fail でない、`perf-windows` を Beta commit で 1 回
+   実行して大きな悪化がない、致命的不具合 (データ損失・起動不能・クラッシュ・
+   セキュリティ) が open で 0、Beta から最低 7 日のソーク、旧 Stable からの
+   アップグレード確認、永続データが追加のみ。性能ゲートは絶対値でなく相対回帰の
+   判定で、`perf-windows` は PR ゲートでも単発 run で止める根拠でもない (D96 /
+   #211) ため「根拠付きの確認項目」として扱う。
+4. **ロールバックは「取り下げ + 直前 Stable を Latest に戻す + 新しい PATCH で修正」**。
+   タグの削除・付け替え・番号の巻き戻しはしない。#92 (移行) が未実装のため、
+   Stable にする版は永続データを追加のみで変更し、構造変更を含む版は #92 まで
+   Stable にしない (Beta 止まり)。
+5. **自動化は 1 点だけ**: 両 release workflow の `softprops/action-gh-release` に
+   `prerelease: ${{ contains(github.ref_name, '-') }}` を渡し、`-` を含むタグを
+   pre-release として公開する。新しい trigger・権限・Secrets は追加していない
+   (タグ push のみ。この trigger は元から存在する)。式が単純なので Python の
+   ヘルパーと unittest は作らない。
+
+### 見送ったもの
+
+- Nightly の定時ビルド・Release 化: 利用者がいない現状では負荷に見合わない。
+- 昇格の自動化: 判定に人の確認 (ソーク・実機アップグレード) が必要で、write 権限を持つ
+  workflow を増やすと公開リポジトリの攻撃面が広がる。
+- タグ形式の検査 (`vX.Y.Z` / `vX.Y.Z-beta.N` 以外を拒否): 既存タグへの影響確認が要る。
+- `release-blocker` ラベルの新設とその機械チェック。
+- `alpha` / `rc` 識別子: チャネルが 2 つなので増やさない。
+
+### 未検証
+
+`prerelease` の式は YAML の構文検査のみで、**実際にタグを push しての動作は未確認**。
+初回の Beta タグ (`v0.x.y-beta.1`) の Release が pre-release 印付きで作られることを、
+そのとき確認する。Windows / Linux の 2 workflow が同じ Release を更新するが、両方が
+同じ式を渡すので値は食い違わない。
+
+**Revisit condition**: (1) 自動更新 (#90) が入ったら、チャネルを更新の追従先として
+定義し直す (Nightly の Release 化も検討)。(2) #92 が入ったら §6.3 の「追加のみ」
+規律を緩める。(3) 個人メンテナ以外が Stable を切るようになったら、昇格判定の
+自動チェックリスト化を検討する。
+
 ## D154: キーボードショートカットの再割り当て (Issue #156) — 上書き表だけを永続化し、生成される JS も toolbar の keydown も「有効表」から作る
 
 **対象**: `browser::shortcuts` (`ShortcutOverrides` / `KeyChord` の serde /

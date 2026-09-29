@@ -4,7 +4,7 @@ OS 固有実装、CI、配布、アプリ構成に関する Decision の入口�
 
 ## 対象
 
-主担当は **D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126, D128, D131, D133–D134, D153, D157–D158** の 24 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
+主担当は **D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126, D128, D131, D133–D134, D153, D157–D158, D161** の 25 件 (網羅的な一覧は下の「詳細」節。ここは読み進める手がかりとしての要約)。
 
 - **D50–D55** — CI / Windows release / icon / download-context fix / WebProcess sharing / auto-merge
 - **D68** — multiple windows
@@ -19,7 +19,7 @@ OS 固有実装、CI、配布、アプリ構成に関する Decision の入口�
 
 ## 詳細
 
-**このカテゴリが主担当の Decision: D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126, D128, D131, D133–D134, D153, D157–D158** (24 件)
+**このカテゴリが主担当の Decision: D50–D55, D68, D70, D73, D83, D91, D98, D100, D103, D107–D108, D126, D128, D131, D133–D134, D153, D157–D158, D161** (25 件)
 
 `archive.md` の全 Decision は、いずれか 1 つのカテゴリが主担当として必ず
 この一覧に載る。複数カテゴリにまたがるものは主担当だけに載せ、必要なら
@@ -53,6 +53,7 @@ OS 固有実装、CI、配布、アプリ構成に関する Decision の入口�
 - [D153](./archive.md#d153-webkitgtk-系ターゲットの-cfg-を-buildrs-の-gtk_backend-エイリアスにまとめる--ソース中の-5-os-列挙をやめる) — WebKitGTK 系ターゲットの cfg を build.rs の `gtk_backend` エイリアスにまとめる — ソース中の 5 OS 列挙をやめる
 - [D157](./archive.md#d157-リリース運用の整備-94--自動生成リリースノート--ラベル分類changelogmd-は置かないissue-フォームで報告の導線を作る) — リリース運用の整備 (#94) — 自動生成リリースノート + ラベル分類、CHANGELOG.md は置かない、Issue フォームで報告の導線を作る
 - [D158](./archive.md#d158-claude-レビューの-bash-権限は広げない-issue-274--ci-の結果を読ませcontents-write-を持つ-workflow-にリポジトリのコードを実行させない) — `@claude` レビューの Bash 権限は広げない (Issue #274) — CI の結果を読ませ、`contents: write` を持つ workflow にリポジトリのコードを実行させない
+- [D161](./archive.md#d161-リリースチャネルを-beta--stable-の-2-つ--タグなし-nightly-としpre-release-タグを自動で-pre-release-公開する-issue-88) — リリースチャネルを Beta / Stable の 2 つ + タグなし Nightly とし、pre-release タグを自動で pre-release 公開する (Issue #88)
 
 ---
 
