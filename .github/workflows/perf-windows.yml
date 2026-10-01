@@ -1534,7 +1534,7 @@ jobs:
       # 展開先を作業ツリーの外に置くのは意図的である。**リポジトリ内に置くと
       # `git status` に未追跡ファイルとして現れ、「範囲外の差分」の検査を
       # 自分で汚す。**
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: ${{ needs.perf-windows.outputs.artifact_name }}
           path: ${{ runner.temp }}/bench-artifact
