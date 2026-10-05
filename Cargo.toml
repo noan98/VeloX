@@ -47,7 +47,7 @@ gtk = "0.18"
 # tree through wry; the exact pins match wry's so a second copy of either
 # can never appear. See docs/decisions D155 and D6.
 webkit2gtk = "=2.0.2"
-javascriptcore-rs = "=1.1.2"
+javascriptcore-rs = "=2.0.0"
 
 # Embeds assets/icon/velox.ico into velox.exe as its resource icon (what
 # Explorer / the taskbar / the Start menu show). Windows-only: other targets
