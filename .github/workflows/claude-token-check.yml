@@ -40,7 +40,7 @@ jobs:
         with:
           fetch-depth: 1
 
-      - uses: anthropics/claude-code-action@b7912aeeb535234e3e9385ff49e8237f689b5f14
+      - uses: anthropics/claude-code-action@115e0b2c49222c831de6748ccdf365bb8d3ea9a3
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # agent モードで動かすための最小プロンプト。モデルが 1 回でも
